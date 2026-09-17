@@ -1,0 +1,23 @@
+# sorgenti di riferimento (worktree di colibri e ds4, commit fissati in docs/ORIGINI.md)
+/ref/
+# build
+/build/
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.dylib
+# modelli e fixture generate
+/models/
+/fixtures/
+*.gguf
+*.safetensors
+# locale
+/tmp/
+.claude/settings.local.json
+.claude/worktrees/
+__pycache__/
+/tools/.venv/
+# risultati di profilazione da un albero sporco (i risultati puliti restano in git come storico)
+/bench/results/*-dirty-*

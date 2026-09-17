@@ -1,0 +1,38 @@
+[
+  {
+    "name": "olmoe-1b-7b-q8_0-t16",
+    "model": "models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf",
+    "prompt_tokens": 32,
+    "gen_tokens": 32,
+    "context": 128,
+    "threads": 16,
+    "runs": 5
+  },
+  {
+    "name": "olmoe-1b-7b-q8_0-t8",
+    "model": "models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf",
+    "prompt_tokens": 32,
+    "gen_tokens": 32,
+    "context": 128,
+    "threads": 8,
+    "runs": 5
+  },
+  {
+    "name": "olmoe-1b-7b-q8_0-t4",
+    "model": "models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf",
+    "prompt_tokens": 32,
+    "gen_tokens": 32,
+    "context": 128,
+    "threads": 4,
+    "runs": 5
+  },
+  {
+    "name": "olmoe-1b-7b-q8_0-t1",
+    "model": "models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf",
+    "prompt_tokens": 32,
+    "gen_tokens": 32,
+    "context": 128,
+    "threads": 1,
+    "runs": 5
+  }
+]

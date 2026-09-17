@@ -1,0 +1,29 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"C:/Users/marce/Desktop/trochilus/.claude/hooks/documenta-prima-del-commit.cjs\"",
+            "if": "Bash(git commit:*)",
+            "timeout": 10,
+            "statusMessage": "Controllo che il lavoro sia documentato..."
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"C:/Users/marce/Desktop/trochilus/.claude/hooks/niente-barre-in-scritture-shell.cjs\"",
+            "timeout": 10,
+            "statusMessage": "Controllo barre rovesciate nelle scritture da shell..."
+          }
+        ]
+      }
+    ]
+  }
+}

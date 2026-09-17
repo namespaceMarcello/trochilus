@@ -1,0 +1,26 @@
+[
+  {
+    "name": "tiny-f32-short-prompt-long-answer",
+    "model": "fixtures/tiny-olmoe/model-f32.gguf",
+    "prompt_tokens": 6,
+    "gen_tokens": 64,
+    "threads": 0,
+    "runs": 5
+  },
+  {
+    "name": "tiny-f32-long-prompt-short-answer",
+    "model": "fixtures/tiny-olmoe/model-f32.gguf",
+    "prompt_tokens": 96,
+    "gen_tokens": 8,
+    "threads": 0,
+    "runs": 5
+  },
+  {
+    "name": "tiny-q8_0-short-prompt-long-answer",
+    "model": "fixtures/tiny-olmoe/model-q8_0.gguf",
+    "prompt_tokens": 6,
+    "gen_tokens": 64,
+    "threads": 0,
+    "runs": 5
+  }
+]

@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""Project lint: the lessons in docs/LEZIONI.md that a script can check.
+
+Each check names the lesson it enforces. Exit 1 on any failure.
+
+  python tools/lint.py            run every check
+"""
+
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+failures = []
+
+
+def fail(lesson, msg):
+    failures.append(f"[LEZIONI #{lesson}] {msg}")
+
+
+def check_docs_control_chars():
+    """#14: backslash sequences written through shell or Python become tabs or carriage returns."""
+    files = [ROOT / "CLAUDE.md", *sorted((ROOT / "docs").rglob("*.md"))]
+    for f in files:
+        data = f.read_bytes()
+        for name, byte in (("tab", b"\t"), ("carriage return", b"\r")):
+            if byte in data:
+                line = data[: data.index(byte)].count(b"\n") + 1
+                fail(14, f"{f.relative_to(ROOT)}:{line}: contains a {name}")
+
+
+def check_doc_limits():
+    """struttura-repo: CLAUDE.md is a map (<= 200 lines), STATO.md does not grow (<= 40 KB)."""
+    claude = ROOT / "CLAUDE.md"
+    n = claude.read_text(encoding="utf-8").count("\n")
+    if n > 200:
+        fail("struttura", f"CLAUDE.md has {n} lines (limit 200)")
+    stato = ROOT / "docs" / "STATO.md"
+    if stato.stat().st_size > 40_000:
+        fail("struttura", f"docs/STATO.md is {stato.stat().st_size} bytes (limit 40 KB)")
+
+
+def check_lessons_table():
+    """The lessons table stays machine-readable: 8 columns, consecutive numbers."""
+    rows = [l for l in (ROOT / "docs" / "LEZIONI.md").read_text(encoding="utf-8").splitlines()
+            if re.match(r"^\| \d+ \|", l)]
+    expected = 1
+    for row in rows:
+        cells = [c.strip() for c in re.split(r"(?<!\\)\|", row.strip().strip("|"))]  # "\|" is a literal pipe
+        if len(cells) != 8:
+            fail("registro", f"LEZIONI row {cells[0]} has {len(cells)} columns, expected 8")
+        if cells[0] != str(expected):
+            fail("registro", f"LEZIONI row numbered {cells[0]}, expected {expected}")
+        expected = int(cells[0]) + 1
+
+
+def check_type_table():
+    """#10: src/format/gguf.c type sizes must equal ggml's (gguf-py GGML_QUANT_SIZES)."""
+    try:
+        import gguf
+    except ImportError:
+        fail(10, "gguf-py not importable: run with tools/.venv python")
+        return
+    src = (ROOT / "src" / "format" / "gguf.c").read_text(encoding="utf-8")
+    table = dict((m.group(1), (int(m.group(2)), int(m.group(3))))
+                 for m in re.finditer(r'\[TR_TYPE_(\w+)\]\s*=\s*\{"\w+",\s*(\d+),\s*(\d+)\}', src))
+    if not table:
+        fail(10, "type table not found in src/format/gguf.c")
+        return
+    for name, (elems, nbytes) in table.items():
+        qt = getattr(gguf.GGMLQuantizationType, name, None)
+        if qt is None:
+            fail(10, f"TR_TYPE_{name} has no ggml counterpart")
+            continue
+        ref = gguf.GGML_QUANT_SIZES.get(qt)
+        if ref is None:
+            continue
+        if (elems, nbytes) != tuple(ref):
+            fail(10, f"TR_TYPE_{name}: gguf.c says {elems}/{nbytes}, ggml says {ref[0]}/{ref[1]}")
+    header = (ROOT / "src" / "format" / "gguf.h").read_text(encoding="utf-8")
+    for m in re.finditer(r"TR_TYPE_(\w+) = (\d+)", header):
+        qt = getattr(gguf.GGMLQuantizationType, m.group(1), None)
+        if qt is not None and int(qt) != int(m.group(2)):
+            fail(10, f"TR_TYPE_{m.group(1)} = {m.group(2)} in gguf.h, ggml numbers it {int(qt)}")
+
+
+def check_tests_no_tmpfile():
+    """#3: tmpfile() needs write access to the drive root on Windows."""
+    for f in sorted((ROOT / "tests").glob("*.c")):
+        for i, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+            if re.search(r"\btmpfile\s*\(", line) and "needs write access" not in line:
+                fail(3, f"{f.relative_to(ROOT)}:{i}: uses tmpfile(); write next to the test binary")
+
+
+# Hot zone (docs/ARCHITETTURA.md §Zona calda): code that runs for every token, between
+# /* hot: begin */ and /* hot: end */. A line may allow a name with /* hot-ok: name -- reason */.
+HOT_FILES = ["src/models/olmoe.c", "src/kernels/kernels.c", "src/kernels/kernels_x86.c",
+             "src/kernels/kernels_internal.h", "src/base/threads.c", "src/base/prof.h"]
+HOT_RULES = [
+    ("allocazione", re.compile(r"\b(malloc|calloc|realloc|free|tr_alloc_aligned|tr_free_aligned|"
+                               r"_aligned_malloc|_aligned_free|posix_memalign|aligned_alloc)\s*\(")),
+    ("stringa o I/O", re.compile(r"\b(str[a-z]+|printf|fprintf|snprintf|sprintf|vsnprintf|puts|fputs|"
+                                 r"fopen|fread|fwrite|getenv|tr_log|tr_file_\w+|tr_gguf_\w+)\s*\(")),
+    ("letterale stringa", re.compile(r'(")(?:[^"\\]|\\.)*"')),
+    ("matematica da tabellare", re.compile(r"\b(pow|powf|cos|cosf|sin|sinf|tan|tanf|log|logf|log2|log10)\s*\(")),
+]
+HOT_BEGIN, HOT_END = "/* hot: begin */", "/* hot: end */"
+
+
+def hot_problems(text):
+    """(line, message) for every hot-zone rule broken in a C source."""
+    def blank(m):
+        return re.sub(r"[^\n]", " ", m.group(0))
+    code_lines = re.sub(r"/\*.*?\*/|//[^\n]*", blank, text, flags=re.S).split("\n")
+    problems, inside, regions = [], False, 0
+    for i, raw in enumerate(text.split("\n"), 1):
+        if HOT_BEGIN in raw:
+            if inside:
+                problems.append((i, "zona calda aperta due volte"))
+            inside, regions = True, regions + 1
+            continue
+        if HOT_END in raw:
+            if not inside:
+                problems.append((i, "fine di una zona calda mai aperta"))
+            inside = False
+            continue
+        if not inside:
+            continue
+        allowed, used = set(), set()
+        w = re.search(r"hot-ok:\s*([^*]*?)\s+--\s+\S", raw)
+        if w:
+            allowed = set(w.group(1).split())
+        code = code_lines[i - 1]
+        if code.lstrip().startswith("#"):
+            continue
+        for label, rx in HOT_RULES:
+            for m in rx.finditer(code):
+                name = m.group(1) if m.group(1) != '"' else "stringa"
+                if name in allowed:
+                    used.add(name)
+                else:
+                    problems.append((i, f"{label}: {name}"))
+        for name in sorted(allowed - used):
+            problems.append((i, f"hot-ok per '{name}' ma la riga non lo usa più: togli l'eccezione"))
+    if inside:
+        problems.append((len(text.split("\n")), "zona calda mai chiusa"))
+    if regions == 0:
+        problems.append((1, "nessuna zona calda marcata"))
+    return problems
+
+
+def check_hot_zones():
+    """Hot zone rules, after proving on samples that the checker sees each kind of problem."""
+    b, e = HOT_BEGIN, HOT_END
+    samples = [
+        (f"{b}\nvoid f(void) {{ char *p = malloc(4); }}\n{e}\n", 1),
+        (f"{b}\nvoid f(void) {{ strlen(s); }}\n{e}\n", 1),
+        (f"{b}\nvoid f(void) {{ g(\"x\"); }}\n{e}\n", 1),
+        (f"{b}\nvoid f(void) {{ y = pow(2, 3); }}\n{e}\n", 1),
+        (f"{b}\nvoid f(void) {{ y = pow(2, 3); /* hot-ok: pow -- sample */ }}\n{e}\n", 0),
+        (f"{b}\nvoid f(void) {{ y = 0; /* hot-ok: cos -- sample */ }}\n{e}\n", 1),
+        (f"{b}\n/* malloc( in a comment */\n{e}\nvoid g(void) {{ malloc(1); }}\n", 0),
+        (f"{b}\nvoid f(void) {{ }}\n", 1),
+        ("void f(void) { }\n", 1),
+    ]
+    for n, (text, want) in enumerate(samples, 1):
+        got = len(hot_problems(text))
+        if got != want:
+            failures.append(f"[zona calda] il controllo è rotto: campione {n} dà {got} problemi invece di {want}")
+            return
+    for rel in HOT_FILES:
+        path = ROOT / rel
+        for line, msg in hot_problems(path.read_text(encoding="utf-8")):
+            failures.append(f"[zona calda, docs/ARCHITETTURA.md] {rel}:{line}: {msg}")
+
+
+def main():
+    for check in (check_docs_control_chars, check_doc_limits, check_lessons_table,
+                  check_type_table, check_tests_no_tmpfile, check_hot_zones):
+        check()
+    for f in failures:
+        print(f)
+    print(f"lint: {len(failures)} problem(s)" if failures else "lint: ok")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,17 @@
+Trochilus
+Copyright 2026 The Trochilus authors
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes software derived from colibri
+(https://github.com/JustVugg/colibri), Copyright 2026 Vincenzo Fornaro,
+licensed under the Apache License, Version 2.0. Its NOTICE is reproduced in
+licenses/colibri-NOTICE.txt.
+
+This product includes software derived from ds4
+(https://github.com/antirez/ds4), Copyright (c) 2026 The ds4.c authors and
+Copyright (c) 2023-2026 The ggml authors, licensed under the MIT License
+(licenses/ds4-MIT.txt).
+
+Every source file derived from either project names its origin (project,
+commit, path) in its header comment and states that it was modified.
