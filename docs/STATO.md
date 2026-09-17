@@ -75,6 +75,21 @@ Sostituisci, non appendere. Tetto 40 KB. Lo storico sta in `archivio/FATTO.md`.
   allocatore, backend, C++. `sgemm.cpp` di llamafile è C++ con intrinseci, non assembly: per i pesi
   Q8_0 vuole attivazioni Q8_0 (non esatte), e il percorso float usa FMA (non bit-identico allo scalare).
 
+- 2026-09-17 — **Prefill a blocchi in C esatto** (passo 1): mappa delle tre fonti in `docs/ORIGINI.md`.
+  Presi: passate da 512 token (llama.cpp), coppie (token, esperto) ordinate per esperto (ds4), attenzione
+  del lotto per (testa, token) dopo aver scritto tutti i K/V (colibri), logit solo dell'ultimo token
+  (tutte). Scartati: attivazioni int8 nel lotto (llama.cpp, ds4: non esatte) e la somma di ds4 per riga su
+  tutti gli esperti (rilegge tutto il lotto a ogni riga). Il decode è una passata da un token: un solo
+  percorso. Invariante: logit e cache identici al bit per ogni `n_batch` e ogni divisione in chiamate
+  (`tests/test_prefill.c`, oracolo al byte). Nessuna delle fonti lo prova (LEZIONI #42).
+  `tr_session_create` prende `n_batch`, la riga di comando `-b`.
+- 2026-09-17 — **Kernel `dot_row_x4`** (una riga di pesi contro 4 token nei registri, idea di ds4 che ne
+  fa 2): risultati identici al bit a `dot_row`, +45% sul prefill, niente sul decode (che ha un token
+  solo). Gli accumulatori vanno in registri con nome, mai in un array (LEZIONI #45).
+- 2026-09-17 — **Confronti di velocità solo con run alternate** (`tools/ab_speed.sh`): misurando prima
+  tutto A e poi tutto B, la macchina che si scalda sposta i numeri del 10-25% e nasconde il vero
+  guadagno (LEZIONI #46: una buona ottimizzazione era stata scartata così).
+
 ## Problemi noti
 
 - Smart App Control di Windows blocca un .exe appena compilato anche per 20 minuti: correttezza in
@@ -102,18 +117,19 @@ Sostituisci, non appendere. Tetto 40 KB. Lo storico sta in `archivio/FATTO.md`.
 
 ## Prossimi passi
 
-Fatti il 2026-09-17: oracolo transformers sul modello vero a 2 layer (`make oracle-real`, logit entro
-2.4e-4) e confronto di velocità (`tools/speed_compare.py`, `docs/MISURE.md` §Velocità): prefill
-llama.cpp 8-13× avanti, decode a più thread +8-19% (cresce col contesto), a 1 thread +46%; tokenizer
-Trochilus 13× HF.
+Fatto il 2026-09-17 (`docs/MISURE.md` §Prefill a blocchi + kernel a 4 token): prefill a blocchi in C
+esatto, profilo, kernel `dot_row_x4`. Prompt 512 a 16 thread: 30 → 197 tok/s (6.5×), a 1 thread 14 →
+28; decode invariato; logit identici al bit al binario di prima e fra passate di ogni dimensione.
+llama.cpp avanti 1.97× a 16 thread e 1.57× a 1 (era 11.8×).
 
-1. Prefill a blocchi guardando tutte e tre le fonti: llama.cpp (`ggml_compute_forward_mul_mat_id` in
-   `ggml-cpu.c`: token raggruppati per esperto), ds4 (prefill a lotti in C), colibri (`step()` di
-   `c/olmoe.c`: stesso modello, prefill a lotto ma senza raggruppare gli esperti). Più token nella stessa
-   moltiplicazione (oggi prefill = decode ≈ 30-34 tok/s, llama.cpp 233-377; un prompt da 10 000
-   token costa ~5 minuti). Prima la versione C esatta (logit identici al prefill token per token),
-   poi il profilo, poi intrinseci; assembly solo sul kernel che il profilo indica.
-2. Attivazioni int8/VNNI come opzione (leva 2), dopo il prefill.
+1. Attivazioni int8/VNNI come opzione (leva 2, domanda 21): è quello che resta del divario per
+   elemento. Definizione scalare nuova, differenza dichiarata e misurata sul modello vero, attivabile;
+   il default lo decide Marcello.
+2. Perché il prefill scala 1.16× da 8 a 16 thread (domanda 20): il profilo esclude il codice
+   (moltiplicazioni 90%, attenzione 2%, seriale 8%), resta da provare il limite di potenza del
+   portatile e i thread su un solo CCD. Misura prima di mettere mano.
+3. Prefill su prompt lunghi (2048-4096), dove l'attenzione per token cresce col quadrato: oggi è al 2%
+   con 512 token, va rimisurata lì prima di ottimizzarla.
 3. Confronto colibri/ds4 per componente (decisione sopra), poi le correzioni che ne escono.
    Misure 13-16 di `docs/MISURE.md` (routing, cache esperti, SSD): ordine da confermare con Marcello.
 4. Decode a contesto lungo: Trochilus perde l'11-13% da 32 a 512 token, llama.cpp il 5-7% (domande

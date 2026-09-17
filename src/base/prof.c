@@ -24,6 +24,7 @@ static const char *const zone_names[TR_PROF_ZONE_COUNT] = {
     [TR_PROF_ATTN_OUT_PROJ] = "attn_out_proj",
     [TR_PROF_FFN_NORM] = "ffn_norm",
     [TR_PROF_ROUTER] = "router",
+    [TR_PROF_EXPERT_GATHER] = "expert_gather",
     [TR_PROF_EXPERT_GATE_UP] = "expert_gate_up",
     [TR_PROF_EXPERT_ACT] = "expert_act",
     [TR_PROF_EXPERT_DOWN] = "expert_down",

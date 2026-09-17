@@ -36,6 +36,8 @@ si sposta nella sezione giusta con il numero quando è misurato.
 | 17 | Ricaricare dal disco la KV di un file già letto costa meno del prefill? La KV in q8 cambia i token? | checkpoint: logit identici al bit dopo il ricaricamento, tempo almeno 10 volte sotto il prefill; q8: token greedy uguali ≥ 99% su 1000 token di codice | leve del coding (file già letti, contesti lunghi), M5 |
 | 18 | Perché il decode perde l'11-13% da 32 a 512 token di contesto, e llama.cpp solo il 5-7%? | profilo per zone a contesto 32, 512, 2048: quota dell'attenzione e della sua parte a thread singolo | nel coding il contesto è lungo: è la differenza che cresce di più dopo il prefill |
 | 19 | Decode a 4-16 thread: llama.cpp è davvero avanti dell'8-12%? | `tools/speed_compare.py` con i due motori alternati run per run nella stessa sessione (fra due sessioni la mediana di llama.cpp si è spostata del 3-7%) | dice se c'è una leva nel decode a più thread o solo rumore |
+| 20 | Il prefill rende 2.0× da 4 a 16 thread e 1.16× da 8 a 16, e a 16 thread lo spread sale al 15-25%. Il profilo dice che non è il codice (moltiplicazioni 90%, attenzione 2%, seriale 8%) e la stessa matrice in cache rende 6.5× da 1 a 16 thread: è il limite di potenza del portatile? | frequenza effettiva durante una run a 16 thread contro una a 1 (contatori del sistema, o tempo di un lavoro fisso su un thread mentre gli altri 15 sono carichi); poi thread su un solo CCD (domanda 2) | dice se conviene ancora lavorare sul parallelo o solo sul lavoro per elemento |
+| 21 | Quanto del divario col prefill di llama.cpp (1.57× a 1 thread) è il dot int8 VNNI contro il nostro float? | microbenchmark `dot_row q8_0 x4` (44 G elementi/s) contro un dot int8 × int8 VNNI sulla stessa riga | dice quanto resta alla strada esatta e quanto chiede la leva 2 |
 
 Macchina di riferimento: Ryzen 9 7940HX (Zen 4, 16 core / 32 thread, AVX-512 VNNI/BF16), 31 GB
 RAM (2×16 GB DDR5-5200), NVMe Micron 1 TB, GPU RTX 4070 Laptop 8 GB e Radeon 610M (non usate fino
@@ -332,6 +334,90 @@ Letture:
 - **Tokenizer: Trochilus 13× HF e 36× llama.cpp**, stessi token di HF.
 - Trochilus nel container va ~5% sotto Windows nativo (31.1 contro 32.8 tok/s a 16 thread).
 
+## Prefill a blocchi in C esatto + kernel a 4 token — OLMoE-1B-7B Q8_0 (2026-09-17)
+
+Container, volume `trochilus-models`, prompt 512 token sintetici, 16 generati, **run alternate**
+binario vecchio / binario nuovo a ogni giro (`tools/ab_speed.sh`; LEZIONI #46: misurando prima tutto
+A e poi tutto B la macchina che si scalda falsa il confronto), mediana di 5 giri più uno di
+riscaldamento. «Prima» = binario di `38d0771` (un token per passata). «Dopo» = passate da 512 token,
+coppie (token, esperto) ordinate per esperto, matrici a blocchi di 16 token con una riga di pesi
+contro 4 token nei registri, logit solo dell'ultimo token.
+
+| Thread | Prefill prima | Prefill dopo | Guadagno | Decode prima | Decode dopo |
+|---|---|---|---|---|---|
+| 16 | 30.1 (26.9–31.1) | **196.9** (158.3–211.2) | 6.5× | 27.9 (24.9–30.9) | 29.4 (24.8–30.9) |
+| 8 | 31.0 (29.5–31.9) | **170.3** (147.9–185.1) | 5.5× | 29.6 (26.9–31.6) | 29.7 (28.3–29.8) |
+| 4 | 31.0 (30.7–32.0) | **100.0** (94.4–101.2) | 3.2× | 29.4 (26.0–31.1) | 27.0 (26.6–30.1) |
+| 1 | 14.4 (13.4–14.6) | **28.4** (26.8–29.0) | 2.0× | 13.5 (12.8–13.7) | 13.4 (12.7–13.8) |
+
+Contro llama.cpp, anche qui alternati run per run (stesso GGUF, `llama-bench -p 512 -n 0 -r 1`):
+
+| Thread | Trochilus | llama.cpp | Divario |
+|---|---|---|---|
+| 16 | 162.8 (121.8–173.8) | 321.0 (184.9–349.7) | 1.97× |
+| 8 | 156.7 (154.2–163.2) | 216.8 (180.0–251.6) | 1.38× |
+| 4 | 93.6 (90.4–96.8) | 146.3 (136.9–148.3) | 1.56× |
+| 1 | 26.1 (24.3–27.0) | 41.0 (40.9–41.2) | 1.57× |
+
+Esattezza sul modello intero (16 layer), 200 token: `logits` del binario di prima e di dopo, un token
+per passata, identici al bit (`cmp`), e identici fra 16 e 3 thread; passate da 16, 64 e 200 token
+identiche al bit alle stesse posizioni. Sul modello a 2 layer (`make oracle-real`) passate da 3, 64 e
+1056 token identiche al bit; `generate` sul prompt da 1024 token dà i token greedy di transformers.
+
+Letture:
+- **Prefill 6.5× a 16 thread** (30 → 197 tok/s), 2.0× anche a 1 thread. Il divario con llama.cpp
+  scende da 11.8× a **1.97×** (1.4-1.6× con meno thread).
+- **Decode invariato** (differenze dentro lo spread): stesso codice con una passata da un token,
+  logit identici al bit.
+- **Scala ancora male**: da 4 a 16 thread rende 2.0×, da 8 a 16 solo 1.16×; llama.cpp 2.2× da 4 a 16.
+  Le due misure di Trochilus a 16 thread di questa sessione (197 e 163) hanno spread ampio: a 16
+  thread la macchina è al limite di potenza e la variabilità sale (domanda 20).
+- **A 1 thread llama.cpp è 1.57× avanti**: stesso lavoro con dot int8 VNNI (leva 2, domanda 21).
+
+## Profilo del prefill — dove va il tempo (2026-09-17)
+
+`bench/scenarios-olmoe-1b-7b.json` (scenari `prefill512-t*`, `tools/profile_suite.py` ora riporta le
+zone anche in prefill), prompt 512, mediana di 5, prima del kernel a 4 token.
+
+| Thread | Prefill tok/s | matmul | attenzione | seriale (norme, RoPE, KV, router, copia per esperto, mix) |
+|---|---|---|---|---|
+| 16 | 144.3 | 89.8% | 2.4% | 7.6% |
+| 8 | 114.9 | 91.1% | 2.3% | 6.4% |
+| 4 | 66.2 | 93.6% | 2.2% | 4.0% |
+| 1 | 18.2 | 95.5% | 2.1% | 2.3% |
+
+Zona per zona a 16 thread: `expert_gate_up` 43.9%, `expert_down` 23.2%, `qkv_proj` 17.2%,
+`attn_out_proj` 5.5%, `attention` 2.4%, `kv_write` 1.6%, `router` 1.5%, `expert_gather` 1.5%.
+Byte di pesi distinti 12.5 MiB/token (1.9 GB/s): il prefill non è al limite della banda come il
+decode (1.2 GiB/token, 41 GB/s), il tempo sta nelle moltiplicazioni.
+
+## Kernel: una riga di pesi contro 4 token (2026-09-17)
+
+`make bench` (`tests/bench_kernels.c`, container, mediana di 5 × 100 ms, un thread), milioni di
+elementi al secondo **per riga di input**:
+
+| Kernel | n=1024 | n=2048 | n=4096 |
+|---|---|---|---|
+| dot_row q8_0 (una riga, un token) | 20 525 | 21 154 | 21 517 |
+| dot_row q8_0 x4 (una riga, 4 token) | 41 467 | 44 169 | 36 898 |
+| dot_f32 (riferimento in float) | 31 421 | 31 653 | 29 153 |
+
+`tr_matmul` su una matrice 1024×2048 q8_0 (forma di una proiezione di esperto), ms per token:
+
+| Thread | 1 token | 64 token |
+|---|---|---|
+| 1 | 0.100 | 0.059 |
+| 4 | 0.027 | 0.016 |
+| 8 | 0.014 | 0.008 |
+| 16 | 0.014 | 0.009 |
+
+Letture:
+- Il kernel a 4 token vale **2.1×** sul prodotto scalare e batte anche `dot_f32`: il peso q8_0 si
+  legge e si converte una volta per quattro prodotti, e occupa un quarto dei byte di un float.
+- La matrice intera guadagna meno del kernel (1.7× a 1 thread): lì pesano anche i byte letti.
+- Da 1 a 16 thread la stessa matrice rende 6.5×, non 16: a 16 thread la macchina è al limite di
+  potenza (domanda 20).
+
 ## Leve di velocità: cosa dice la ricerca (2026-09-17)
 
 Numeri delle fonti, su altre macchine: indicano la direzione, non promettono. Esatto = stessi
@@ -341,8 +427,8 @@ numeri; dichiarato = numeri diversi, differenza da misurare sul modello vero pri
 |---|---|---|---|---|
 | 1 | SIMD sul prodotto riga × vettore | esatto | — | fatto: 10× sul kernel |
 | 2 | Attivazioni in int8 + VNNI (`VPDPBUSD`), come llama.cpp per Q8_0 | dichiarato | llama.cpp usa questa strada per Q8_0 | alto: meno byte e meno lavoro per elemento |
-| 3 | Prefill a blocchi (più token nella stessa moltiplicazione) | esatto | prefill lineare nel lotto ([discussione #18030](https://github.com/ggml-org/llama.cpp/discussions/18030)) | alto sul prefill, zero sul decode |
-| 4 | Token raggruppati per esperto nel prefill | esatto | nessun numero isolato | alto sul prefill |
+| 3 | Prefill a blocchi (più token nella stessa moltiplicazione) | esatto | prefill lineare nel lotto ([discussione #18030](https://github.com/ggml-org/llama.cpp/discussions/18030)) | fatto con la 4: prefill 4.3× a 16 thread, decode invariato |
+| 4 | Token raggruppati per esperto nel prefill | esatto | nessun numero isolato | fatto con la 3 |
 | 5 | Pesi riordinati a blocchi di righe (repack 8×8) | esatto | +53% prefill, ~0% decode su Zen 5 ([PR #9532](https://github.com/ggml-org/llama.cpp/pull/9532)) | dopo 3-4 |
 | 6 | Cache blocking (Goto/BLIS) | esatto | base di 3-5 ([Goto 2008](https://www.cs.utexas.edu/~flame/pubs/GotoTOMS_revision.pdf)) | solo con più token insieme |
 | 7 | tinyBLAS di llamafile | esatto | prefill 1.3-4×, decode poco ([PR #6414](https://github.com/ggml-org/llama.cpp/pull/6414)) | idee per 3-5 |
@@ -366,3 +452,8 @@ riusano le stesse righe (leve 3-6).
 | 2026-09-17 | pool di thread: attesa attiva 2 ms, uno slot per thread (Linux/Docker) | matmul esperto 16 thread 0.376 ms | 0.014 ms | 9% / 16% | tenuto; da misurare su Windows nativo e sul modello vero (mediana di 5) |
 | 2026-09-17 | OLMoE-1B-7B Q8_0 decode, pool nuovo (Windows nativo, mediana di 5) | 21.08 tok/s (8 thread, una run) | 27.02 tok/s (8 thread) | 2.4% | tenuto; 16 thread = 8 thread (26.90) |
 | 2026-09-17 | rope da tabella, attivazioni in parallelo, attenzione per testa + `axpy_f32` AVX-512 (logit identici al bit) | 26.34 tok/s (16 thread) | 32.78 tok/s (16 thread) | 1.4% / 2.8% | tenuto; 4 thread = 16 thread (32.93): limite della memoria |
+| 2026-09-17 | prefill a blocchi in C esatto: passate da 512 token, token per esperto, matrici a blocchi di 16 token, logit solo dell'ultimo (logit identici al bit) | prefill 30.1 tok/s (16 thread, prompt 512) | 196.9 tok/s col kernel a 4 token | 14% / 27% | tenuto; decode invariato; scala 1.16× da 8 a 16 thread (domanda 20) |
+| 2026-09-17 | riga q8_0 decompressa una volta per blocco di token in uno scratch per worker, poi `dot_f32` (esatto per contratto) | prefill 144 tok/s (16 thread) | 140 tok/s | 6% / 6% | **scartato**: nessun guadagno (legge 4 byte per elemento invece di 1, e la misura non era alternata); l'idea buona è tenere il peso compresso e dividerlo fra più token (riga sotto) |
+| 2026-09-17 | kernel `dot_row_x4`: una riga di pesi contro 4 token nei registri (scalare, AVX2, AVX-512), risultati identici al bit a `dot_row` | prefill 124 tok/s (16 thread, run alternate) | 180 tok/s | 12% / 16% | tenuto; da solo il kernel vale 2.1× (44 contro 21 G elementi/s) |
+| 2026-09-17 | accumulatori del kernel a 4 token in un array `__m512 acc[4]` invece che in registri con nome | — | — | — | **scartato**: il compilatore li tiene sullo stack e il guadagno sparisce (LEZIONI #45) |
+| 2026-09-17 | blocco di token di `tr_matmul` a 32, 64, 128 invece di 16 | prefill 180.5 tok/s (16 thread, tile 16) | 176.9 / 183.3 / 172.5 | 10-13% | scartato: tutto dentro il rumore, resta 16 |

@@ -33,7 +33,7 @@ int __wrap_posix_memalign(void **p, size_t a, size_t n) { atomic_fetch_add(&g_al
 
 /* 2 layers, n_embd 256, 4 heads (2 kv), n_ff 512, 8 experts (2 used), vocab 64, context 32:
  * every matmul has hundreds of rows, so pools of 2+ threads really split them. */
-static const synth_params P = {2, 256, 4, 2, 512, 8, 2, 64, 32};
+static const synth_params P = {2, 256, 4, 2, 512, 8, 2, 64, 32, TR_TYPE_F32};
 enum { N_TOKENS = 12 };
 
 /* Generates N_TOKENS with a pool of `threads`; logits of the last token go to out.
@@ -42,7 +42,7 @@ static unsigned long run(const char *path, int threads, int profile, float *out)
     tr_pool *pool = tr_pool_create(threads);
     char err[256];
     tr_model *model = pool ? tr_model_load(path, pool, err, sizeof err) : NULL;
-    tr_session *s = model ? tr_session_create(model, 0, err, sizeof err) : NULL;
+    tr_session *s = model ? tr_session_create(model, 0, 0, err, sizeof err) : NULL;
     TR_CHECK(s != NULL);
     unsigned long allocs = 0;
     if (s != NULL) {

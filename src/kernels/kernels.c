@@ -91,6 +91,44 @@ static float k_dot_row_q8_0(const void *row, const float *x, int64_t n) {
     return lane_combine(lane);
 }
 
+/* One weight row against TR_DOT_TOKENS input rows: the block scale and the decoded
+ * weight are computed once and used for all of them, each accumulating in its own
+ * lanes, so out[t] is exactly k_dot_row_q8_0(row, x + t*stride, n). */
+static void k_dot_row_x4_q8_0(const void *row, const float *x, int64_t stride, int64_t n, float *out) {
+    const unsigned char *p = (const unsigned char *)row;
+    int64_t nb = n / TR_Q8_0_BLOCK_ELEMS;
+    float lane[TR_DOT_TOKENS][TR_LANES] = {{0}};
+    int64_t k = 0;
+    for (int64_t b = 0; b < nb; b++) {
+        const unsigned char *blk = p + (size_t)b * TR_Q8_0_BLOCK_BYTES;
+        float scale = q8_0_block_scale(blk);
+        const int8_t *qs = (const int8_t *)(blk + TR_Q8_0_SCALE_BYTES);
+        for (int j = 0; j < TR_Q8_0_BLOCK_ELEMS; j++, k++) {
+            float w = scale * (float)qs[j];
+            for (int t = 0; t < TR_DOT_TOKENS; t++) lane[t][k % TR_LANES] += w * x[t * stride + k];
+        }
+    }
+    for (int t = 0; t < TR_DOT_TOKENS; t++) out[t] = lane_combine(lane[t]);
+}
+
+static void k_dot_row_x4_f32(const void *row, const float *x, int64_t stride, int64_t n, float *out) {
+    const float *w = (const float *)row;
+    float lane[TR_DOT_TOKENS][TR_LANES] = {{0}};
+    for (int64_t k = 0; k < n; k++)
+        for (int t = 0; t < TR_DOT_TOKENS; t++) lane[t][k % TR_LANES] += w[k] * x[t * stride + k];
+    for (int t = 0; t < TR_DOT_TOKENS; t++) out[t] = lane_combine(lane[t]);
+}
+
+static void k_dot_row_x4_f16(const void *row, const float *x, int64_t stride, int64_t n, float *out) {
+    const uint16_t *r = (const uint16_t *)row;
+    float lane[TR_DOT_TOKENS][TR_LANES] = {{0}};
+    for (int64_t k = 0; k < n; k++) {
+        float w = half_to_float(r[k]);
+        for (int t = 0; t < TR_DOT_TOKENS; t++) lane[t][k % TR_LANES] += w * x[t * stride + k];
+    }
+    for (int t = 0; t < TR_DOT_TOKENS; t++) out[t] = lane_combine(lane[t]);
+}
+
 /* hot: end */
 
 /* ---- type table and dispatch ---------------------------------------------- */
@@ -118,6 +156,9 @@ static void build_scalar_table(tr_kernels *k) {
     k->dot_row[TR_TYPE_F32] = k_dot_row_f32;
     k->dot_row[TR_TYPE_F16] = k_dot_row_f16;
     k->dot_row[TR_TYPE_Q8_0] = k_dot_row_q8_0;
+    k->dot_row_x4[TR_TYPE_F32] = k_dot_row_x4_f32;
+    k->dot_row_x4[TR_TYPE_F16] = k_dot_row_x4_f16;
+    k->dot_row_x4[TR_TYPE_Q8_0] = k_dot_row_x4_q8_0;
     k->dequant_row[TR_TYPE_F32] = k_dequant_f32;
     k->dequant_row[TR_TYPE_F16] = k_dequant_f16;
     k->dequant_row[TR_TYPE_Q8_0] = k_dequant_q8_0;
@@ -167,42 +208,113 @@ void tr_rope_table(float *cos_t, float *sin_t, int64_t n_pos, int64_t head_dim, 
 
 /* hot: begin */
 
+/* Index space of a matmul job: p * rows + r (input row p, weight row r). */
 typedef struct {
-    const tr_mat *w;
+    const tr_mat *w;          /* [n_groups], all with the same type, rows and cols */
+    const int64_t *offsets;   /* [n_groups + 1] */
+    int64_t n_groups, rows, cols;
     const float *x;
     float *y;
-    const tr_kernels *k;
+    float (*dot_row)(const void *row, const float *x, int64_t n);
+    void (*dot_row_x4)(const void *row, const float *x, int64_t stride, int64_t n, float *out);
     size_t row_bytes;
 } matmul_ctx;
 
-static void matmul_body(void *ctx_, int64_t begin, int64_t end, int worker) {
-    (void)worker;
-    matmul_ctx *ctx = (matmul_ctx *)ctx_;
-    int64_t rows = ctx->w->rows;
-    int64_t cols = ctx->w->cols;
-    const unsigned char *base = (const unsigned char *)ctx->w->data;
-    float (*dot_row)(const void *, const float *, int64_t) = ctx->k->dot_row[ctx->w->type];
-    for (int64_t idx = begin; idx < end; idx++) {
-        int64_t t = idx / rows;
-        int64_t r = idx % rows;
-        const void *row = base + (size_t)r * ctx->row_bytes;
-        ctx->y[t * rows + r] = dot_row(row, ctx->x + t * cols, cols);
+/* The group of input row p: the last g with offsets[g] <= p (an empty group before it
+ * shares its offset, and only the last one of them has offsets[g+1] > p). */
+static int64_t matmul_group_of(const matmul_ctx *c, int64_t p) {
+    int64_t lo = 0, hi = c->n_groups - 1;
+    while (lo < hi) {
+        int64_t mid = lo + (hi - lo + 1) / 2;
+        if (c->offsets[mid] <= p) lo = mid;
+        else hi = mid - 1;
+    }
+    return lo;
+}
+
+/* weight rows [r0, r1) against input row p */
+static void matmul_rows(const matmul_ctx *c, int64_t p, int64_t r0, int64_t r1) {
+    const unsigned char *base = (const unsigned char *)c->w[matmul_group_of(c, p)].data;
+    const float *xp = c->x + p * c->cols;
+    float *yp = c->y + p * c->rows;
+    for (int64_t r = r0; r < r1; r++) yp[r] = c->dot_row(base + (size_t)r * c->row_bytes, xp, c->cols);
+}
+
+/* every weight row against input rows [p0, p1), group by group, in blocks of TR_MATMUL_TILE.
+ * Inside a block the rows go TR_DOT_TOKENS at a time through dot_row_x4 where the type has
+ * one: the weight is read and decoded once for all of them, and each result is the dot_row
+ * of its own input row, bit for bit. */
+static void matmul_tiled(const matmul_ctx *c, int64_t p0, int64_t p1) {
+    int64_t g = matmul_group_of(c, p0);
+    for (int64_t p = p0; p < p1;) {
+        while (c->offsets[g + 1] <= p) g++;
+        int64_t run_end = c->offsets[g + 1] < p1 ? c->offsets[g + 1] : p1;
+        const unsigned char *base = (const unsigned char *)c->w[g].data;
+        for (int64_t b = p; b < run_end; b += TR_MATMUL_TILE) {
+            int64_t b_end = b + TR_MATMUL_TILE < run_end ? b + TR_MATMUL_TILE : run_end;
+            for (int64_t r = 0; r < c->rows; r++) {
+                const void *row = base + (size_t)r * c->row_bytes;
+                int64_t q = b;
+                if (c->dot_row_x4 != NULL) {
+                    float out[TR_DOT_TOKENS];
+                    for (; q + TR_DOT_TOKENS <= b_end; q += TR_DOT_TOKENS) {
+                        c->dot_row_x4(row, c->x + q * c->cols, c->cols, c->cols, out);
+                        for (int j = 0; j < TR_DOT_TOKENS; j++) c->y[(q + j) * c->rows + r] = out[j];
+                    }
+                }
+                for (; q < b_end; q++) c->y[q * c->rows + r] = c->dot_row(row, c->x + q * c->cols, c->cols);
+            }
+        }
+        p = run_end;
     }
 }
 
-void tr_matmul(tr_pool *pool, const tr_mat *w, const float *x, int64_t n_tokens, float *y) {
+/* A chunk may start or end inside an input row: those rows go one dot at a time, the
+ * whole input rows in between tiled. */
+static void matmul_body(void *ctx_, int64_t begin, int64_t end, int worker) {
+    (void)worker;
+    const matmul_ctx *c = (const matmul_ctx *)ctx_;
+    int64_t p_begin = begin / c->rows, r_begin = begin % c->rows;
+    int64_t p_end = end / c->rows, r_end = end % c->rows;
+    if (p_begin == p_end) {
+        matmul_rows(c, p_begin, r_begin, r_end);
+        return;
+    }
+    int64_t p_full = p_begin;
+    if (r_begin != 0) {
+        matmul_rows(c, p_begin, r_begin, c->rows);
+        p_full++;
+    }
+    if (p_full < p_end) matmul_tiled(c, p_full, p_end);
+    if (r_end != 0) matmul_rows(c, p_end, 0, r_end);
+}
+
+void tr_matmul_grouped(tr_pool *pool, const tr_mat *w, const int64_t *offsets, int64_t n_groups, const float *x,
+                       float *y) {
+    if (n_groups <= 0 || offsets[n_groups] <= 0 || w[0].rows <= 0) return;
     matmul_ctx ctx;
     ctx.w = w;
+    ctx.offsets = offsets;
+    ctx.n_groups = n_groups;
+    ctx.rows = w[0].rows;
+    ctx.cols = w[0].cols;
     ctx.x = x;
     ctx.y = y;
-    ctx.k = tr_kernels_get();
-    ctx.row_bytes = tr_row_bytes(w->type, w->cols);
+    const tr_kernels *k = tr_kernels_get();
+    ctx.dot_row = k->dot_row[w[0].type];
+    ctx.dot_row_x4 = k->dot_row_x4[w[0].type];
+    ctx.row_bytes = tr_row_bytes(w[0].type, w[0].cols);
 
-    int64_t n = n_tokens * w->rows;
+    int64_t n = offsets[n_groups] * ctx.rows;
     /* Keep chunks worth threading: roughly a few thousand scalar multiplies
      * worth of rows per chunk, never less than one row. */
-    int64_t min_chunk = w->cols > 0 ? (4096 / w->cols) + 1 : 1;
+    int64_t min_chunk = ctx.cols > 0 ? (4096 / ctx.cols) + 1 : 1;
     tr_parallel_for(pool, n, min_chunk, matmul_body, &ctx);
+}
+
+void tr_matmul(tr_pool *pool, const tr_mat *w, const float *x, int64_t n_tokens, float *y) {
+    const int64_t offsets[2] = {0, n_tokens};
+    tr_matmul_grouped(pool, w, offsets, 1, x, y);
 }
 
 void tr_get_row(const tr_mat *w, int64_t row, float *out) {

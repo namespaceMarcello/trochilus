@@ -99,19 +99,47 @@ static void measure(dot_job *j, int runs, double run_ms, double *ns_median, doub
     *spread = (ns[runs - 1] - ns[0]) / ns[runs / 2];
 }
 
+/* Same row against TR_DOT_TOKENS input rows (the block path of tr_matmul): ns per call
+ * covers TR_DOT_TOKENS * n elements. */
+static void measure_x4(const tr_kernels *k, const uint8_t *row, const float *x, int64_t n, int runs, double run_ms,
+                        double *ns_median, double *spread) {
+    float out[TR_DOT_TOKENS];
+    long calls = 1;
+    double t0 = tr_time_sec();
+    while (tr_time_sec() - t0 < 0.02) {
+        for (long c = 0; c < calls; c++) k->dot_row_x4[TR_TYPE_Q8_0](row, x, n, n, out);
+        calls *= 2;
+    }
+    double per_call = (tr_time_sec() - t0) / (double)(calls - 1);
+    calls = (long)(run_ms / 1000.0 / (per_call > 0 ? per_call : 1e-9));
+    if (calls < 1) calls = 1;
+
+    double ns[MAX_RUNS];
+    for (int r = 0; r < runs; r++) {
+        double a = tr_time_sec();
+        for (long c = 0; c < calls; c++) k->dot_row_x4[TR_TYPE_Q8_0](row, x, n, n, out);
+        ns[r] = (tr_time_sec() - a) * 1e9 / (double)calls;
+    }
+    qsort(ns, (size_t)runs, sizeof ns[0], cmp_double);
+    *ns_median = ns[runs / 2];
+    *spread = (ns[runs - 1] - ns[0]) / ns[runs / 2];
+}
+
 typedef struct {
     tr_mat w;
     const float *x;
     float *y;
 } mat_job;
 
-/* One run = `calls` matmuls back to back, the rhythm of a decode step. */
-static void measure_matmul(tr_pool *pool, mat_job *m, int runs, int calls, double *ms_median, double *spread) {
-    tr_matmul(pool, &m->w, m->x, 1, m->y);                 /* warm-up */
+/* One run = `calls` matmuls of `n_tokens` input rows back to back: n_tokens 1 is the rhythm
+ * of a decode step, a larger one the block path of a prefill pass. */
+static void measure_matmul(tr_pool *pool, mat_job *m, int runs, int calls, int64_t n_tokens, double *ms_median,
+                            double *spread) {
+    tr_matmul(pool, &m->w, m->x, n_tokens, m->y);          /* warm-up */
     double ms[MAX_RUNS];
     for (int r = 0; r < runs; r++) {
         double a = tr_time_sec();
-        for (int c = 0; c < calls; c++) tr_matmul(pool, &m->w, m->x, 1, m->y);
+        for (int c = 0; c < calls; c++) tr_matmul(pool, &m->w, m->x, n_tokens, m->y);
         ms[r] = (tr_time_sec() - a) * 1e3 / calls;
     }
     qsort(ms, (size_t)runs, sizeof ms[0], cmp_double);
@@ -190,6 +218,25 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* The same row against TR_DOT_TOKENS input rows: elements per second counted per input
+     * row, so it compares directly with the dot_row q8_0 line above. */
+    float *x4 = tr_alloc_aligned((size_t)max_n * TR_DOT_TOKENS * sizeof(float), 64);
+    if (!x4) { fprintf(stderr, "out of memory\n"); return 1; }
+    for (int64_t i = 0; i < max_n * TR_DOT_TOKENS; i++) x4[i] = frand();
+    for (size_t t = 0; t < sizeof tiers / sizeof tiers[0]; t++) {
+        const tr_kernels *k = tr_kernels_tier(tiers[t]);
+        if (k == NULL || k->dot_row_x4[TR_TYPE_Q8_0] == NULL) continue;
+        for (size_t s = 0; s < sizeof sizes / sizeof sizes[0]; s++) {
+            int64_t n = sizes[s];
+            fill_row(TR_TYPE_Q8_0, row, n);
+            double ns, spread;
+            measure_x4(k, row, x4, n, runs, run_ms, &ns, &spread);
+            printf("%-12s %-14s %6lld %12.1f %12.1f %7.1f%%\n", k->tier, "dot_row q8_0 x4", (long long)n, ns,
+                   (double)n * TR_DOT_TOKENS / ns * 1e3, spread * 100.0);
+        }
+    }
+    tr_free_aligned(x4);
+
     /* One whole matrix through tr_matmul with the active tier: 1024 x 2048 q8_0,
      * the shape of an OLMoE expert projection. */
     int64_t rows = 1024, cols = 2048;
@@ -198,7 +245,13 @@ int main(int argc, char **argv) {
     float *y = tr_alloc_aligned((size_t)rows * sizeof(float), 64);
     if (!w || !y) { fprintf(stderr, "out of memory\n"); return 1; }
     for (int64_t r = 0; r < rows; r++) fill_row(TR_TYPE_Q8_0, w + rb * (size_t)r, cols);
+    int64_t bench_tokens = 64;
+    float *xb = tr_alloc_aligned((size_t)cols * (size_t)bench_tokens * sizeof(float), 64);
+    float *yb = tr_alloc_aligned((size_t)rows * (size_t)bench_tokens * sizeof(float), 64);
+    if (!xb || !yb) { fprintf(stderr, "out of memory (block matmul)"); return 1; }
+    for (int64_t i = 0; i < cols * bench_tokens; i++) xb[i] = frand();
     mat_job m = {{TR_TYPE_Q8_0, rows, cols, w}, x, y};
+    mat_job mb = {{TR_TYPE_Q8_0, rows, cols, w}, xb, yb};
 
     int n_phys = tr_cpu()->physical_cores;
     int counts[8] = {1, 2, 4, 8, 16, 32, 0, 0}, n_counts = 0;
@@ -206,16 +259,20 @@ int main(int argc, char **argv) {
         if (counts[c] <= n_phys) counts[n_counts++] = counts[c];
     if (counts[n_counts - 1] != n_phys) counts[n_counts++] = n_phys;
     if (threads > 0) counts[n_counts++] = threads;
-    printf("\n%-10s %16s %8s %22s %8s\n", "threads", "dispatch us", "spread", "matmul 1024x2048 ms", "spread");
+    printf("\n%-8s %13s %7s %18s %7s %25s %7s\n", "threads", "dispatch us", "spread", "1024x2048 1 token",
+           "spread", "1024x2048 64 tokens/tok", "spread");
     for (int c = 0; c < n_counts; c++) {
         tr_pool *pool = tr_pool_create(counts[c]);
-        double us, ms, s1, s2;
+        double us, ms, msb, s1, s2, s3;
         measure_dispatch(pool, runs, 2000, &us, &s1);
-        measure_matmul(pool, &m, runs, 50, &ms, &s2);
-        printf("%-10d %16.3f %7.1f%% %22.3f %7.1f%%\n", counts[c], us, s1 * 100.0, ms, s2 * 100.0);
+        measure_matmul(pool, &m, runs, 50, 1, &ms, &s2);
+        measure_matmul(pool, &mb, runs, 5, bench_tokens, &msb, &s3);
+        printf("%-8d %13.3f %6.1f%% %15.3f ms %6.1f%% %22.3f ms %6.1f%%\n", counts[c], us, s1 * 100.0, ms,
+               s2 * 100.0, msb / (double)bench_tokens, s3 * 100.0);
         tr_pool_destroy(pool);
     }
 
     tr_free_aligned(a); tr_free_aligned(x); tr_free_aligned(row); tr_free_aligned(w); tr_free_aligned(y);
+    tr_free_aligned(xb); tr_free_aligned(yb);
     return 0;
 }

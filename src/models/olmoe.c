@@ -1,12 +1,13 @@
 /* olmoe.c — tr_arch_vtable for "olmoe" (src/models/model.h).
  *
  * Reads hyperparameters and every weight tensor from GGUF metadata (M0: no
- * streaming, the whole model is loaded), then runs a per-token forward pass:
- * embedding -> N x [attention with GQA and NeoX RoPE, softmax-then-topk MoE
- * FFN] -> output norm -> logits. Matches transformers' OlmoeForCausalLM
- * (tools/.venv/.../modeling_olmoe.py): q_norm/k_norm over the whole
- * projection (not per head), router softmax over all experts before top-k,
- * ties broken to the lower expert id, optional norm_topk_prob rescaling. */
+ * streaming, the whole model is loaded), then runs forward passes over blocks of
+ * tokens: embedding -> N x [attention with GQA and NeoX RoPE, softmax-then-topk MoE
+ * FFN, tokens grouped by expert] -> output norm -> logits of the last token.
+ * Matches transformers' OlmoeForCausalLM (tools/.venv/.../modeling_olmoe.py):
+ * q_norm/k_norm over the whole projection (not per head), router softmax over
+ * all experts before top-k, ties broken to the lower expert id, optional
+ * norm_topk_prob rescaling. */
 #include "model.h"
 #include "model_internal.h"
 
@@ -29,12 +30,12 @@ typedef struct {
     tr_mat wq, wk, wv, wo;  /* wq/wk/wv: cols=n_embd; wo: cols=n_qkv, rows=n_embd */
     tr_mat gate_inp;         /* router: rows=n_expert, cols=n_embd */
 
-    /* stacked expert tensors, raw ggml layout [in, out, n_expert]; sliced by
-     * expert_slice() at forward time (byte offset e * out * row_bytes(in)). */
-    tr_type ffn_gate_type, ffn_up_type, ffn_down_type;
-    const void *ffn_gate; /* per expert: rows=n_ff, cols=n_embd */
-    const void *ffn_up;    /* per expert: rows=n_ff, cols=n_embd */
-    const void *ffn_down;   /* per expert: rows=n_embd, cols=n_ff */
+    /* stacked expert tensors, raw ggml layout [in, out, n_expert], seen as one tr_mat per
+     * expert (byte offset e * out * row_bytes(in)): [n_expert] each, one allocation */
+    tr_mat *exps;
+    const tr_mat *gate_exps; /* rows=n_ff, cols=n_embd */
+    const tr_mat *up_exps;    /* rows=n_ff, cols=n_embd */
+    const tr_mat *down_exps;   /* rows=n_embd, cols=n_ff */
 } olmoe_layer;
 
 typedef struct {
@@ -56,9 +57,13 @@ typedef struct {
     size_t n_owned, cap_owned;
 } olmoe_model;
 
+/* Tokens in one forward pass when the caller does not choose (llama.cpp's n_ubatch). */
+#define OLMOE_DEFAULT_BATCH 512
+
 typedef struct {
     olmoe_model *m; /* not owned */
     int64_t n_ctx;
+    int64_t n_batch; /* most tokens in one forward pass (B below) */
     int64_t pos;
     tr_prof prof; /* disabled by default (zero-initialized in olmoe_session_create) */
 
@@ -68,16 +73,22 @@ typedef struct {
     /* RoPE cos/sin per position: [n_ctx][head_dim / 2] each (tr_rope_table) */
     float *rope_cos, *rope_sin;
 
-    /* per-token scratch, reused every call */
-    float *x, *normed, *q, *k, *v, *attn_concat, *attn_out;
-    float *router, *ffn_out, *logits;
-    float *h1, *h2;  /* gate and up outputs: [n_expert_used][n_ff] */
-    float *h3;       /* down outputs: [n_expert_used][n_embd] */
-    float *scores;   /* attention scores, one row per pool worker: [n_workers][n_ctx] */
+    /* scratch of one forward pass, reused every call; U = n_expert_used */
+    float *x, *normed, *attn_out, *ffn_out; /* [B][n_embd] */
+    float *q, *attn_concat;                 /* [B][n_qkv] */
+    float *k, *v;                           /* [B][n_kv] */
+    float *router;                          /* [B][n_expert] */
+    int64_t *sel_id;  /* [B][U] experts of each token, increasing id */
+    float *sel_w;     /* [B][U] their weights */
+    int64_t *place;   /* [B][U] row of each (token, slot) in the grouped buffers below */
+    int64_t *offsets; /* [n_expert + 1] grouped rows of each expert */
+    unsigned char *taken; /* [n_expert] */
+    float *xg;        /* [B*U][n_embd] expert inputs, grouped by expert */
+    float *h1, *h2;   /* [B*U][n_ff] gate and up outputs */
+    float *h3;        /* [B*U][n_embd] down outputs */
+    float *logits;    /* [vocab] */
+    float *scores;    /* attention scores, one row per pool worker: [n_workers][n_ctx] */
     int64_t n_workers;
-    unsigned char *taken;
-    int64_t *sel_id;
-    float *sel_w;
 } olmoe_session;
 
 /* ---- loading helpers ---------------------------------------------------- */
@@ -227,17 +238,17 @@ static const void *read_experts(tr_gguf *g, olmoe_model *m, const char *name, in
     return raw;
 }
 
-/* hot: begin */
-static tr_mat expert_slice(const void *base, tr_type type, int64_t in_dim, int64_t out_dim, int64_t e) {
+/* One tr_mat per expert over a stacked tensor: exps[e] = rows [e*out_dim, (e+1)*out_dim). */
+static void expert_views(tr_mat *exps, const void *base, tr_type type, int64_t in_dim, int64_t out_dim,
+                         int64_t n_expert) {
     size_t rb = tr_row_bytes(type, in_dim);
-    tr_mat mm;
-    mm.type = type;
-    mm.rows = out_dim;
-    mm.cols = in_dim;
-    mm.data = (const unsigned char *)base + (size_t)e * (size_t)out_dim * rb;
-    return mm;
+    for (int64_t e = 0; e < n_expert; e++) {
+        exps[e].type = type;
+        exps[e].rows = out_dim;
+        exps[e].cols = in_dim;
+        exps[e].data = (const unsigned char *)base + (size_t)e * (size_t)out_dim * rb;
+    }
 }
-/* hot: end */
 
 /* ---- vtable: free ------------------------------------------------------- */
 
@@ -246,6 +257,8 @@ static void olmoe_free(void *model) {
     if (m == NULL) return;
     for (size_t i = 0; i < m->n_owned; i++) tr_free_aligned(m->owned[i]);
     free(m->owned);
+    if (m->layers != NULL)
+        for (int64_t L = 0; L < m->n_layers; L++) free(m->layers[L].exps);
     free(m->layers);
     free(m);
 }
@@ -423,19 +436,31 @@ static void *olmoe_load(tr_gguf *g, tr_pool *pool, char *err, size_t err_len) {
         snprintf(name, sizeof name, "blk.%" PRId64 ".ffn_gate_inp.weight", L);
         if (read_mat(g, m, name, m->n_embd, m->n_expert, &layer->gate_inp, err, err_len) != 0) goto fail;
 
+        layer->exps = (tr_mat *)calloc((size_t)m->n_expert * 3, sizeof(tr_mat));
+        if (layer->exps == NULL) {
+            snprintf(err, err_len, "out of memory");
+            goto fail;
+        }
+        tr_type type;
+        const void *raw;
+
         snprintf(name, sizeof name, "blk.%" PRId64 ".ffn_gate_exps.weight", L);
-        layer->ffn_gate =
-            read_experts(g, m, name, m->n_embd, m->n_ff, m->n_expert, &layer->ffn_gate_type, err, err_len);
-        if (layer->ffn_gate == NULL) goto fail;
+        raw = read_experts(g, m, name, m->n_embd, m->n_ff, m->n_expert, &type, err, err_len);
+        if (raw == NULL) goto fail;
+        expert_views(layer->exps, raw, type, m->n_embd, m->n_ff, m->n_expert);
+        layer->gate_exps = layer->exps;
 
         snprintf(name, sizeof name, "blk.%" PRId64 ".ffn_up_exps.weight", L);
-        layer->ffn_up = read_experts(g, m, name, m->n_embd, m->n_ff, m->n_expert, &layer->ffn_up_type, err, err_len);
-        if (layer->ffn_up == NULL) goto fail;
+        raw = read_experts(g, m, name, m->n_embd, m->n_ff, m->n_expert, &type, err, err_len);
+        if (raw == NULL) goto fail;
+        expert_views(layer->exps + m->n_expert, raw, type, m->n_embd, m->n_ff, m->n_expert);
+        layer->up_exps = layer->exps + m->n_expert;
 
         snprintf(name, sizeof name, "blk.%" PRId64 ".ffn_down_exps.weight", L);
-        layer->ffn_down =
-            read_experts(g, m, name, m->n_ff, m->n_embd, m->n_expert, &layer->ffn_down_type, err, err_len);
-        if (layer->ffn_down == NULL) goto fail;
+        raw = read_experts(g, m, name, m->n_ff, m->n_embd, m->n_expert, &type, err, err_len);
+        if (raw == NULL) goto fail;
+        expert_views(layer->exps + 2 * m->n_expert, raw, type, m->n_ff, m->n_embd, m->n_expert);
+        layer->down_exps = layer->exps + 2 * m->n_expert;
     }
 
     m->info.arch = "olmoe";
@@ -469,40 +494,50 @@ static void olmoe_session_free(void *session) {
     tr_free_aligned(s->rope_sin);
     tr_free_aligned(s->x);
     tr_free_aligned(s->normed);
+    tr_free_aligned(s->attn_out);
+    tr_free_aligned(s->ffn_out);
     tr_free_aligned(s->q);
+    tr_free_aligned(s->attn_concat);
     tr_free_aligned(s->k);
     tr_free_aligned(s->v);
-    tr_free_aligned(s->attn_concat);
-    tr_free_aligned(s->attn_out);
     tr_free_aligned(s->router);
+    tr_free_aligned(s->sel_id);
+    tr_free_aligned(s->sel_w);
+    tr_free_aligned(s->place);
+    tr_free_aligned(s->offsets);
+    tr_free_aligned(s->taken);
+    tr_free_aligned(s->xg);
     tr_free_aligned(s->h1);
     tr_free_aligned(s->h2);
     tr_free_aligned(s->h3);
-    tr_free_aligned(s->ffn_out);
-    tr_free_aligned(s->scores);
     tr_free_aligned(s->logits);
-    tr_free_aligned(s->taken);
-    tr_free_aligned(s->sel_id);
-    tr_free_aligned(s->sel_w);
+    tr_free_aligned(s->scores);
     free(s);
 }
 
-static void *olmoe_session_create(void *model, int64_t n_ctx, char *err, size_t err_len) {
+static float *alloc_f32(int64_t n) {
+    return (float *)tr_alloc_aligned((size_t)n * sizeof(float), 64);
+}
+
+static void *olmoe_session_create(void *model, int64_t n_ctx, int64_t n_batch, char *err, size_t err_len) {
     olmoe_model *m = (olmoe_model *)model;
 
     int64_t actual_ctx = n_ctx;
     if (actual_ctx <= 0) actual_ctx = m->n_ctx_train < 4096 ? m->n_ctx_train : 4096;
     if (actual_ctx <= 0) actual_ctx = 4096;
+    int64_t B = n_batch > 0 ? n_batch : OLMOE_DEFAULT_BATCH;
+    if (B > actual_ctx) B = actual_ctx;
 
     int64_t n_workers = m->pool != NULL ? tr_pool_size(m->pool) : 1;
-    int64_t n_used = m->n_expert_used;
+    int64_t U = m->n_expert_used;
     uint64_t kv_elems = (uint64_t)m->n_layers * (uint64_t)actual_ctx * (uint64_t)m->n_kv;
     uint64_t kv_bytes = kv_elems * 2 * sizeof(float);
     uint64_t rope_elems = (uint64_t)actual_ctx * (uint64_t)(m->head_dim / 2);
-    uint64_t scratch_elems = (uint64_t)(m->n_embd * 4 + m->n_qkv * 2 + m->n_kv * 2 + m->n_expert * 2 +
-                                         n_used * (m->n_ff * 2 + m->n_embd) + n_workers * actual_ctx + m->vocab) +
-                             rope_elems * 2;
-    uint64_t scratch_bytes = scratch_elems * sizeof(float);
+    uint64_t scratch_f32 = (uint64_t)B * (uint64_t)(m->n_embd * 4 + m->n_qkv * 2 + m->n_kv * 2 + m->n_expert + U) +
+                           (uint64_t)B * (uint64_t)U * (uint64_t)(m->n_embd * 2 + m->n_ff * 2) +
+                           (uint64_t)(n_workers * actual_ctx + m->vocab) + rope_elems * 2;
+    uint64_t scratch_i64 = (uint64_t)B * (uint64_t)U * 2 + (uint64_t)m->n_expert + 1;
+    uint64_t scratch_bytes = scratch_f32 * sizeof(float) + scratch_i64 * sizeof(int64_t) + (uint64_t)m->n_expert;
     if (tr_mem_guard(kv_bytes + scratch_bytes, err, err_len) != 0) return NULL;
 
     olmoe_session *s = (olmoe_session *)calloc(1, sizeof *s);
@@ -512,6 +547,7 @@ static void *olmoe_session_create(void *model, int64_t n_ctx, char *err, size_t 
     }
     s->m = m;
     s->n_ctx = actual_ctx;
+    s->n_batch = B;
     s->pos = 0;
 
     s->k_cache = (float *)tr_alloc_aligned((size_t)kv_elems * sizeof(float), 64);
@@ -519,29 +555,32 @@ static void *olmoe_session_create(void *model, int64_t n_ctx, char *err, size_t 
     s->rope_cos = (float *)tr_alloc_aligned((size_t)rope_elems * sizeof(float), 64);
     s->rope_sin = (float *)tr_alloc_aligned((size_t)rope_elems * sizeof(float), 64);
     s->n_workers = n_workers;
-    s->x =(float *)tr_alloc_aligned((size_t)m->n_embd * sizeof(float), 64);
-    s->normed = (float *)tr_alloc_aligned((size_t)m->n_embd * sizeof(float), 64);
-    s->q = (float *)tr_alloc_aligned((size_t)m->n_qkv * sizeof(float), 64);
-    s->k = (float *)tr_alloc_aligned((size_t)m->n_kv * sizeof(float), 64);
-    s->v = (float *)tr_alloc_aligned((size_t)m->n_kv * sizeof(float), 64);
-    s->attn_concat = (float *)tr_alloc_aligned((size_t)m->n_qkv * sizeof(float), 64);
-    s->attn_out = (float *)tr_alloc_aligned((size_t)m->n_embd * sizeof(float), 64);
-    s->router = (float *)tr_alloc_aligned((size_t)m->n_expert * sizeof(float), 64);
-    s->h1 = (float *)tr_alloc_aligned((size_t)(n_used * m->n_ff) * sizeof(float), 64);
-    s->h2 = (float *)tr_alloc_aligned((size_t)(n_used * m->n_ff) * sizeof(float), 64);
-    s->h3 = (float *)tr_alloc_aligned((size_t)(n_used * m->n_embd) * sizeof(float), 64);
-    s->ffn_out = (float *)tr_alloc_aligned((size_t)m->n_embd * sizeof(float), 64);
-    s->scores = (float *)tr_alloc_aligned((size_t)(n_workers * actual_ctx) * sizeof(float), 64);
-    s->logits = (float *)tr_alloc_aligned((size_t)m->vocab * sizeof(float), 64);
-    s->taken = (unsigned char *)tr_alloc_aligned((size_t)m->n_expert * sizeof(unsigned char), 64);
-    s->sel_id = (int64_t *)tr_alloc_aligned((size_t)m->n_expert * sizeof(int64_t), 64);
-    s->sel_w = (float *)tr_alloc_aligned((size_t)m->n_expert * sizeof(float), 64);
+    s->x = alloc_f32(B * m->n_embd);
+    s->normed = alloc_f32(B * m->n_embd);
+    s->attn_out = alloc_f32(B * m->n_embd);
+    s->ffn_out = alloc_f32(B * m->n_embd);
+    s->q = alloc_f32(B * m->n_qkv);
+    s->attn_concat = alloc_f32(B * m->n_qkv);
+    s->k = alloc_f32(B * m->n_kv);
+    s->v = alloc_f32(B * m->n_kv);
+    s->router = alloc_f32(B * m->n_expert);
+    s->sel_id = (int64_t *)tr_alloc_aligned((size_t)(B * U) * sizeof(int64_t), 64);
+    s->sel_w = alloc_f32(B * U);
+    s->place = (int64_t *)tr_alloc_aligned((size_t)(B * U) * sizeof(int64_t), 64);
+    s->offsets = (int64_t *)tr_alloc_aligned((size_t)(m->n_expert + 1) * sizeof(int64_t), 64);
+    s->taken = (unsigned char *)tr_alloc_aligned((size_t)m->n_expert, 64);
+    s->xg = alloc_f32(B * U * m->n_embd);
+    s->h1 = alloc_f32(B * U * m->n_ff);
+    s->h2 = alloc_f32(B * U * m->n_ff);
+    s->h3 = alloc_f32(B * U * m->n_embd);
+    s->logits = alloc_f32(m->vocab);
+    s->scores = alloc_f32(n_workers * actual_ctx);
 
-    if (s->k_cache == NULL || s->v_cache == NULL || s->rope_cos == NULL || s->rope_sin == NULL ||
-        s->x == NULL || s->normed == NULL || s->q == NULL ||
-        s->k == NULL || s->v == NULL || s->attn_concat == NULL || s->attn_out == NULL || s->router == NULL ||
-        s->h1 == NULL || s->h2 == NULL || s->h3 == NULL || s->ffn_out == NULL || s->scores == NULL ||
-        s->logits == NULL || s->taken == NULL || s->sel_id == NULL || s->sel_w == NULL) {
+    if (s->k_cache == NULL || s->v_cache == NULL || s->rope_cos == NULL || s->rope_sin == NULL || s->x == NULL ||
+        s->normed == NULL || s->attn_out == NULL || s->ffn_out == NULL || s->q == NULL || s->attn_concat == NULL ||
+        s->k == NULL || s->v == NULL || s->router == NULL || s->sel_id == NULL || s->sel_w == NULL ||
+        s->place == NULL || s->offsets == NULL || s->taken == NULL || s->xg == NULL || s->h1 == NULL ||
+        s->h2 == NULL || s->h3 == NULL || s->logits == NULL || s->scores == NULL) {
         if (err != NULL) snprintf(err, err_len, "out of memory allocating session");
         olmoe_session_free(s);
         return NULL;
@@ -570,78 +609,160 @@ static uint64_t mat_bytes(const tr_mat *w) {
     return (uint64_t)w->rows * (uint64_t)tr_row_bytes(w->type, w->cols);
 }
 
-/* One layer's attention, split by query head: each head writes only its own slice of
+/* One layer's attention for every token of a pass, one item per (query head, token) with the
+ * head first: a chunk holds whole heads, so the tokens at the end of a pass (the longest
+ * contexts) are spread over every chunk. Token i sits at position pos0 + i and attends to
+ * positions 0..pos0+i, all already in the cache; an item writes only its own slice of
  * attn_concat and uses the score row of the worker running it. */
 typedef struct {
     const float *q, *keys, *values;
     float *scores, *out;
     float scale;
-    int64_t n_ctx, n_kv, head_dim, group, n_pos;
+    int64_t n_ctx, n_kv, n_qkv, head_dim, group, n_tok, pos0;
 } attn_ctx;
 
 static void attn_body(void *ctx_, int64_t begin, int64_t end, int worker) {
     const attn_ctx *c = (const attn_ctx *)ctx_;
     float *scores = c->scores + (int64_t)worker * c->n_ctx;
-    for (int64_t h = begin; h < end; h++) {
-        tr_attention_head(c->q + h * c->head_dim, c->keys, c->values, c->n_kv, (h / c->group) * c->head_dim,
-                          c->n_pos, c->head_dim, c->scale, scores, c->out + h * c->head_dim);
+    for (int64_t idx = begin; idx < end; idx++) {
+        int64_t h = idx / c->n_tok, i = idx % c->n_tok;
+        tr_attention_head(c->q + i * c->n_qkv + h * c->head_dim, c->keys, c->values, c->n_kv,
+                          (h / c->group) * c->head_dim, c->pos0 + i + 1, c->head_dim, c->scale, scores,
+                          c->out + i * c->n_qkv + h * c->head_dim);
     }
 }
 
-static void forward_one(olmoe_model *m, olmoe_session *s, int32_t token, int64_t pos) {
+/* Each token's expert outputs weighted and summed in increasing expert id, then added to
+ * the residual stream: one item per token, the same additions in the same order whatever
+ * the pass size. */
+typedef struct {
+    const tr_kernels *K;
+    const float *h3, *sel_w;
+    const int64_t *place;
+    float *ffn_out, *x;
+    int64_t n_embd, n_used;
+} mix_ctx;
+
+static void mix_body(void *ctx_, int64_t begin, int64_t end, int worker) {
+    (void)worker;
+    const mix_ctx *c = (const mix_ctx *)ctx_;
+    int64_t n_embd = c->n_embd;
+    for (int64_t i = begin; i < end; i++) {
+        float *out = c->ffn_out + i * n_embd;
+        float *xi = c->x + i * n_embd;
+        for (int64_t d = 0; d < n_embd; d++) out[d] = 0.0f;
+        for (int64_t slot = 0; slot < c->n_used; slot++) {
+            int64_t j = i * c->n_used + slot;
+            c->K->axpy_f32(out, c->h3 + c->place[j] * n_embd, c->sel_w[j], n_embd);
+        }
+        for (int64_t d = 0; d < n_embd; d++) xi[d] += out[d];
+    }
+}
+
+/* Router of token i: softmax over all experts, top-k (ties to the lower id), optional
+ * renormalization, then the selection sorted by increasing expert id (the order in which
+ * contributions are added). Writes n_used entries of sel_id and sel_w. */
+static void route_token(const olmoe_model *m, float *router, unsigned char *taken, int64_t *sel_id, float *sel_w) {
+    int64_t n_expert = m->n_expert, n_used = m->n_expert_used;
+    tr_softmax(router, n_expert);
+    for (int64_t e = 0; e < n_expert; e++) taken[e] = 0;
+    for (int64_t slot = 0; slot < n_used; slot++) {
+        int64_t best = -1;
+        float best_val = 0.0f;
+        for (int64_t e = 0; e < n_expert; e++) {
+            if (taken[e]) continue;
+            if (best == -1 || router[e] > best_val) {
+                best = e;
+                best_val = router[e];
+            }
+        }
+        taken[best] = 1;
+        sel_id[slot] = best;
+        sel_w[slot] = best_val;
+    }
+    if (m->norm_topk) {
+        float sum = 0.0f;
+        for (int64_t i = 0; i < n_used; i++) sum += sel_w[i];
+        for (int64_t i = 0; i < n_used; i++) sel_w[i] /= sum;
+    }
+    for (int64_t i = 1; i < n_used; i++) {
+        int64_t id = sel_id[i];
+        float w = sel_w[i];
+        int64_t j = i - 1;
+        while (j >= 0 && sel_id[j] > id) {
+            sel_id[j + 1] = sel_id[j];
+            sel_w[j + 1] = sel_w[j];
+            j--;
+        }
+        sel_id[j + 1] = id;
+        sel_w[j + 1] = w;
+    }
+}
+
+/* One forward pass over n_tok tokens (1 <= n_tok <= n_batch) at positions pos..pos+n_tok-1.
+ * Every value is computed with the same kernel call as when the tokens run one per pass:
+ * a matmul element is one dot_row, norms/RoPE/routing/mixing are per token, and a token's
+ * attention reads only cache positions up to its own. So the logits and the cache are
+ * bit-identical for every split of the input into passes (tests/test_prefill.c).
+ * Logits (of the last token only) when want_logits. */
+static void forward_pass(olmoe_model *m, olmoe_session *s, const int32_t *tokens, int64_t n_tok, int want_logits) {
     tr_prof *prof = &s->prof;
-    uint64_t t_token = tr_prof_begin(prof);
+    uint64_t t_pass = tr_prof_begin(prof);
 
     const tr_kernels *K = tr_kernels_get();
     tr_pool *pool = m->pool;
-    const float *rope_cos = s->rope_cos + pos * (m->head_dim / 2);
-    const float *rope_sin = s->rope_sin + pos * (m->head_dim / 2);
+    const int64_t pos0 = s->pos;
     int64_t n_embd = m->n_embd, n_qkv = m->n_qkv, n_kv = m->n_kv;
-    int64_t n_head = m->n_head, n_head_kv = m->n_head_kv, head_dim = m->head_dim;
+    int64_t n_head = m->n_head, n_head_kv = m->n_head_kv, head_dim = m->head_dim, half = head_dim / 2;
     int64_t n_ff = m->n_ff, n_expert = m->n_expert, n_used = m->n_expert_used;
-    int64_t group = n_head / n_head_kv;
+    int64_t n_rows = n_tok * n_used; /* (token, slot) pairs = rows of the grouped expert buffers */
     float scale = 1.0f / sqrtf((float)head_dim);
 
     uint64_t t = tr_prof_begin(prof);
-    tr_get_row(&m->token_embd, token, s->x);
+    for (int64_t i = 0; i < n_tok; i++) tr_get_row(&m->token_embd, tokens[i], s->x + i * n_embd);
     tr_prof_end(prof, TR_PROF_EMBED, t);
-    tr_prof_count(prof, (uint64_t)tr_row_bytes(m->token_embd.type, m->token_embd.cols), 0);
+    tr_prof_count(prof, (uint64_t)n_tok * (uint64_t)tr_row_bytes(m->token_embd.type, m->token_embd.cols), 0);
 
     for (int64_t L = 0; L < m->n_layers; L++) {
         olmoe_layer *layer = &m->layers[L];
 
         /* ---- attention ---- */
         t = tr_prof_begin(prof);
-        memcpy(s->normed, s->x, (size_t)n_embd * sizeof(float));
-        tr_rmsnorm(s->normed, layer->attn_norm, n_embd, m->rms_eps);
+        memcpy(s->normed, s->x, (size_t)(n_tok * n_embd) * sizeof(float));
+        for (int64_t i = 0; i < n_tok; i++) tr_rmsnorm(s->normed + i * n_embd, layer->attn_norm, n_embd, m->rms_eps);
         tr_prof_end(prof, TR_PROF_ATTN_NORM, t);
 
         t = tr_prof_begin(prof);
-        tr_matmul(pool, &layer->wq, s->normed, 1, s->q);
-        tr_matmul(pool, &layer->wk, s->normed, 1, s->k);
-        tr_matmul(pool, &layer->wv, s->normed, 1, s->v);
+        tr_matmul(pool, &layer->wq, s->normed, n_tok, s->q);
+        tr_matmul(pool, &layer->wk, s->normed, n_tok, s->k);
+        tr_matmul(pool, &layer->wv, s->normed, n_tok, s->v);
         tr_prof_end(prof, TR_PROF_QKV_PROJ, t);
         tr_prof_count(prof, mat_bytes(&layer->wq) + mat_bytes(&layer->wk) + mat_bytes(&layer->wv), 0);
 
         t = tr_prof_begin(prof);
-        tr_rmsnorm(s->q, layer->q_norm, n_qkv, m->rms_eps);
-        tr_rmsnorm(s->k, layer->k_norm, n_kv, m->rms_eps);
+        for (int64_t i = 0; i < n_tok; i++) {
+            tr_rmsnorm(s->q + i * n_qkv, layer->q_norm, n_qkv, m->rms_eps);
+            tr_rmsnorm(s->k + i * n_kv, layer->k_norm, n_kv, m->rms_eps);
+        }
         tr_prof_end(prof, TR_PROF_QK_NORM, t);
 
         if (m->have_clamp) {
-            clamp_inplace(s->q, n_qkv, m->clamp);
-            clamp_inplace(s->k, n_kv, m->clamp);
-            clamp_inplace(s->v, n_kv, m->clamp);
+            clamp_inplace(s->q, n_tok * n_qkv, m->clamp);
+            clamp_inplace(s->k, n_tok * n_kv, m->clamp);
+            clamp_inplace(s->v, n_tok * n_kv, m->clamp);
         }
 
         t = tr_prof_begin(prof);
-        tr_rope_neox(s->q, n_head, head_dim, rope_cos, rope_sin);
-        tr_rope_neox(s->k, n_head_kv, head_dim, rope_cos, rope_sin);
+        for (int64_t i = 0; i < n_tok; i++) {
+            const float *cos_p = s->rope_cos + (pos0 + i) * half, *sin_p = s->rope_sin + (pos0 + i) * half;
+            tr_rope_neox(s->q + i * n_qkv, n_head, head_dim, cos_p, sin_p);
+            tr_rope_neox(s->k + i * n_kv, n_head_kv, head_dim, cos_p, sin_p);
+        }
         tr_prof_end(prof, TR_PROF_ROPE, t);
 
         t = tr_prof_begin(prof);
-        memcpy(kv_slot(s->k_cache, s->n_ctx, n_kv, L, pos), s->k, (size_t)n_kv * sizeof(float));
-        memcpy(kv_slot(s->v_cache, s->n_ctx, n_kv, L, pos), s->v, (size_t)n_kv * sizeof(float));
+        memcpy(kv_slot(s->k_cache, s->n_ctx, n_kv, L, pos0), s->k, (size_t)(n_tok * n_kv) * sizeof(float));
+        memcpy(kv_slot(s->v_cache, s->n_ctx, n_kv, L, pos0), s->v, (size_t)(n_tok * n_kv) * sizeof(float));
         tr_prof_end(prof, TR_PROF_KV_WRITE, t);
 
         t = tr_prof_begin(prof);
@@ -654,112 +775,101 @@ static void forward_one(olmoe_model *m, olmoe_session *s, int32_t token, int64_t
         ac.scale = scale;
         ac.n_ctx = s->n_ctx;
         ac.n_kv = n_kv;
+        ac.n_qkv = n_qkv;
         ac.head_dim = head_dim;
-        ac.group = group;
-        ac.n_pos = pos + 1;
-        /* a head costs ~30 ns per cached position: short contexts keep several heads per chunk */
-        tr_parallel_for(pool, n_head, 1 + 256 / (pos + 1), attn_body, &ac);
+        ac.group = n_head / n_head_kv;
+        ac.n_tok = n_tok;
+        ac.pos0 = pos0;
+        /* an item costs ~30 ns per cached position: short contexts keep several per chunk */
+        tr_parallel_for(pool, n_head * n_tok, 1 + 256 / (pos0 + n_tok), attn_body, &ac);
         tr_prof_end(prof, TR_PROF_ATTENTION, t);
 
         t = tr_prof_begin(prof);
-        tr_matmul(pool, &layer->wo, s->attn_concat, 1, s->attn_out);
-        for (int64_t i = 0; i < n_embd; i++) s->x[i] += s->attn_out[i];
+        tr_matmul(pool, &layer->wo, s->attn_concat, n_tok, s->attn_out);
+        for (int64_t j = 0; j < n_tok * n_embd; j++) s->x[j] += s->attn_out[j];
         tr_prof_end(prof, TR_PROF_ATTN_OUT_PROJ, t);
         tr_prof_count(prof, mat_bytes(&layer->wo), 0);
 
         /* ---- MoE FFN ---- */
         t = tr_prof_begin(prof);
-        memcpy(s->normed, s->x, (size_t)n_embd * sizeof(float));
-        tr_rmsnorm(s->normed, layer->ffn_norm, n_embd, m->rms_eps);
+        memcpy(s->normed, s->x, (size_t)(n_tok * n_embd) * sizeof(float));
+        for (int64_t i = 0; i < n_tok; i++) tr_rmsnorm(s->normed + i * n_embd, layer->ffn_norm, n_embd, m->rms_eps);
         tr_prof_end(prof, TR_PROF_FFN_NORM, t);
 
+        /* route every token, then a counting sort of the (token, slot) pairs by expert:
+         * offsets[e] counts, then starts, place[] takes each pair's row, and the shift
+         * at the end turns the advanced starts back into starts */
         t = tr_prof_begin(prof);
-        tr_matmul(pool, &layer->gate_inp, s->normed, 1, s->router);
-        tr_softmax(s->router, n_expert);
-
-        for (int64_t e = 0; e < n_expert; e++) s->taken[e] = 0;
-        for (int64_t slot = 0; slot < n_used; slot++) {
-            int64_t best = -1;
-            float best_val = 0.0f;
-            for (int64_t e = 0; e < n_expert; e++) {
-                if (s->taken[e]) continue;
-                if (best == -1 || s->router[e] > best_val) {
-                    best = e;
-                    best_val = s->router[e];
-                }
-            }
-            s->taken[best] = 1;
-            s->sel_id[slot] = best;
-            s->sel_w[slot] = best_val;
+        tr_matmul(pool, &layer->gate_inp, s->normed, n_tok, s->router);
+        for (int64_t e = 0; e <= n_expert; e++) s->offsets[e] = 0;
+        for (int64_t i = 0; i < n_tok; i++) {
+            route_token(m, s->router + i * n_expert, s->taken, s->sel_id + i * n_used, s->sel_w + i * n_used);
+            for (int64_t slot = 0; slot < n_used; slot++) s->offsets[s->sel_id[i * n_used + slot] + 1]++;
         }
-        if (m->norm_topk) {
-            float sum = 0.0f;
-            for (int64_t i = 0; i < n_used; i++) sum += s->sel_w[i];
-            for (int64_t i = 0; i < n_used; i++) s->sel_w[i] /= sum;
-        }
-        /* sort selected experts by increasing id: contributions are added in
-         * that order (the task's documented accumulation order). */
-        for (int64_t i = 1; i < n_used; i++) {
-            int64_t id = s->sel_id[i];
-            float w = s->sel_w[i];
-            int64_t j = i - 1;
-            while (j >= 0 && s->sel_id[j] > id) {
-                s->sel_id[j + 1] = s->sel_id[j];
-                s->sel_w[j + 1] = s->sel_w[j];
-                j--;
-            }
-            s->sel_id[j + 1] = id;
-            s->sel_w[j + 1] = w;
-        }
+        for (int64_t e = 0; e < n_expert; e++) s->offsets[e + 1] += s->offsets[e];
+        for (int64_t j = 0; j < n_rows; j++) s->place[j] = s->offsets[s->sel_id[j]]++;
+        for (int64_t e = n_expert; e > 0; e--) s->offsets[e] = s->offsets[e - 1];
+        s->offsets[0] = 0;
         tr_prof_end(prof, TR_PROF_ROUTER, t);
         tr_prof_count(prof, mat_bytes(&layer->gate_inp), 0);
 
-        /* experts in stages, each stage over all selected experts: the activations of
-         * every expert then run as one parallel job (slot i: h1/h2 at i*n_ff, h3 at i*n_embd) */
+        /* experts in stages, each one job over every (token, slot) row grouped by expert */
         t = tr_prof_begin(prof);
-        for (int64_t slot = 0; slot < n_used; slot++) {
-            int64_t e = s->sel_id[slot];
-            tr_mat gate_e = expert_slice(layer->ffn_gate, layer->ffn_gate_type, n_embd, n_ff, e);
-            tr_mat up_e = expert_slice(layer->ffn_up, layer->ffn_up_type, n_embd, n_ff, e);
-            tr_matmul(pool, &gate_e, s->normed, 1, s->h1 + slot * n_ff);
-            tr_matmul(pool, &up_e, s->normed, 1, s->h2 + slot * n_ff);
-            tr_prof_count(prof, mat_bytes(&gate_e) + mat_bytes(&up_e), 0);
-        }
+        for (int64_t j = 0; j < n_rows; j++)
+            memcpy(s->xg + s->place[j] * n_embd, s->normed + (j / n_used) * n_embd, (size_t)n_embd * sizeof(float));
+        tr_prof_end(prof, TR_PROF_EXPERT_GATHER, t);
+
+        t = tr_prof_begin(prof);
+        tr_matmul_grouped(pool, layer->gate_exps, s->offsets, n_expert, s->xg, s->h1);
+        tr_matmul_grouped(pool, layer->up_exps, s->offsets, n_expert, s->xg, s->h2);
         tr_prof_end(prof, TR_PROF_EXPERT_GATE_UP, t);
 
         t = tr_prof_begin(prof);
-        tr_swiglu(pool, s->h1, s->h2, n_used * n_ff);
+        tr_swiglu(pool, s->h1, s->h2, n_rows * n_ff);
         tr_prof_end(prof, TR_PROF_EXPERT_ACT, t);
 
         t = tr_prof_begin(prof);
-        for (int64_t slot = 0; slot < n_used; slot++) {
-            tr_mat down_e = expert_slice(layer->ffn_down, layer->ffn_down_type, n_ff, n_embd, s->sel_id[slot]);
-            tr_matmul(pool, &down_e, s->h1 + slot * n_ff, 1, s->h3 + slot * n_embd);
-            tr_prof_count(prof, mat_bytes(&down_e), 0);
-        }
+        tr_matmul_grouped(pool, layer->down_exps, s->offsets, n_expert, s->h1, s->h3);
         tr_prof_end(prof, TR_PROF_EXPERT_DOWN, t);
+        if (prof->enabled) {
+            for (int64_t e = 0; e < n_expert; e++)
+                if (s->offsets[e + 1] > s->offsets[e])
+                    tr_prof_count(prof, mat_bytes(&layer->gate_exps[e]) + mat_bytes(&layer->up_exps[e]) +
+                                            mat_bytes(&layer->down_exps[e]), 0);
+        }
 
         t = tr_prof_begin(prof);
-        for (int64_t i = 0; i < n_embd; i++) s->ffn_out[i] = 0.0f;
-        for (int64_t slot = 0; slot < n_used; slot++)
-            K->axpy_f32(s->ffn_out, s->h3 + slot * n_embd, s->sel_w[slot], n_embd);
+        mix_ctx mc;
+        mc.K = K;
+        mc.h3 = s->h3;
+        mc.sel_w = s->sel_w;
+        mc.place = s->place;
+        mc.ffn_out = s->ffn_out;
+        mc.x = s->x;
+        mc.n_embd = n_embd;
+        mc.n_used = n_used;
+        /* a token is n_used axpys of n_embd: a few thousand elements per chunk at least */
+        tr_parallel_for(pool, n_tok, 1 + 65536 / (n_used * n_embd), mix_body, &mc);
         tr_prof_end(prof, TR_PROF_EXPERT_MIX, t);
-        for (int64_t i = 0; i < n_embd; i++) s->x[i] += s->ffn_out[i];
     }
 
-    t = tr_prof_begin(prof);
-    tr_rmsnorm(s->x, m->output_norm, n_embd, m->rms_eps);
-    tr_prof_end(prof, TR_PROF_OUTPUT_NORM, t);
+    if (want_logits) {
+        float *last = s->x + (n_tok - 1) * n_embd;
+        t = tr_prof_begin(prof);
+        tr_rmsnorm(last, m->output_norm, n_embd, m->rms_eps);
+        tr_prof_end(prof, TR_PROF_OUTPUT_NORM, t);
 
-    t = tr_prof_begin(prof);
-    tr_matmul(pool, &m->output, s->x, 1, s->logits);
-    tr_prof_end(prof, TR_PROF_LM_HEAD, t);
-    tr_prof_count(prof, mat_bytes(&m->output), 0);
+        t = tr_prof_begin(prof);
+        tr_matmul(pool, &m->output, last, 1, s->logits);
+        tr_prof_end(prof, TR_PROF_LM_HEAD, t);
+        tr_prof_count(prof, mat_bytes(&m->output), 0);
+    }
 
-    tr_prof_end(prof, TR_PROF_TOKEN, t_token);
-    if (prof->enabled) prof->tokens[prof->phase]++;
+    tr_prof_end(prof, TR_PROF_TOKEN, t_pass);
+    if (prof->enabled) prof->tokens[prof->phase] += (uint64_t)n_tok;
 }
 
+/* Passes of at most n_batch tokens; only the last one computes logits. */
 static int olmoe_eval(void *session, const int32_t *tokens, int64_t n) {
     olmoe_session *s = (olmoe_session *)session;
     olmoe_model *m = s->m;
@@ -770,9 +880,10 @@ static int olmoe_eval(void *session, const int32_t *tokens, int64_t n) {
         if (tokens[i] < 0 || tokens[i] >= m->vocab) return -1;
     }
 
-    for (int64_t i = 0; i < n; i++) {
-        forward_one(m, s, tokens[i], s->pos);
-        s->pos++;
+    for (int64_t off = 0; off < n; off += s->n_batch) {
+        int64_t len = n - off < s->n_batch ? n - off : s->n_batch;
+        forward_pass(m, s, tokens + off, len, off + len == n);
+        s->pos += len;
     }
     return 0;
 }

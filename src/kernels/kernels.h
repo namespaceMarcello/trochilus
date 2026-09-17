@@ -30,6 +30,14 @@
 #include "../base/threads.h"
 
 #define TR_LANES 16
+/* Tokens per block in tr_matmul: a block of activations stays in L2 while every weight
+ * row is dotted against it, so the weight is read once per block instead of once per
+ * token. Changes speed only, never a result; -DTR_MATMUL_TILE=<n> to measure another. */
+#ifndef TR_MATMUL_TILE
+#define TR_MATMUL_TILE 16
+#endif
+/* Input rows a dot_row_x4 kernel handles in one pass over the weight row. */
+#define TR_DOT_TOKENS 4
 
 /* A 2-D weight in ggml layout: `rows` output rows, each `cols` input elements,
  * stored as consecutive rows of type `type` (row bytes = tr_row_bytes). */
@@ -56,6 +64,11 @@ typedef struct {
      * applied to the dequantized weights: w_k = d_block * q_k computed as a
      * float product first, then w_k * x_k into lane k % 16 */
     float (*dot_row[TR_TYPE_COUNT])(const void *row, const float *x, int64_t n);
+    /* TR_DOT_TOKENS dots of the same row with consecutive input rows x, x+stride, ...:
+     * out[j] = dot_row(row, x + j*stride, n), each under the lane contract, with the row
+     * read and decoded once for all of them (fewer bytes and conversions per element, same
+     * numbers). NULL for a type without a variant: the caller loops over dot_row. */
+    void (*dot_row_x4[TR_TYPE_COUNT])(const void *row, const float *x, int64_t stride, int64_t n, float *out);
     /* decode one row of n elements to f32 */
     void (*dequant_row[TR_TYPE_COUNT])(const void *row, float *out, int64_t n);
 } tr_kernels;
@@ -70,8 +83,17 @@ const tr_kernels *tr_kernels_tier(const char *tier);
 
 /* ---- operations built on the table (all deterministic across thread counts) ---- */
 
-/* y[t*rows + r] = row r of w  ·  x[t*cols ..] for t < n_tokens; parallel over (t, r). */
+/* y[t*rows + r] = row r of w  ·  x[t*cols ..] for t < n_tokens; parallel over (t, r).
+ * Each y element is one dot_row call, whatever the thread count or the visiting order:
+ * several tokens are visited in blocks (every weight row against a block of TR_MATMUL_TILE
+ * tokens), so a weight is read once per block instead of once per token. */
 void tr_matmul(tr_pool *pool, const tr_mat *w, const float *x, int64_t n_tokens, float *y);
+/* The same over input rows grouped by weight (MoE experts): group g holds rows
+ * [offsets[g], offsets[g+1]) of x and multiplies them by w[g]; every w[g] has the same
+ * type, rows and cols; offsets is non-decreasing with offsets[0] = 0, and empty groups
+ * are skipped. y[p*rows + r] = row r of w[g] · x[p*cols ..] for the group g of row p. */
+void tr_matmul_grouped(tr_pool *pool, const tr_mat *w, const int64_t *offsets, int64_t n_groups, const float *x,
+                       float *y);
 /* out = dequantized row `row` of w (cols elements): an embedding lookup. */
 void tr_get_row(const tr_mat *w, int64_t row, float *out);
 /* x[i] = x[i] / sqrt(mean(x^2) + eps) * weight[i], mean via the lane contract, f32. */

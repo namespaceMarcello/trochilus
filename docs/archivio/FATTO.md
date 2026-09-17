@@ -156,3 +156,28 @@ stampa token e valutazioni e divide per le valutazioni; `make check` lo verifica
 `docs/MISURE.md`. Prova, nel container con i modelli nel volume `trochilus-models`:
 `tools/speed_compare.py --model /models/<gguf> --trochilus build/linux-gcc/trochilus --llama-bench
 ref/llama.cpp/build-trochilus/bin/llama-bench --threads 16,8 --prompt 32 --gen 32`.
+
+### 2026-09-17 — Prefill a blocchi in C esatto
+`tr_session_eval` corre in passate da al più `n_batch` token (default 512; `tr_session_create` prende
+`n_batch`, `-b` in `generate`/`run`/`chat`/`logits`). In una passata: K/V di tutti i token, attenzione
+per (testa, token); router per token e counting sort delle coppie (token, esperto) per esperto;
+`tr_matmul_grouped` (nuovo, `kernels.c`) per gate/up/down, e `tr_matmul` che visita i token a blocchi
+di 16 contro ogni riga di pesi; somma degli esperti per token in ordine di id; logit solo dell'ultimo
+token. Il decode è la passata da un token. Prompt 512 a 16 thread: 30 → 197 tok/s (col kernel qui
+sotto), decode invariato,
+logit identici al bit al binario di prima. Prova: `make check` (`tests/test_prefill.c`: 90 casi f32/Q8_0,
+n_batch, chiamate, thread, rewind; `test_kernels`: gruppi vuoti e righe spezzate fra thread;
+`tools/oracle.py`: `logits -b 3/64/tutto` al byte su tiny e OLMoE a 2 layer); velocità con
+`tools/speed_compare.py ... --prompt 512`.
+
+### 2026-09-17 — Profilo del prefill, kernel a 4 token, confronti alternati
+`tools/profile_suite.py` riporta le zone anche in prefill e accetta `batch` in uno scenario;
+`bench/scenarios-olmoe-1b-7b.json` ha gli scenari `prefill512-t16/8/4/1`. Il profilo dice che il
+prefill sta al 90% nelle moltiplicazioni (attenzione 2%, seriale 8%), quindi kernel `dot_row_x4`
+(scalare, AVX2, AVX-512): una riga di pesi contro 4 token nei registri, un carico e una conversione
+per quattro prodotti, ognuno identico al bit al suo `dot_row`. `TR_MATMUL_TILE` si può cambiare da
+riga di compilazione. `tests/bench_kernels.c` misura `dot_row q8_0 x4` e `tr_matmul` con 64 token;
+`tests/test_kernels.c` confronta x4 con `dot_row` su ogni livello SIMD. Nuovo `tools/ab_speed.sh`:
+due binari alternati run per run, perché il portatile che si scalda falsa i confronti in sequenza
+(LEZIONI #46). Prova: `make check`, `make bench`, e
+`sh tools/ab_speed.sh models/<gguf> build/base/b/trochilus build/linux-gcc/trochilus` nel container.

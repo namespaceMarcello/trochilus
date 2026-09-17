@@ -90,6 +90,7 @@ build/trochilus chat -m <file.gguf>                       # conversazione con il
 make chat-check          # chat sul modello vero: seconda risposta = run da zero (saltato senza modello)
 sh tools/build_llamacpp.sh; tools/compare_llamacpp.py ...   # nel container: llama.cpp e confronto dei logit
 tools/speed_compare.py ...   # nel container: velocità contro llama.cpp e colibri (modelli nel volume trochilus-models)
+sh tools/ab_speed.sh <gguf> <binario A> <binario B>   # due binari alternati run per run (LEZIONI #46)
 make bench               # microbenchmark dei kernel (mediana + rumore)
 make profile             # scenari col profiler, mediana di N, token identici, confronto col precedente
 make profile SCENARIOS=bench/scenarios-olmoe-1b-7b.json   # modello vero, 16/8/4/1 thread

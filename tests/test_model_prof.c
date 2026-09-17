@@ -17,7 +17,7 @@
 
 int main(int argc, char **argv) {
     /* 1 layer, n_embd 8, 2 heads (1 kv), n_ff 4, 2 experts (1 used), vocab 4, context 8 */
-    static const synth_params P = {1, 8, 2, 1, 4, 2, 1, 4, 8};
+    static const synth_params P = {1, 8, 2, 1, 4, 2, 1, 4, 8, TR_TYPE_F32};
     char path[512];
     TR_CHECK(synth_write(&P, argc > 0 ? argv[0] : "", "test_model_prof_tmp.gguf", path, sizeof path) == 0);
 
@@ -36,7 +36,7 @@ int main(int argc, char **argv) {
     }
     const tr_model_info *info = tr_model_get_info(model);
 
-    tr_session *sess = tr_session_create(model, 0, err, sizeof err);
+    tr_session *sess = tr_session_create(model, 0, 0, err, sizeof err);
     TR_CHECK(sess != NULL);
     if (sess == NULL) {
         fprintf(stderr, "session failed: %s\n", err);
@@ -62,7 +62,7 @@ int main(int argc, char **argv) {
 
     /* a fresh session with the profiler enabled must produce bit-identical
      * logits: the profiler must never change a computed value. */
-    tr_session *sess2 = tr_session_create(model, 0, err, sizeof err);
+    tr_session *sess2 = tr_session_create(model, 0, 0, err, sizeof err);
     TR_CHECK(sess2 != NULL);
     if (sess2 != NULL) {
         tr_prof *prof2 = tr_session_prof(sess2);
@@ -73,13 +73,13 @@ int main(int argc, char **argv) {
         if (logits_off != NULL)
             TR_CHECK(memcmp(logits_off, tr_session_logits(sess2), logits_bytes) == 0);
 
-        /* it recorded real work: one TOKEN zone per forward pass, the MoE
-         * zones ran once per token (1 layer, 1 expert used), and it counted
+        /* it recorded real work: the 3 tokens ran as one forward pass (one TOKEN
+         * zone, MoE zones once per layer of the pass: 1 layer), and it counted
          * bytes of weights touched (the material for MiB/token, GB/s). */
         TR_CHECK_EQ_INT(prof2->tokens[TR_PHASE_PREFILL], 3);
-        TR_CHECK_EQ_INT(prof2->acc[TR_PHASE_PREFILL][TR_PROF_TOKEN].calls, 3);
-        TR_CHECK_EQ_INT(prof2->acc[TR_PHASE_PREFILL][TR_PROF_ROUTER].calls, 3);
-        TR_CHECK_EQ_INT(prof2->acc[TR_PHASE_PREFILL][TR_PROF_EXPERT_GATE_UP].calls, 3);
+        TR_CHECK_EQ_INT(prof2->acc[TR_PHASE_PREFILL][TR_PROF_TOKEN].calls, 1);
+        TR_CHECK_EQ_INT(prof2->acc[TR_PHASE_PREFILL][TR_PROF_ROUTER].calls, 1);
+        TR_CHECK_EQ_INT(prof2->acc[TR_PHASE_PREFILL][TR_PROF_EXPERT_GATE_UP].calls, 1);
         TR_CHECK_EQ_INT(prof2->acc[TR_PHASE_DECODE][TR_PROF_TOKEN].calls, 0);
         TR_CHECK(prof2->weight_bytes_touched[TR_PHASE_PREFILL] > 0);
 

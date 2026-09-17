@@ -1,5 +1,6 @@
-/* synth_olmoe.h — writes a synthetic OLMoE GGUF (f32, deterministic weights) of any
- * size, so model tests need no external fixture or Python tool. */
+/* synth_olmoe.h — writes a synthetic OLMoE GGUF (deterministic weights) of any size, so
+ * model tests need no external fixture or Python tool. Norms are f32; matrices are f32 or
+ * Q8_0 (then every matrix row length, n_embd and n_ff, must be a multiple of 32). */
 #ifndef TR_TEST_SYNTH_OLMOE_H
 #define TR_TEST_SYNTH_OLMOE_H
 
@@ -12,6 +13,7 @@
 
 typedef struct {
     uint32_t layers, n_embd, n_head, n_head_kv, n_ff, n_expert, n_used, vocab, ctx;
+    tr_type type; /* of the 2-D and 3-D tensors: TR_TYPE_F32 or TR_TYPE_Q8_0 */
 } synth_params;
 
 typedef struct {
@@ -39,8 +41,11 @@ static void synth_kv_u32(synth_buf *b, const char *key, uint32_t v) {
     synth_u32(b, v);
 }
 
-/* Small pseudo-random weights in [-0.1, 0.1]: same file every run, no NaN/Inf. */
-static void synth_tensor(synth_buf *hdr, synth_buf *data, const char *name, int ndims, uint64_t ne[3], uint32_t seed) {
+/* Small pseudo-random weights, same file every run, no NaN/Inf: f32 in [-0.1, 0.1], or Q8_0
+ * blocks with an f16 scale in [2^-10, 2^-9) (exponent bits 5, random mantissa) and random
+ * quants in [-127, 127]. */
+static void synth_tensor(synth_buf *hdr, synth_buf *data, const char *name, int ndims, uint64_t ne[3], uint32_t seed,
+                         tr_type type) {
     synth_pad(data, 32);
     synth_str(hdr, name);
     synth_u32(hdr, (uint32_t)ndims);
@@ -49,8 +54,21 @@ static void synth_tensor(synth_buf *hdr, synth_buf *data, const char *name, int 
         synth_u64(hdr, ne[i]);
         n *= ne[i];
     }
-    synth_u32(hdr, (uint32_t)TR_TYPE_F32);
+    synth_u32(hdr, (uint32_t)type);
     synth_u64(hdr, data->len);
+    if (type == TR_TYPE_Q8_0) {
+        for (uint64_t b = 0; b < n / 32; b++) {
+            seed = seed * 1103515245u + 12345u;
+            uint16_t d = (uint16_t)((5u << 10) | ((seed >> 16) & 0x3FFu));
+            synth_put(data, &d, sizeof d);
+            for (int k = 0; k < 32; k++) {
+                seed = seed * 1103515245u + 12345u;
+                int8_t q = (int8_t)((int)((seed >> 16) % 255u) - 127);
+                synth_put(data, &q, 1);
+            }
+        }
+        return;
+    }
     for (uint64_t i = 0; i < n; i++) {
         seed = seed * 1103515245u + 12345u;
         float v = ((float)((seed >> 16) & 0xFFFFu) / 65535.0f - 0.5f) * 0.2f;
@@ -89,7 +107,7 @@ static synth_buf synth_olmoe(const synth_params *P) {
     n_kv_count++;
 
     uint32_t seed = 1;
-#define T(nm, nd, a, b, c) do { uint64_t ne[3] = {(a), (b), (c)}; synth_tensor(&hdr, &data, (nm), (nd), ne, seed++); n_tensors++; } while (0)
+#define T(nm, nd, a, b, c) do { uint64_t ne[3] = {(a), (b), (c)}; synth_tensor(&hdr, &data, (nm), (nd), ne, seed++, (nd) >= 2 ? P->type : TR_TYPE_F32); n_tensors++; } while (0)
     T("token_embd.weight", 2, P->n_embd, P->vocab, 0);
     T("output_norm.weight", 1, P->n_embd, 0, 0);
     T("output.weight", 2, P->n_embd, P->vocab, 0);

@@ -17,7 +17,7 @@ enum { VOCAB = 16 };
 
 /* logits of a fresh session after evaluating seq[0..n), one eval call per chunk of `step` */
 static int fresh_logits(tr_model *model, const int32_t *seq, int64_t n, int64_t step, float *out) {
-    tr_session *s = tr_session_create(model, 0, NULL, 0);
+    tr_session *s = tr_session_create(model, 0, 0, NULL, 0);
     if (s == NULL) return -1;
     int rc = 0;
     for (int64_t i = 0; i < n && rc == 0; i += step) rc = tr_session_eval(s, seq + i, n - i < step ? n - i : step);
@@ -28,7 +28,7 @@ static int fresh_logits(tr_model *model, const int32_t *seq, int64_t n, int64_t 
 
 int main(int argc, char **argv) {
     /* 2 layers, n_embd 16, 4 heads (2 kv), n_ff 8, 4 experts (2 used), vocab 16, context 32 */
-    static const synth_params P = {2, 16, 4, 2, 8, 4, 2, VOCAB, 32};
+    static const synth_params P = {2, 16, 4, 2, 8, 4, 2, VOCAB, 32, TR_TYPE_F32};
     char path[512];
     TR_CHECK(synth_write(&P, argc > 0 ? argv[0] : "", "test_session_tmp.gguf", path, sizeof path) == 0);
 
@@ -36,7 +36,7 @@ int main(int argc, char **argv) {
     char err[256];
     tr_model *model = pool != NULL ? tr_model_load(path, pool, err, sizeof err) : NULL;
     TR_CHECK(model != NULL);
-    tr_session *s = model != NULL ? tr_session_create(model, 0, err, sizeof err) : NULL;
+    tr_session *s = model != NULL ? tr_session_create(model, 0, 0, err, sizeof err) : NULL;
     TR_CHECK(s != NULL);
     if (s == NULL) {
         tr_model_free(model);

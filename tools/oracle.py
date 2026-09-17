@@ -92,19 +92,49 @@ def run_generate(binary, model, prompt_ids, n_gen):
     return parse_tokens_line(r.stdout) or []
 
 
-def run_logits(binary, model, full_ids):
+def run_logits(binary, model, full_ids, batch=1):
     """Returns the path to a temp file with Trochilus's logits for full_ids, or
-    None on failure. Caller removes the file."""
+    None on failure. Caller removes the file. batch > 1: the tokens run `batch` per
+    forward pass, one row per pass (its last token)."""
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=".bin")
     os.close(tmp_fd)
     tokens_arg = ",".join(str(t) for t in full_ids)
-    r = subprocess.run([binary, "logits", "-m", model, "--tokens", tokens_arg, "--out", tmp_path],
+    r = subprocess.run([binary, "logits", "-m", model, "--tokens", tokens_arg, "--out", tmp_path, "-b", str(batch)],
                         capture_output=True, text=True)
     if r.returncode != 0:
         print("logits failed (exit %d):\n%s" % (r.returncode, r.stderr), file=sys.stderr)
         os.remove(tmp_path)
         return None
     return tmp_path
+
+
+# Tokens per forward pass checked against one token per pass, plus the whole sequence in one pass.
+BATCH_SIZES = (3, 64)
+
+
+def check_batches(binary, model, full_ids, per_token_path, vocab, label=""):
+    """Prefill in blocks (docs/STATO.md): `logits -b k` must write, for the last token of
+    each pass, the very bytes that one token per pass gives at that position. Exact by
+    design, so any difference fails whatever --expect says. Returns True if all match."""
+    with open(per_token_path, "rb") as f:
+        per_token = f.read()
+    row, n, ok = 4 * vocab, len(full_ids), True
+    for k in sorted({k for k in BATCH_SIZES if 1 < k < n} | {n}):
+        path = run_logits(binary, model, full_ids, batch=k)
+        if path is None:
+            ok = False
+            continue
+        try:
+            with open(path, "rb") as f:
+                got = f.read()
+        finally:
+            os.remove(path)
+        ends = [min(i + k, n) - 1 for i in range(0, n, k)]
+        same = got == b"".join(per_token[e * row:(e + 1) * row] for e in ends)
+        print("%s%d tokens per pass: %d rows %s" % (label, k, len(ends),
+              "bit-identical to one token per pass" if same else "DIFFERENT from one token per pass"))
+        ok = ok and same
+    return ok
 
 
 def run_single(args, binary, ref):
@@ -116,7 +146,7 @@ def run_single(args, binary, ref):
     n_gen = len(full_ids) - len(prompt_ids)
     expected_gen = full_ids[len(prompt_ids):]
 
-    ok = True
+    ok, batches_ok = True, True
     generated = run_generate(binary, args.model, prompt_ids, n_gen)
     if generated is None:
         ok, generated = False, []
@@ -152,10 +182,11 @@ def run_single(args, binary, ref):
             print("argmax agreement: %d/%d" % (argmax_agree, len(full_ids)))
             if max_diff > args.logit_tol:
                 ok = False
+            batches_ok = check_batches(binary, args.model, full_ids, tmp_path, vocab)
         finally:
             os.remove(tmp_path)
 
-    return ok and tokens_exact and max_diff <= args.logit_tol
+    return ok and tokens_exact and max_diff <= args.logit_tol, batches_ok
 
 
 def run_multi(args, binary, ref):
@@ -163,7 +194,7 @@ def run_multi(args, binary, ref):
     prompts, logits as a separate float32 binary per prompt (numpy comparison --
     the real vocab is tens of thousands wide, prompts up to ~1000+ tokens)."""
     vocab = ref["vocab_size"]
-    ok = True
+    ok, batches_ok = True, True
     for p in ref["prompts"]:
         name = p["name"]
         prompt_ids, full_ids = p["prompt_ids"], p["full_ids"]
@@ -185,6 +216,7 @@ def run_multi(args, binary, ref):
             continue
         try:
             got = read_logits_np(tmp_path, len(full_ids), vocab)
+            batches_ok = check_batches(binary, args.model, full_ids, tmp_path, vocab, "[%s] " % name) and batches_ok
         finally:
             os.remove(tmp_path)
         ref_logits = read_logits_np(os.path.join(args.fixture_dir, p["logits_file"]), len(full_ids), vocab)
@@ -199,7 +231,7 @@ def run_multi(args, binary, ref):
         if max_diff > args.logit_tol:
             ok = False
 
-    return ok
+    return ok, batches_ok
 
 
 def main():
@@ -221,12 +253,14 @@ def main():
         ref = json.load(f)
 
     t0 = time.perf_counter()
-    ok = run_multi(args, binary, ref) if "prompts" in ref else run_single(args, binary, ref)
+    ok, batches_ok = run_multi(args, binary, ref) if "prompts" in ref else run_single(args, binary, ref)
     self_rss, child_rss = peak_rss_mb()
     msg = ("peak RSS: oracle.py %.0f MB, %s %.0f MB" % (self_rss, os.path.basename(binary), child_rss)
            if self_rss is not None else "peak RSS: n/a on this platform")
     print("comparison: %.1fs, %s" % (time.perf_counter() - t0, msg))
 
+    if not batches_ok:
+        return 1
     if args.expect == "report":
         return 0
     return 0 if ok else 1

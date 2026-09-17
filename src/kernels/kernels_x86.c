@@ -131,6 +131,88 @@ static float avx512_dot_row_q8_0(const void *row, const float *x, int64_t n) {
     return tr_lane_combine(lane);
 }
 
+/* ---- one weight row against TR_DOT_TOKENS input rows ---------------------- */
+/* The block scale and the decoded weights are computed once and multiplied into each
+ * input row's own accumulators: out[t] is bit for bit the dot_row of that row, with a
+ * quarter of the weight loads and conversions per element. */
+
+TR_TARGET_AVX2
+static void avx2_dot_row_x4_q8_0(const void *row, const float *x, int64_t stride, int64_t n, float *out) {
+    const unsigned char *p = (const unsigned char *)row;
+    int64_t nb = n / TR_Q8_0_BLOCK_ELEMS;
+    /* one named register per input row, never an array: an indexed accumulator ends up on
+     * the stack, and with it the whole point of one pass over the weight row */
+    __m256 lo0 = _mm256_setzero_ps(), lo1 = _mm256_setzero_ps(), lo2 = _mm256_setzero_ps(),
+           lo3 = _mm256_setzero_ps();
+    __m256 hi0 = _mm256_setzero_ps(), hi1 = _mm256_setzero_ps(), hi2 = _mm256_setzero_ps(),
+           hi3 = _mm256_setzero_ps();
+    for (int64_t b = 0; b < nb; b++) {
+        const unsigned char *blk = p + (size_t)b * TR_Q8_0_BLOCK_BYTES;
+        const unsigned char *qs = blk + TR_Q8_0_SCALE_BYTES;
+        const float *xb = x + b * TR_Q8_0_BLOCK_ELEMS;
+        __m256 d = _mm256_set1_ps(tr_q8_0_block_scale(blk));
+        for (int j = 0; j < TR_Q8_0_BLOCK_ELEMS; j += TR_LANES) {
+            __m256 w0 = _mm256_mul_ps(d, avx2_i8_to_ps(qs + j));
+            __m256 w1 = _mm256_mul_ps(d, avx2_i8_to_ps(qs + j + 8));
+            const float *x0 = xb + j, *x1 = x0 + stride, *x2 = x1 + stride, *x3 = x2 + stride;
+            lo0 = _mm256_add_ps(lo0, _mm256_mul_ps(w0, _mm256_loadu_ps(x0)));
+            hi0 = _mm256_add_ps(hi0, _mm256_mul_ps(w1, _mm256_loadu_ps(x0 + 8)));
+            lo1 = _mm256_add_ps(lo1, _mm256_mul_ps(w0, _mm256_loadu_ps(x1)));
+            hi1 = _mm256_add_ps(hi1, _mm256_mul_ps(w1, _mm256_loadu_ps(x1 + 8)));
+            lo2 = _mm256_add_ps(lo2, _mm256_mul_ps(w0, _mm256_loadu_ps(x2)));
+            hi2 = _mm256_add_ps(hi2, _mm256_mul_ps(w1, _mm256_loadu_ps(x2 + 8)));
+            lo3 = _mm256_add_ps(lo3, _mm256_mul_ps(w0, _mm256_loadu_ps(x3)));
+            hi3 = _mm256_add_ps(hi3, _mm256_mul_ps(w1, _mm256_loadu_ps(x3 + 8)));
+        }
+    }
+    float lane[TR_LANES];
+    _mm256_storeu_ps(lane, lo0);
+    _mm256_storeu_ps(lane + 8, hi0);
+    out[0] = tr_lane_combine(lane);
+    _mm256_storeu_ps(lane, lo1);
+    _mm256_storeu_ps(lane + 8, hi1);
+    out[1] = tr_lane_combine(lane);
+    _mm256_storeu_ps(lane, lo2);
+    _mm256_storeu_ps(lane + 8, hi2);
+    out[2] = tr_lane_combine(lane);
+    _mm256_storeu_ps(lane, lo3);
+    _mm256_storeu_ps(lane + 8, hi3);
+    out[3] = tr_lane_combine(lane);
+}
+
+TR_TARGET_AVX512
+static void avx512_dot_row_x4_q8_0(const void *row, const float *x, int64_t stride, int64_t n, float *out) {
+    const unsigned char *p = (const unsigned char *)row;
+    int64_t nb = n / TR_Q8_0_BLOCK_ELEMS;
+    /* named registers, never an array (see the AVX2 variant above) */
+    __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps(), acc2 = _mm512_setzero_ps(),
+           acc3 = _mm512_setzero_ps();
+    for (int64_t b = 0; b < nb; b++) {
+        const unsigned char *blk = p + (size_t)b * TR_Q8_0_BLOCK_BYTES;
+        const unsigned char *qs = blk + TR_Q8_0_SCALE_BYTES;
+        const float *xb = x + b * TR_Q8_0_BLOCK_ELEMS;
+        __m512 d = _mm512_set1_ps(tr_q8_0_block_scale(blk));
+        for (int j = 0; j < TR_Q8_0_BLOCK_ELEMS; j += TR_LANES) {
+            __m512 q = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(const void *)(qs + j))));
+            __m512 w = _mm512_mul_ps(d, q);
+            const float *x0 = xb + j, *x1 = x0 + stride, *x2 = x1 + stride, *x3 = x2 + stride;
+            acc0 = _mm512_add_ps(acc0, _mm512_mul_ps(w, _mm512_loadu_ps(x0)));
+            acc1 = _mm512_add_ps(acc1, _mm512_mul_ps(w, _mm512_loadu_ps(x1)));
+            acc2 = _mm512_add_ps(acc2, _mm512_mul_ps(w, _mm512_loadu_ps(x2)));
+            acc3 = _mm512_add_ps(acc3, _mm512_mul_ps(w, _mm512_loadu_ps(x3)));
+        }
+    }
+    float lane[TR_LANES];
+    _mm512_storeu_ps(lane, acc0);
+    out[0] = tr_lane_combine(lane);
+    _mm512_storeu_ps(lane, acc1);
+    out[1] = tr_lane_combine(lane);
+    _mm512_storeu_ps(lane, acc2);
+    out[2] = tr_lane_combine(lane);
+    _mm512_storeu_ps(lane, acc3);
+    out[3] = tr_lane_combine(lane);
+}
+
 /* hot: end */
 
 /* ---- tables --------------------------------------------------------------- */
@@ -148,6 +230,7 @@ const tr_kernels *tr_kernels_x86_tier(const char *tier) {
             g_avx2.dot_f32 = avx2_dot_f32;
             g_avx2.axpy_f32 = avx2_axpy_f32;
             g_avx2.dot_row[TR_TYPE_Q8_0] = avx2_dot_row_q8_0;
+            g_avx2.dot_row_x4[TR_TYPE_Q8_0] = avx2_dot_row_x4_q8_0;
             g_avx2_built = 1;
         }
         return &g_avx2;
@@ -160,6 +243,7 @@ const tr_kernels *tr_kernels_x86_tier(const char *tier) {
             g_avx512.dot_f32 = avx512_dot_f32;
             g_avx512.axpy_f32 = avx512_axpy_f32;
             g_avx512.dot_row[TR_TYPE_Q8_0] = avx512_dot_row_q8_0;
+            g_avx512.dot_row_x4[TR_TYPE_Q8_0] = avx512_dot_row_x4_q8_0;
             g_avx512_built = 1;
         }
         return &g_avx512;

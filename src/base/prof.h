@@ -32,6 +32,7 @@ typedef enum {
     TR_PROF_ATTN_OUT_PROJ,
     TR_PROF_FFN_NORM,
     TR_PROF_ROUTER,           /* router projection, softmax, top-k */
+    TR_PROF_EXPERT_GATHER,    /* the pass's token inputs copied, grouped by expert */
     TR_PROF_EXPERT_GATE_UP,
     TR_PROF_EXPERT_ACT,
     TR_PROF_EXPERT_DOWN,

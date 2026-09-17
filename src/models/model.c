@@ -113,14 +113,14 @@ const tr_model_info *tr_model_get_info(const tr_model *m) {
     return m->vt->info(m->impl);
 }
 
-tr_session *tr_session_create(tr_model *m, int64_t n_ctx, char *err, size_t err_len) {
+tr_session *tr_session_create(tr_model *m, int64_t n_ctx, int64_t n_batch, char *err, size_t err_len) {
     char local_err[256];
     if (err == NULL) {
         err = local_err;
         err_len = sizeof local_err;
     }
 
-    void *impl = m->vt->session_create(m->impl, n_ctx, err, err_len);
+    void *impl = m->vt->session_create(m->impl, n_ctx, n_batch, err, err_len);
     if (impl == NULL) return NULL;
 
     tr_session *s = (tr_session *)malloc(sizeof *s);

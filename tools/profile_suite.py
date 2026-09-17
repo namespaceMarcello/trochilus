@@ -80,8 +80,10 @@ def launch(binary, args):
 
 
 def run_generate(binary, model, prompt_tokens, gen_tokens, threads, profile_json=None, also_profile_flag=False,
-                 context=0):
+                 context=0, batch=0):
     args = ["generate", "-m", model, "-p", str(prompt_tokens), "-n", str(gen_tokens)]
+    if batch:
+        args += ["-b", str(batch)]
     if threads:
         args += ["-t", str(threads)]
     if context:
@@ -128,25 +130,26 @@ def aggregate(records):
         agg[phase] = {"tokens_per_sec_median": med(tps), "tokens_per_sec_spread": spread(tps),
                       "tokens_per_sec_min": min(tps), "tokens_per_sec_max": max(tps)}
 
-    decode_records = [r["engine"]["phases"]["decode"] for r in records]
-    zone_names = set()
-    for d in decode_records:
-        zone_names.update(d["zones"].keys())
-    zones = {}
-    for z in zone_names:
-        secs = [d["zones"].get(z, {"seconds": 0.0})["seconds"] for d in decode_records]
-        token_secs = [d["seconds"] for d in decode_records]
-        shares = [(s / t) if t > 0 else 0.0 for s, t in zip(secs, token_secs)]
-        zones[z] = {"seconds_median": med(secs), "share_median": med(shares)}
-    agg["decode"]["zones"] = zones
+    for phase in ("prefill", "decode"):
+        phase_records = [r["engine"]["phases"][phase] for r in records]
+        zone_names = set()
+        for d in phase_records:
+            zone_names.update(d["zones"].keys())
+        zones = {}
+        for z in zone_names:
+            secs = [d["zones"].get(z, {"seconds": 0.0})["seconds"] for d in phase_records]
+            token_secs = [d["seconds"] for d in phase_records]
+            shares = [(s / t) if t > 0 else 0.0 for s, t in zip(secs, token_secs)]
+            zones[z] = {"seconds_median": med(secs), "share_median": med(shares)}
+        agg[phase]["zones"] = zones
 
-    mibs, gbps = [], []
-    for d in decode_records:
-        toks, wb, secs = d["tokens"], d["weight_bytes"], d["seconds"]
-        mibs.append((wb / toks / (1024.0 * 1024.0)) if toks else 0.0)
-        gbps.append((wb / secs / 1e9) if secs > 0 else 0.0)
-    agg["decode"]["mib_per_token_median"] = med(mibs)
-    agg["decode"]["gb_per_sec_median"] = med(gbps)
+        mibs, gbps = [], []
+        for d in phase_records:
+            toks, wb, secs = d["tokens"], d["weight_bytes"], d["seconds"]
+            mibs.append((wb / toks / (1024.0 * 1024.0)) if toks else 0.0)
+            gbps.append((wb / secs / 1e9) if secs > 0 else 0.0)
+        agg[phase]["mib_per_token_median"] = med(mibs)
+        agg[phase]["gb_per_sec_median"] = med(gbps)
     return agg
 
 
@@ -197,12 +200,16 @@ def print_report(results, prev_name, prev_scenarios):
                 old_tps, pct, verdict = cmp
                 line += "  vs %.2f tok/s: %+.1f%% (%s)" % (old_tps, pct, verdict)
             print(line)
-        zones = sorted(agg["decode"]["zones"].items(), key=lambda kv: kv[1]["seconds_median"], reverse=True)
-        print("  decode zones by share:")
-        for zname, zinfo in zones:
-            print("    %-16s %8.3f ms  %5.1f%%" % (zname, zinfo["seconds_median"] * 1000.0, zinfo["share_median"] * 100.0))
-        print("  weights: %.2f MiB/token, %.2f GB/s of memory traffic" %
-              (agg["decode"]["mib_per_token_median"], agg["decode"]["gb_per_sec_median"]))
+        for phase in ("prefill", "decode"):
+            zones = sorted(agg[phase]["zones"].items(), key=lambda kv: kv[1]["seconds_median"], reverse=True)
+            if not zones:
+                continue
+            print("  %s zones by share:" % phase)
+            for zname, zinfo in zones:
+                print("    %-16s %8.3f ms  %5.1f%%" %
+                      (zname, zinfo["seconds_median"] * 1000.0, zinfo["share_median"] * 100.0))
+            print("  %s weights: %.2f MiB/token, %.2f GB/s of memory traffic" %
+                  (phase, agg[phase]["mib_per_token_median"], agg[phase]["gb_per_sec_median"]))
         print("")
 
 
@@ -223,7 +230,7 @@ def run_scenario(binary, sc, runs_override, smoke):
     name = sc["name"]
     model = resolve_model(sc["model"])
     prompt_tokens, gen_tokens, threads = sc["prompt_tokens"], sc["gen_tokens"], sc.get("threads", 0)
-    context = sc.get("context", 0)
+    context, batch = sc.get("context", 0), sc.get("batch", 0)
     n_runs = 1 if smoke else (runs_override if runs_override is not None else sc.get("runs", 1))
 
     tmp_dir = tempfile.mkdtemp(prefix="trprof_")
@@ -232,13 +239,13 @@ def run_scenario(binary, sc, runs_override, smoke):
 
         if not smoke:
             run_generate(binary, model, prompt_tokens, gen_tokens, threads, profile_json=tmp_json,
-                         context=context)  # warm-up, discarded
+                         context=context, batch=batch)  # warm-up, discarded
 
         records, tokens = [], []
         smoke_ok = True
         for _ in range(n_runs):
             r = run_generate(binary, model, prompt_tokens, gen_tokens, threads, profile_json=tmp_json,
-                             also_profile_flag=True, context=context)
+                             also_profile_flag=True, context=context, batch=batch)
             if r.returncode != 0:
                 print("error: scenario '%s' failed (exit %d):\n%s" % (name, r.returncode, r.stderr), file=sys.stderr)
                 sys.exit(1)
@@ -247,7 +254,7 @@ def run_scenario(binary, sc, runs_override, smoke):
             tokens.append(parse_tokens_line(r.stdout))
 
             if smoke:
-                r2 = run_generate(binary, model, prompt_tokens, gen_tokens, threads, context=context)
+                r2 = run_generate(binary, model, prompt_tokens, gen_tokens, threads, context=context, batch=batch)
                 if r2.returncode != 0:
                     print("error: scenario '%s' (no profile) failed (exit %d):\n%s" %
                           (name, r2.returncode, r2.stderr), file=sys.stderr)
@@ -262,7 +269,7 @@ def run_scenario(binary, sc, runs_override, smoke):
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     result = {"name": name, "model": sc["model"], "prompt_tokens": prompt_tokens, "gen_tokens": gen_tokens,
-              "threads": threads, "context": context, "runs": records, "aggregate": aggregate(records),
+              "threads": threads, "context": context, "batch": batch, "runs": records, "aggregate": aggregate(records),
               "tokens": tokens[0] if tokens else None, "tokens_stable": all(t == tokens[0] for t in tokens)}
     return result, smoke_ok
 

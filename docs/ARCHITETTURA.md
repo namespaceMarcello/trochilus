@@ -129,6 +129,14 @@ codice macchina con e senza, verificato): nella zona calda restano quelli che sp
 - **Esperti**: `lease(layer, expert)` restituisce un puntatore valido finché non si rilascia.
   Mancante → lettura dal disco. La lettura degli esperti mancanti avviene **mentre** si calcola
   quello che è già in memoria (disciplina di ds4, `PIPE` di colibri).
+- **Passate**: una chiamata di valutazione corre in passate da al più `n_batch` token (512, `-b`); il
+  decode è una passata da un token, lo stesso codice. In una passata ogni numero è la stessa chiamata di
+  kernel che con un token solo (un elemento di matmul = un `dot_row`; norme, RoPE, router e somma degli
+  esperti per token; attenzione di un token sulle posizioni fino alla sua), quindi logit e cache sono
+  identici al bit per ogni `n_batch`. Gli esperti lavorano sulle coppie (token, esperto) ordinate per
+  esperto; le matrici si visitano a blocchi di token, e una riga di pesi va contro 4 token alla volta
+  nei registri (`dot_row_x4`: un carico e una conversione per quattro prodotti, ognuno identico al suo
+  `dot_row`). Logit solo per l'ultimo token.
 - **Thread**: pool persistente dimensionato sui **core fisici** (colibri: +2.3x su Zen 3 contro i
   core logici), `parallel_for` su intervalli di righe.
 - **GPU**: tutto il token in un solo lotto di comandi, tensori che restano sul dispositivo (ds4).
@@ -143,6 +151,7 @@ codice macchina con e senza, verificato): nella zona calda restano quelli che sp
 | modello minuscolo | token greedy **identici** a transformers; logit entro tolleranza per posizione | `tools/make_tiny_<famiglia>.py` → `tests/oracle_<famiglia>.py` |
 | modello vero | token greedy contro transformers su un prompt fisso | a mano, fuori dalla CI |
 | ottimizzazione esatta | logit del modello vero prima e dopo, identici al bit, con più numeri di thread | `trochilus logits` + `cmp`, a mano |
+| prefill a blocchi | logit e cache con molti token per passata identici al bit a un token per passata: `n_batch`, divisione in chiamate, thread, f32/Q8_0, rewind | `tests/test_prefill.c`; `tools/oracle.py` (`logits -b 3/64/tutto` al byte) su tiny e OLMoE a 2 layer |
 
 ## Scala dei modelli
 

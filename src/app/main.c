@@ -30,14 +30,15 @@ static void usage(void) {
             "  trochilus cpu               describe this machine\n"
             "  trochilus inspect <file>    print GGUF metadata and tensors\n"
             "  trochilus generate -m <file.gguf> (--tokens id,id,... | -p <n>) -n <count>\n"
-            "                     [-t threads] [-c context] [--profile] [--profile-json <file>]\n"
-            "  trochilus logits -m <file.gguf> --tokens id,id,... --out <file> [-t threads]\n"
+            "                     [-t threads] [-c context] [-b batch] [--profile] [--profile-json <file>]\n"
+            "  trochilus logits -m <file.gguf> --tokens id,id,... --out <file> [-t threads] [-b batch]\n"
             "  trochilus tokenize -m <file.gguf> (-p <text> | -f <file> | --batch <file>)\n"
             "                     [--no-parse-special] [--no-add-special] [--pieces | --decode]\n"
             "  trochilus run -m <file.gguf> (-p <text> | -f <file>) [-n <max tokens>]\n"
-            "                [-t threads] [-c context] [--no-parse-special]\n"
+            "                [-t threads] [-c context] [-b batch] [--no-parse-special]\n"
             "  trochilus chat -m <file.gguf> [-s <system prompt>] [-n <max tokens per reply>]\n"
-            "                 [-t threads] [-c context]\n");
+            "                 [-t threads] [-c context] [-b batch]\n"
+            "  -b: most tokens in one forward pass (default 512): memory and prompt speed, same results\n");
 }
 
 static void print_bytes(uint64_t n) {
@@ -229,7 +230,7 @@ static int write_profile_json(const char *path, tr_prof *prof, const char *model
 
 static int cmd_generate(int argc, char **argv) {
     const char *model_path = NULL, *tokens_str = NULL, *profile_json_path = NULL;
-    int64_t n_gen = -1, n_prompt_synth = -1, n_ctx = 0;
+    int64_t n_gen = -1, n_prompt_synth = -1, n_ctx = 0, n_batch = 0;
     int n_threads = 0, do_profile = 0;
 
     for (int i = 0; i < argc; i++) {
@@ -239,6 +240,7 @@ static int cmd_generate(int argc, char **argv) {
         else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) n_gen = atoll(argv[++i]);
         else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) n_threads = atoi(argv[++i]);
         else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) n_ctx = atoll(argv[++i]);
+        else if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) n_batch = atoll(argv[++i]);
         else if (strcmp(argv[i], "--profile") == 0) do_profile = 1;
         else if (strcmp(argv[i], "--profile-json") == 0 && i + 1 < argc) profile_json_path = argv[++i];
         else {
@@ -250,7 +252,7 @@ static int cmd_generate(int argc, char **argv) {
     if (model_path == NULL || n_gen < 0 || (tokens_str == NULL) == (n_prompt_synth < 0)) {
         fprintf(stderr,
                 "usage: trochilus generate -m <file.gguf> (--tokens id,id,... | -p <n>) -n <count>\n"
-                "                   [-t threads] [-c context] [--profile] [--profile-json <file>]\n");
+                "                   [-t threads] [-c context] [-b batch] [--profile] [--profile-json <file>]\n");
         return 2;
     }
 
@@ -268,7 +270,7 @@ static int cmd_generate(int argc, char **argv) {
     }
     /* -c: KV cache size in tokens, 0 = model default. A small context keeps the cache and
      * the memory guard small when profiling a real model. */
-    tr_session *sess = tr_session_create(model, n_ctx, err, sizeof err);
+    tr_session *sess = tr_session_create(model, n_ctx, n_batch, err, sizeof err);
     if (sess == NULL) {
         fprintf(stderr, "error: %s\n", err);
         tr_model_free(model);
@@ -381,19 +383,23 @@ static int cmd_generate(int argc, char **argv) {
 static int cmd_logits(int argc, char **argv) {
     const char *model_path = NULL, *tokens_str = NULL, *out_path = NULL;
     int n_threads = 0;
+    int64_t chunk = 1;
 
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) model_path = argv[++i];
         else if (strcmp(argv[i], "--tokens") == 0 && i + 1 < argc) tokens_str = argv[++i];
         else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) out_path = argv[++i];
         else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) n_threads = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) chunk = atoll(argv[++i]);
         else {
             fprintf(stderr, "logits: unknown argument '%s'\n", argv[i]);
             return 2;
         }
     }
-    if (model_path == NULL || tokens_str == NULL || out_path == NULL) {
-        fprintf(stderr, "usage: trochilus logits -m <file.gguf> --tokens id,id,... --out <file> [-t threads]\n");
+    /* -b k: tokens evaluated k at a time (one forward pass each), one logits row per
+     * evaluation, for the last token of each; -b 1 gives every position */
+    if (model_path == NULL || tokens_str == NULL || out_path == NULL || chunk <= 0) {
+        fprintf(stderr, "usage: trochilus logits -m <file.gguf> --tokens id,id,... --out <file> [-t threads] [-b batch]\n");
         return 2;
     }
 
@@ -418,7 +424,7 @@ static int cmd_logits(int argc, char **argv) {
         tr_pool_destroy(pool);
         return 1;
     }
-    tr_session *sess = tr_session_create(model, 0, err, sizeof err);
+    tr_session *sess = tr_session_create(model, 0, chunk, err, sizeof err);
     if (sess == NULL) {
         fprintf(stderr, "error: %s\n", err);
         free(tokens);
@@ -439,8 +445,8 @@ static int cmd_logits(int argc, char **argv) {
 
     const tr_model_info *info = tr_model_get_info(model);
     int rc = 0;
-    for (int64_t i = 0; i < n_tokens; i++) {
-        if (tr_session_eval(sess, &tokens[i], 1) != 0) {
+    for (int64_t i = 0; i < n_tokens; i += chunk) {
+        if (tr_session_eval(sess, &tokens[i], n_tokens - i < chunk ? n_tokens - i : chunk) != 0) {
             fprintf(stderr, "logits: evaluation failed at token %" PRId64 "\n", i);
             rc = 1;
             break;
@@ -614,7 +620,7 @@ static int cmd_tokenize(int argc, char **argv) {
 
 static int cmd_run(int argc, char **argv) {
     const char *model_path = NULL, *text = NULL, *file = NULL;
-    int64_t n_max = 256, n_ctx = 0;
+    int64_t n_max = 256, n_ctx = 0, n_batch = 0;
     int n_threads = 0, flags = TR_TOK_ADD_SPECIAL | TR_TOK_PARSE_SPECIAL;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) model_path = argv[++i];
@@ -623,6 +629,7 @@ static int cmd_run(int argc, char **argv) {
         else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) n_max = atoll(argv[++i]);
         else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) n_threads = atoi(argv[++i]);
         else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) n_ctx = atoll(argv[++i]);
+        else if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) n_batch = atoll(argv[++i]);
         else if (strcmp(argv[i], "--no-parse-special") == 0) flags &= ~TR_TOK_PARSE_SPECIAL;
         else {
             model_path = NULL;
@@ -631,7 +638,7 @@ static int cmd_run(int argc, char **argv) {
     }
     if (model_path == NULL || (text != NULL) == (file != NULL) || n_max < 0) {
         fprintf(stderr, "usage: trochilus run -m <file.gguf> (-p <text> | -f <file>) [-n <max tokens>]\n"
-                        "                     [-t threads] [-c context] [--no-parse-special]\n");
+                        "                     [-t threads] [-c context] [-b batch] [--no-parse-special]\n");
         return 2;
     }
 
@@ -672,7 +679,7 @@ static int cmd_run(int argc, char **argv) {
         goto done;
     }
     if ((model = tr_model_load(model_path, pool, err, sizeof err)) == NULL ||
-        (sess = tr_session_create(model, n_ctx, err, sizeof err)) == NULL) {
+        (sess = tr_session_create(model, n_ctx, n_batch, err, sizeof err)) == NULL) {
         fprintf(stderr, "error: %s\n", err);
         goto done;
     }
@@ -865,7 +872,7 @@ static int cmd_chat_template(int argc, char **argv) {
 
 static int cmd_chat(int argc, char **argv) {
     const char *model_path = NULL, *system = NULL;
-    int64_t n_max = 1024, n_ctx = 0;
+    int64_t n_max = 1024, n_ctx = 0, n_batch = 0;
     int n_threads = 0;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) model_path = argv[++i];
@@ -873,6 +880,7 @@ static int cmd_chat(int argc, char **argv) {
         else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) n_max = atoll(argv[++i]);
         else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) n_threads = atoi(argv[++i]);
         else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) n_ctx = atoll(argv[++i]);
+        else if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) n_batch = atoll(argv[++i]);
         else {
             model_path = NULL;
             break;
@@ -880,7 +888,7 @@ static int cmd_chat(int argc, char **argv) {
     }
     if (model_path == NULL || n_max <= 0) {
         fprintf(stderr, "usage: trochilus chat -m <file.gguf> [-s <system prompt>] [-n <max tokens per reply>]\n"
-                        "                      [-t threads] [-c context]\n");
+                        "                      [-t threads] [-c context] [-b batch]\n");
         return 2;
     }
 
@@ -918,7 +926,7 @@ static int cmd_chat(int argc, char **argv) {
     /* Without -c the chat takes the training context, and halves it (down to 512 tokens)
      * while the memory guard refuses the cache: a shorter conversation beats no conversation. */
     int64_t ctx = n_ctx > 0 ? n_ctx : info->n_ctx_train;
-    while ((sess = tr_session_create(model, ctx, err, sizeof err)) == NULL && n_ctx <= 0 && ctx / 2 >= 512)
+    while ((sess = tr_session_create(model, ctx, n_batch, err, sizeof err)) == NULL && n_ctx <= 0 && ctx / 2 >= 512)
         ctx /= 2;
     if (sess == NULL) {
         fprintf(stderr, "error: %s\n", err);

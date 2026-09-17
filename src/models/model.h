@@ -33,12 +33,16 @@ tr_model *tr_model_load(const char *path, tr_pool *pool, char *err, size_t err_l
 void tr_model_free(tr_model *m);
 const tr_model_info *tr_model_get_info(const tr_model *m);
 
-/* A conversation with room for n_ctx tokens (n_ctx <= 0: the training context). */
-tr_session *tr_session_create(tr_model *m, int64_t n_ctx, char *err, size_t err_len);
+/* A conversation with room for n_ctx tokens (n_ctx <= 0: the training context, at most
+ * 4096). n_batch is the most tokens run in one forward pass (<= 0: 512; never more than
+ * n_ctx): it sets the scratch memory and the speed of a long prompt, never a result. */
+tr_session *tr_session_create(tr_model *m, int64_t n_ctx, int64_t n_batch, char *err, size_t err_len);
 void tr_session_free(tr_session *s);
-/* Appends n tokens and runs them. On success the logits of the last token are
- * available through tr_session_logits. -1 if the context is full or a token id
- * is out of range (the session is then unchanged). */
+/* Appends n tokens and runs them, in forward passes of at most n_batch tokens. On success
+ * the logits of the last token are available through tr_session_logits; they and the
+ * cache are bit-identical for every n_batch and every way of splitting the tokens across
+ * eval calls. -1 if the context is full or a token id is out of range (the session is
+ * then unchanged). */
 int tr_session_eval(tr_session *s, const int32_t *tokens, int64_t n);
 /* vocab_size logits of the last evaluated token, valid until the next eval. */
 const float *tr_session_logits(const tr_session *s);
@@ -61,7 +65,7 @@ typedef struct {
     void *(*load)(tr_gguf *g, tr_pool *pool, char *err, size_t err_len);   /* takes ownership of g, also on failure */
     void (*free)(void *model);
     const tr_model_info *(*info)(const void *model);
-    void *(*session_create)(void *model, int64_t n_ctx, char *err, size_t err_len);
+    void *(*session_create)(void *model, int64_t n_ctx, int64_t n_batch, char *err, size_t err_len);
     void (*session_free)(void *session);
     int (*eval)(void *session, const int32_t *tokens, int64_t n);
     const float *(*logits)(const void *session);

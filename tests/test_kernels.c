@@ -2,7 +2,7 @@
  * the 16-lane reduction contract (kernels.h) against an independent in-test
  * implementation, dot_row == dot_f32(dequantized), every SIMD tier == scalar,
  * rope/swiglu/attention == their first per-element definitions, tr_matmul
- * thread-count determinism. */
+ * thread-count determinism, tr_matmul_grouped == one dot_row per element. */
 #include "test.h"
 
 #include "../src/kernels/kernels.h"
@@ -241,6 +241,17 @@ static void count_diffs(const tr_kernels *K, const tr_kernels *S, unsigned seed,
             fill_q8_0(row, nb, &seed, round % 2);
             int64_t n = nb * 32;
             if (!same_float(K->dot_row[TR_TYPE_Q8_0](row, b, n), S->dot_row[TR_TYPE_Q8_0](row, b, n))) (*bad_row)++;
+            /* the same row against 4 consecutive input rows: same as the tier's own
+             * dot_row on each of them, and as scalar's (4 * n floats must fit in b) */
+            if (K->dot_row_x4[TR_TYPE_Q8_0] != NULL && 4 * n <= CMP_MAX_N) {
+                float xk[TR_DOT_TOKENS], xs[TR_DOT_TOKENS];
+                K->dot_row_x4[TR_TYPE_Q8_0](row, b, n, n, xk);
+                S->dot_row_x4[TR_TYPE_Q8_0](row, b, n, n, xs);
+                for (int t = 0; t < TR_DOT_TOKENS; t++) {
+                    if (!same_float(xk[t], xs[t])) (*bad_row)++;
+                    if (!same_float(xk[t], K->dot_row[TR_TYPE_Q8_0](row, b + t * n, n))) (*bad_row)++;
+                }
+            }
         }
     }
 }
@@ -473,6 +484,82 @@ static void test_matmul_thread_determinism(void) {
     free(x);
 }
 
+/* ---- tr_matmul_grouped: each element is one dot_row of its own group -------- */
+
+static void test_matmul_grouped(void) {
+    enum { G = 6, ROWS = 21, COLS = 64, N = 45 };
+    /* empty groups first, in the middle and last; a one-row group; runs longer than
+     * TR_MATMUL_TILE; ROWS odd, so thread chunks start and end inside input rows */
+    static const int64_t offsets[G + 1] = {0, 0, 1, 20, 20, 45, 45};
+    static const tr_type types[2] = {TR_TYPE_F32, TR_TYPE_Q8_0};
+    static const int threads[4] = {1, 2, 3, 7};
+    const tr_kernels *K = tr_kernels_get();
+
+    for (int ti = 0; ti < 2; ti++) {
+        tr_type type = types[ti];
+        size_t rb = tr_row_bytes(type, COLS);
+        unsigned char *wdata = (unsigned char *)malloc((size_t)G * ROWS * rb);
+        float *x = (float *)malloc((size_t)N * COLS * sizeof(float));
+        float *ref = (float *)malloc((size_t)N * ROWS * sizeof(float));
+        float *y = (float *)malloc((size_t)N * ROWS * sizeof(float));
+        TR_CHECK(wdata != NULL && x != NULL && ref != NULL && y != NULL);
+        if (wdata == NULL || x == NULL || ref == NULL || y == NULL) {
+            free(wdata);
+            free(x);
+            free(ref);
+            free(y);
+            return;
+        }
+
+        unsigned seed = 7u + (unsigned)ti;
+        for (int64_t i = 0; i < G * ROWS; i++) {
+            unsigned char *row = wdata + (size_t)i * rb;
+            if (type == TR_TYPE_Q8_0) {
+                fill_q8_0(row, COLS / 32, &seed, 0);
+            } else {
+                for (int64_t j = 0; j < COLS; j++) {
+                    float v = rand_float(&seed);
+                    memcpy(row + (size_t)j * sizeof(float), &v, sizeof v);
+                }
+            }
+        }
+        for (int64_t i = 0; i < N * COLS; i++) x[i] = rand_float(&seed);
+
+        tr_mat w[G];
+        for (int64_t g = 0; g < G; g++) {
+            w[g].type = type;
+            w[g].rows = ROWS;
+            w[g].cols = COLS;
+            w[g].data = wdata + (size_t)g * ROWS * rb;
+            for (int64_t p = offsets[g]; p < offsets[g + 1]; p++)
+                for (int64_t r = 0; r < ROWS; r++)
+                    ref[p * ROWS + r] = K->dot_row[type]((const unsigned char *)w[g].data + (size_t)r * rb,
+                                                        x + p * COLS, COLS);
+        }
+
+        memset(y, 0, (size_t)N * ROWS * sizeof(float));
+        tr_matmul_grouped(NULL, w, offsets, G, x, y);
+        TR_CHECK(memcmp(y, ref, (size_t)N * ROWS * sizeof(float)) == 0);
+        for (int t = 0; t < 4; t++) {
+            tr_pool *pool = tr_pool_create(threads[t]);
+            TR_CHECK(pool != NULL);
+            if (pool == NULL) continue;
+            memset(y, 0, (size_t)N * ROWS * sizeof(float));
+            tr_matmul_grouped(pool, w, offsets, G, x, y);
+            TR_CHECK(memcmp(y, ref, (size_t)N * ROWS * sizeof(float)) == 0);
+            /* one group alone through tr_matmul */
+            memset(y, 0, (size_t)N * ROWS * sizeof(float));
+            tr_matmul(pool, &w[4], x + 20 * COLS, 25, y);
+            TR_CHECK(memcmp(y, ref + 20 * ROWS, 25 * ROWS * sizeof(float)) == 0);
+            tr_pool_destroy(pool);
+        }
+        free(wdata);
+        free(x);
+        free(ref);
+        free(y);
+    }
+}
+
 int main(void) {
     tr_kernels_init();
 
@@ -486,6 +573,7 @@ int main(void) {
     test_swiglu_threads();
     test_attention_head();
     test_matmul_thread_determinism();
+    test_matmul_grouped();
 
     TR_TEST_EXIT();
 }
