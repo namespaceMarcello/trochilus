@@ -354,8 +354,10 @@ static int cmd_generate(int argc, char **argv) {
     double prompt_secs = t1 - t0, gen_secs = t2 - t1;
     fprintf(stderr, "prompt: %" PRId64 " tokens in %.4fs (%.2f tok/s)\n", n_prompt, prompt_secs,
             prompt_secs > 0 ? (double)n_prompt / prompt_secs : 0.0);
-    fprintf(stderr, "generate: %" PRId64 " tokens in %.4fs (%.2f tok/s)\n", produced, gen_secs,
-            gen_secs > 0 ? (double)produced / gen_secs : 0.0);
+    /* the first generated token comes from the prompt's logits: speed counts evaluations only */
+    int64_t evals = produced > 0 ? produced - 1 : 0;
+    fprintf(stderr, "generate: %" PRId64 " tokens, %" PRId64 " evaluations in %.4fs (%.2f tok/s)\n", produced,
+            evals, gen_secs, gen_secs > 0 ? (double)evals / gen_secs : 0.0);
 
     if (do_profile) tr_prof_print(prof, stderr);
     /* fewer tokens than asked is a failure, not a success with short output (LEZIONI #17) */

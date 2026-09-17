@@ -137,3 +137,22 @@ Senza `-c`, se la RAM non basta per 4096 token la chat dimezza il contesto e lo 
 e logit per posizione (parola migliore, KL, margini). Risultati in `docs/MISURE.md`. Prova:
 `sh tools/build_llamacpp.sh` e `tools/compare_llamacpp.py ... --prompt bench/prompts/dante.txt` nel
 container. `make check` su Windows ora svuota alla fine la cache della VM di Docker.
+
+### 2026-09-17 — Oracolo transformers sul modello vero tagliato a 2 layer
+`tools/make_olmoe_2layer_gguf.py` copia i primi 2 layer del GGUF vero (tensori byte per byte, solo
+`block_count` cambia); `tools/make_olmoe_2layer_ref.py` costruisce OLMoE in transformers con la
+configurazione del GGUF e i pesi dequantizzati, e scrive token greedy e logit per posizione di due
+prompt (27 e 1024 token). `tools/oracle.py` legge anche il formato a più prompt (`--logit-tol`).
+`make oracle-real` entra in `make check` (saltato senza il modello): token identici, logit entro
+1e-3 (misurato 2.4e-4). Prova: `make check`, oppure nel container
+`make BUILD=build/linux-gcc CC=gcc oracle-real`. Numeri in `docs/MISURE.md`.
+
+### 2026-09-17 — Confronto di velocità con llama.cpp e colibri
+`tools/speed_compare.py`: stessi thread e stesse lunghezze per Trochilus (`generate`), llama.cpp
+(`llama-bench`, decode alla stessa profondità di contesto) e colibri (`olmoe` sulla sua conversione
+int8), mediana di N run; con `--tok-file` anche la velocità dei tokenizer (Trochilus, `llama-tokenize`,
+HF `tokenizers`). `tools/build_llamacpp.sh` compila anche `llama-bench`. `trochilus generate` ora
+stampa token e valutazioni e divide per le valutazioni; `make check` lo verifica. Numeri in
+`docs/MISURE.md`. Prova, nel container con i modelli nel volume `trochilus-models`:
+`tools/speed_compare.py --model /models/<gguf> --trochilus build/linux-gcc/trochilus --llama-bench
+ref/llama.cpp/build-trochilus/bin/llama-bench --threads 16,8 --prompt 32 --gen 32`.

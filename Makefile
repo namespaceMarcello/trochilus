@@ -46,7 +46,7 @@ APP_OBJ  := $(BUILD)/src/app/main.o
 TEST_BIN := $(patsubst tests/%.c,$(BUILD)/tests/%$(EXE),$(wildcard tests/test_*.c))
 BENCH_BIN := $(BUILD)/tests/bench_kernels$(EXE)
 
-.PHONY: all test oracle oracle-tokenizer chat-check bench lint profile check check-linux clean
+.PHONY: all test oracle oracle-tokenizer chat-check oracle-real bench lint profile check check-linux clean
 all: $(BUILD)/trochilus$(EXE)
 
 $(BUILD)/trochilus$(EXE): $(CORE_OBJ) $(APP_OBJ)
@@ -130,6 +130,22 @@ oracle-tokenizer: $(BUILD)/trochilus$(EXE) $(TOKFIX)/vocab.gguf
 chat-check: $(BUILD)/trochilus$(EXE) $(TOKFIX)/tokenizer.json
 	$(PY) tools/chat_check.py --binary $(BUILD)/trochilus$(EXE) --model models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf --hf $(TOKFIX)
 
+# Real OLMoE weights cut to 2 layers (tools/make_olmoe_2layer_gguf.py, tensors copied
+# unchanged from the real Q8_0 file) against transformers on those same weights,
+# dequantized (tools/make_olmoe_2layer_ref.py): an exact-reference oracle that does not
+# depend on the tiny random fixture. Skipped (message, exit 0) without the real model.
+REALFIX := fixtures/olmoe-2layer
+REAL_MODEL := models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf
+$(REALFIX)/model.gguf: $(REAL_MODEL) tools/make_olmoe_2layer_gguf.py
+	$(PY) tools/make_olmoe_2layer_gguf.py $(REAL_MODEL) $@
+$(REALFIX)/ref.json: $(REALFIX)/model.gguf tools/make_olmoe_2layer_ref.py
+	$(PY) tools/make_olmoe_2layer_ref.py --gguf $(REALFIX)/model.gguf --hf $(TOKFIX) --output $(REALFIX)
+oracle-real: $(BUILD)/trochilus$(EXE)
+	@if [ ! -f $(REAL_MODEL) ]; then echo "oracle-real: SKIPPED, $(REAL_MODEL) not found"; else \
+		$(MAKE) $(REALFIX)/model.gguf $(REALFIX)/ref.json && \
+		$(PY) tools/oracle.py $(REALFIX) $(REALFIX)/model.gguf --binary $(BUILD)/trochilus$(EXE) --expect exact --logit-tol 1e-3; \
+	fi
+
 # The gate. Correctness runs in Linux (Docker image trochilus-dev, tools/docker/Dockerfile) so that
 # Windows Smart App Control, which blocks freshly built executables for minutes (docs/LEZIONI.md #12),
 # cannot make it flaky; on Windows the native build is still compiled with 0 warnings.
@@ -164,11 +180,16 @@ check-linux:
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle-tokenizer
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} chat-check
+	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle-real
 	$(PY) tools/profile_suite.py --binary build/linux-gcc/trochilus$(EXE) --smoke
 	@# -c is honoured: 6 + 4 tokens fit a context of 16, and do not fit one of 8
 	build/linux-gcc/trochilus generate -m $(FIX)/model-f32.gguf -p 6 -n 4 -c 16 > /dev/null
 	! build/linux-gcc/trochilus generate -m $(FIX)/model-f32.gguf -p 6 -n 4 -c 8 > /dev/null 2>&1
 	@echo "== context flag ok"
+	@# decode speed counts evaluations, not tokens: 4 tokens are 3 evaluations (docs/LEZIONI.md #40;
+	@# tools/speed_compare.py reads this line)
+	build/linux-gcc/trochilus generate -m $(FIX)/model-f32.gguf -p 6 -n 4 2>&1 >/dev/null | grep -q "generate: 4 tokens, 3 evaluations in"
+	@echo "== speed line ok"
 
 clean:
 	rm -rf $(BUILD)

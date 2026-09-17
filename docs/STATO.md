@@ -69,6 +69,11 @@ Sostituisci, non appendere. Tetto 40 KB. Lo storico sta in `archivio/FATTO.md`.
   su disco come checkpoint dei file già letti, non per i token vecchi con attenzione piena. Si decide
   con le misure 13-17 di `docs/MISURE.md` §Da misurare; ordine proposto: 13-16 dopo i passi 1-2 qui
   sotto, 17 con il lavoro sulla KV (in attesa del sì di Marcello sull'ordine).
+- 2026-09-17 — **llama.cpp terza fonte** (Marcello): da llama.cpp/ggml (MIT) si portano solo i pezzi
+  dove le misure dicono che vince (prefill a blocchi, attivazioni int8/VNNI come opzione), con il metodo
+  di colibri/ds4 (intestazione, `docs/ORIGINI.md`, bit-identità, benchmark). Non si portano grafo ggml,
+  allocatore, backend, C++. `sgemm.cpp` di llamafile è C++ con intrinseci, non assembly: per i pesi
+  Q8_0 vuole attivazioni Q8_0 (non esatte), e il percorso float usa FMA (non bit-identico allo scalare).
 
 ## Problemi noti
 
@@ -88,22 +93,31 @@ Sostituisci, non appendere. Tetto 40 KB. Lo storico sta in `archivio/FATTO.md`.
 - OLMoE in transformers 5.x: esperti salvati fusi (`gate_up_proj` [E, 2I, H], gate prima),
   `q_norm` su tutta la proiezione (hidden), `k_norm` su kv_heads × head_dim, RoPE stile neox
   (`rotate_half`), softmax su tutti gli esperti poi top-k, normalizzazione solo con `norm_topk_prob`.
+- Misure di velocità nel container: modelli nel volume Docker `trochilus-models` (GGUF + conversione
+  colibri, 14 GB), non dal disco di Windows (LEZIONI #41). Fermare i container degli altri progetti è
+  bloccato dal controllo automatico dei permessi di Claude Code: o li ferma Marcello, o una regola nei
+  permessi.
 - Sul PC non ci sono clang né CUDA toolkit: build Windows con MinGW-w64 gcc 15.2 (scoop), Linux
   nel container `trochilus-dev` (Ubuntu 24.04, gcc + clang; ASan, UBSan e TSan con gcc).
 
 ## Prossimi passi
 
-1. **In parallelo, agente Sonnet**: oracolo transformers su OLMoE vero tagliato a 2 layer (GGUF con i
-   primi 2 layer copiati dal Q8_0; transformers con gli stessi pesi dequantizzati; logit per posizione
-   entro ~1e-4, token greedy identici; nel `make check` quando il modello c'è). Se differisce, la
-   prova dice dove. Il confronto con llama.cpp c'è già: `tools/build_llamacpp.sh`,
-   `tools/compare_llamacpp.py`.
-2. M0, passo 5: confronto di velocità con llama.cpp (già compilato in `ref/llama.cpp/build-trochilus`)
-   e colibri, stesso modello e prompt → `docs/MISURE.md`; anche la velocità del tokenizer.
+Fatti il 2026-09-17: oracolo transformers sul modello vero a 2 layer (`make oracle-real`, logit entro
+2.4e-4) e confronto di velocità (`tools/speed_compare.py`, `docs/MISURE.md` §Velocità): prefill
+llama.cpp 8-13× avanti, decode a più thread +8-19% (cresce col contesto), a 1 thread +46%; tokenizer
+Trochilus 13× HF.
+
+1. Prefill a blocchi guardando tutte e tre le fonti: llama.cpp (`ggml_compute_forward_mul_mat_id` in
+   `ggml-cpu.c`: token raggruppati per esperto), ds4 (prefill a lotti in C), colibri (`step()` di
+   `c/olmoe.c`: stesso modello, prefill a lotto ma senza raggruppare gli esperti). Più token nella stessa
+   moltiplicazione (oggi prefill = decode ≈ 30-34 tok/s, llama.cpp 233-377; un prompt da 10 000
+   token costa ~5 minuti). Prima la versione C esatta (logit identici al prefill token per token),
+   poi il profilo, poi intrinseci; assembly solo sul kernel che il profilo indica.
+2. Attivazioni int8/VNNI come opzione (leva 2), dopo il prefill.
 3. Confronto colibri/ds4 per componente (decisione sopra), poi le correzioni che ne escono.
    Misure 13-16 di `docs/MISURE.md` (routing, cache esperti, SSD): ordine da confermare con Marcello.
-4. Prefill a blocchi: più token nella stessa moltiplicazione (oggi prefill = decode = 33 tok/s; un
-   prompt da 10 000 token costa ~5 minuti).
+4. Decode a contesto lungo: Trochilus perde l'11-13% da 32 a 512 token, llama.cpp il 5-7% (domande
+   18-19 di `docs/MISURE.md`).
 5. Memoria: banda reale della RAM (domanda 4 in `docs/MISURE.md`), poi pagine da 2 MB e thread
    fissati ai core (domande 2, 3, 5). 4 thread vanno come 16 (33 tok/s, 41 GB/s).
 6. Attivazioni in int8 con VNNI (leva 2 in `docs/MISURE.md`): nuova definizione scalare, differenza

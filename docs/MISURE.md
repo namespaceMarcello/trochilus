@@ -34,6 +34,8 @@ si sposta nella sezione giusta con il numero quando è misurato.
 | 15 | Streaming dal disco per layer interi (DeepSpeed) o per esperti: quanti byte per token? | stessa traccia: layer interi contro soli esperti scelti e non in cache | con un solo utente leggere tutto il modello a ogni token dà al massimo ~0.3 tok/s su 10 GB |
 | 16 | Quanto legge davvero l'NVMe in blocchi grandi quanto un esperto, a posizioni casuali, senza cache? | microbenchmark `pread` senza cache del sistema (`FILE_FLAG_NO_BUFFERING`, `O_DIRECT`), al massimo 60 s | con 14 e 15 dà i token/s attesi (M1 per esperti se ≥ 5 tok/s al 50%); decide anche la KV vecchia su SSD, attesa no con attenzione piena |
 | 17 | Ricaricare dal disco la KV di un file già letto costa meno del prefill? La KV in q8 cambia i token? | checkpoint: logit identici al bit dopo il ricaricamento, tempo almeno 10 volte sotto il prefill; q8: token greedy uguali ≥ 99% su 1000 token di codice | leve del coding (file già letti, contesti lunghi), M5 |
+| 18 | Perché il decode perde l'11-13% da 32 a 512 token di contesto, e llama.cpp solo il 5-7%? | profilo per zone a contesto 32, 512, 2048: quota dell'attenzione e della sua parte a thread singolo | nel coding il contesto è lungo: è la differenza che cresce di più dopo il prefill |
+| 19 | Decode a 4-16 thread: llama.cpp è davvero avanti dell'8-12%? | `tools/speed_compare.py` con i due motori alternati run per run nella stessa sessione (fra due sessioni la mediana di llama.cpp si è spostata del 3-7%) | dice se c'è una leva nel decode a più thread o solo rumore |
 
 Macchina di riferimento: Ryzen 9 7940HX (Zen 4, 16 core / 32 thread, AVX-512 VNNI/BF16), 31 GB
 RAM (2×16 GB DDR5-5200), NVMe Micron 1 TB, GPU RTX 4070 Laptop 8 GB e Radeon 610M (non usate fino
@@ -261,8 +263,74 @@ Letture:
 
 Non conclusivo: llama.cpp moltiplica i pesi Q8_0 con attivazioni quantizzate a 8 bit e tiene la
 cache KV in f16, Trochilus usa attivazioni esatte. La prova che decide è transformers sugli stessi
-pesi (modello tagliato a 2 layer), prossimo passo. Entrambi i motori inventano i versi di Dante:
-limite del modello.
+pesi (sezione sotto). Entrambi i motori inventano i versi di Dante: limite del modello.
+
+## Correttezza sul modello vero — Trochilus contro transformers, 2 layer (2026-09-17)
+
+`make oracle-real`: i primi 2 layer del GGUF Q8_0 vero copiati byte per byte
+(`tools/make_olmoe_2layer_gguf.py`); transformers 5.14.1 float32 con gli stessi pesi dequantizzati e
+la configurazione letta dal GGUF (`tools/make_olmoe_2layer_ref.py`). 32 token greedy e logit a ogni
+posizione (teacher forcing). Container Linux, gcc.
+
+| Prompt | Token | Greedy | Parola migliore | Massima differenza di un logit |
+|---|---|---|---|---|
+| `bench/prompts/dante.txt` | 27 + 32 | identici | 59/59 | 1.3e-5 (posizione 8) |
+| primi 1024 token di `src/models/olmoe.c` | 1024 + 32 | identici | 1056/1056 | 2.4e-4 (posizione 813) |
+
+Soglia del controllo: 1e-3. La differenza residua viene dall'aritmetica, non dal modello: Trochilus
+moltiplica i blocchi Q8_0 con attivazioni esatte, torch moltiplica matrici già dequantizzate; cresce
+con la posizione (sommatorie dell'attenzione più lunghe). Costo: riferimento 29 s e 6.0 GB di picco
+(solo quando manca), confronto 33 s e 1.1 GB a ogni `make check`.
+
+## Velocità — Trochilus contro llama.cpp e colibri, OLMoE-1B-7B (2026-09-17)
+
+`tools/speed_compare.py` nel container Linux (`trochilus-dev`, gcc; la VM di Docker vede 32 CPU e
+15 GB), modelli nel volume Docker `trochilus-models` (non dal disco di Windows: LEZIONI #41), un motore
+alla volta, **mediana di 5 run** (min–max) più una di riscaldamento; container degli altri progetti
+accesi ma fermi. Trochilus e llama.cpp sullo stesso GGUF Q8_0; colibri (`a90bed9`, `ARCH=native`) sulla
+sua conversione int8 da Hugging Face, cache di 64 esperti per layer (tutti), processo nuovo a ogni run.
+llama.cpp `b49650a` con `GGML_NATIVE`: `llama-bench`, prefill a contesto vuoto e decode dopo un
+contesto grande quanto il prompt (`-d`). Decode = valutazioni di un token al secondo (LEZIONI #40).
+Token del prompt: codice vero (`src/models/olmoe.c`) per Trochilus e colibri, casuali per llama-bench.
+
+**Prompt 32, 32 generati** (tok/s)
+
+| Thread | Trochilus prefill | Trochilus decode | llama.cpp prefill | llama.cpp decode | colibri prefill | colibri decode |
+|---|---|---|---|---|---|---|
+| 16 | 30.4 (28.5–33.0) | 31.1 (28.0–31.7) | 232.9 (230.3–245.4) | 34.8 (34.0–35.3) | 10.1 (3.9–10.8) | 12.4 (11.5–15.1) |
+| 8 | 34.0 (33.1–34.1) | 34.0 (31.3–34.2) | 200.9 (198.0–212.6) | 36.9 (36.3–38.2) | 12.1 (11.2–13.1) | 13.3 (11.1–14.0) |
+| 4 | 33.7 (32.9–34.1) | 33.3 (30.3–34.5) | 126.0 (124.7–129.5) | 36.1 (35.7–36.4) | 12.3 (12.2–12.8) | 12.5 (10.8–13.6) |
+| 1 | 15.4 (13.8–15.6) | 15.4 (15.0–15.5) | 38.3 (37.9–38.9) | 22.5 (22.0–22.7) | 8.3 (7.9–8.6) | 6.2 (5.4–6.5) |
+
+**Prompt 512, 128 generati** (tok/s; colibri non misurato)
+
+| Thread | Trochilus prefill | Trochilus decode | llama.cpp prefill | llama.cpp decode |
+|---|---|---|---|---|
+| 16 | 29.6 (28.7–29.9) | 27.7 (27.5–29.0) | 376.6 (361.3–382.5) | 33.1 (32.5–34.2) |
+| 8 | 31.8 (31.1–32.4) | 29.7 (28.2–31.0) | 270.2 (262.7–275.3) | 34.2 (33.9–34.5) |
+
+**Tokenizer** su 2.2 MB di codice e testo (sorgenti di llama.cpp, README di colibri in italiano,
+inglese e cinese), tempo senza il caricamento del vocabolario:
+
+| Tokenizer | Secondi (min–max) | MB/s | Token |
+|---|---|---|---|
+| Trochilus | 0.100 (0.097–0.104) | 22.0 | 815 460 |
+| HF `tokenizers` 0.22.2 (in processo) | 1.31 (1.24–1.45) | 1.7 | 815 460 |
+| llama.cpp `llama-tokenize` | 3.60 (3.52–3.64) | 0.6 | 814 194 (diversi da HF, non indagato) |
+
+Letture:
+- **Prefill: llama.cpp 8× più veloce a 16 thread con prompt 32, 13× con prompt 512** (2.5× a 1
+  thread). Moltiplica tutti i token del prompt insieme; in Trochilus prefill = decode. È il primo lavoro.
+- **Decode a 4-16 thread: llama.cpp avanti dell'8-12%** a contesto corto, del 15-19% a contesto 512.
+  Con prompt 512 Trochilus perde l'11-13%, llama.cpp il 5-7%: il costo del contesto lungo è nostro
+  (domanda 18). La prima serie di llama.cpp (decode a contesto vuoto) dava 33.2 / 34.4 / 33.6: fra due
+  sessioni la mediana si sposta del 3-7%, il numero preciso chiede run alternate (domanda 19).
+- **1 thread: llama.cpp 1.46× nel decode**: attivazioni in int8 con VNNI (leva 2, non esatta).
+- 8 thread battono 16 in entrambi i motori: il limite è la banda della memoria.
+- colibri a 12-13 tok/s riparte ogni run con la cache degli esperti vuota (hit 90%): misura del suo
+  avvio a freddo, non del suo regime.
+- **Tokenizer: Trochilus 13× HF e 36× llama.cpp**, stessi token di HF.
+- Trochilus nel container va ~5% sotto Windows nativo (31.1 contro 32.8 tok/s a 16 thread).
 
 ## Leve di velocità: cosa dice la ricerca (2026-09-17)
 
