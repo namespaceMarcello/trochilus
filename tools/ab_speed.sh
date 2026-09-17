@@ -29,9 +29,20 @@ while [ $R -le "$ROUNDS" ]; do
   for WHO in A B; do
     if [ "$WHO" = A ]; then BIN=$A; else BIN=$B; fi
     for T in $THREADS; do
-      $BIN generate -m "$MODEL" -p "$PROMPT" -n "$GEN" -c $((PROMPT + GEN + 64)) -t "$T" 2>&1 >/dev/null |
+      ERR=$($BIN generate -m "$MODEL" -p "$PROMPT" -n "$GEN" -c $((PROMPT + GEN + 64)) -t "$T" 2>&1 >/dev/null)
+      LINES=$(printf '%s\n' "$ERR" |
         sed -n "s/^prompt: $PROMPT tokens in .* (\([0-9.]*\) tok.s)/$WHO t$T prefill $R \1/p;
-                s/^generate: .* evaluations in .* (\([0-9.]*\) tok.s)/$WHO t$T decode $R \1/p" | tee -a "$OUT"
+                s/^generate: .* evaluations in .* (\([0-9.]*\) tok.s)/$WHO t$T decode $R \1/p")
+      # A run that measured nothing (the engine refused to load, the binary is blocked, a flag is
+      # wrong) must stop the comparison: printing the medians of the runs that did work would be a
+      # table with a hole in it that nobody sees (docs/LEZIONI.md #56).
+      if [ -z "$LINES" ]; then
+        echo "ab_speed: $WHO t$T round $R produced no tok/s line, stopping. The run said:" >&2
+        printf '%s\n' "$ERR" | tail -3 >&2
+        rm -f "$OUT"
+        exit 1
+      fi
+      printf '%s\n' "$LINES" | tee -a "$OUT"
     done
   done
   R=$((R + 1))

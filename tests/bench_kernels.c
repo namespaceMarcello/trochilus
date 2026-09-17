@@ -19,6 +19,11 @@
 #include "../src/base/cpu.h"
 #include "../src/base/threads.h"
 #include "../src/kernels/kernels.h"
+#include "../src/kernels/kernels_internal.h"
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 
 #define MAX_RUNS 31
 
@@ -59,6 +64,79 @@ static void fill_row(tr_type type, uint8_t *row, int64_t n) {
         break;
     }
 }
+
+/* ---- candidate: int8 x int8 with VNNI (docs/MISURE.md question 21) --------
+ *
+ * Not a kernel and not a tier: a measurement. Quantizing the activations to int8 is a
+ * different number from the float dot, so this can never be one of our bit-identical
+ * variants; it lives here to say how much lever 2 (int8 activations, llama.cpp's prefill
+ * path) could be worth before a line of it is written. Same row layout as dot_row q8_0
+ * (34-byte blocks: fp16 scale + 32 int8), same elements per call, so the two lines compare
+ * directly. The per-block weight sums the unsigned trick needs are precomputed, as a real
+ * kernel would store them beside the row; the cost of quantizing the activations is measured
+ * on its own line, because a matmul pays it once for every row of the matrix. */
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+#define TR_BENCH_VNNI 1
+
+/* x -> int8 with one scale per 32 elements, the same blocking as Q8_0. */
+static void quantize_q8_0(const float *x, int64_t n, int8_t *q, float *d) {
+    for (int64_t b = 0; b < n / TR_Q8_0_BLOCK_ELEMS; b++) {
+        const float *src = x + b * TR_Q8_0_BLOCK_ELEMS;
+        float amax = 0.0f;
+        for (int i = 0; i < TR_Q8_0_BLOCK_ELEMS; i++) {
+            float v = src[i] < 0.0f ? -src[i] : src[i];
+            if (v > amax) amax = v;
+        }
+        float scale = amax / 127.0f;
+        float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
+        d[b] = scale;
+        for (int i = 0; i < TR_Q8_0_BLOCK_ELEMS; i++) {
+            float v = src[i] * inv;
+            int r = (int)(v < 0.0f ? v - 0.5f : v + 0.5f);
+            q[b * TR_Q8_0_BLOCK_ELEMS + i] = (int8_t)(r < -127 ? -127 : (r > 127 ? 127 : r));
+        }
+    }
+}
+
+/* sum of the 32 weights of each block, for the +128 correction below */
+static void q8_0_row_sums(const uint8_t *row, int64_t n, int32_t *sums) {
+    for (int64_t b = 0; b < n / TR_Q8_0_BLOCK_ELEMS; b++) {
+        const int8_t *w = (const int8_t *)(row + TR_Q8_0_BLOCK_BYTES * b + TR_Q8_0_SCALE_BYTES);
+        int32_t s = 0;
+        for (int i = 0; i < TR_Q8_0_BLOCK_ELEMS; i++) s += w[i];
+        sums[b] = s;
+    }
+}
+
+/* One 32-element block per iteration: _mm256_dpbusd_epi32 wants the first operand unsigned,
+ * so the activations are shifted by +128 and the block's weight sum pays the shift back
+ * (dot(x + 128, w) = dot(x, w) + 128 * sum(w)). The int32 lanes are converted and scaled into
+ * a float accumulator without a horizontal sum per block, as ggml does. */
+__attribute__((target("avx2,fma,avx512f,avx512bw,avx512vl,avx512vnni")))
+static float dot_q8_q8_vnni(const uint8_t *row, const int8_t *xq, const float *xd,
+                            const int32_t *wsums, int64_t n) {
+    const __m256i off = _mm256_set1_epi8((char)-128); /* xor flips the sign bit: +128 unsigned */
+    __m256 acc = _mm256_setzero_ps();
+    float corr = 0.0f;
+    for (int64_t b = 0; b < n / TR_Q8_0_BLOCK_ELEMS; b++) {
+        const uint8_t *blk = row + TR_Q8_0_BLOCK_BYTES * b;
+        uint16_t half;
+        memcpy(&half, blk, sizeof half);
+        float dw = tr_half_to_float(half);
+        __m256i w = _mm256_loadu_si256((const __m256i *)(blk + TR_Q8_0_SCALE_BYTES));
+        __m256i x = _mm256_loadu_si256((const __m256i *)(xq + b * TR_Q8_0_BLOCK_ELEMS));
+        __m256i xu = _mm256_xor_si256(x, off);
+        __m256i prod = _mm256_dpbusd_epi32(_mm256_setzero_si256(), xu, w);
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(dw * xd[b]), _mm256_cvtepi32_ps(prod), acc);
+        corr += dw * xd[b] * 128.0f * (float)wsums[b];
+    }
+    __m128 lo = _mm256_castps256_ps128(acc), hi = _mm256_extractf128_ps(acc, 1);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    return _mm_cvtss_f32(s) - corr;
+}
+#endif
 
 typedef struct {
     const tr_kernels *k;
@@ -124,6 +202,56 @@ static void measure_x4(const tr_kernels *k, const uint8_t *row, const float *x, 
     *ns_median = ns[runs / 2];
     *spread = (ns[runs - 1] - ns[0]) / ns[runs / 2];
 }
+
+#if defined(TR_BENCH_VNNI)
+/* Same shape as measure_x4, for the two candidate lines of question 21. */
+static void measure_vnni(const uint8_t *row, const int8_t *xq, const float *xd, const int32_t *wsums, int64_t n,
+                         int runs, double run_ms, double *ns_median, double *spread) {
+    volatile float sink = 0;
+    long calls = 1;
+    double t0 = tr_time_sec();
+    while (tr_time_sec() - t0 < 0.02) {
+        for (long c = 0; c < calls; c++) sink += dot_q8_q8_vnni(row, xq, xd, wsums, n);
+        calls *= 2;
+    }
+    double per_call = (tr_time_sec() - t0) / (double)(calls - 1);
+    calls = (long)(run_ms / 1000.0 / (per_call > 0 ? per_call : 1e-9));
+    if (calls < 1) calls = 1;
+
+    double ns[MAX_RUNS];
+    for (int r = 0; r < runs; r++) {
+        double a = tr_time_sec();
+        for (long c = 0; c < calls; c++) sink += dot_q8_q8_vnni(row, xq, xd, wsums, n);
+        ns[r] = (tr_time_sec() - a) * 1e9 / (double)calls;
+    }
+    qsort(ns, (size_t)runs, sizeof ns[0], cmp_double);
+    *ns_median = ns[runs / 2];
+    *spread = (ns[runs - 1] - ns[0]) / ns[runs / 2];
+}
+
+static void measure_quant(const float *x, int64_t n, int8_t *q, float *d, int runs, double run_ms,
+                          double *ns_median, double *spread) {
+    long calls = 1;
+    double t0 = tr_time_sec();
+    while (tr_time_sec() - t0 < 0.02) {
+        for (long c = 0; c < calls; c++) quantize_q8_0(x, n, q, d);
+        calls *= 2;
+    }
+    double per_call = (tr_time_sec() - t0) / (double)(calls - 1);
+    calls = (long)(run_ms / 1000.0 / (per_call > 0 ? per_call : 1e-9));
+    if (calls < 1) calls = 1;
+
+    double ns[MAX_RUNS];
+    for (int r = 0; r < runs; r++) {
+        double a = tr_time_sec();
+        for (long c = 0; c < calls; c++) quantize_q8_0(x, n, q, d);
+        ns[r] = (tr_time_sec() - a) * 1e9 / (double)calls;
+    }
+    qsort(ns, (size_t)runs, sizeof ns[0], cmp_double);
+    *ns_median = ns[runs / 2];
+    *spread = (ns[runs - 1] - ns[0]) / ns[runs / 2];
+}
+#endif
 
 typedef struct {
     tr_mat w;
@@ -236,6 +364,36 @@ int main(int argc, char **argv) {
         }
     }
     tr_free_aligned(x4);
+
+#if defined(TR_BENCH_VNNI)
+    /* Question 21: how much faster is int8 x int8 with VNNI than our float activations on the
+     * very same row? The dot line assumes the activations are already quantized (a matmul
+     * quantizes them once and reuses them for every row); the quantize line says what that
+     * one-off costs, per element of one input row. */
+    if (tr_cpu()->avx512vnni) {
+        int64_t nblk = max_n / TR_Q8_0_BLOCK_ELEMS;
+        int8_t *xq = tr_alloc_aligned((size_t)max_n, 64);
+        float *xd = tr_alloc_aligned((size_t)nblk * sizeof(float), 64);
+        int32_t *wsums = tr_alloc_aligned((size_t)nblk * sizeof(int32_t), 64);
+        if (xq == NULL || xd == NULL || wsums == NULL) { fprintf(stderr, "out of memory\n"); return 1; }
+        for (size_t s = 0; s < sizeof sizes / sizeof sizes[0]; s++) {
+            int64_t n = sizes[s];
+            fill_row(TR_TYPE_Q8_0, row, n);
+            q8_0_row_sums(row, n, wsums);
+            quantize_q8_0(x, n, xq, xd);
+            double ns, spread;
+            measure_vnni(row, xq, xd, wsums, n, runs, run_ms, &ns, &spread);
+            printf("%-12s %-14s %6lld %12.1f %12.1f %7.1f%%\n", "avx512vnni", "dot q8_0xq8_0", (long long)n, ns,
+                   (double)n / ns * 1e3, spread * 100.0);
+            measure_quant(x, n, xq, xd, runs, run_ms, &ns, &spread);
+            printf("%-12s %-14s %6lld %12.1f %12.1f %7.1f%%\n", "scalar", "quantize x q8_0", (long long)n, ns,
+                   (double)n / ns * 1e3, spread * 100.0);
+        }
+        tr_free_aligned(xq);
+        tr_free_aligned(xd);
+        tr_free_aligned(wsums);
+    }
+#endif
 
     /* One whole matrix through tr_matmul with the active tier: 1024 x 2048 q8_0,
      * the shape of an OLMoE expert projection. */

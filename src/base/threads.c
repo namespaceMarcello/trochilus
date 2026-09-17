@@ -53,6 +53,9 @@ typedef struct {
     int64_t begin, end;
     tr_pool *pool;
     int id;
+    int pin;                /* number of processors the worker pins itself to, 0: none */
+    unsigned pin_group;
+    unsigned short pin_cpu[TR_CPU_MAX_SMT];
 } slot;
 
 /* one slot per cache line: workers polling their state never share a line */
@@ -68,6 +71,7 @@ struct tr_pool {
     atomic_int remaining;
     atomic_int caller_sleeping;
     atomic_int shutdown;
+    tr_affinity caller_affinity; /* where the calling thread ran before it was pinned */
 
 #if defined(_WIN32)
     HANDLE *workers;
@@ -129,14 +133,21 @@ static void worker_loop(slot *w) {
 }
 /* hot: end */
 
+/* A worker pins itself, once, before it ever waits for work: affinity applies to the
+ * calling thread, and this is the only moment the new thread is outside the hot loop. */
+static void worker_start(slot *w) {
+    if (w->pin > 0) tr_thread_pin(w->pin_group, w->pin_cpu, w->pin, NULL);
+    worker_loop(w);
+}
+
 #if defined(_WIN32)
 static DWORD WINAPI worker_main(LPVOID arg) {
-    worker_loop((slot *)arg);
+    worker_start((slot *)arg);
     return 0;
 }
 #else
 static void *worker_main(void *arg) {
-    worker_loop((slot *)arg);
+    worker_start((slot *)arg);
     return NULL;
 }
 #endif
@@ -164,9 +175,20 @@ tr_pool *tr_pool_create(int n_threads) {
     const char *env = getenv("TR_POOL_SPIN_US");
     if (env != NULL) p->spin_sec = atof(env) * 1e-6;
 
+    /* One thread per slot, in the order cpu.c ranked them: physical cores first, spread
+     * over the last-level caches. More threads than slots means the extra ones are left
+     * to the scheduler rather than doubled onto a core that already has one.
+     * TR_POOL_PIN: 0 no pin, 1 one logical processor per thread, 2 (the default) the whole
+     * physical core, which keeps one thread per core but lets the scheduler pick the sibling
+     * (docs/MISURE.md §Il pin dei thread). */
+    const char *pin_env = getenv("TR_POOL_PIN");
+    int pin_mode = pin_env != NULL ? atoi(pin_env) : 2;
+    if (cpu->n_slots <= 0) pin_mode = 0;
+
     atomic_init(&p->remaining, 0);
     atomic_init(&p->caller_sleeping, 0);
     atomic_init(&p->shutdown, 0);
+    p->caller_affinity.valid = 0;
     for (int i = 0; i < n_threads; i++) {
         slot *w = &p->slots[i].s;
         atomic_init(&w->state, SLOT_IDLE);
@@ -176,7 +198,21 @@ tr_pool *tr_pool_create(int n_threads) {
         w->begin = w->end = 0;
         w->pool = p;
         w->id = i;
+        w->pin = 0;
+        w->pin_group = 0;
+        if (pin_mode > 0 && i < cpu->n_slots) {
+            const tr_cpu_slot *s = &cpu->slot[i];
+            w->pin_group = s->group;
+            w->pin = pin_mode >= 2 ? (int)s->n_core : 1;
+            for (int j = 0; j < w->pin; j++) w->pin_cpu[j] = s->core[j];
+        }
     }
+    /* The calling thread runs chunk 0, so it takes slot 0 like any other worker; its
+     * previous affinity comes back in tr_pool_destroy. */
+    if (p->slots[0].s.pin > 0 &&
+        tr_thread_pin(p->slots[0].s.pin_group, p->slots[0].s.pin_cpu, p->slots[0].s.pin,
+                      &p->caller_affinity) != 0)
+        p->caller_affinity.valid = 0;
 
 #if defined(_WIN32)
     InitializeSRWLock(&p->lock);
@@ -223,6 +259,9 @@ void tr_pool_destroy(tr_pool *p) {
     pthread_cond_destroy(&p->cond_work);
     pthread_cond_destroy(&p->cond_done);
 #endif
+    /* The caller outlives the pool: a process that creates pools of different sizes (the
+     * benchmarks do) must not be left pinned to one core by the first of them. */
+    tr_thread_affinity_restore(&p->caller_affinity);
     free(p->workers);
     tr_free_aligned(p->slots);
     free(p);

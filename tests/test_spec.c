@@ -1,17 +1,21 @@
 /* test_spec.c — speculation on the prompt changes the speed, never the tokens.
  *
- * Four things are checked on a synthetic OLMoE (synth_olmoe.h):
+ * Five things are checked on a synthetic OLMoE (synth_olmoe.h):
  *   1. tr_lookup_draft picks the continuation of the most recent earlier occurrence of the
  *      tail, longest n-gram first, and never reads past the context.
  *   2. tr_session_eval_rows keeps one row of logits per position, and each row is identical
  *      bit for bit to the logits that position gives when the tokens run one per pass.
  *   3. a rejected draft leaves no trace: after eval_rows on wrong tokens and a rewind, the
  *      next token gives the logits of a session that never saw them.
- *   4. greedy generation with any draft size emits the same tokens as with no speculation,
- *      and the logits it ends on are the logits of those tokens. Two vocabularies are used:
- *      the model's, where the drafts are almost always right, and a narrow one (the argmax
- *      is taken over the first 8 logits), where the tokens vary and drafts are often wrong,
- *      so both the accepting and the rejecting branch run.
+ *   4. greedy generation with any draft size, under either draft policy, emits the same
+ *      tokens as with no speculation, and the logits it ends on are the logits of those
+ *      tokens. Two vocabularies are used: the model's, where the drafts are almost always
+ *      right, and a narrow one (the argmax is taken over the first 8 logits), where the
+ *      tokens vary and drafts are often wrong, so both the accepting and the rejecting
+ *      branch run.
+ *   5. the adaptive policy's k_cur, on the model's own vocabulary (mostly right, occasionally
+ *      not): left alone it still dips below n_draft at every real rejection, and starting from
+ *      a shrunk state it climbs all the way back to n_draft — see test_adaptive_* below.
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -130,14 +134,14 @@ static int reject_leaves_no_trace(tr_model *model, const int32_t *seq, int64_t n
 /* 4. greedy generation, speculative when n_draft > 0. Writes the first N_GEN tokens to out,
  * the whole history to hist (it can overshoot by up to n_draft), the final logits to last. */
 static int generate_with_batch(tr_model *model, const int32_t *prompt, int64_t vocab, int64_t n_draft,
-                               int64_t n_want, int64_t n_batch, int32_t *out, int32_t *hist, int64_t *n_hist,
-                               float *last, tr_greedy *g_out) {
+                               tr_draft_policy policy, int64_t n_want, int64_t n_batch, int32_t *out,
+                               int32_t *hist, int64_t *n_hist, float *last, tr_greedy *g_out) {
     tr_session *s = tr_session_create(model, CTX, n_batch, NULL, 0);
     if (s == NULL) return -1;
     memcpy(hist, prompt, N_PROMPT * sizeof(int32_t));
     int rc = tr_session_eval(s, prompt, N_PROMPT);
     tr_greedy g;
-    if (rc == 0) rc = tr_greedy_init(&g, s, vocab, tr_session_n_ctx(s), n_draft, hist, N_PROMPT);
+    if (rc == 0) rc = tr_greedy_init(&g, s, vocab, tr_session_n_ctx(s), n_draft, policy, hist, N_PROMPT);
     int64_t produced = 0;
     int32_t step[1 + TR_GREEDY_DRAFT_MAX];
     while (rc == 0 && produced < n_want) {
@@ -154,12 +158,145 @@ static int generate_with_batch(tr_model *model, const int32_t *prompt, int64_t v
     return rc;
 }
 
-static int generate_with(tr_model *model, const int32_t *prompt, int64_t vocab, int64_t n_draft, int64_t n_want,
-                         int32_t *out, int32_t *hist, int64_t *n_hist, float *last, tr_greedy *g_out) {
-    return generate_with_batch(model, prompt, vocab, n_draft, n_want, 64, out, hist, n_hist, last, g_out);
+static int generate_with(tr_model *model, const int32_t *prompt, int64_t vocab, int64_t n_draft,
+                         tr_draft_policy policy, int64_t n_want, int32_t *out, int32_t *hist, int64_t *n_hist,
+                         float *last, tr_greedy *g_out) {
+    return generate_with_batch(model, prompt, vocab, n_draft, policy, n_want, 64, out, hist, n_hist, last, g_out);
+}
+
+/* 5. the k_cur rule, direct: a step drafts min(k_cur, n_draft, room); after the step, a full
+ * accept (a == k) grows k_cur by one (capped at n_draft), anything less shrinks it to max(1, a),
+ * and an empty draft (k == 0, nothing to propose) leaves k_cur untouched. Runs its own session
+ * because what is asserted here is g.k_cur and g.n_drafted/g.n_steps, not the tokens. */
+enum { N_ADAPT = 1500, ADAPT_CTX = 2048 };
+
+static void test_adaptive_shrinks_on_reject(tr_model *model, const int32_t *prompt) {
+    tr_session *s = tr_session_create(model, ADAPT_CTX, 64, NULL, 0);
+    TR_CHECK(s != NULL);
+    if (s == NULL) return;
+    static int32_t hist[N_PROMPT + N_ADAPT + TR_GREEDY_DRAFT_MAX];
+    memcpy(hist, prompt, N_PROMPT * sizeof(int32_t));
+    tr_greedy g;
+    int rc = tr_session_eval(s, prompt, N_PROMPT);
+    if (rc == 0)
+        rc = tr_greedy_init(&g, s, VOCAB, tr_session_n_ctx(s), TR_GREEDY_DRAFT_MAX, TR_DRAFT_ADAPTIVE, hist,
+                            N_PROMPT);
+    TR_CHECK(rc == 0);
+    if (rc == 0) {
+        int32_t step[1 + TR_GREEDY_DRAFT_MAX];
+        int64_t produced = 0;
+        int64_t min_k_cur = g.k_cur;
+        while (produced < N_ADAPT) {
+            int64_t got = tr_greedy_step(&g, step);
+            TR_CHECK(got > 0);
+            if (got < 0) break;
+            produced += got;
+            if (g.k_cur < min_k_cur) min_k_cur = g.k_cur;
+        }
+        /* this prompt's near-periodic tail is a good draft most of the time (the plain-greedy
+         * comparison above accepts most of it) but not always: every real rejection must pull
+         * k_cur below the n_draft it started at, so the average step drafts fewer tokens than
+         * the fixed policy would (which always asks for n_draft, room permitting). */
+        double mean = g.n_steps > 0 ? (double)g.n_drafted / (double)g.n_steps : 0.0;
+        TR_CHECK(min_k_cur < TR_GREEDY_DRAFT_MAX);
+        TR_CHECK(mean < (double)TR_GREEDY_DRAFT_MAX);
+        if (min_k_cur >= TR_GREEDY_DRAFT_MAX || mean >= (double)TR_GREEDY_DRAFT_MAX)
+            printf("  adaptive/reject: k_cur dipped to %lld, mean draft %.2f, %llu steps\n", (long long)min_k_cur,
+                   mean, (unsigned long long)g.n_steps);
+    }
+    tr_session_free(s);
+}
+
+static void test_adaptive_grows_on_repeat(tr_model *model, const int32_t *prompt) {
+    tr_session *s = tr_session_create(model, ADAPT_CTX, 64, NULL, 0);
+    TR_CHECK(s != NULL);
+    if (s == NULL) return;
+    static int32_t hist[N_PROMPT + N_ADAPT + TR_GREEDY_DRAFT_MAX];
+    memcpy(hist, prompt, N_PROMPT * sizeof(int32_t));
+    tr_greedy g;
+    int rc = tr_session_eval(s, prompt, N_PROMPT);
+    if (rc == 0)
+        rc = tr_greedy_init(&g, s, VOCAB, tr_session_n_ctx(s), TR_GREEDY_DRAFT_MAX, TR_DRAFT_ADAPTIVE, hist,
+                            N_PROMPT);
+    TR_CHECK(rc == 0);
+    if (rc == 0) {
+        g.k_cur = 1; /* as if a rejection had just shrunk it: the rule must recover from here */
+        int32_t step[1 + TR_GREEDY_DRAFT_MAX];
+        int64_t produced = 0;
+        int64_t max_k_cur = g.k_cur;
+        while (produced < N_ADAPT) {
+            int64_t got = tr_greedy_step(&g, step);
+            TR_CHECK(got > 0);
+            if (got < 0) break;
+            produced += got;
+            if (g.k_cur > max_k_cur) max_k_cur = g.k_cur;
+        }
+        /* on the real vocabulary this prompt's near-periodic tail is right often enough that,
+         * one accepted step at a time, k_cur must climb all the way back to n_draft at some
+         * point in the run (whether or not a later rejection pulls it back down again). */
+        TR_CHECK_EQ_INT((int)max_k_cur, TR_GREEDY_DRAFT_MAX);
+        if ((int)max_k_cur != TR_GREEDY_DRAFT_MAX)
+            printf("  adaptive/repeat: k_cur peaked at %lld (ended %lld), expected a peak of %d, %llu steps\n",
+                   (long long)max_k_cur, (long long)g.k_cur, TR_GREEDY_DRAFT_MAX, (unsigned long long)g.n_steps);
+    }
+    tr_session_free(s);
+}
+
+/* The pause after a draft where nothing was accepted: that step must be followed by steps that
+ * draft nothing at all (a wrong draft costs more than half a pass, docs/MISURE.md). Checked on
+ * every step of a real run, and the test fails if no such rejection ever happened, so it cannot
+ * pass for the wrong reason (LEZIONI #43, #50, #55). */
+static int64_t test_adaptive_pauses_after_a_wrong_draft(tr_model *model, const int32_t *prompt) {
+    tr_session *s = tr_session_create(model, ADAPT_CTX, 64, NULL, 0);
+    TR_CHECK(s != NULL);
+    if (s == NULL) return 0;
+    static int32_t hist[N_PROMPT + N_ADAPT + TR_GREEDY_DRAFT_MAX];
+    memcpy(hist, prompt, N_PROMPT * sizeof(int32_t));
+    tr_greedy g;
+    int64_t all_wrong = 0;
+    int rc = tr_session_eval(s, prompt, N_PROMPT);
+    if (rc == 0)
+        rc = tr_greedy_init(&g, s, VOCAB, tr_session_n_ctx(s), TR_GREEDY_DRAFT_MAX, TR_DRAFT_ADAPTIVE, hist,
+                            N_PROMPT);
+    TR_CHECK(rc == 0);
+    if (rc == 0) {
+        int32_t step[1 + TR_GREEDY_DRAFT_MAX];
+        int64_t produced = 0, paused_after = 0;
+        uint64_t prev_drafted = 0, prev_accepted = 0;
+        int expect_pause = 0;
+        while (produced < N_ADAPT) {
+            int64_t got = tr_greedy_step(&g, step);
+            TR_CHECK(got > 0);
+            if (got < 0) break;
+            produced += got;
+            uint64_t k = g.n_drafted - prev_drafted, a = g.n_accepted - prev_accepted;
+            prev_drafted = g.n_drafted;
+            prev_accepted = g.n_accepted;
+            if (expect_pause) {
+                TR_CHECK_EQ_INT((int)k, 0);
+                if (k == 0) paused_after++;
+                expect_pause = 0;
+            }
+            if (k > 0 && a == 0) {
+                all_wrong++;
+                expect_pause = 1; /* the next step must not draft */
+                TR_CHECK_EQ_INT((int)g.k_cur, 0);
+                TR_CHECK(g.cool > 0);
+            }
+        }
+        /* whether a given model and prompt ever produce a fully wrong draft is their business;
+         * that at least one case in the suite does is checked once, in main. */
+        if (all_wrong > 0)
+            printf("  adaptive/pause: %lld drafts fully rejected, %lld followed by a step with no draft\n",
+                   (long long)all_wrong, (long long)paused_after);
+    }
+    tr_session_free(s);
+    return all_wrong;
 }
 
 int main(int argc, char **argv) {
+    int64_t pause_rule_seen = 0; /* drafts fully rejected across the suite: the pause rule needs one */
+
     test_lookup();
 
     /* 2 layers, n_embd 64, 4 heads (2 kv), n_ff 64, 8 experts (3 used), vocab 48 */
@@ -170,6 +307,7 @@ int main(int argc, char **argv) {
     static const int64_t drafts[5] = {1, 2, 3, 5, TR_GREEDY_DRAFT_MAX};
     static const int threads[2] = {1, 4};
     static const int64_t vocabs[2] = {VOCAB, NARROW};
+    static const tr_draft_policy policies[2] = {TR_DRAFT_FIXED, TR_DRAFT_ADAPTIVE};
 
     static int32_t prompt[N_PROMPT];
     for (int i = 0; i < N_PROMPT; i++) prompt[i] = (int32_t)(((i % 13) * 3 + (i / 13) % 5) % VOCAB);
@@ -194,10 +332,10 @@ int main(int argc, char **argv) {
             for (int v = 0; v < 2; v++) {
                 tr_greedy g;
                 int64_t n_hist_plain = 0, n_hist_spec = 0;
-                /* the plain greedy run is the reference for the tokens */
-                /* it runs past N_GEN because a speculative step can overshoot the count */
-                TR_CHECK(generate_with(model, prompt, vocabs[v], 0, N_REF, plain, hist_plain, &n_hist_plain,
-                                       last_plain, &g) == 0);
+                /* the plain greedy run is the reference for the tokens; policy does not matter
+                 * when n_draft = 0 (nothing is ever ahead to draft) */
+                TR_CHECK(generate_with(model, prompt, vocabs[v], 0, TR_DRAFT_FIXED, N_REF, plain, hist_plain,
+                                       &n_hist_plain, last_plain, &g) == 0);
                 TR_CHECK(n_hist_plain == N_PROMPT + N_REF);
                 memcpy(seq, hist_plain, (size_t)(N_PROMPT + N_REF) * sizeof(int32_t));
                 TR_CHECK(reference(model, seq, N_PROMPT + N_REF, ref) == 0);
@@ -211,30 +349,36 @@ int main(int argc, char **argv) {
                             printf("  %s, %d threads, %lld rows: %d differ\n", name, threads[t], (long long)k, bad);
                     }
                     TR_CHECK_EQ_INT(reject_leaves_no_trace(model, seq, N_PROMPT, ref), 0);
+                    test_adaptive_shrinks_on_reject(model, prompt);
+                    test_adaptive_grows_on_repeat(model, prompt);
+                    pause_rule_seen += test_adaptive_pauses_after_a_wrong_draft(model, prompt);
                 }
 
-                for (int d = 0; d < 5; d++) {
-                    TR_CHECK(generate_with(model, prompt, vocabs[v], drafts[d], N_GEN, spec, hist_spec,
-                                           &n_hist_spec, last_spec, &g) == 0);
-                    int same = memcmp(plain, spec, N_GEN * sizeof(int32_t)) == 0;
-                    TR_CHECK(same);
-                    if (!same)
-                        printf("  %s, %d threads, vocab %lld, draft %lld: tokens differ\n", name, threads[t],
-                               (long long)vocabs[v], (long long)drafts[d]);
-                    /* the whole history is greedy, overshoot included, and the session ends
-                     * on the logits of its last token: the cache survived every rejection */
-                    TR_CHECK(n_hist_spec <= N_PROMPT + N_REF);
-                    TR_CHECK(memcmp(hist_spec, seq, (size_t)n_hist_spec * sizeof(int32_t)) == 0);
-                    TR_CHECK(memcmp(last_spec, ref + (n_hist_spec - 1) * VOCAB, VOCAB * sizeof(float)) == 0);
-                    TR_CHECK(g.n_drafted > 0);
-                    accepted_total += g.n_accepted;
-                    rejected_total += g.n_drafted - g.n_accepted;
-                    cases++;
+                for (int pp = 0; pp < 2; pp++) {
+                    for (int d = 0; d < 5; d++) {
+                        TR_CHECK(generate_with(model, prompt, vocabs[v], drafts[d], policies[pp], N_GEN, spec,
+                                               hist_spec, &n_hist_spec, last_spec, &g) == 0);
+                        int same = memcmp(plain, spec, N_GEN * sizeof(int32_t)) == 0;
+                        TR_CHECK(same);
+                        if (!same)
+                            printf("  %s, %d threads, vocab %lld, %s, draft %lld: tokens differ\n", name,
+                                   threads[t], (long long)vocabs[v],
+                                   policies[pp] == TR_DRAFT_ADAPTIVE ? "adaptive" : "fixed", (long long)drafts[d]);
+                        /* the whole history is greedy, overshoot included, and the session ends
+                         * on the logits of its last token: the cache survived every rejection */
+                        TR_CHECK(n_hist_spec <= N_PROMPT + N_REF);
+                        TR_CHECK(memcmp(hist_spec, seq, (size_t)n_hist_spec * sizeof(int32_t)) == 0);
+                        TR_CHECK(memcmp(last_spec, ref + (n_hist_spec - 1) * VOCAB, VOCAB * sizeof(float)) == 0);
+                        TR_CHECK(g.n_drafted > 0);
+                        accepted_total += g.n_accepted;
+                        rejected_total += g.n_drafted - g.n_accepted;
+                        cases++;
+                    }
                 }
 
                 /* a small -b leaves room for fewer rows: the draft is lowered, not refused */
-                TR_CHECK(generate_with_batch(model, prompt, vocabs[v], TR_GREEDY_DRAFT_MAX, N_GEN, 4, spec,
-                                             hist_spec, &n_hist_spec, last_spec, &g) == 0);
+                TR_CHECK(generate_with_batch(model, prompt, vocabs[v], TR_GREEDY_DRAFT_MAX, TR_DRAFT_ADAPTIVE,
+                                             N_GEN, 4, spec, hist_spec, &n_hist_spec, last_spec, &g) == 0);
                 TR_CHECK_EQ_INT((int)g.n_draft, 3);
                 TR_CHECK(memcmp(plain, spec, N_GEN * sizeof(int32_t)) == 0);
                 cases++;
@@ -247,8 +391,11 @@ int main(int argc, char **argv) {
     /* a run where nothing is ever accepted, or nothing ever rejected, would prove half of it */
     TR_CHECK(accepted_total > 0);
     TR_CHECK(rejected_total > 0);
-    printf("  %d cases (f32/q8_0, 1/4 threads, vocab %d/%d, draft 1..%d): same tokens as plain greedy, "
-           "%llu drafted tokens accepted, %llu rejected\n",
+    /* and the pause rule is only proved if some case really did produce a draft with nothing
+     * accepted: without one, test_adaptive_pauses_after_a_wrong_draft checked nothing */
+    TR_CHECK(pause_rule_seen > 0);
+    printf("  %d cases (f32/q8_0, 1/4 threads, vocab %d/%d, fixed/adaptive, draft 1..%d): same tokens as plain "
+           "greedy, %llu drafted tokens accepted, %llu rejected\n",
            cases, VOCAB, NARROW, TR_GREEDY_DRAFT_MAX, (unsigned long long)accepted_total,
            (unsigned long long)rejected_total);
     TR_TEST_EXIT();

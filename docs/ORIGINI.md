@@ -37,6 +37,7 @@ Non richiedono attribuzione, si registrano per sapere dove guardare quando si mi
 |---|---|---|---|
 | pool di thread persistente, niente OpenMP | ds4 | `ds4.c` `ds4_parallel_for` | `src/base/threads.c` |
 | thread sui core fisici, non logici | colibri | `c/omp_tune.h` | `tr_pool_create(0)` |
+| ogni thread del pool fissato a un processore logico suo | llama.cpp (le due chiamate di sistema, e l'idea di una maschera per thread di `--cpu-strict`) | `ggml-cpu.c` `ggml_thread_apply_affinity`, `ggml_thread_cpumask_next` | `src/base/platform.c` `tr_thread_pin`, ordine degli slot in `src/base/cpu.c`, pin nel pool in `src/base/threads.c` |
 | pesi con `pread` invece di `mmap` | colibri | `c/st.h` (commento sul bug RSS) | `src/base/platform.h` |
 | oracolo su modelli minuscoli generati | colibri | `c/tools/make_*_tiny.py`, job CI | `tools/`, `make oracle` |
 | tokenizer letto dai metadati GGUF, merge "a b" come chiave del rango | ds4 | `ds4.c` `vocab_load`, `bpe_rank` | `src/tokenizer/tokenizer.c` (il merge diventa coppia di id → rango e risultato) |
@@ -64,6 +65,26 @@ Non richiedono attribuzione, si registrano per sapere dove guardare quando si mi
 Non preso: le attivazioni int8 (non esatte: leva 2, opzione a parte) e la somma di ds4 per riga su
 tutti gli esperti, che a ogni riga di pesi rilegge le attivazioni intermedie di tutto il lotto (con 512
 token ~16 MB per riga): Trochilus tiene l'ordine per esperto a blocchi di token, e somma per token.
+
+### Collocamento dei thread: le tre fonti (2026-09-17)
+
+| | llama.cpp | colibri | ds4 |
+|---|---|---|---|
+| quanti thread | `logici / 2`, o i core fisici dove il conteggio Windows è compilato (escluso su MinGW-w64, UPSTREAM #4) | core fisici contati davvero (`GetLogicalProcessorInformationEx`, `thread_siblings_list`, `hw.perflevel0`), e mai indovinati | `omp_get_max_threads()` |
+| dove vanno | in nessun posto: senza `--cpu-mask` non chiama l'affinità | `OMP_PROC_BIND=close` passato a libgomp, solo Linux, con un re-exec del processo | niente |
+| chi decide la maschera | l'utente, a mano (`--cpu-mask`, `--cpu-strict` = un processore per thread) | libgomp | — |
+| oltre 64 processori | non ci arriva (`SetThreadAffinityMask`, UPSTREAM #3) | dipende da libgomp | — |
+
+Preso: le due chiamate di sistema (Windows e Linux) e l'idea di `--cpu-strict`, cioè una maschera
+da un processore solo per ogni thread invece di una maschera comune. Non preso: la maschera scritta
+a mano dall'utente (qui la topologia la conta il motore), `OMP_PROC_BIND` con il re-exec (nessun
+OpenMP, e le variabili d'ambiente lette dentro il motore sono un anti-pattern di colibri), e
+`SetThreadAffinityMask` (sostituito da `SetThreadGroupAffinity`, che arriva a ogni gruppo).
+Nuovo qui: l'**ordine** degli slot (un thread per core fisico prima di ogni fratello SMT, e i core
+presi a giro sulle cache di ultimo livello, perché 4+4 sui due chiplet batte 8 sullo stesso), il
+rispetto di una maschera già imposta al processo (`taskset`, `start /affinity`), il ripristino
+dell'affinità del chiamante quando il pool muore, e un test che **chiede al sistema operativo** su
+quale processore ha girato ogni chunk (`tests/test_base.c`): nessuna delle tre fonti lo verifica.
 
 ### Speculazione sul prompt: le tre fonti (2026-09-17)
 

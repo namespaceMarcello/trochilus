@@ -232,7 +232,7 @@ static int write_profile_json(const char *path, tr_prof *prof, const char *model
 static int cmd_generate(int argc, char **argv) {
     const char *model_path = NULL, *tokens_str = NULL, *profile_json_path = NULL;
     int64_t n_gen = -1, n_prompt_synth = -1, n_ctx = 0, n_batch = 0, n_draft = 0;
-    int n_threads = 0, do_profile = 0;
+    int n_threads = 0, do_profile = 0, spec_fixed = 0;
 
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--spec") == 0 && i + 1 < argc) { n_draft = atoll(argv[++i]); continue; }
@@ -243,6 +243,7 @@ static int cmd_generate(int argc, char **argv) {
         else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) n_threads = atoi(argv[++i]);
         else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) n_ctx = atoll(argv[++i]);
         else if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) n_batch = atoll(argv[++i]);
+        else if (strcmp(argv[i], "--spec-fixed") == 0) spec_fixed = 1;
         else if (strcmp(argv[i], "--profile") == 0) do_profile = 1;
         else if (strcmp(argv[i], "--profile-json") == 0 && i + 1 < argc) profile_json_path = argv[++i];
         else {
@@ -255,6 +256,7 @@ static int cmd_generate(int argc, char **argv) {
         fprintf(stderr,
                 "usage: trochilus generate -m <file.gguf> (--tokens id,id,... | -p <n>) -n <count>\n"
                 "                   [-t threads] [-c context] [-b batch] [--spec <draft>]\n"
+                "                   [--spec-fixed]  (fixed draft length instead of adaptive, for measurement)\n"
                 "                   [--profile] [--profile-json <file>]\n");
         return 2;
     }
@@ -371,7 +373,9 @@ static int cmd_generate(int argc, char **argv) {
             return 1;
         }
         memcpy(hist, prompt, (size_t)n_prompt * sizeof(int32_t));
-        if (tr_greedy_init(&g, sess, info->vocab_size, tr_session_n_ctx(sess), n_draft, hist, n_prompt) != 0) {
+        tr_draft_policy policy = spec_fixed ? TR_DRAFT_FIXED : TR_DRAFT_ADAPTIVE;
+        if (tr_greedy_init(&g, sess, info->vocab_size, tr_session_n_ctx(sess), n_draft, policy, hist, n_prompt) !=
+            0) {
             fprintf(stderr, "generate: could not start speculation\n");
             free(hist);
             free(generated);
@@ -407,10 +411,11 @@ static int cmd_generate(int argc, char **argv) {
             evals, gen_secs, gen_secs > 0 ? (double)evals / gen_secs : 0.0);
     if (n_draft > 0) {
         fprintf(stderr, "speculation: %" PRIu64 " passes, %" PRIu64 "/%" PRIu64 " drafted tokens accepted (%.1f%%), "
-                        "%.2f tokens per pass\n",
+                        "%.2f tokens per pass, mean draft %.2f\n",
                 g.n_steps, g.n_accepted, g.n_drafted,
                 g.n_drafted > 0 ? 100.0 * (double)g.n_accepted / (double)g.n_drafted : 0.0,
-                g.n_steps > 0 ? (double)(g.n_steps + g.n_accepted) / (double)g.n_steps : 0.0);
+                g.n_steps > 0 ? (double)(g.n_steps + g.n_accepted) / (double)g.n_steps : 0.0,
+                g.n_steps > 0 ? (double)g.n_drafted / (double)g.n_steps : 0.0);
     }
 
     if (do_profile) tr_prof_print(prof, stderr);
@@ -674,7 +679,7 @@ static int cmd_tokenize(int argc, char **argv) {
 static int cmd_run(int argc, char **argv) {
     const char *model_path = NULL, *text = NULL, *file = NULL;
     int64_t n_max = 256, n_ctx = 0, n_batch = 0, n_draft = 0;
-    int n_threads = 0, flags = TR_TOK_ADD_SPECIAL | TR_TOK_PARSE_SPECIAL;
+    int n_threads = 0, flags = TR_TOK_ADD_SPECIAL | TR_TOK_PARSE_SPECIAL, spec_fixed = 0;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--spec") == 0 && i + 1 < argc) { n_draft = atoll(argv[++i]); continue; }
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) model_path = argv[++i];
@@ -684,6 +689,7 @@ static int cmd_run(int argc, char **argv) {
         else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) n_threads = atoi(argv[++i]);
         else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) n_ctx = atoll(argv[++i]);
         else if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) n_batch = atoll(argv[++i]);
+        else if (strcmp(argv[i], "--spec-fixed") == 0) spec_fixed = 1;
         else if (strcmp(argv[i], "--no-parse-special") == 0) flags &= ~TR_TOK_PARSE_SPECIAL;
         else {
             model_path = NULL;
@@ -694,6 +700,8 @@ static int cmd_run(int argc, char **argv) {
         n_draft > TR_GREEDY_DRAFT_MAX) {
         fprintf(stderr, "usage: trochilus run -m <file.gguf> (-p <text> | -f <file>) [-n <max tokens>]\n"
                         "                     [-t threads] [-c context] [-b batch] [--spec <draft>]\n"
+                        "                     [--spec-fixed]  (fixed draft length instead of adaptive, for "
+                        "measurement)\n"
                         "                     [--no-parse-special]\n");
         return 2;
     }
@@ -759,7 +767,9 @@ static int cmd_run(int argc, char **argv) {
         goto done;
     }
     memcpy(hist, prompt, n_prompt * sizeof(int32_t));
-    if (tr_greedy_init(&g, sess, info->vocab_size, tr_session_n_ctx(sess), n_draft, hist, (int64_t)n_prompt) != 0) {
+    tr_draft_policy policy = spec_fixed ? TR_DRAFT_FIXED : TR_DRAFT_ADAPTIVE;
+    if (tr_greedy_init(&g, sess, info->vocab_size, tr_session_n_ctx(sess), n_draft, policy, hist,
+                       (int64_t)n_prompt) != 0) {
         fprintf(stderr, "run: could not start generation\n");
         free(hist);
         goto done;
@@ -793,9 +803,11 @@ static int cmd_run(int argc, char **argv) {
     fprintf(stderr, "generate: %" PRId64 " tokens in %.4fs (%.2f tok/s)\n", produced, t2 - t1,
             t2 > t1 ? (double)produced / (t2 - t1) : 0.0);
     if (n_draft > 0)
-        fprintf(stderr, "speculation: %" PRIu64 " passes, %" PRIu64 "/%" PRIu64 " drafted tokens accepted (%.1f%%)\n",
+        fprintf(stderr, "speculation: %" PRIu64 " passes, %" PRIu64 "/%" PRIu64 " drafted tokens accepted (%.1f%%), "
+                        "mean draft %.2f\n",
                 g.n_steps, g.n_accepted, g.n_drafted,
-                g.n_drafted > 0 ? 100.0 * (double)g.n_accepted / (double)g.n_drafted : 0.0);
+                g.n_drafted > 0 ? 100.0 * (double)g.n_accepted / (double)g.n_drafted : 0.0,
+                g.n_steps > 0 ? (double)g.n_drafted / (double)g.n_steps : 0.0);
     rc = context_full ? 3 : 0;
 
 done:

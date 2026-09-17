@@ -30,6 +30,26 @@ void tr_free_aligned(void *p);
 /* Monotonic clock in seconds. */
 double tr_time_sec(void);
 
+/* Where a thread was allowed to run before it was pinned, so it can be put back.
+ * Opaque: only tr_thread_pin and tr_thread_affinity_restore read it. */
+typedef struct {
+    int valid;
+    unsigned short group;     /* Windows processor group */
+    unsigned char mask[128];  /* the platform's own bitmap (KAFFINITY, cpu_set_t) */
+} tr_affinity;
+
+/* Pins the calling thread to the n logical processors listed in `lcpus`; `group` is the
+ * Windows processor group they belong to and is ignored elsewhere. One processor ties the
+ * thread down, a whole core's processors leave the scheduler the choice of sibling. When prev
+ * is not NULL it receives the affinity the thread had, for tr_thread_affinity_restore.
+ * Returns 0 if the pin was applied, -1 if the platform has no affinity or the call failed
+ * (macOS: always -1). Only the calling thread is affected. */
+int tr_thread_pin(unsigned group, const unsigned short *lcpus, int n, tr_affinity *prev);
+
+/* Puts the calling thread back where `prev` says. 0 on success, -1 otherwise; a `prev`
+ * that was never filled in (valid == 0) is a no-op and returns 0. */
+int tr_thread_affinity_restore(const tr_affinity *prev);
+
 typedef struct {
     uint64_t total_bytes;      /* physical RAM */
     uint64_t available_bytes;  /* what can be allocated now without swapping */

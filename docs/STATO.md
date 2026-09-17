@@ -109,6 +109,24 @@ Sostituisci, non appendere. Tetto 40 KB. Lo storico sta in `archivio/FATTO.md`.
   è intorno al 15%. Perciò `--spec` resta **spento di default** finché la bozza non si accorcia da
   sola dopo un rifiuto: con quella, il caso peggiore diventa «come senza».
 
+- 2026-09-18 — **I thread del pool si fissano al core fisico, non al processore logico** (domande 22,
+  27 e 3). Uno per core, i core presi a giro sui due chiplet, i fratelli SMT solo se i thread sono più
+  dei core; ogni thread è libero fra i due fratelli del **suo** core. Prefill +24% a 16 thread (+30%
+  a 8), decode invariato. Legare invece ogni thread a un processore solo costava il 17% sul decode:
+  quello che serve è impedire che due thread finiscano sullo stesso core, non inchiodarli. 32 thread
+  (SMT) affondano: prefill -33%, decode -90%. Il pin regge anche a macchina occupata (+19% sul
+  prefill). Su macOS non si pinna (non si può) e una maschera già imposta al processo viene
+  rispettata. `TR_POOL_PIN=0/1/2` per i confronti.
+- 2026-09-18 — **Su un MoE una riga di bozza in più non è quasi gratis**: costa 15-27 ms contro i ~35
+  di una passata, perché il token in bozza sceglie altri esperti e la passata legge anche i loro pesi.
+  Il pareggio della speculazione è al 60-75% di bozze accettate, non al 15% misurato in container
+  (LEZIONI #59). Perciò la bozza adattiva non si limita ad accorciarsi: dopo una bozza tutta sbagliata
+  **si ferma** per 1, 3, 7, 15 passi. Caso peggiore 1.01× (era 0.60×), caso buono 1.15× (1.34× con
+  `--spec-fixed`, che resta per chi sa di star riscrivendo un file).
+- 2026-09-18 — **La leva 2 (attivazioni int8/VNNI) non si scrive** (domanda 21): misurata prima di
+  scriverla, dà +1-8% sul nostro dot float, mentre il nostro kernel a 4 token è 2.7× più veloce di
+  entrambi. Il divario col prefill di llama.cpp è da cercare in blocchi più larghi, non nell'int8.
+
 ## Problemi noti
 
 - Smart App Control di Windows blocca un .exe appena compilato anche per 20 minuti: correttezza in
@@ -134,6 +152,11 @@ Sostituisci, non appendere. Tetto 40 KB. Lo storico sta in `archivio/FATTO.md`.
 - Sul PC non ci sono clang né CUDA toolkit: build Windows con MinGW-w64 gcc 15.2 (scoop), Linux
   nel container `trochilus-dev` (Ubuntu 24.04, gcc + clang; ASan, UBSan e TSan con gcc).
 
+- Le misure di velocità native vogliono la macchina ferma: i container degli altri progetti vanno
+  fermati e riavviati dopo (il guard di memoria rifiuta di caricare il modello sotto i ~10 GB liberi),
+  e nessun agente deve compilare in Docker nel frattempo (LEZIONI #57). `tools/ab_speed.sh` e
+  `ab_spec.sh` ora si fermano se una run non produce un numero, invece di stampare una tabella vuota.
+
 ## Prossimi passi
 
 Fatto il 2026-09-17 (`docs/MISURE.md` §Prefill a blocchi + kernel a 4 token): prefill a blocchi in C
@@ -143,24 +166,29 @@ llama.cpp avanti 1.97× a 16 thread e 1.57× a 1 (era 11.8×).
 
 Fatto dopo (`docs/MISURE.md` §Dove vanno i thread, `docs/archivio/FATTO.md`): chiusa la domanda 20
 (era il collocamento dei thread, non la potenza), e decodifica speculativa dal prompt con `--spec`,
-esatta al bit e provata da `tests/test_spec.c` e `make spec-check`. Manca la sua misura di velocità
-sul modello vero: è il passo 2 qui sotto.
+esatta al bit e provata da `tests/test_spec.c` e `make spec-check`.
 
-1. **Thread fissati ai core fisici** nel pool (Windows `SetThreadAffinityMask`, Linux
-   `sched_setaffinity`): la misura dice +30% sul prefill e 2.02× da 8 a 16 core. Poi rimisurare
-   prefill e decode con quella base, e rispondere alla domanda 22 (Linux, decode, macchina occupata)
-   e alla seconda metà della 3 (32 thread SMT contro 16 fissati).
-2. **Bozza adattiva** (domanda 25): accorciarla dopo un rifiuto e allungarla dopo un'accettazione,
-   così il caso peggiore misurato (0.62× quando il modello inventa) diventa «come senza» e il
-   guadagno (1.42× quando ricopia) resta. Solo dopo si può accendere `--spec` di default.
-3. Attivazioni int8/VNNI come opzione (leva 2, domanda 21): è quello che resta del divario per
-   elemento. Definizione scalare nuova, differenza dichiarata e misurata sul modello vero, attivabile;
-   il default lo decide Marcello.
+Fatto il 2026-09-18 (`docs/MISURE.md` §Il pin dei thread, §SMT, §Bozza adattiva, §Attivazioni int8):
+pin dei thread al core fisico (prefill +24-30%, decode invariato), bozza adattiva con pausa (caso
+peggiore da 0.60× a 1.01×, caso buono 1.15×), e la leva 2 chiusa con un microbenchmark invece che con
+del codice. Chiuse le domande 3, 21, 22 (tranne Linux), 24, 25, 27; aperte la 26 e la 28.
+
+1. **Accendere `--spec` di default?** La condizione posta il 2026-09-17 è soddisfatta: il caso
+   peggiore è «come senza» (1.01×) e quello buono 1.15×. Lo decide Marcello; oggi resta spento.
+2. **Thread per fase** (domanda 26): il prefill vuole tutti i core (217.8 tok/s a 16), il decode ne
+   vuole 8 (31.0 contro 28.7 a 16). Oggi il numero è uno solo per tutte e due: usare i primi n slot
+   del pool nel decode è esatto per costruzione (i logit non dipendono dal numero di thread) e vale
+   circa l'8% del decode.
+3. **Dov'è il resto del divario col prefill di llama.cpp** (domanda 28), visto che non è l'int8: un
+   kernel che tiene 8 o 16 token nei registri invece di 4, e il profilo per zone contro il loro.
 4. Prefill su prompt lunghi (2048-4096), dove l'attenzione per token cresce col quadrato: a 512 token
-   è al 2%, a 2048 il prefill è già sceso da 197 a 174 tok/s (domanda 7).
+   è al 2%, a 2048 il prefill è già sceso da 217.8 a 159.2 tok/s col pin (domanda 7).
 5. Confronto colibri/ds4 per componente (decisione sopra), poi le correzioni che ne escono.
    Misure 13-16 di `docs/MISURE.md` (routing, cache esperti, SSD): ordine da confermare con Marcello.
 6. Decode a contesto lungo: Trochilus perde l'11-13% da 32 a 512 token, llama.cpp il 5-7% (domande
    18-19 di `docs/MISURE.md`).
 7. Memoria: banda reale della RAM (domanda 4 in `docs/MISURE.md`), poi pagine da 2 MB (domanda 5).
-   4 thread vanno come 16 (33 tok/s, 41 GB/s): da rimisurare dopo il pin.
+   Col pin il decode a 4 e a 8 thread va uguale (31 tok/s) e a 16 scende: la banda è il tetto, e
+   la domanda 4 dice quanto manca.
+8. Il pin su Linux: il codice c'è e `make check` lo prova, i numeri no (serve una macchina Linux
+   vera, in WSL2 la topologia è sintetica). Resta l'ultima metà della domanda 22.

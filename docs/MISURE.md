@@ -19,7 +19,7 @@ si sposta nella sezione giusta con il numero quando è misurato.
 |---|---|---|---|
 | 1 | ~~Quanto costa svegliare i thread su Windows nativo?~~ Misurato: §Pool di thread | — | — |
 | 2 | ~~8 thread vincono perché stanno in un solo gruppo di core (CCD, L3 da 32 MB)?~~ No: 4+4 sui due CCD vanno **meglio** di 8 su uno solo. Misurato: §Dove vanno i thread | — | — |
-| 3 | Le copie SMT aiutano o peggiorano? Metà risposta: **due thread sullo stesso core fisico peggiorano** (§Dove vanno i thread). Resta da misurare 32 thread su 32 processori logici contro 16 su 16 core | scenario a 32 thread contro 16 fissati ai core | oggi il default esclude SMT, e il pin lo renderà una scelta |
+| 3 | ~~Le copie SMT aiutano o peggiorano?~~ **Peggiorano**: 32 thread pinnati (i due fratelli di ogni core) contro 16 (uno per core) danno prefill 110 contro 164 e decode 2.2 contro 22.9. Misurato: §SMT | — | — |
 | 4 | Qual è la banda reale della RAM di questa macchina? | microbenchmark di lettura sequenziale e `memcpy` da 1 GB, 1-16 thread | il tetto del decode (1.2 GB per token) si calcola da qui, non dai ~83 GB/s teorici (2×16 GB DDR5-5200); dal 2026-09-17 4 thread vanno come 16 a 41 GB/s |
 | 5 | Quanti TLB miss per token, e quanto valgono le pagine da 2 MB? | Linux: pesi con `madvise(MADV_HUGEPAGE)` contro senza, stessi token/s mediani | 300 000 pagine da 4 KB toccate per token |
 | 6 | Il portatile rallenta quando si scalda? | 60 s di decode continuo, token/s ogni 5 s | una misura breve può non valere per un uso reale |
@@ -37,11 +37,14 @@ si sposta nella sezione giusta con il numero quando è misurato.
 | 18 | Perché il decode perde l'11-13% da 32 a 512 token di contesto, e llama.cpp solo il 5-7%? | profilo per zone a contesto 32, 512, 2048: quota dell'attenzione e della sua parte a thread singolo | nel coding il contesto è lungo: è la differenza che cresce di più dopo il prefill |
 | 19 | Decode a 4-16 thread: llama.cpp è davvero avanti dell'8-12%? | `tools/speed_compare.py` con i due motori alternati run per run nella stessa sessione (fra due sessioni la mediana di llama.cpp si è spostata del 3-7%) | dice se c'è una leva nel decode a più thread o solo rumore |
 | 20 | ~~Il prefill rende 1.16× da 8 a 16 thread: è il limite di potenza del portatile?~~ No, e nemmeno il CCD: è lo scheduler che mette due thread sullo stesso core fisico. Misurato: §Dove vanno i thread | — | — |
-| 22 | Fissare i thread ai core fisici vale anche su Linux e sul decode, e quanto costa quando la macchina è occupata da altro? | stessa prova nativa su Linux (`sched_setaffinity`) e scenari di decode; poi una run con un altro carico addosso | il pin è una decisione di prodotto, non solo una misura: se è sempre meglio diventa il default |
+| 22 | Fissare i thread ai core fisici vale anche **sul decode** e **con la macchina occupata**? Misurato (§Il pin dei thread): sul decode **no a 16 thread** (0.82×) e **sì a 4-8** (1.14-1.32×); con la macchina occupata il prefill tiene (1.19×) e il decode perde (0.67×). Resta la sola parte **Linux**: su questa macchina non è misurabile (niente Linux nativo, e in WSL2 la topologia è sintetica, LEZIONI #47); il codice Linux gira ed è provato in `make check`, i numeri no | una macchina Linux vera, stessi scenari | il pin è una decisione di prodotto: sulle altre righe è già presa (acceso) |
+| 26 | Quanti thread vuole **ogni fase**? Il prefill scala fino a 16 core (231.9 tok/s), il decode è al massimo a 4-8 thread pinnati (32.7) e a 16 scende a 25.1 | scenari di decode e prefill a 1/4/8/16 thread pinnati, contesto 512 e 2048; poi un pool che nel decode usa meno worker (i primi n slot, che sono già core distinti sui due chiplet) | oggi il numero di thread è uno solo per tutte e due le fasi: il decode lascia circa il 30% sul tavolo |
+| 27 | ~~Perché il decode a 16 thread pinnati va il 17% più piano che senza pin?~~ Perché era pinnato a **un processore**: legando ogni thread al suo **core** (i due fratelli SMT) il decode torna alla pari e il prefill resta 1.24×. Non è la latenza di risveglio (spin da 2 a 20 ms: peggio). Misurato: §Il pin dei thread | — | — |
 | 23 | ~~Quante bozze vengono accettate su lavoro di codice vero?~~ Misurato: §Speculazione dal prompt. 64% riscrivendo un file già nel prompt (1.42×), 13% scrivendo codice nuovo (0.62×) | — | — |
-| 24 | ~~Una bozza sbagliata quanto costa?~~ ~5.2 ms per riga in più contro 34 ms di passata: pareggio intorno al 15% di bozze accettate (§Speculazione dal prompt) | — | — |
-| 25 | Una bozza che si accorcia dopo un rifiuto e si allunga dopo un'accettazione toglie il caso peggiore senza togliere il guadagno? | stessi due prompt di §Speculazione dal prompt, bozza fissa contro adattiva | è quello che decide se `--spec` può diventare il default |
-| 21 | Quanto del divario col prefill di llama.cpp (1.57× a 1 thread) è il dot int8 VNNI contro il nostro float? | microbenchmark `dot_row q8_0 x4` (44 G elementi/s) contro un dot int8 × int8 VNNI sulla stessa riga | dice quanto resta alla strada esatta e quanto chiede la leva 2 |
+| 24 | ~~Una bozza sbagliata quanto costa?~~ **Molto più di quanto diceva la misura in container** (5.2 ms): nativo, col pin, una riga in più costa **15-27 ms** contro i ~35 di una passata, perché il token in bozza sceglie altri esperti e la passata legge anche i loro pesi. Il pareggio non è al 15% di bozze accettate ma intorno al **60-75%** (§Speculazione dal prompt, LEZIONI #59) | — | — |
+| 25 | ~~Una bozza che si accorcia dopo un rifiuto e si allunga dopo un'accettazione toglie il caso peggiore?~~ Accorciarla non basta (0.89×): serve **fermarla** dopo una bozza tutta sbagliata, con pausa che raddoppia. Con quella: **1.01×** quando il modello inventa e **1.15×** quando ricopia (§Speculazione dal prompt) | — | — |
+| 21 | ~~Quanto del divario col prefill di llama.cpp è il dot int8 VNNI contro il nostro float?~~ **Niente**: sulla stessa riga il dot int8 VNNI fa +1-8% sul nostro dot float, e il nostro kernel a 4 token è 2.7× più veloce di entrambi. La leva 2 non si scrive (§Attivazioni int8 con VNNI) | — | — |
+| 28 | Il divario di prefill che resta con llama.cpp dov'è, se non è nell'int8? | profilo per zone del prefill nostro contro il loro sullo stesso prompt; e un kernel che tiene più di 4 token nei registri (8, 16) contro il nostro `dot_row_x4` | il nostro x4 è 2.7× il dot a un token: la stessa strada, più larga, è dove può esserci il resto |
 
 Macchina di riferimento: Ryzen 9 7940HX (Zen 4, 16 core / 32 thread, AVX-512 VNNI/BF16), 31 GB
 RAM (2×16 GB DDR5-5200), NVMe Micron 1 TB, GPU RTX 4070 Laptop 8 GB e Radeon 610M (non usate fino
@@ -430,12 +433,104 @@ Letture:
 Prossimo passo che ne discende: fissare i thread del pool ai core fisici, e rimisurare le righe
 di velocità con quella base.
 
+## Il pin dei thread ai core fisici (2026-09-18)
+
+Windows **nativo** (LEZIONI #47), macchina ferma: container degli altri progetti fermati e cache
+della VM di Docker restituita, 15.9 GB liberi (misurare mentre un agente compila in Docker dà numeri
+falsi, LEZIONI #57). Un solo binario e tre modi, scelti con `TR_POOL_PIN`: **0** nessuna affinità,
+**1** ogni thread su un processore logico suo, **2** (il default) ogni thread sul suo **core fisico**
+intero, cioè libero fra i due fratelli SMT di quel core ma solo di quello. Run **alternate**
+(`tools/ab_speed.sh`, LEZIONI #46), mediana dei giri dopo uno di riscaldamento, OLMoE-1B-7B Q8_0 dal
+disco di Windows, prompt 512, 24 token generati.
+
+**Il default contro nessun pin** (2 contro 0), 6 giri:
+
+| thread | prefill core | prefill senza | | decode core | decode senza | |
+|---|---|---|---|---|---|---|
+| 16 | **217.8** (184.9-220.3) | 175.1 (148.4-183.4) | **1.24×** | 28.7 (26.4-29.8) | 29.9 (27.2-30.3) | 0.96× |
+| 8 | **147.3** (141.9-151.4) | 113.4 (105.6-117.3) | **1.30×** | 31.0 (28.4-31.5) | 30.4 (26.4-30.9) | 1.02× |
+
+**I due modi di pin** (2 contro 1), 3 giri: a 16 thread il core intero dà prefill 212.5 contro 178.6
+e decode 27.2 contro 21.5; a 8 thread 145.9 contro 141.4 e 29.4 contro 31.1.
+
+**Il pin al singolo processore contro nessun pin** (1 contro 0), 3 giri, la strada scartata:
+
+| thread | prefill | senza | | decode | senza | |
+|---|---|---|---|---|---|---|
+| 16 | 231.9 | 191.3 | 1.21× | 25.1 | **30.5** | **0.82×** |
+| 8 | 171.0 | 125.9 | 1.36× | 32.7 | 28.6 | 1.14× |
+| 4 | 90.5 | 60.4 | 1.50× | 32.5 | 24.6 | 1.32× |
+| 1 | 24.0 | 24.0 | 1.00× | 12.2 | 10.7 | 1.14× |
+
+Stesso modo (1 contro 0) a prompt 2048, 16 token: 16 thread prefill 159.2 contro 147.2 (1.08×) e
+decode 19.5 contro 23.4 (0.83×); 8 thread prefill 130.1 contro 86.7 (1.50×) e decode 21.4 contro
+22.0. Macchina occupata (4 processi che girano a vuoto, prompt 512, 16 thread): prefill 206.5 contro
+173.6 (**1.19×**), decode 20.3 contro 30.4 (0.67×).
+
+Letture:
+- **Il prefill guadagna sempre**, e tanto più quanto meno thread ci sono: a 4 thread vale 1.50×,
+  perché senza affinità Windows appoggia quei 4 thread su 2 core fisici. Col default (pin al core) a
+  16 thread è 1.24×. Anche con la macchina occupata il guadagno resta (1.19×): il pin non è fragile
+  sotto contesa (domanda 22).
+- **Il modo di pinnare decide il decode.** Legare un thread a **un processore** costa il 17-18% sul
+  decode a 16 thread (0.82×, e 0.67× con la macchina occupata); legarlo al **suo core** lo riporta
+  alla pari (0.96× e 1.02×, dentro lo spread) e tiene il guadagno del prefill. Quello che serve non
+  è inchiodare un thread, è impedire che **due** thread finiscano sullo stesso core: il fratello
+  libero è una valvola che il decode usa e il prefill no. Chiude la domanda 27.
+- Non era la latenza di risveglio: allungando lo spin da 2 a 20 ms il decode a 16 thread pinnati al
+  processore andava 21.0 invece di 23.6, cioè peggio.
+- **Il decode preferisce 8 thread a 16** in ogni modo (31.0 contro 28.7 col default): il prefill
+  vuole tutti i core, il decode no. Oggi il numero di thread è uno solo per tutte e due le fasi:
+  è una leva aperta (domanda 26).
+- A 1 thread il pin non cambia il prefill (non c'è niente da collocare) e dà +14% sul decode.
+
+## Attivazioni int8 con VNNI: quanto darebbe la leva 2 (2026-09-18)
+
+Domanda 21. Candidato scritto **nel benchmark**, non nei kernel (`tests/bench_kernels.c`): quantizza
+le attivazioni a int8 a blocchi di 32 come Q8_0 e usa `_mm256_dpbusd_epi32`, con la stessa struttura
+di ggml (accumulo int32 per blocco, conversione e scala in un accumulatore float, somme dei pesi del
+blocco precalcolate per la correzione +128). Non è e non sarà un kernel nostro: le attivazioni a 8
+bit sono un altro numero, quindi non può essere bit-identico. `make bench`, 9 run da 40 ms, mediana.
+
+| kernel | attivazioni | n=1024 | n=2048 | n=4096 |
+|---|---|---|---|---|
+| `dot_row q8_0` (AVX-512) | float | 11 083 | 11 278 | 11 379 |
+| `dot q8_0 x q8_0` VNNI (candidato) | int8 | 11 184 | 11 398 | 12 310 |
+| `dot_row q8_0 x4` (già nostro) | float, 4 token | **28 644** | **29 969** | **30 565** |
+
+Milioni di elementi al secondo per riga di attivazioni. Quantizzare le attivazioni costa 467 M
+elem/s (scalare), che un matmul paga una volta ogni 1024 righe: trascurabile.
+
+Letture:
+- **La leva 2 non si scrive.** Sulla stessa riga il dot int8 VNNI fa +1% a 1024 e +8% a 4096
+  rispetto al nostro dot float: dentro il rumore, e in cambio si perderebbe l'esattezza.
+- Il nostro kernel a 4 token è **2.6-2.7× più veloce di entrambi**: il guadagno del prefill non
+  stava nell'int8, stava nel riusare la riga di pesi su più token. Il divario che resta con
+  llama.cpp va cercato lì (blocchi più larghi, non VNNI), non nelle attivazioni a 8 bit.
+- A questi n il dot non è limitato dalla memoria (12 GB/s contro i ~41 misurati): è latenza e
+  istruzioni per blocco, ed è per questo che una istruzione che fa 4 prodotti non cambia il totale.
+
+## SMT: 32 thread contro 16 (2026-09-18)
+
+Stesso metodo, prompt 2048, 16 token, entrambi i casi **pinnati**: A = 16 thread, uno per core
+fisico; B = 32 thread, uno per processore logico (i due fratelli di ogni core).
+
+| | 16 thread (un core ciascuno) | 32 thread (fratelli SMT) |
+|---|---|---|
+| prefill tok/s | **163.6** | 110.2 |
+| decode tok/s | **22.9** | 2.2 |
+
+Il prefill perde un terzo, il decode crolla di **dieci volte**: due thread sullo stesso core si
+tolgono la cache a vicenda e, con 464 dispatch per token, ognuno aspetta il fratello. Chiude la
+domanda 3: le copie SMT non aiutano, e il default (thread = core fisici) è quello giusto.
+
 ## Speculazione dal prompt — quanto rende e quando perde (2026-09-17)
 
 Container, volume `trochilus-models`, OLMoE-1B-7B Q8_0 intero, `run -f <prompt> -n 200`,
 `--spec 0` e `--spec k` **alternati run per run** (`tools/ab_spec.sh`, LEZIONI #46), mediana di 3
 giri dopo uno di riscaldamento. Il testo generato è identico in ogni giro: lo script si ferma se
-non lo è. Nessun pin dei thread (le righe andranno rifatte dopo il pin, §Dove vanno i thread).
+non lo è. Nessun pin dei thread e misure in container: rifatte native e col pin in §Bozza adattiva,
+dove il costo di una riga in più risulta 3-5 volte quello scritto qui sotto (LEZIONI #59).
 
 | Prompt | Bozza | Decode tok/s (min-max) | Bozze accettate | Contro `--spec 0` |
 |---|---|---|---|---|
@@ -459,6 +554,39 @@ Letture:
   conviene più spesso. Da rimisurare lì.
 - Conseguenza: `--spec` resta **spento di default** finché la bozza non si accorcia da sola dopo un
   rifiuto (llama.cpp lo fa). Con la bozza adattiva il caso peggiore diventa «come senza».
+
+## Bozza adattiva: quanto costa davvero una riga in più (2026-09-18)
+
+Windows **nativo**, macchina ferma, pin al core (il default), 16 thread, `run -f <prompt> -n 200`,
+`--spec 0` e `--spec 8` **alternati run per run** (`tools/ab_spec.sh`), mediana di 3 giri dopo uno
+di riscaldamento, testo identico in ogni giro. `--spec-fixed` sceglie la bozza fissa.
+
+| Prompt | Politica della bozza | `--spec 0` | `--spec 8` | | Accettate | Bozza media |
+|---|---|---|---|---|---|---|
+| `code-edit.txt` (il file è già nel prompt) | fissa 8 | 27.99 | **37.61** | **1.34×** | 64.4% | 8.00 |
+| | adattiva, solo si accorcia | 26.96 | 32.81 | 1.22× | 70.9% | 2.86 |
+| | adattiva con pausa (oggi) | 28.63 | 32.98 | **1.15×** | 69.4% | 2.34 |
+| `code.txt` (codice nuovo) | fissa 8 | 29.65 | 17.67 | **0.60×** | 13.1% | 3.04 |
+| | adattiva, solo si accorcia | 29.61 | 26.22 | 0.89× | 41.3% | 0.70 |
+| | adattiva con pausa (oggi) | 27.49 | 27.76 | **1.01×** | 43.1% | 0.38 |
+
+Il costo di una riga in più, ricavato dai passaggi stampati (ms per passata = 1000 · token / tok·s⁻¹
+/ passaggi, meno i ~35 ms di una passata da un token, diviso la bozza media): **15 ms** con bozza
+fissa 8, **20 ms** con bozza media 2.3, **27 ms** con bozza media 0.4.
+
+Letture:
+- **Su un MoE una riga in più non è quasi gratis, come sarebbe su un modello denso.** Il decode
+  costa perché legge i pesi degli 8 esperti scelti in ogni strato; il token in bozza ne sceglie
+  altri, e la passata legge anche quelli. Una riga in più costa così mezza passata o più, e il
+  pareggio sta intorno al **60-75% di bozze accettate**, non al 15% che diceva la misura fatta in
+  container (LEZIONI #59). È anche il motivo per cui la bozza lunga rende solo dove il testo è già
+  nel prompt: lì gli esperti scelti sono gli stessi, perché i token sono gli stessi.
+- **Accorciare la bozza non bastava**: con il 41% di accettate si perdeva ancora l'11%. Fermarla del
+  tutto dopo una bozza tutta sbagliata (pausa 1, 3, 7, 15 passi, capped 16) porta il caso peggiore a
+  **1.01×**, cioè «come senza», al prezzo di 1.22× → 1.15× nel caso buono. Chiude la domanda 25:
+  `--spec` può diventare il default.
+- La bozza fissa resta la più veloce dove il modello ricopia (1.34×): chi sa che sta riscrivendo un
+  file può ancora chiedere `--spec 8 --spec-fixed`.
 
 ## Kernel: una riga di pesi contro 4 token (2026-09-17)
 

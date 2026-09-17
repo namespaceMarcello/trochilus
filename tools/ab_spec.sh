@@ -33,7 +33,16 @@ while [ $R -le "$ROUNDS" ]; do
     for T in $THREADS; do
       if [ "$K" = 0 ]; then TXT=$TXT0; else TXT=$TXT1; fi
       "$BIN" run -m "$MODEL" -f "$PROMPT" -n "$GEN" -t "$T" --spec "$K" 2>"$OUT.err" >"$TXT"
-      sed -n "s/^generate: [0-9]* tokens in .* (\([0-9.]*\) tok.s)/spec$K t$T $R \1/p" "$OUT.err" | tee -a "$OUT"
+      LINE=$(sed -n "s/^generate: [0-9]* tokens in .* (\([0-9.]*\) tok.s)/spec$K t$T $R \1/p" "$OUT.err")
+      # No tok/s line means the run never generated: stop instead of printing medians with a hole
+      # in them (docs/LEZIONI.md #56).
+      if [ -z "$LINE" ]; then
+        echo "ab_spec: --spec $K, t$T, round $R produced no tok/s line, stopping. The run said:" >&2
+        tail -3 "$OUT.err" >&2
+        rm -f "$OUT" "$OUT.err" "$TXT0" "$TXT1"
+        exit 1
+      fi
+      printf '%s\n' "$LINE" | tee -a "$OUT"
       sed -n "s/^speculation: /    spec$K t$T $R accepted: /p" "$OUT.err"
       # identical text, every round: a faster run that changed a token is not a win
       if [ "$K" != 0 ] && ! cmp -s "$TXT0" "$TXT1"; then

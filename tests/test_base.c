@@ -1,5 +1,8 @@
 /* test_base.c — tests for src/base/platform.c, threads.c, cpu.c. */
 
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE /* sched_getcpu, to see where a pinned worker really ran */
+#endif
 #if defined(__linux__) && !defined(_POSIX_C_SOURCE)
 #define _POSIX_C_SOURCE 200809L
 #endif
@@ -20,8 +23,12 @@
 
 #if defined(_WIN32)
 #include <direct.h>
+#include <windows.h>
 #else
 #include <sys/stat.h>
+#if defined(__linux__)
+#include <sched.h>
+#endif
 #endif
 
 static void ensure_dir(const char *path) {
@@ -383,6 +390,84 @@ static void test_parallel_varying_chunks(void) {
     }
 }
 
+/* ---- thread placement ---------------------------------------------------- */
+
+/* Every slot names a different logical processor, and the first physical_cores of them
+ * come before any SMT sibling: that ordering is what makes the pin worth its 30%
+ * (docs/MISURE.md "Dove vanno i thread"). */
+static void test_cpu_slots(void) {
+    const tr_cpu_info *c = tr_cpu();
+    TR_CHECK(c->n_slots >= 0 && c->n_slots <= TR_CPU_MAX_SLOTS);
+    if (c->n_slots == 0) {
+        printf("thread placement: no topology on this platform, nothing is pinned\n");
+        return;
+    }
+    TR_CHECK(c->n_slots <= c->logical_cores);
+    TR_CHECK(c->n_slots >= c->physical_cores || c->physical_cores > TR_CPU_MAX_SLOTS);
+    for (int i = 0; i < c->n_slots; i++)
+        for (int j = i + 1; j < c->n_slots; j++)
+            TR_CHECK(!(c->slot[i].group == c->slot[j].group && c->slot[i].lcpu == c->slot[j].lcpu));
+}
+
+/* Where each worker really ran, one index per worker. */
+typedef struct {
+    int *cpu;
+    int n;
+} where_ctx;
+
+static int current_cpu(void) {
+#if defined(_WIN32)
+    return (int)GetCurrentProcessorNumber();
+#elif defined(__linux__)
+    return sched_getcpu();
+#else
+    return -1;
+#endif
+}
+
+static void where_fn(void *ctx_, int64_t begin, int64_t end, int worker) {
+    where_ctx *ctx = ctx_;
+    for (int64_t i = begin; i < end; i++)
+        if (i < ctx->n) ctx->cpu[i] = current_cpu();
+    (void)worker;
+}
+
+/* The pin is only worth something if the threads really are where cpu.c put them: ask the
+ * OS, from inside the pool, which processor each chunk ran on. */
+static void test_pool_pinned(void) {
+    const tr_cpu_info *c = tr_cpu();
+    if (c->n_slots == 0 || current_cpu() < 0) return; /* platform without placement */
+
+    int n = c->physical_cores < c->n_slots ? c->physical_cores : c->n_slots;
+    if (n > 8) n = 8; /* enough to catch a doubled-up core without a long test */
+    tr_pool *p = tr_pool_create(n);
+    TR_CHECK(p != NULL);
+    if (p == NULL) return;
+
+    int cpu_of[8];
+    where_ctx ctx = { cpu_of, n };
+    for (int i = 0; i < n; i++) cpu_of[i] = -1;
+    tr_parallel_for(p, n, 1, where_fn, &ctx); /* one index per worker */
+    tr_parallel_for(p, n, 1, where_fn, &ctx); /* again: every worker has started by now */
+
+    for (int i = 0; i < n; i++) {
+        /* chunk i is run by worker i, which is pinned to slot i: with TR_POOL_PIN=2 (the
+         * default) that is any processor of slot i's physical core, with 1 exactly slot i's */
+        int on_its_core = 0;
+        for (int s = 0; s < (int)c->slot[i].n_core; s++)
+            if (cpu_of[i] == (int)c->slot[i].core[s]) on_its_core = 1;
+        TR_CHECK(on_its_core);
+        if (!on_its_core)
+            printf("  worker %d ran on cpu %d, its core is %d (+%d siblings)\n", i, cpu_of[i],
+                   (int)c->slot[i].lcpu, (int)c->slot[i].n_core - 1);
+        /* whatever the mode, no two workers may share a physical core */
+        for (int j = i + 1; j < n; j++)
+            for (int s = 0; s < (int)c->slot[i].n_core; s++)
+                TR_CHECK(cpu_of[j] != (int)c->slot[i].core[s]);
+    }
+    tr_pool_destroy(p);
+}
+
 /* ---- cpu ----------------------------------------------------------------- */
 
 static void test_cpu(void) {
@@ -422,6 +507,8 @@ int main(void) {
     }
 
     test_parallel_varying_chunks();
+    test_cpu_slots();
+    test_pool_pinned();
     test_cpu();
 
     TR_TEST_EXIT();

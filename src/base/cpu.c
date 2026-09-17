@@ -11,6 +11,9 @@
  * the worker pool (and therefore any other thread) exists — tr_pool_create()
  * itself calls tr_cpu() to resolve n_threads <= 0, which establishes this. */
 
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE /* sched_getaffinity and the CPU_* macros */
+#endif
 #if defined(__linux__) && !defined(_POSIX_C_SOURCE)
 #define _POSIX_C_SOURCE 200809L
 #endif
@@ -40,6 +43,7 @@
 #  include <sys/types.h>
 #else
 #  include <dirent.h>
+#  include <sched.h>
 #  include <unistd.h>
 #  if defined(TR_CPU_ARM64)
 #    include <sys/auxv.h>
@@ -199,7 +203,116 @@ static void fill_vendor_brand(tr_cpu_info *c) {
 
 /* ---- core topology ----------------------------------------------------- */
 
+/* One physical core: its logical processors, and which last-level cache it shares.
+ * `domain` only has to separate the caches from one another, its value means nothing. */
+typedef struct {
+    int domain;
+    int n_cpu;
+    tr_cpu_slot cpu[TR_CPU_MAX_SMT];
+} core_desc;
+
+static void core_add_cpu(core_desc *co, unsigned group, unsigned lcpu) {
+    if (co->n_cpu >= TR_CPU_MAX_SMT) return;
+    co->cpu[co->n_cpu].group = (unsigned short)group;
+    co->cpu[co->n_cpu].lcpu = (unsigned short)lcpu;
+    co->n_cpu++;
+    /* every sibling carries the whole core: slot.core[0] stays the sibling itself, so
+     * pinning to one processor and pinning to the core are the same call with a different n */
+    for (int i = 0; i < co->n_cpu; i++) {
+        tr_cpu_slot *s = &co->cpu[i];
+        s->core[0] = s->lcpu;
+        s->n_core = 1;
+        for (int j = 0; j < co->n_cpu; j++)
+            if (co->cpu[j].lcpu != s->lcpu && s->n_core < TR_CPU_MAX_SMT)
+                s->core[s->n_core++] = co->cpu[j].lcpu;
+    }
+}
+
+/* Fills c->slot from the cores, best placement first: one logical processor per physical
+ * core before any second sibling (two threads on one core measured 30% slower than one
+ * per core), and the cores taken round robin over the last-level caches (4+4 over the two
+ * chiplets of a 7940HX beat 8 on one by 7-9%). Both numbers: docs/MISURE.md. */
+static void order_slots(tr_cpu_info *c, const core_desc *cores, int n_cores) {
+    c->n_slots = 0;
+    if (n_cores <= 0) return;
+
+    int domains[TR_CPU_MAX_SLOTS], n_domains = 0;
+    for (int i = 0; i < n_cores; i++) {
+        int seen = 0;
+        for (int d = 0; d < n_domains; d++)
+            if (domains[d] == cores[i].domain) { seen = 1; break; }
+        if (!seen && n_domains < TR_CPU_MAX_SLOTS) domains[n_domains++] = cores[i].domain;
+    }
+
+    /* Cores in round-robin order over the domains, keeping each domain's own order. */
+    int order[TR_CPU_MAX_SLOTS], n_order = 0;
+    for (int rank = 0; n_order < n_cores; rank++) {
+        int added = 0;
+        for (int d = 0; d < n_domains; d++) {
+            int seen = 0;
+            for (int i = 0; i < n_cores; i++) {
+                if (cores[i].domain != domains[d]) continue;
+                if (seen++ != rank) continue;
+                order[n_order++] = i;
+                added = 1;
+                break;
+            }
+        }
+        if (!added) break; /* every domain is exhausted */
+    }
+
+    for (int s = 0; s < TR_CPU_MAX_SMT; s++)
+        for (int k = 0; k < n_order && c->n_slots < TR_CPU_MAX_SLOTS; k++)
+            if (s < cores[order[k]].n_cpu) c->slot[c->n_slots++] = cores[order[k]].cpu[s];
+}
+
 #if defined(_WIN32)
+
+/* The processors this process may run on, so an outer `start /affinity` still decides.
+ * Only asked for a single-group machine: GetProcessAffinityMask cannot describe more. */
+static int win_process_mask(KAFFINITY *out) {
+    DWORD_PTR proc = 0, sys = 0;
+    if (GetActiveProcessorGroupCount() != 1) return 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) || proc == 0) return 0;
+    *out = (KAFFINITY)proc;
+    return 1;
+}
+
+/* Reads one relationship into a malloc'd buffer; *len is its size. NULL on failure. */
+static char *win_proc_info(LOGICAL_PROCESSOR_RELATIONSHIP rel, DWORD *len) {
+    *len = 0;
+    GetLogicalProcessorInformationEx(rel, NULL, len);
+    if (*len == 0) return NULL;
+    char *buf = malloc(*len);
+    if (buf == NULL) return NULL;
+    if (!GetLogicalProcessorInformationEx(rel, (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)buf, len)) {
+        free(buf);
+        return NULL;
+    }
+    return buf;
+}
+
+/* Index of the last-level cache that holds (group, lcpu), or -1. */
+static int win_cache_domain(const char *caches, DWORD len, unsigned group, unsigned lcpu) {
+    int best = -1, idx = 0;
+    BYTE best_level = 0;
+    for (DWORD off = 0; off + sizeof(DWORD) * 2 <= len;) {
+        PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX rec =
+            (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(caches + off);
+        if (rec->Size == 0 || off + rec->Size > len) break;
+        if (rec->Relationship == RelationCache && rec->Cache.Level >= 2) {
+            const GROUP_AFFINITY *ga = &rec->Cache.GroupMask;
+            if (ga->Group == group && (ga->Mask & ((KAFFINITY)1 << lcpu)) != 0 &&
+                rec->Cache.Level >= best_level) {
+                best_level = rec->Cache.Level;
+                best = idx;
+            }
+        }
+        if (rec->Relationship == RelationCache) idx++;
+        off += rec->Size;
+    }
+    return best;
+}
 
 static void detect_cores(tr_cpu_info *c) {
     c->logical_cores = (int)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
@@ -209,29 +322,61 @@ static void detect_cores(tr_cpu_info *c) {
         c->logical_cores = (int)si.dwNumberOfProcessors;
     }
 
-    int physical = 0;
-    DWORD len = 0;
-    GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len);
-    if (len > 0) {
-        char *buf = malloc(len);
-        if (buf != NULL) {
-            if (GetLogicalProcessorInformationEx(RelationProcessorCore,
-                    (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)buf, &len)) {
-                DWORD off = 0;
-                while (off < len) {
-                    PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX rec =
-                        (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(buf + off);
-                    if (rec->Relationship == RelationProcessorCore) physical++;
-                    off += rec->Size;
+    KAFFINITY allowed = 0;
+    int have_allowed = win_process_mask(&allowed);
+
+    DWORD cores_len = 0, caches_len = 0;
+    char *cores_buf = win_proc_info(RelationProcessorCore, &cores_len);
+    char *caches_buf = win_proc_info(RelationCache, &caches_len);
+
+    core_desc *cores = calloc(TR_CPU_MAX_SLOTS, sizeof *cores);
+    int n_cores = 0, physical = 0;
+
+    if (cores_buf != NULL) {
+        for (DWORD off = 0; off + sizeof(DWORD) * 2 <= cores_len;) {
+            PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX rec =
+                (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(cores_buf + off);
+            if (rec->Size == 0 || off + rec->Size > cores_len) break; /* truncated record */
+            if (rec->Relationship == RelationProcessorCore) {
+                physical++;
+                if (cores != NULL && n_cores < TR_CPU_MAX_SLOTS) {
+                    core_desc *co = &cores[n_cores];
+                    co->domain = -1;
+                    co->n_cpu = 0;
+                    for (WORD g = 0; g < rec->Processor.GroupCount; g++) {
+                        const GROUP_AFFINITY *ga = &rec->Processor.GroupMask[g];
+                        for (unsigned bit = 0; bit < sizeof(KAFFINITY) * 8; bit++) {
+                            if ((ga->Mask & ((KAFFINITY)1 << bit)) == 0) continue;
+                            if (have_allowed && ga->Group == 0 &&
+                                (allowed & ((KAFFINITY)1 << bit)) == 0) continue;
+                            if (co->n_cpu == 0 && caches_buf != NULL)
+                                co->domain = win_cache_domain(caches_buf, caches_len, ga->Group, bit);
+                            core_add_cpu(co, ga->Group, bit);
+                        }
+                    }
+                    if (co->n_cpu > 0) n_cores++; /* a core with no allowed processor is dropped */
                 }
             }
-            free(buf);
+            off += rec->Size;
         }
     }
 
     c->physical_cores = (physical > 0) ? physical : c->logical_cores;
+    if (cores != NULL && n_cores > 0) {
+        /* Counted on the processors this process may use: a restricted process must not
+         * size its pool on cores it will never run on. */
+        int usable = 0;
+        for (int i = 0; i < n_cores; i++) usable += cores[i].n_cpu;
+        c->physical_cores = n_cores;
+        c->logical_cores = usable;
+    }
     if (c->physical_cores < 1) c->physical_cores = 1;
     if (c->logical_cores < 1) c->logical_cores = 1;
+
+    if (cores != NULL) order_slots(c, cores, n_cores);
+    free(cores);
+    free(cores_buf);
+    free(caches_buf);
 }
 
 #elif defined(__APPLE__)
@@ -243,67 +388,72 @@ static void detect_cores(tr_cpu_info *c) {
     v = 0;
     len = sizeof v;
     c->physical_cores = (sysctlbyname("hw.physicalcpu", &v, &len, NULL, 0) == 0 && v > 0) ? v : c->logical_cores;
+    c->n_slots = 0; /* macOS has no way to pin a thread to a core */
 }
 
 #else /* Linux */
 
-typedef struct { long pkg, core; } pkg_core_t;
+/* One number out of a sysfs file, or `def` when it is missing or unreadable. */
+static long sysfs_long(const char *fmt, int cpu, const char *leaf, long def) {
+    char path[256];
+    snprintf(path, sizeof path, fmt, cpu, leaf);
+    FILE *fp = fopen(path, "r");
+    if (fp == NULL) return def;
+    long v = def;
+    if (fscanf(fp, "%ld", &v) != 1) v = def;
+    fclose(fp);
+    return v;
+}
 
 static void detect_cores(tr_cpu_info *c) {
     long logical = sysconf(_SC_NPROCESSORS_ONLN);
     c->logical_cores = (logical > 0) ? (int)logical : 1;
 
-    pkg_core_t seen[1024];
-    int n_seen = 0;
+    cpu_set_t allowed;
+    int have_allowed = sched_getaffinity(0, sizeof allowed, &allowed) == 0;
 
-    DIR *dir = opendir("/sys/devices/system/cpu");
-    if (dir != NULL) {
-        struct dirent *ent;
-        while ((ent = readdir(dir)) != NULL) {
-            const char *name = ent->d_name;
-            if (strncmp(name, "cpu", 3) != 0) continue;
-            const char *digits = name + 3;
-            if (*digits == '\0') continue;
-            int all_digits = 1;
-            for (const char *q = digits; *q; q++) {
-                if (*q < '0' || *q > '9') { all_digits = 0; break; }
-            }
-            if (!all_digits) continue;
+    core_desc *cores = calloc(TR_CPU_MAX_SLOTS, sizeof *cores);
+    long pkg_of[TR_CPU_MAX_SLOTS], core_of[TR_CPU_MAX_SLOTS];
+    int n_cores = 0;
 
-            char path[512];
-            snprintf(path, sizeof path, "/sys/devices/system/cpu/%s/topology/physical_package_id", name);
-            FILE *fp = fopen(path, "r");
-            long pkg = -1;
-            if (fp != NULL) {
-                if (fscanf(fp, "%ld", &pkg) != 1) pkg = -1;
-                fclose(fp);
-            }
+    /* cpu ids can be sparse: walk the range instead of readdir, so siblings of one core
+     * always come in cpu order and the placement is the same from one run to the next. */
+    for (int cpu = 0; cpu < TR_CPU_MAX_SLOTS * TR_CPU_MAX_SMT && cores != NULL; cpu++) {
+        long pkg = sysfs_long("/sys/devices/system/cpu/cpu%d/topology/%s", cpu, "physical_package_id", -1);
+        long core = sysfs_long("/sys/devices/system/cpu/cpu%d/topology/%s", cpu, "core_id", -1);
+        if (pkg < 0 || core < 0) continue;
+        if (have_allowed && !CPU_ISSET(cpu, &allowed)) continue;
 
-            snprintf(path, sizeof path, "/sys/devices/system/cpu/%s/topology/core_id", name);
-            fp = fopen(path, "r");
-            long core = -1;
-            if (fp != NULL) {
-                if (fscanf(fp, "%ld", &core) != 1) core = -1;
-                fclose(fp);
-            }
-
-            if (pkg < 0 || core < 0) continue;
-
-            int dup = 0;
-            for (int i = 0; i < n_seen; i++) {
-                if (seen[i].pkg == pkg && seen[i].core == core) { dup = 1; break; }
-            }
-            if (!dup && n_seen < (int)(sizeof seen / sizeof seen[0])) {
-                seen[n_seen].pkg = pkg;
-                seen[n_seen].core = core;
-                n_seen++;
-            }
+        int idx = -1;
+        for (int i = 0; i < n_cores; i++)
+            if (pkg_of[i] == pkg && core_of[i] == core) { idx = i; break; }
+        if (idx < 0) {
+            if (n_cores >= TR_CPU_MAX_SLOTS) continue;
+            idx = n_cores++;
+            pkg_of[idx] = pkg;
+            core_of[idx] = core;
+            cores[idx].n_cpu = 0;
+            /* index3 is the L3 on every machine that has one; without it the package
+             * separates the chiplets no better and no worse than nothing. */
+            long dom = sysfs_long("/sys/devices/system/cpu/cpu%d/cache/index3/%s", cpu, "id", -1);
+            cores[idx].domain = (dom >= 0) ? (int)dom : (int)pkg;
         }
-        closedir(dir);
+        core_add_cpu(&cores[idx], 0, (unsigned)cpu);
     }
 
-    c->physical_cores = (n_seen > 0) ? n_seen : c->logical_cores;
+    c->physical_cores = (n_cores > 0) ? n_cores : c->logical_cores;
+    if (cores != NULL && n_cores > 0) {
+        /* Counted on the processors this process may use (an outer taskset restricts them),
+         * so a restricted process does not size its pool on cores it will never run on. */
+        int usable = 0;
+        for (int i = 0; i < n_cores; i++) usable += cores[i].n_cpu;
+        c->logical_cores = usable;
+    }
     if (c->physical_cores < 1) c->physical_cores = 1;
+    if (c->logical_cores < 1) c->logical_cores = 1;
+
+    if (cores != NULL) order_slots(c, cores, n_cores);
+    free(cores);
 }
 
 #endif

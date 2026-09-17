@@ -7,6 +7,9 @@
  * goes through a shared file pointer. Linux and macOS use pread(2), which is
  * positional and thread-safe by definition. */
 
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE /* sched_setaffinity and the CPU_* macros */
+#endif
 #if defined(__linux__) && !defined(_POSIX_C_SOURCE)
 #define _POSIX_C_SOURCE 200809L
 #endif
@@ -28,6 +31,7 @@
 #else
 #  include <errno.h>
 #  include <fcntl.h>
+#  include <sched.h>
 #  include <time.h>
 #  include <unistd.h>
 #  include <sys/stat.h>
@@ -191,6 +195,39 @@ double tr_time_sec(void) {
     return (double)now.QuadPart / (double)freq.QuadPart;
 }
 
+int tr_thread_pin(unsigned group, const unsigned short *lcpus, int n, tr_affinity *prev) {
+    if (lcpus == NULL || n <= 0) return -1;
+    GROUP_AFFINITY want, had;
+    ZeroMemory(&want, sizeof want);
+    ZeroMemory(&had, sizeof had);
+    want.Group = (WORD)group;
+    for (int i = 0; i < n; i++) {
+        if (lcpus[i] >= sizeof(KAFFINITY) * 8) return -1; /* a group never has more than 64 */
+        want.Mask |= (KAFFINITY)1 << lcpus[i];
+    }
+    /* SetThreadGroupAffinity, not SetThreadAffinityMask: the latter only reaches the
+     * thread's current processor group, so on a machine with more than 64 processors it
+     * cannot name half of them (llama.cpp has that limit, see docs/UPSTREAM.md). */
+    if (!SetThreadGroupAffinity(GetCurrentThread(), &want, &had)) return -1;
+    if (prev != NULL) {
+        prev->valid = 1;
+        prev->group = had.Group;
+        memset(prev->mask, 0, sizeof prev->mask);
+        memcpy(prev->mask, &had.Mask, sizeof had.Mask);
+    }
+    return 0;
+}
+
+int tr_thread_affinity_restore(const tr_affinity *prev) {
+    if (prev == NULL || !prev->valid) return 0;
+    GROUP_AFFINITY back;
+    ZeroMemory(&back, sizeof back);
+    back.Group = (WORD)prev->group;
+    memcpy(&back.Mask, prev->mask, sizeof back.Mask);
+    if (back.Mask == 0) return -1;
+    return SetThreadGroupAffinity(GetCurrentThread(), &back, NULL) ? 0 : -1;
+}
+
 int tr_mem_info(tr_meminfo *out) {
     MEMORYSTATUSEX ms;
     ms.dwLength = sizeof ms;
@@ -268,6 +305,54 @@ double tr_time_sec(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
+
+#if defined(__linux__)
+
+int tr_thread_pin(unsigned group, const unsigned short *lcpus, int n, tr_affinity *prev) {
+    (void)group; /* Linux has one flat cpu space */
+    cpu_set_t set;
+    if (lcpus == NULL || n <= 0) return -1;
+    if (prev != NULL) {
+        cpu_set_t had;
+        prev->valid = 0;
+        if (sched_getaffinity(0, sizeof had, &had) == 0 && sizeof had <= sizeof prev->mask) {
+            memset(prev->mask, 0, sizeof prev->mask);
+            memcpy(prev->mask, &had, sizeof had);
+            prev->group = 0;
+            prev->valid = 1;
+        }
+    }
+    CPU_ZERO(&set);
+    for (int i = 0; i < n; i++) {
+        if (lcpus[i] >= (unsigned short)CPU_SETSIZE) return -1;
+        CPU_SET((int)lcpus[i], &set);
+    }
+    return sched_setaffinity(0, sizeof set, &set) == 0 ? 0 : -1;
+}
+
+int tr_thread_affinity_restore(const tr_affinity *prev) {
+    if (prev == NULL || !prev->valid) return 0;
+    cpu_set_t back;
+    if (sizeof back > sizeof prev->mask) return -1;
+    memcpy(&back, prev->mask, sizeof back);
+    return sched_setaffinity(0, sizeof back, &back) == 0 ? 0 : -1;
+}
+
+#else /* macOS and any other Unix: no way to pin a thread to one core */
+
+int tr_thread_pin(unsigned group, const unsigned short *lcpus, int n, tr_affinity *prev) {
+    (void)group;
+    (void)lcpus;
+    (void)n;
+    if (prev != NULL) prev->valid = 0;
+    return -1;
+}
+
+int tr_thread_affinity_restore(const tr_affinity *prev) {
+    return (prev == NULL || !prev->valid) ? 0 : -1;
+}
+
+#endif
 
 #if defined(__APPLE__)
 

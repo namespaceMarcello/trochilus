@@ -209,3 +209,59 @@ Misurata sul modello intero (`docs/MISURE.md` §Speculazione dal prompt): 1.42×
 già nel prompt (64% di bozze accettate), 0.62× scrivendo codice nuovo (13%), pareggio intorno al 15%.
 `--spec` resta spento di default fino alla bozza adattiva. `make` rifiuta ora di mescolare oggetti di
 due piattaforme nella stessa cartella (LEZIONI #52).
+
+### 2026-09-18 — I thread del pool fissati ai core fisici
+`src/base/cpu.c` costruisce la lista dei posti (`tr_cpu_info.slot`, `n_slots`): un processore logico
+per core fisico prima di ogni fratello SMT, e i core presi a giro sulle cache di ultimo livello,
+perché 4+4 sui due chiplet batte 8 sullo stesso. Su Windows la topologia viene da
+`GetLogicalProcessorInformationEx` (core e cache L3), su Linux da `topology/` e `cache/index3/id`,
+su macOS non c'è (un thread non si può fissare: `n_slots` resta 0 e non si pinna niente). La lista
+rispetta una maschera già imposta al processo (`taskset`, `start /affinity`), e in quel caso anche il
+conteggio dei core scende a quelli usabili, così il pool non si dimensiona su core dove non girerà
+mai. `src/base/platform.c` aggiunge `tr_thread_pin` (Windows `SetThreadGroupAffinity`, che arriva
+oltre il primo gruppo di processori — llama.cpp no, UPSTREAM #3; Linux `sched_setaffinity`) e
+`tr_thread_affinity_restore`. In `src/base/threads.c` ogni worker si fissa al suo posto appena parte,
+il thread chiamante prende il posto 0 e torna dov'era quando il pool muore (un processo che crea pool
+di dimensioni diverse — i benchmark — non deve restare inchiodato al primo core). `TR_POOL_PIN`
+sceglie il modo: 0 niente, 1 un processore logico per thread, **2 il core fisico intero (default)**.
+Il modo conta: legare un thread a un processore costa il 17% sul decode, legarlo al suo core no
+(LEZIONI #58). Prova: `make check`, dove `tests/test_base.c` chiede al sistema
+operativo (`GetCurrentProcessorNumber`, `sched_getcpu`) su quale processore ha girato ogni chunk e
+pretende che sia il posto assegnato — con `TR_POOL_PIN=0` quel test è rosso. Velocità:
+`sh tools/ab_speed.sh <gguf> build/pin/on.sh build/pin/off.sh` e `docs/MISURE.md` §Il pin dei thread.
+Fonti e cosa si è preso: `docs/ORIGINI.md` §Collocamento dei thread.
+
+### 2026-09-18 — Bozza adattiva per `--spec`
+`src/gen/greedy.c` tiene `k_cur`: parte da `n_draft`, dopo un rifiuto parziale scende a quanto è
+stato davvero accettato, dopo una bozza accettata per intero risale di uno fino a `n_draft`, e dopo
+una bozza **tutta** sbagliata la speculazione si ferma per qualche passo, con pausa che raddoppia
+finché la sonda da un token continua a sbagliare (1, 3, 7, 15, al massimo 16). La pausa è la metà
+importante: su un MoE una riga in più costa 15-27 ms contro i ~35 di una passata, perché il token in
+bozza sceglie altri esperti e la passata legge anche i loro pesi, quindi il pareggio è al 60-75% di
+bozze accettate (`docs/MISURE.md` §Bozza adattiva, LEZIONI #59). Risultato: 1.01× quando il modello
+inventa (era 0.60× con bozza fissa) e 1.15× quando ricopia un file già nel prompt (1.34× con bozza
+fissa, che resta disponibile con `--spec-fixed`). Una bozza vuota (il lookup non ha trovato nulla da
+proporre) non cambia niente. La politica si sceglie
+(`tr_draft_policy`): adattiva di default, `--spec-fixed` torna alla bozza fissa per le misure. La
+riga di statistiche stampa anche la bozza media per passata. I token restano identici a quelli senza
+speculazione, con ogni politica: è l'invariante di `tests/test_spec.c` e di `make spec-check`, che
+ora gira sul modello intero e pretende bozze accettate (LEZIONI #54). Nuovi test: `k_cur` scende sotto
+`n_draft` a ogni rifiuto vero e, partendo da 1, risale fino a `n_draft` su un contesto che si ripete
+(LEZIONI #55), e dopo una bozza tutta sbagliata il passo successivo non deve proporre niente —
+controllato a ogni passo, e la suite fallisce se in nessun caso una bozza è mai stata rifiutata del
+tutto, così il test non può passare per il motivo sbagliato. Prova: `make check`, e
+`sh tools/ab_spec.sh <gguf> <binario> bench/prompts/code.txt 8` per la velocità; numeri in
+`docs/MISURE.md` §Bozza adattiva.
+
+### 2026-09-18 — Quanto darebbe la leva 2 (attivazioni int8 con VNNI): niente
+Domanda 21 chiusa con una misura, senza scrivere il kernel. `tests/bench_kernels.c` ha ora un
+candidato int8 × int8 con `_mm256_dpbusd_epi32` (stessa struttura di ggml) accanto ai nostri dot:
+sulla stessa riga fa 11.4 G elementi/s contro gli 11.3 del nostro dot float, mentre il nostro
+`dot_row_x4` (una riga di pesi contro 4 token) ne fa 30.6. Il candidato resta nel benchmark, non
+diventa un kernel: le attivazioni a 8 bit non sono lo stesso numero. Prova: `make bench`, righe
+`dot q8_0xq8_0` e `quantize x q8_0`; numeri e letture in `docs/MISURE.md` §Attivazioni int8 con VNNI.
+
+### 2026-09-17 — Una misura che non misura si ferma
+`tools/ab_speed.sh` e `tools/ab_spec.sh` si fermano alla prima run che non produce la riga dei tok/s
+e stampano le ultime righe di quella run: prima stampavano la tabella delle mediane su un file vuoto,
+e una misura muta sembrava una misura riuscita (LEZIONI #56).

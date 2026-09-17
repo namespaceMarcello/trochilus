@@ -19,7 +19,7 @@ static int32_t argmax_f32(const float *x, int64_t n) {
 }
 
 int tr_greedy_init(tr_greedy *g, tr_session *s, int64_t vocab, int64_t n_ctx, int64_t n_draft,
-                   int32_t *hist, int64_t n_hist) {
+                   tr_draft_policy policy, int32_t *hist, int64_t n_hist) {
     const float *logits = tr_session_logits(s);
     if (g == NULL || s == NULL || hist == NULL || logits == NULL) return -1;
     if (n_draft < 0 || n_draft > TR_GREEDY_DRAFT_MAX) return -1;
@@ -30,6 +30,10 @@ int tr_greedy_init(tr_greedy *g, tr_session *s, int64_t vocab, int64_t n_ctx, in
     g->vocab = vocab;
     g->n_ctx = n_ctx;
     g->n_draft = n_draft;
+    g->policy = policy;
+    g->k_cur = n_draft;
+    g->cool = 0;
+    g->back = 0;
     g->hist = hist;
     g->n_hist = n_hist;
     g->next = argmax_f32(logits, vocab);
@@ -48,9 +52,11 @@ int64_t tr_greedy_step(tr_greedy *g, int32_t *out) {
      * a failed step leaves the session and the history as they were. */
     g->hist[g->n_hist] = g->next;
 
-    /* Room left decides how much can be verified in this pass. */
+    /* Room left decides how much can be verified in this pass; k_cur (== n_draft under
+     * TR_DRAFT_FIXED) decides how much this step is willing to risk. */
     int64_t room = g->n_ctx - pos - 1;
-    int64_t want = g->n_draft < room ? g->n_draft : room;
+    int64_t want = g->k_cur < g->n_draft ? g->k_cur : g->n_draft;
+    if (room < want) want = room;
     int64_t k = want > 0 ? tr_lookup_draft(g->hist, g->n_hist + 1, g->draft, want) : 0;
 
     int32_t buf[1 + TR_GREEDY_DRAFT_MAX];
@@ -74,6 +80,33 @@ int64_t tr_greedy_step(tr_greedy *g, int32_t *out) {
     /* Anything past the accepted prefix was never emitted: forget those cache rows. Must come
      * after the line above, because a rewind invalidates the logits. */
     if (a < k) tr_session_rewind(s, g->n_hist);
+
+    /* Adaptive: a fully accepted draft grows k_cur by one (capped at n_draft, slow growth);
+     * a partly accepted one shrinks it to what was actually accepted; a draft where nothing was
+     * accepted stops drafting altogether for `cool` steps, and that pause doubles every time the
+     * probe is wrong again (1, 3, 7, 15, capped at 16). The pause is the important half: an extra
+     * row of a pass costs 15-22 ms against the 34 ms of the pass itself, because the drafted
+     * token usually routes to other experts and the pass reads their weights too, so a draft
+     * pays only above roughly half accepted (docs/MISURE.md §Speculazione dal prompt). A step
+     * where the lookup proposed nothing although it was allowed to (k == 0 with want > 0) leaves
+     * everything as it was: nothing was risked. */
+    if (g->policy == TR_DRAFT_ADAPTIVE) {
+        if (want == 0) {
+            if (g->cool > 0 && --g->cool == 0) g->k_cur = 1; /* the pause is over: probe once */
+        } else if (k > 0) {
+            if (a == k) {
+                g->k_cur = g->k_cur + 1 < g->n_draft ? g->k_cur + 1 : g->n_draft;
+                g->back = 0;
+            } else if (a > 0) {
+                g->k_cur = a;
+                g->back = 0;
+            } else {
+                g->k_cur = 0;
+                g->back = g->back == 0 ? 1 : (g->back < 16 ? g->back * 2 + 1 : 16);
+                g->cool = g->back;
+            }
+        }
+    }
 
     g->n_steps++;
     g->n_drafted += (uint64_t)k;
