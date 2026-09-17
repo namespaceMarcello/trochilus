@@ -135,8 +135,8 @@ static float avx512_dot_row_q8_0(const void *row, const float *x, int64_t n) {
 
 /* ---- tables --------------------------------------------------------------- */
 
-static tr_kernels g_avx2, g_avx512;
-static int g_avx2_built = 0, g_avx512_built = 0;
+static tr_kernels g_avx2, g_avx512;                 /* global-ok: kernel tables depend only on the CPU */
+static int g_avx2_built = 0, g_avx512_built = 0;    /* global-ok: same */
 
 const tr_kernels *tr_kernels_x86_tier(const char *tier) {
     const tr_cpu_info *c = tr_cpu();

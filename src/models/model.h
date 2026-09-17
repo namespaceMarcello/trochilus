@@ -44,6 +44,10 @@ int tr_session_eval(tr_session *s, const int32_t *tokens, int64_t n);
 const float *tr_session_logits(const tr_session *s);
 /* Number of tokens already in the KV cache. */
 int64_t tr_session_pos(const tr_session *s);
+/* Forgets every token after the first n (0 <= n <= pos): the next eval continues from
+ * position n exactly as if only those n tokens had been evaluated. The logits are
+ * not valid again until the next eval. -1 if n is out of range (nothing changes). */
+int tr_session_rewind(tr_session *s, int64_t n);
 /* The session's own profiler (docs/ARCHITETTURA.md §Profilazione), disabled by
  * default: set ->enabled and ->phase to turn it on. Never NULL. */
 tr_prof *tr_session_prof(tr_session *s);
@@ -62,6 +66,7 @@ typedef struct {
     int (*eval)(void *session, const int32_t *tokens, int64_t n);
     const float *(*logits)(const void *session);
     int64_t (*pos)(const void *session);
+    int (*rewind)(void *session, int64_t n);
     tr_prof *(*prof)(void *session);
 } tr_arch_vtable;
 

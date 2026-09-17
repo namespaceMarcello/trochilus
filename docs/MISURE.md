@@ -29,6 +29,11 @@ si sposta nella sezione giusta con il numero quando è misurato.
 | 10 | Più corsie (32 o 64) sbloccano la catena delle somme su un thread? | kernel sperimentale, `make bench` | AVX-512 va come AVX2 per quel limite; cambierebbe i numeri (dichiarato) |
 | 11 | Quanto pesa la divisione per riga e la chiamata indiretta in `matmul_body`? | kernel che riceve tutta la matrice contro uno per riga | 1024 chiamate e 2 divisioni a 64 bit per matrice |
 | 12 | Gli esperti scelti in token consecutivi si ripetono? | contare gli esperti in comune fra token vicini | se sì, i loro pesi sono ancora in cache e si può prevedere cosa caricare |
+| 13 | Il router del layer successivo, applicato allo stato del layer corrente, indovina gli esperti che verranno scelti? | traccia del routing sul modello vero (prompt di codice, ~1000 token): esperti previsti (primi 8, 12, 16) contro scelti | se prevedendone al massimo 12 se ne indovina almeno l'80%, gli esperti si precaricano dal disco prima che servano (M1) |
+| 14 | Quanti byte per token restano da leggere dal disco con una cache degli esperti grande il 25, 50, 75% del modello? | simulazione LRU sulla stessa traccia | decide il budget di RAM di default della M1 |
+| 15 | Streaming dal disco per layer interi (DeepSpeed) o per esperti: quanti byte per token? | stessa traccia: layer interi contro soli esperti scelti e non in cache | con un solo utente leggere tutto il modello a ogni token dà al massimo ~0.3 tok/s su 10 GB |
+| 16 | Quanto legge davvero l'NVMe in blocchi grandi quanto un esperto, a posizioni casuali, senza cache? | microbenchmark `pread` senza cache del sistema (`FILE_FLAG_NO_BUFFERING`, `O_DIRECT`), al massimo 60 s | con 14 e 15 dà i token/s attesi (M1 per esperti se ≥ 5 tok/s al 50%); decide anche la KV vecchia su SSD, attesa no con attenzione piena |
+| 17 | Ricaricare dal disco la KV di un file già letto costa meno del prefill? La KV in q8 cambia i token? | checkpoint: logit identici al bit dopo il ricaricamento, tempo almeno 10 volte sotto il prefill; q8: token greedy uguali ≥ 99% su 1000 token di codice | leve del coding (file già letti, contesti lunghi), M5 |
 
 Macchina di riferimento: Ryzen 9 7940HX (Zen 4, 16 core / 32 thread, AVX-512 VNNI/BF16), 31 GB
 RAM (2×16 GB DDR5-5200), NVMe Micron 1 TB, GPU RTX 4070 Laptop 8 GB e Radeon 610M (non usate fino
@@ -240,6 +245,24 @@ Letture:
   La domanda 4 (banda reale della RAM: 2×16 GB DDR5-5200, ~83 GB/s teorici) è ora la prima.
 - A un thread +10%: rope e somma pesata vettorizzata, niente parallelismo.
 - Spread 13% a 8 thread (una run a 30.4): rumore della macchina, le altre righe stanno sotto il 5%.
+
+## Correttezza sul modello vero — Trochilus contro llama.cpp (2026-09-17)
+
+`tools/compare_llamacpp.py` nel container, OLMoE-1B-7B-0125-Instruct Q8_0, prompt
+`bench/prompts/dante.txt` (template di chat), 128 token greedy, llama.cpp `b49650a` su CPU.
+
+| Cosa | Risultato |
+|---|---|
+| token del prompt (27) | identici a `llama-tokenize` |
+| generazione greedy | identica per i primi 19 token, poi le strade si separano |
+| stessa parola migliore, 155 posizioni (prompt + generati, teacher forcing) | 149/155; nelle 6 diverse il margine di Trochilus fra le prime due è 0.04–0.18 |
+| KL(llama.cpp ‖ Trochilus) | media 8.9e-3, massimo 0.30 |
+| massima differenza di un logit | 3.63 |
+
+Non conclusivo: llama.cpp moltiplica i pesi Q8_0 con attivazioni quantizzate a 8 bit e tiene la
+cache KV in f16, Trochilus usa attivazioni esatte. La prova che decide è transformers sugli stessi
+pesi (modello tagliato a 2 layer), prossimo passo. Entrambi i motori inventano i versi di Dante:
+limite del modello.
 
 ## Leve di velocità: cosa dice la ricerca (2026-09-17)
 

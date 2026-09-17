@@ -4,6 +4,7 @@
 #   make            build/trochilus
 #   make test       C tests (every kernel variant against scalar, GGUF, pool, profiler)
 #   make oracle     tiny models against transformers (needs tools/.venv or the Docker image)
+#   make oracle-tokenizer  a real tokenizer against transformers (ids, pieces, NFC, decoding)
 #   make bench      kernel microbenchmark (median and noise), native
 #   make lint       docs and tables against the lessons in docs/LEZIONI.md
 #   make WERROR=1   warnings are errors
@@ -45,11 +46,16 @@ APP_OBJ  := $(BUILD)/src/app/main.o
 TEST_BIN := $(patsubst tests/%.c,$(BUILD)/tests/%$(EXE),$(wildcard tests/test_*.c))
 BENCH_BIN := $(BUILD)/tests/bench_kernels$(EXE)
 
-.PHONY: all test oracle bench lint profile check check-linux clean
+.PHONY: all test oracle oracle-tokenizer chat-check bench lint profile check check-linux clean
 all: $(BUILD)/trochilus$(EXE)
 
 $(BUILD)/trochilus$(EXE): $(CORE_OBJ) $(APP_OBJ)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDLIBS)
+
+ifeq ($(OS),Windows_NT)
+# wmain: Windows passes the command line as UTF-16, main.c converts it to UTF-8 (docs/LEZIONI.md #13)
+$(BUILD)/trochilus$(EXE): LDLIBS += -municode
+endif
 
 # Makefile as a prerequisite: a changed flag recompiles everything (docs/LEZIONI.md #21)
 $(BUILD)/%.o: %.c Makefile
@@ -72,8 +78,10 @@ HOT_WRAP := malloc calloc realloc free posix_memalign
 endif
 $(BUILD)/tests/test_hot$(EXE): LDLIBS += $(foreach s,$(HOT_WRAP),-Wl,--wrap=$(s))
 
+# a test that loops forever fails instead of hanging the gate (docs/LEZIONI.md #35); no timeout(1): no limit
+TEST_RUN := $(shell command -v timeout >/dev/null 2>&1 && echo timeout 300)
 test: $(TEST_BIN)
-	@set -e; for t in $(TEST_BIN); do echo "== $$t"; ./$$t; done; echo "== all C tests passed"
+	@set -e; for t in $(TEST_BIN); do echo "== $$t"; $(TEST_RUN) ./$$t; done; echo "== all C tests passed"
 
 bench: $(BENCH_BIN)
 	./$(BENCH_BIN)
@@ -104,6 +112,24 @@ oracle: $(BUILD)/trochilus$(EXE) $(FIX)/model-f32.gguf $(FIX)/model-f16.gguf $(F
 	$(PY) tools/oracle.py $(FIX) $(FIX)/model-f16.gguf --binary $(BUILD)/trochilus$(EXE) --expect exact
 	$(PY) tools/oracle.py $(FIX) $(FIX)/model-q8_0.gguf --binary $(BUILD)/trochilus$(EXE) --expect report
 
+# A real tokenizer against transformers: the model's tokenizer files pinned to a Hub revision
+# (downloaded once into fixtures/), a vocabulary-only GGUF written as llama.cpp's converter writes
+# it, and, when the model file is there, its own tokenizer metadata must be the same.
+TOKFIX := fixtures/olmoe-1b-7b-0125-instruct-tokenizer
+$(TOKFIX)/tokenizer.json:
+	$(PY) tools/fetch_hf_tokenizer.py --repo allenai/OLMoE-1B-7B-0125-Instruct \
+		--revision b89a7c4bc24fb9e55ce2543c9458ce0ca5c4650e --output $(TOKFIX)
+$(TOKFIX)/vocab.gguf: $(TOKFIX)/tokenizer.json tools/hf_to_gguf.py
+	$(PY) tools/hf_to_gguf.py $(TOKFIX) $@ --vocab-only --tokenizer-pre olmo
+oracle-tokenizer: $(BUILD)/trochilus$(EXE) $(TOKFIX)/vocab.gguf
+	$(PY) tools/tokenizer_oracle.py --gguf $(TOKFIX)/vocab.gguf --hf $(TOKFIX) --binary $(BUILD)/trochilus$(EXE) \
+		--compare-gguf models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf
+
+# trochilus chat on the real model (skipped without it): reusing the cache between turns gives the
+# same second reply as a fresh run on the whole conversation.
+chat-check: $(BUILD)/trochilus$(EXE) $(TOKFIX)/tokenizer.json
+	$(PY) tools/chat_check.py --binary $(BUILD)/trochilus$(EXE) --model models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf --hf $(TOKFIX)
+
 # The gate. Correctness runs in Linux (Docker image trochilus-dev, tools/docker/Dockerfile) so that
 # Windows Smart App Control, which blocks freshly built executables for minutes (docs/LEZIONI.md #12),
 # cannot make it flaky; on Windows the native build is still compiled with 0 warnings.
@@ -112,6 +138,9 @@ ifeq ($(OS),Windows_NT)
 check: lint
 	$(MAKE) WERROR=1 all $(TEST_BIN) $(BENCH_BIN)
 	MSYS_NO_PATHCONV=1 docker run --rm --security-opt seccomp=unconfined -v "$(CURDIR):/src" -w /src $(DOCKER_IMG) make check-linux
+	@# give the Docker VM's file cache back to Windows (docs/LEZIONI.md #38)
+	MSYS_NO_PATHCONV=1 docker run --rm --privileged $(DOCKER_IMG) sh -c "sync; echo 3 > /proc/sys/vm/drop_caches"
+	sh tools/check_argv_utf8.sh $(BUILD)/trochilus$(EXE) $(TOKFIX)/vocab.gguf
 	@echo "== check passed (native Windows build: 0 warnings; tests, ASan and oracles: Linux)"
 else
 check: lint check-linux
@@ -133,6 +162,8 @@ check-linux:
 	@for i in $$(seq 20); do build/linux-gcc/tests/test_hot > /dev/null || exit 1; done; echo "== test_hot 20/20"
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 build/linux-gcc/tests/bench_kernels
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle
+	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle-tokenizer
+	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} chat-check
 	$(PY) tools/profile_suite.py --binary build/linux-gcc/trochilus$(EXE) --smoke
 	@# -c is honoured: 6 + 4 tokens fit a context of 16, and do not fit one of 8
 	build/linux-gcc/trochilus generate -m $(FIX)/model-f32.gguf -p 6 -n 4 -c 16 > /dev/null

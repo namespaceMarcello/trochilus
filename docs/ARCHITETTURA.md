@@ -115,7 +115,7 @@ codice macchina con e senza, verificato): nella zona calda restano quelli che sp
 | `src/backend/` | interfaccia backend (tensori residenti sul dispositivo, grafo per token) e backend CPU | ds4 `ds4_gpu.h` (modello di esecuzione), ridotto alle primitive generiche |
 | `src/memory/` | archivio esperti a livelli (VRAM / RAM / disco), lease, LRU O(1), pool I/O, pin appresi dall'uso | colibri `expert_store.h`, `st.h`, `route_trace.h`; ds4 streaming su VRAM |
 | `src/kv/` | cache KV, riuso del prefisso, checkpoint su disco con punteggio a decadimento | colibri `kv_prefix.h`, `kv_fp8.h`; ds4 `ds4_kvstore.c` |
-| `src/tokenizer/` | BPE byte-level dai metadati GGUF, template di chat per architettura | colibri `tok.h` |
+| `src/tokenizer/` | BPE byte-level dai metadati GGUF (famiglie di pretokenizer ammesse solo con oracolo), NFC e classi Unicode sondate da HF `tokenizers`, template di chat per architettura | idee: colibri `tok.h` (regex rigiocata in C), ds4 `vocab_load` (dal GGUF); codice nuovo |
 | `src/models/` | un grafo per famiglia, costruito dalle primitive | colibri `olmoe.c`, ds4 / colibri DeepSeek V4 |
 | `src/app/` | CLI, poi server (API OpenAI e Anthropic) | entrambi |
 | `backends/cuda/`, `backends/metal/` | moduli GPU caricabili | ds4 `cuda/mmq` (ggml, MIT), `metal/*.metal` |

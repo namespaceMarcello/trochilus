@@ -13,13 +13,21 @@ Purpose:
 
 Usage:
   tools/.venv/Scripts/python.exe tools/hf_to_gguf.py <hf_dir> <out.gguf> --type {f32,f16,q8_0}
+  tools/.venv/Scripts/python.exe tools/hf_to_gguf.py <hf_dir> <out.gguf> --vocab-only [--tokenizer-pre NAME]
 
-  <hf_dir>   directory with config.json, model.safetensors (or a sharded
-             model.safetensors.index.json), and optionally tokenizer.json /
-             tokenizer_config.json.
-  <out.gguf> output path.
-  --type     weight storage type for everything except 1-D norms and the MoE
-             router, which are always F32 (see select_tensor_dtype below).
+  <hf_dir>       directory with config.json and, for a full conversion,
+                 model.safetensors (or a sharded model.safetensors.index.json);
+                 tokenizer.json / tokenizer_config.json are read whenever present.
+  <out.gguf>     output path.
+  --type         weight storage type for everything except 1-D norms and the MoE
+                 router, which are always F32 (see select_tensor_dtype below).
+                 Required unless --vocab-only.
+  --vocab-only   write only general.architecture, general.name and tokenizer.*
+                 metadata: no tensors, no other hparams, --type not needed.
+  --tokenizer-pre  value for tokenizer.ggml.pre (llama.cpp fingerprints
+                 tokenizer.json against a signature table to pick this; that
+                 table isn't available here, so without this flag the writer
+                 falls back to "default" - see detect_bpe_pretokenizer).
 
 Adding an architecture: implement ArchConverter and register it with
 @register_architecture("HFArchClassName") - see OlmoeConverter below.
@@ -283,25 +291,77 @@ def detect_bpe_pretokenizer(hf_dir: Path) -> str:
     return "default"
 
 
-def write_tokenizer(writer: gguf.GGUFWriter, hf_dir: Path) -> None:
-    try:
-        vocab = gguf.BpeVocab(hf_dir)
-    except FileNotFoundError as exc:
-        print(
-            f"note: tokenizer.json present but not a GPT-2 BPE tokenizer ({exc}); "
-            "skipping tokenizer metadata",
-            file=sys.stderr,
-        )
-        return
+def does_token_look_special(text: str) -> bool:
+    """Mirrors llama.cpp convert_hf_to_gguf.py Model.does_token_look_special:
+    added tokens that are not marked `special` in tokenizer.json but that look
+    like they should be a control token by their spelling (some converters get
+    this wrong upstream, e.g. deepseek-coder, gemma)."""
+    if text in ("<pad>", "<mask>", "<2mass>", "[@BOS@]"):
+        return True
+    if text.startswith("<|") and text.endswith("|>"):
+        return True
+    if text.startswith("<｜") and text.endswith("｜>"):  # "<｜...｜>", e.g. deepseek_r1
+        return True
+    if text.startswith("<unused"):
+        return True
+    return False
+
+
+def get_vocab_base(hf_dir: Path, config: dict) -> tuple[list[bytes], list[int]]:
+    """Mirrors llama.cpp convert_hf_to_gguf.py Model.get_vocab_base for a gpt2
+    (BPE) tokenizer: AutoTokenizer.from_pretrained, one token+type per id in
+    range(vocab_size), ids missing from the vocab filled with UNUSED "[PAD{i}]"
+    placeholders. Unlike gguf.BpeVocab (which marks every added token CONTROL),
+    an added token is CONTROL only when tokenizer.json marks it `special` or its
+    spelling looks special (does_token_look_special); otherwise it is
+    USER_DEFINED, with the non-normalized round-trip and the U+2581 -> space
+    substitution llama.cpp applies to that case."""
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(hf_dir)
+    vocab_size = config.get("vocab_size") or len(tokenizer.vocab)
+
+    reverse_vocab = {id_: tok for tok, id_ in tokenizer.vocab.items()}
+    added_vocab = tokenizer.get_added_vocab()
+    added_tokens_decoder = tokenizer.added_tokens_decoder
 
     tokens: list[bytes] = []
     toktypes: list[int] = []
-    for text, _score, toktype in vocab.all_tokens():
-        tokens.append(text if isinstance(text, bytes) else str(text).encode("utf-8"))
-        toktypes.append(int(toktype))
+    for i in range(vocab_size):
+        if i not in reverse_vocab:
+            tokens.append(f"[PAD{i}]".encode("utf-8"))
+            toktypes.append(int(gguf.TokenType.UNUSED))
+            continue
 
-    writer.add_tokenizer_model(gguf.BpeVocab.tokenizer_model)  # "gpt2"
-    writer.add_tokenizer_pre(detect_bpe_pretokenizer(hf_dir))
+        text = reverse_vocab[i]
+        if text in added_vocab:
+            decoder_entry = added_tokens_decoder.get(i)
+            # llama.cpp assumes CONTROL/USER_DEFINED tokens are pre-normalized;
+            # a non-normalized added token is re-encoded/decoded once to match.
+            if decoder_entry is not None and not decoder_entry.normalized:
+                text = tokenizer.decode(tokenizer.encode(text, add_special_tokens=False))
+            is_special = (decoder_entry is not None and decoder_entry.special) or does_token_look_special(
+                reverse_vocab[i]
+            )
+            if is_special:
+                toktypes.append(int(gguf.TokenType.CONTROL))
+            else:
+                text = text.replace("▁", " ")
+                toktypes.append(int(gguf.TokenType.USER_DEFINED))
+        else:
+            toktypes.append(int(gguf.TokenType.NORMAL))
+        tokens.append(text.encode("utf-8"))
+
+    return tokens, toktypes
+
+
+def write_tokenizer(
+    writer: gguf.GGUFWriter, hf_dir: Path, config: dict, tokenizer_pre: str | None
+) -> None:
+    tokens, toktypes = get_vocab_base(hf_dir, config)
+
+    writer.add_tokenizer_model("gpt2")
+    writer.add_tokenizer_pre(tokenizer_pre if tokenizer_pre is not None else detect_bpe_pretokenizer(hf_dir))
     writer.add_token_list(tokens)
     writer.add_token_types(toktypes)
 
@@ -315,8 +375,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("hf_dir", type=Path, help="HF transformers checkpoint directory")
     parser.add_argument("out_gguf", type=Path, help="output .gguf path")
-    parser.add_argument("--type", required=True, choices=sorted(FILE_TYPE_FOR_OUT_TYPE))
+    parser.add_argument("--type", default=None, choices=sorted(FILE_TYPE_FOR_OUT_TYPE),
+                         help="required unless --vocab-only")
+    parser.add_argument("--tokenizer-pre", default=None, metavar="NAME",
+                         help="tokenizer.ggml.pre value; default falls back to detect_bpe_pretokenizer")
+    parser.add_argument("--vocab-only", action="store_true",
+                         help="write only general.architecture/name and tokenizer.* metadata, no tensors")
     args = parser.parse_args(argv)
+
+    if not args.vocab_only and args.type is None:
+        parser.error("--type is required unless --vocab-only")
 
     hf_dir: Path = args.hf_dir.resolve()
     config_path = hf_dir / "config.json"
@@ -337,7 +405,6 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     converter = converter_cls()
 
-    source = SafetensorsSource(hf_dir)
     arch_name = gguf.MODEL_ARCH_NAMES[converter.gguf_arch]
     model_name = config.get("_name_or_path") or hf_dir.name
 
@@ -345,18 +412,23 @@ def main(argv: list[str] | None = None) -> int:
     writer = gguf.GGUFWriter(str(args.out_gguf), arch_name, endianess=gguf.GGUFEndian.LITTLE)
     # GGUFWriter.__init__ already calls add_architecture() from the `arch` argument.
     writer.add_name(model_name)
-    converter.write_metadata(writer, config)
-    writer.add_file_type(FILE_TYPE_FOR_OUT_TYPE[args.type])
-    writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
 
     n_tensors = 0
-    for spec in converter.iter_tensors(source, config):
-        data, raw_dtype = select_tensor_dtype(spec.data, spec.force_f32, args.type)
-        writer.add_tensor(spec.name, data, raw_dtype=raw_dtype)
-        n_tensors += 1
+    if args.vocab_only:
+        print("note: --vocab-only: no tensors, no hparams beyond general.architecture/name", file=sys.stderr)
+    else:
+        converter.write_metadata(writer, config)
+        writer.add_file_type(FILE_TYPE_FOR_OUT_TYPE[args.type])
+        writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
+
+        source = SafetensorsSource(hf_dir)
+        for spec in converter.iter_tensors(source, config):
+            data, raw_dtype = select_tensor_dtype(spec.data, spec.force_f32, args.type)
+            writer.add_tensor(spec.name, data, raw_dtype=raw_dtype)
+            n_tensors += 1
 
     if (hf_dir / "tokenizer.json").exists():
-        write_tokenizer(writer, hf_dir)
+        write_tokenizer(writer, hf_dir, config, args.tokenizer_pre)
     else:
         print(f"note: no tokenizer.json in {hf_dir}; GGUF written without tokenizer metadata", file=sys.stderr)
 
@@ -365,7 +437,7 @@ def main(argv: list[str] | None = None) -> int:
     writer.write_tensors_to_file(progress=False)
     writer.close()
 
-    print(f"wrote {args.out_gguf} ({n_tensors} tensors, arch={arch_name}, type={args.type})")
+    print(f"wrote {args.out_gguf} ({n_tensors} tensors, arch={arch_name}, type={args.type or 'vocab-only'})")
     return 0
 
 

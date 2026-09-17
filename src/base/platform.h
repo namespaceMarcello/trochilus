@@ -47,4 +47,23 @@ void tr_log(int level, const char *fmt, ...)
     ;
 void tr_log_set_level(int level);
 
+/* stdout writes bytes as given: no "\n" -> "\r\n" translation on Windows (no-op elsewhere).
+ * For commands whose output is data (token ids, generated text). */
+void tr_stdout_binary(void);
+
+/* One line of stdin as UTF-8, without its line ending (a Windows console is read as
+ * UTF-16 and converted; a pipe or file is read as bytes). malloc'd, *len its length.
+ * NULL at end of input (Ctrl+D, Ctrl+Z) or if memory ran out. */
+char *tr_stdin_line(size_t *len);
+
+#if defined(_WIN32)
+#include <wchar.h>
+/* Windows gives wmain its arguments in UTF-16: the same arguments as UTF-8 strings
+ * (argv[argc] is NULL). NULL if memory ran out or an argument does not convert. */
+char **tr_utf8_argv(int argc, wchar_t **wargv);
+void tr_utf8_argv_free(int argc, char **argv);
+/* Console output as UTF-8 (a Windows console starts in the OEM code page). */
+void tr_console_utf8(void);
+#endif
+
 #endif

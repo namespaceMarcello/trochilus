@@ -12,7 +12,7 @@
 #define TR_HAVE_RDTSC 0
 #endif
 
-static const char *zone_names[TR_PROF_ZONE_COUNT] = {
+static const char *const zone_names[TR_PROF_ZONE_COUNT] = {
     [TR_PROF_TOKEN] = "token",
     [TR_PROF_EMBED] = "embed",
     [TR_PROF_ATTN_NORM] = "attn_norm",
@@ -35,7 +35,7 @@ static const char *zone_names[TR_PROF_ZONE_COUNT] = {
     [TR_PROF_POOL_WAIT] = "pool_wait",
 };
 
-static const char *phase_names[TR_PHASE_COUNT] = {"prefill", "decode"};
+static const char *const phase_names[TR_PHASE_COUNT] = {"prefill", "decode"};
 
 const char *tr_prof_zone_name(tr_prof_zone z) {
     return (unsigned)z < TR_PROF_ZONE_COUNT ? zone_names[z] : "?";
@@ -50,8 +50,8 @@ void tr_prof_reset(tr_prof *p) {
 
 /* ------------------------------------------------------------------ ticks */
 
-static int tick_mode = -1;          /* -1 unknown, 0 OS clock (ns), 1 RDTSC */
-static double tick_rate = 1e9;
+static int tick_mode = -1;          /* global-ok: clock of the machine; -1 unknown, 0 OS clock (ns), 1 RDTSC */
+static double tick_rate = 1e9;      /* global-ok: calibrated once for the machine */
 
 static void tick_init(void) {
     if (tick_mode >= 0) return;

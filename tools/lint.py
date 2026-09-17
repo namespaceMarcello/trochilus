@@ -174,9 +174,72 @@ def check_hot_zones():
             failures.append(f"[zona calda, docs/ARCHITETTURA.md] {rel}:{line}: {msg}")
 
 
+# No global state per model (CLAUDE.md): a mutable static variable in src/ is shared by every
+# model and thread in the process. Process-wide facts (CPU features, log level) are allowed on
+# the line with /* global-ok: reason */.
+def mutable_static(line):
+    """True if the line declares a static variable whose outermost object can be written."""
+    m = re.match(r"^\s*static\s+(.*)$", line)
+    if not m or m.group(1).startswith("inline"):
+        return False
+    parts = re.split(r"[=;\[]", m.group(1), maxsplit=1)
+    head = parts[0]
+    if len(parts) == 1 or "(" in head:      # a function, or a declaration going on the next line
+        return False
+    if "*" in head:                         # the pointer itself must be const: T *const p
+        return re.search(r"\*\s*const\b[^*]*$", head) is None
+    return re.search(r"\bconst\b", head) is None
+
+
+def global_problems(text):
+    """(line, declaration) for every mutable static variable without a global-ok note."""
+    stripped = re.sub(r"/\*.*?\*/", lambda m: re.sub(r"[^\n]", " ", m.group(0)), text, flags=re.S)
+    stripped = re.sub(r"//[^\n]*", "", stripped)
+    raw = text.split("\n")
+    return [(n + 1, line.strip()) for n, line in enumerate(stripped.split("\n"))
+            if mutable_static(line) and "global-ok:" not in raw[n]]
+
+
+def check_global_state():
+    """#28: a qsort comparison context kept in a static variable made loading two tokenizers at once a race."""
+    samples = [
+        ("static int x = 0;\n", 1),
+        ("    static uint32_t counter;\n", 1),
+        ("static tr_kernels g_a, g_b;\n", 1),
+        ("static char buf[64];\n", 1),
+        ("static const int x = 0;\n", 0),
+        ("static const tr_kernels *g_active = NULL;\n", 1),
+        ("static const char *names[] = {0};\n", 1),
+        ("static const char *const names[] = {0};\n", 0),
+        ("static int f(void) {\n", 0),
+        ("static inline int g(int a) { return a; }\n", 0),
+        ("static int x = 0; /* global-ok: log level -- sample */\n", 0),
+        ("/* static int x; */\n", 0),
+    ]
+    for n, (text, want) in enumerate(samples, 1):
+        got = len(global_problems(text))
+        if got != want:
+            fail(28, f"il controllo dello stato globale è rotto: campione {n} dà {got} problemi invece di {want}")
+            return
+    for path in sorted((ROOT / "src").rglob("*.[ch]")):
+        rel = path.relative_to(ROOT).as_posix()
+        for line, decl in global_problems(path.read_text(encoding="utf-8")):
+            fail(28, f"{rel}:{line}: variabile statica mutabile (stato globale): `{decl}`; "
+                     "se è un fatto del processo, annotala con /* global-ok: motivo */")
+
+
+def check_makefile_recipes_ascii():
+    """#36: GNU make on Windows passes recipes to the shell in the local code page."""
+    for n, line in enumerate((ROOT / "Makefile").read_text(encoding="utf-8").split("\n"), 1):
+        if line.startswith("\t") and not line.isascii():
+            fail(36, f"Makefile:{n}: carattere non ASCII in una ricetta (su Windows arriva rovinato); "
+                     "mettilo in uno script in tools/")
+
+
 def main():
     for check in (check_docs_control_chars, check_doc_limits, check_lessons_table,
-                  check_type_table, check_tests_no_tmpfile, check_hot_zones):
+                  check_type_table, check_tests_no_tmpfile, check_hot_zones, check_global_state,
+                  check_makefile_recipes_ascii):
         check()
     for f in failures:
         print(f)

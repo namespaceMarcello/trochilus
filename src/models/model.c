@@ -152,6 +152,10 @@ int64_t tr_session_pos(const tr_session *s) {
     return s->vt->pos(s->impl);
 }
 
+int tr_session_rewind(tr_session *s, int64_t n) {
+    return s->vt->rewind(s->impl, n);
+}
+
 tr_prof *tr_session_prof(tr_session *s) {
     return s->vt->prof(s->impl);
 }

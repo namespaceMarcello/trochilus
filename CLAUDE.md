@@ -83,6 +83,11 @@ make check               # il cancello: lint, build 0 warning, test, ASan, TSan,
 make                     # build/trochilus (nucleo, senza dipendenze)
 make test                # test C: kernel SIMD = scalare, GGUF malformati, pool, profiler
 make oracle              # modelli minuscoli: genera, converte, confronta con transformers
+make oracle-tokenizer    # tokenizer di OLMoE contro transformers: id, pezzi, NFC, decodifica
+build/trochilus run -m <file.gguf> -f prompt.txt -n 200    # testo in entrata, generazione greedy
+build/trochilus chat -m <file.gguf>                       # conversazione con il template del modello
+make chat-check          # chat sul modello vero: seconda risposta = run da zero (saltato senza modello)
+sh tools/build_llamacpp.sh; tools/compare_llamacpp.py ...   # nel container: llama.cpp e confronto dei logit
 make bench               # microbenchmark dei kernel (mediana + rumore)
 make profile             # scenari col profiler, mediana di N, token identici, confronto col precedente
 make profile SCENARIOS=bench/scenarios-olmoe-1b-7b.json   # modello vero, 16/8/4/1 thread

@@ -23,6 +23,8 @@
 
 #if defined(_WIN32)
 #  include <windows.h>
+#  include <fcntl.h>
+#  include <io.h>
 #else
 #  include <errno.h>
 #  include <fcntl.h>
@@ -64,6 +66,35 @@ static wchar_t *utf8_to_utf16(const char *path) {
         return NULL;
     }
     return w;
+}
+
+void tr_utf8_argv_free(int argc, char **argv) {
+    if (argv == NULL) return;
+    for (int i = 0; i < argc; i++) free(argv[i]);
+    free(argv);
+}
+
+char **tr_utf8_argv(int argc, wchar_t **wargv) {
+    char **argv = calloc((size_t)argc + 1, sizeof(char *));
+    if (argv == NULL) return NULL;
+    for (int i = 0; i < argc; i++) {
+        int needed = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, NULL, 0, NULL, NULL);
+        if (needed <= 0 || (argv[i] = malloc((size_t)needed)) == NULL ||
+            WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, argv[i], needed, NULL, NULL) <= 0) {
+            tr_utf8_argv_free(argc, argv);
+            return NULL;
+        }
+    }
+    return argv;
+}
+
+void tr_console_utf8(void) {
+    SetConsoleOutputCP(CP_UTF8);
+}
+
+void tr_stdout_binary(void) {
+    fflush(stdout);
+    _setmode(_fileno(stdout), _O_BINARY);
 }
 
 tr_file *tr_file_open(const char *path, char *err, size_t err_len) {
@@ -149,8 +180,8 @@ void tr_free_aligned(void *p) {
 }
 
 double tr_time_sec(void) {
-    static LARGE_INTEGER freq;
-    static int have_freq = 0;
+    static LARGE_INTEGER freq;   /* global-ok: the performance counter frequency is fixed at boot */
+    static int have_freq = 0;    /* global-ok: same value from every thread */
     if (!have_freq) {
         QueryPerformanceFrequency(&freq); /* idempotent: every thread computes the same value */
         have_freq = 1;
@@ -174,6 +205,9 @@ int tr_mem_info(tr_meminfo *out) {
 }
 
 #else /* POSIX: Linux and macOS */
+
+void tr_stdout_binary(void) {
+}
 
 tr_file *tr_file_open(const char *path, char *err, size_t err_len) {
     int fd = open(path, O_RDONLY);
@@ -305,7 +339,79 @@ int tr_mem_info(tr_meminfo *out) {
 
 #endif /* POSIX */
 
-static int g_log_level = TR_LOG_INFO;
+/* Bytes up to '\n'; the line without "\n" or "\r\n". NULL at end of input. */
+static char *read_line_bytes(FILE *in, size_t *len) {
+    size_t cap = 256, n = 0;
+    char *buf = malloc(cap);
+    if (buf == NULL) return NULL;
+    int c;
+    while ((c = fgetc(in)) != EOF && c != '\n') {
+        if (n + 1 == cap) {
+            char *grown = realloc(buf, cap * 2);
+            if (grown == NULL) {
+                free(buf);
+                return NULL;
+            }
+            buf = grown;
+            cap *= 2;
+        }
+        buf[n++] = (char)c;
+    }
+    if (c == EOF && n == 0) {
+        free(buf);
+        return NULL;
+    }
+    if (n > 0 && buf[n - 1] == '\r') n--;
+    buf[n] = '\0';
+    *len = n;
+    return buf;
+}
+
+char *tr_stdin_line(size_t *len) {
+#if defined(_WIN32)
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode;
+    if (h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &mode)) {
+        size_t cap = 256, n = 0;
+        wchar_t *w = malloc(cap * sizeof(wchar_t));
+        if (w == NULL) return NULL;
+        for (;;) {
+            if (cap - n < 128) {
+                wchar_t *grown = realloc(w, cap * 2 * sizeof(wchar_t));
+                if (grown == NULL) {
+                    free(w);
+                    return NULL;
+                }
+                w = grown;
+                cap *= 2;
+            }
+            DWORD got = 0;
+            if (!ReadConsoleW(h, w + n, (DWORD)(cap - n - 1), &got, NULL) || got == 0) break;
+            n += got;
+            if (w[n - 1] == L'\n') break;
+        }
+        if (n == 0 || w[0] == 0x1A) {   /* end of input, or Ctrl+Z */
+            free(w);
+            return NULL;
+        }
+        while (n > 0 && (w[n - 1] == L'\n' || w[n - 1] == L'\r')) n--;
+        int need = n > 0 ? WideCharToMultiByte(CP_UTF8, 0, w, (int)n, NULL, 0, NULL, NULL) : 0;
+        char *out = need >= 0 ? malloc((size_t)need + 1) : NULL;
+        if (out == NULL || (need > 0 && WideCharToMultiByte(CP_UTF8, 0, w, (int)n, out, need, NULL, NULL) != need)) {
+            free(out);
+            free(w);
+            return NULL;
+        }
+        out[need] = '\0';
+        free(w);
+        *len = (size_t)need;
+        return out;
+    }
+#endif
+    return read_line_bytes(stdin, len);
+}
+
+static int g_log_level = TR_LOG_INFO;   /* global-ok: one log level for the process */
 
 void tr_log_set_level(int level) {
     g_log_level = level;

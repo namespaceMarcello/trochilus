@@ -106,9 +106,9 @@ int tr_kernels_support(tr_type type) {
     return type == TR_TYPE_F32 || type == TR_TYPE_F16 || type == TR_TYPE_Q8_0;
 }
 
-static tr_kernels g_scalar_kernels;
-static int g_scalar_built = 0;
-static const tr_kernels *g_active = NULL;
+static tr_kernels g_scalar_kernels;          /* global-ok: kernel tables depend only on the CPU */
+static int g_scalar_built = 0;               /* global-ok: same */
+static const tr_kernels *g_active = NULL;    /* global-ok: tier chosen for the CPU (or forced by tests) */
 
 static void build_scalar_table(tr_kernels *k) {
     memset(k, 0, sizeof *k);

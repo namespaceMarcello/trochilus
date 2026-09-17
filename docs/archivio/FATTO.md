@@ -104,3 +104,36 @@ per volta in `tr_attention_head` (somma pesata con il kernel nuovo `axpy_f32`, s
 AVX-512), teste in parallelo con una riga di punteggi per thread. Logit del modello vero identici al
 bit a prima. Prova: `make check`; `trochilus logits` sugli stessi token con il binario di prima e di
 dopo, `cmp` dei file; `make profile SCENARIOS=bench/scenarios-olmoe-1b-7b.json`.
+
+### 2026-09-17 — Tokenizer BPE dai metadati GGUF, esatto contro transformers; `trochilus run` con testo
+`src/tokenizer/`: token, tipi e merge letti dal GGUF (il merge diventa coppia di id → rango e
+risultato), added token cercati leftmost-longest per primo byte, NFC e classi `\p{L}` `\p{N}` `\s`
+da tabelle generate sondando HF `tokenizers` 0.22.2 (`tools/gen_unicode_tables.py`), regole GPT-2
+rigiocate sui codepoint, BPE con coda di priorità (n log n). Famiglie ammesse solo con oracolo: oggi
+`olmo`. Comandi `trochilus tokenize` (anche a lotti, pezzi, decodifica) e `trochilus run` (testo in
+entrata, generazione greedy in uscita). Convertitore: vocabolario come `convert_hf_to_gguf.py` di
+llama.cpp e modalità `--vocab-only`. Windows: argomenti in UTF-8 (`wmain`), stdout binario.
+Lint: niente variabili statiche mutabili senza `global-ok`. Test con timeout.
+Prova: `make check` (test C `test_tokenizer` e `test_unicode`, `make oracle-tokenizer`: 20 745 testi
+con sweep di tutti i codepoint, 0 differenze su id, pezzi, testo normalizzato e decodifica; metadati
+del GGUF vero identici); `trochilus run -m models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf -f prompt.txt -n 120`.
+
+### 2026-09-17 — `trochilus chat`: conversazione con il template del modello
+`src/tokenizer/chat.c`: il template di chat del GGUF si riconosce dai suoi byte esatti (lunghezza e
+FNV-1a) e si rende in C; un template sconosciuto si rifiuta (oggi: OLMoE-0125-Instruct).
+`tr_session_rewind` nel modello: a ogni turno la chat rende tutta la conversazione, tiene i token
+già in cache uguali e calcola solo il resto. Console Windows letta in UTF-16 (`tr_stdin_line`),
+caratteri spezzati fra due token stampati interi. Comandi `trochilus chat` e `chat-template`
+(per l'oracolo). Prova: `make check` (`test_session`: logit identici al bit dopo il rewind;
+`make oracle-tokenizer`: 600 conversazioni uguali ad `apply_chat_template`, testo e token;
+`make chat-check`: sul modello vero la seconda risposta della chat è identica a `run` sulla
+conversazione intera); a mano: `build/trochilus chat -m models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf`.
+Senza `-c`, se la RAM non basta per 4096 token la chat dimezza il contesto e lo scrive (LEZIONI #37).
+
+### 2026-09-17 — Confronto con llama.cpp sul modello vero (strumenti)
+`ref/llama.cpp` (commit `b49650a`, solo riferimento) compilato nel container da
+`tools/build_llamacpp.sh`, con `tools/llamacpp_logits.c` (logit per posizione nello stesso formato di
+`trochilus logits`, generazione greedy). `tools/compare_llamacpp.py` confronta tokenizzazione, greedy
+e logit per posizione (parola migliore, KL, margini). Risultati in `docs/MISURE.md`. Prova:
+`sh tools/build_llamacpp.sh` e `tools/compare_llamacpp.py ... --prompt bench/prompts/dante.txt` nel
+container. `make check` su Windows ora svuota alla fine la cache della VM di Docker.

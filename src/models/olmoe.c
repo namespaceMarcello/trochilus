@@ -788,6 +788,15 @@ static int64_t olmoe_pos(const void *session) {
     return s->pos;
 }
 
+/* The cache rows past n are simply overwritten by the next eval: attention only ever
+ * reads positions below the current one. */
+static int olmoe_rewind(void *session, int64_t n) {
+    olmoe_session *s = (olmoe_session *)session;
+    if (n < 0 || n > s->pos) return -1;
+    s->pos = n;
+    return 0;
+}
+
 static tr_prof *olmoe_prof(void *session) {
     olmoe_session *s = (olmoe_session *)session;
     return &s->prof;
@@ -803,5 +812,6 @@ const tr_arch_vtable tr_olmoe_vtable = {
     olmoe_eval,
     olmoe_logits,
     olmoe_pos,
+    olmoe_rewind,
     olmoe_prof,
 };

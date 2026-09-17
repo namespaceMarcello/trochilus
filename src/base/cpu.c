@@ -329,8 +329,8 @@ static void apply_cpu_max(tr_cpu_info *c) {
 
 /* ---- cache and public API -------------------------------------------- */
 
-static tr_cpu_info g_cpu;
-static int g_detected = 0; /* see the file header comment for the race-free assumption */
+static tr_cpu_info g_cpu;     /* global-ok: the CPU is a fact of the process */
+static int g_detected = 0;    /* global-ok: CPU detected once; see the file header comment for the race-free assumption */
 
 const tr_cpu_info *tr_cpu(void) {
     if (!g_detected) {

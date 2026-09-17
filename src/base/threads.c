@@ -82,8 +82,8 @@ struct tr_pool {
 #endif
 };
 
-static _Thread_local int t_worker_id = -1;
-static _Thread_local int t_depth = 0;
+static _Thread_local int t_worker_id = -1;  /* global-ok: per thread, not per model */
+static _Thread_local int t_depth = 0;       /* global-ok: per thread, not per model */
 
 #if defined(_WIN32)
 #  define POOL_LOCK(p)      AcquireSRWLockExclusive(&(p)->lock)
