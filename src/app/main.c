@@ -19,6 +19,7 @@
 #include "../base/prof.h"
 #include "../base/threads.h"
 #include "../format/gguf.h"
+#include "../gen/greedy.h"
 #include "../kernels/kernels.h"
 #include "../models/model.h"
 #include "../tokenizer/chat.h"
@@ -230,10 +231,11 @@ static int write_profile_json(const char *path, tr_prof *prof, const char *model
 
 static int cmd_generate(int argc, char **argv) {
     const char *model_path = NULL, *tokens_str = NULL, *profile_json_path = NULL;
-    int64_t n_gen = -1, n_prompt_synth = -1, n_ctx = 0, n_batch = 0;
+    int64_t n_gen = -1, n_prompt_synth = -1, n_ctx = 0, n_batch = 0, n_draft = 0;
     int n_threads = 0, do_profile = 0;
 
     for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--spec") == 0 && i + 1 < argc) { n_draft = atoll(argv[++i]); continue; }
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) model_path = argv[++i];
         else if (strcmp(argv[i], "--tokens") == 0 && i + 1 < argc) tokens_str = argv[++i];
         else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) n_prompt_synth = atoll(argv[++i]);
@@ -252,7 +254,12 @@ static int cmd_generate(int argc, char **argv) {
     if (model_path == NULL || n_gen < 0 || (tokens_str == NULL) == (n_prompt_synth < 0)) {
         fprintf(stderr,
                 "usage: trochilus generate -m <file.gguf> (--tokens id,id,... | -p <n>) -n <count>\n"
-                "                   [-t threads] [-c context] [-b batch] [--profile] [--profile-json <file>]\n");
+                "                   [-t threads] [-c context] [-b batch] [--spec <draft>]\n"
+                "                   [--profile] [--profile-json <file>]\n");
+        return 2;
+    }
+    if (n_draft < 0 || n_draft > TR_GREEDY_DRAFT_MAX) {
+        fprintf(stderr, "generate: --spec must be between 0 and %d\n", TR_GREEDY_DRAFT_MAX);
         return 2;
     }
 
@@ -332,19 +339,57 @@ static int cmd_generate(int argc, char **argv) {
 
     int64_t produced = 0;
     int context_full = 0;
-    for (int64_t i = 0; i < n_gen; i++) {
-        const float *logits = tr_session_logits(sess);
-        uint64_t ts = tr_prof_begin(prof);
-        int32_t next = argmax_f32(logits, info->vocab_size);
-        tr_prof_end(prof, TR_PROF_SAMPLE, ts);
-        generated[i] = next;
-        produced++;
-        if (i + 1 < n_gen) {
-            if (tr_session_eval(sess, &next, 1) != 0) {
+    tr_greedy g;
+    int32_t *hist = NULL;
+    if (n_draft == 0) {
+        for (int64_t i = 0; i < n_gen; i++) {
+            const float *logits = tr_session_logits(sess);
+            uint64_t ts = tr_prof_begin(prof);
+            int32_t next = argmax_f32(logits, info->vocab_size);
+            tr_prof_end(prof, TR_PROF_SAMPLE, ts);
+            generated[i] = next;
+            produced++;
+            if (i + 1 < n_gen) {
+                if (tr_session_eval(sess, &next, 1) != 0) {
+                    fprintf(stderr, "generate: context full while generating\n");
+                    context_full = 1;
+                    break;
+                }
+            }
+        }
+    } else {
+        /* the draft is read from prompt and generated tokens together, so they live in one buffer */
+        size_t cap = (size_t)(n_prompt + n_gen + n_draft + 1);
+        hist = (int32_t *)malloc(cap * sizeof(int32_t));
+        if (hist == NULL) {
+            fprintf(stderr, "generate: out of memory\n");
+            free(generated);
+            free(prompt);
+            tr_session_free(sess);
+            tr_model_free(model);
+            tr_pool_destroy(pool);
+            return 1;
+        }
+        memcpy(hist, prompt, (size_t)n_prompt * sizeof(int32_t));
+        if (tr_greedy_init(&g, sess, info->vocab_size, tr_session_n_ctx(sess), n_draft, hist, n_prompt) != 0) {
+            fprintf(stderr, "generate: could not start speculation\n");
+            free(hist);
+            free(generated);
+            free(prompt);
+            tr_session_free(sess);
+            tr_model_free(model);
+            tr_pool_destroy(pool);
+            return 1;
+        }
+        int32_t step[1 + TR_GREEDY_DRAFT_MAX];
+        while (produced < n_gen) {
+            int64_t got = tr_greedy_step(&g, step);
+            if (got < 0) {
                 fprintf(stderr, "generate: context full while generating\n");
                 context_full = 1;
                 break;
             }
+            for (int64_t j = 0; j < got && produced < n_gen; j++) generated[produced++] = step[j];
         }
     }
     double t2 = tr_time_sec();
@@ -360,6 +405,13 @@ static int cmd_generate(int argc, char **argv) {
     int64_t evals = produced > 0 ? produced - 1 : 0;
     fprintf(stderr, "generate: %" PRId64 " tokens, %" PRId64 " evaluations in %.4fs (%.2f tok/s)\n", produced,
             evals, gen_secs, gen_secs > 0 ? (double)evals / gen_secs : 0.0);
+    if (n_draft > 0) {
+        fprintf(stderr, "speculation: %" PRIu64 " passes, %" PRIu64 "/%" PRIu64 " drafted tokens accepted (%.1f%%), "
+                        "%.2f tokens per pass\n",
+                g.n_steps, g.n_accepted, g.n_drafted,
+                g.n_drafted > 0 ? 100.0 * (double)g.n_accepted / (double)g.n_drafted : 0.0,
+                g.n_steps > 0 ? (double)(g.n_steps + g.n_accepted) / (double)g.n_steps : 0.0);
+    }
 
     if (do_profile) tr_prof_print(prof, stderr);
     /* fewer tokens than asked is a failure, not a success with short output (LEZIONI #17) */
@@ -370,6 +422,7 @@ static int cmd_generate(int argc, char **argv) {
         rc = 1;
     }
 
+    free(hist);
     free(generated);
     free(prompt);
     tr_session_free(sess);
@@ -620,9 +673,10 @@ static int cmd_tokenize(int argc, char **argv) {
 
 static int cmd_run(int argc, char **argv) {
     const char *model_path = NULL, *text = NULL, *file = NULL;
-    int64_t n_max = 256, n_ctx = 0, n_batch = 0;
+    int64_t n_max = 256, n_ctx = 0, n_batch = 0, n_draft = 0;
     int n_threads = 0, flags = TR_TOK_ADD_SPECIAL | TR_TOK_PARSE_SPECIAL;
     for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--spec") == 0 && i + 1 < argc) { n_draft = atoll(argv[++i]); continue; }
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) model_path = argv[++i];
         else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) text = argv[++i];
         else if (strcmp(argv[i], "-f") == 0 && i + 1 < argc) file = argv[++i];
@@ -636,9 +690,11 @@ static int cmd_run(int argc, char **argv) {
             break;
         }
     }
-    if (model_path == NULL || (text != NULL) == (file != NULL) || n_max < 0) {
+    if (model_path == NULL || (text != NULL) == (file != NULL) || n_max < 0 || n_draft < 0 ||
+        n_draft > TR_GREEDY_DRAFT_MAX) {
         fprintf(stderr, "usage: trochilus run -m <file.gguf> (-p <text> | -f <file>) [-n <max tokens>]\n"
-                        "                     [-t threads] [-c context] [-b batch] [--no-parse-special]\n");
+                        "                     [-t threads] [-c context] [-b batch] [--spec <draft>]\n"
+                        "                     [--no-parse-special]\n");
         return 2;
     }
 
@@ -691,23 +747,44 @@ static int cmd_run(int argc, char **argv) {
         goto done;
     }
     double t1 = tr_time_sec();
-    /* greedy until the end-of-sequence token, any control token (never content), or n_max */
+    /* greedy until the end-of-sequence token, any control token (never content), or n_max.
+     * With --spec a step returns more than one token at a time; the tokens are the same. */
     int64_t produced = 0;
     int context_full = 0;
     int32_t eos = tr_tokenizer_eos(tok);
-    while (produced < n_max) {
-        int32_t next = argmax_f32(tr_session_logits(sess), info->vocab_size);
-        produced++;
-        if (next == eos || tr_tokenizer_type(tok, next) == TR_TOKEN_CONTROL) break;
-        size_t pl;
-        const char *piece = tr_tokenizer_piece(tok, next, &pl);
-        fwrite(piece, 1, pl, stdout);
-        fflush(stdout);
-        if (produced < n_max && tr_session_eval(sess, &next, 1) != 0) {
+    tr_greedy g;
+    int32_t *hist = (int32_t *)malloc((n_prompt + (size_t)(n_max + n_draft + 1)) * sizeof(int32_t));
+    if (hist == NULL) {
+        fprintf(stderr, "run: out of memory\n");
+        goto done;
+    }
+    memcpy(hist, prompt, n_prompt * sizeof(int32_t));
+    if (tr_greedy_init(&g, sess, info->vocab_size, tr_session_n_ctx(sess), n_draft, hist, (int64_t)n_prompt) != 0) {
+        fprintf(stderr, "run: could not start generation\n");
+        free(hist);
+        goto done;
+    }
+    int32_t step[1 + TR_GREEDY_DRAFT_MAX];
+    int stopped = 0;
+    while (produced < n_max && !stopped) {
+        int64_t got = tr_greedy_step(&g, step);
+        if (got < 0) {
             context_full = 1;
             break;
         }
+        for (int64_t j = 0; j < got && produced < n_max; j++) {
+            produced++;
+            if (step[j] == eos || tr_tokenizer_type(tok, step[j]) == TR_TOKEN_CONTROL) {
+                stopped = 1;
+                break;
+            }
+            size_t pl;
+            const char *piece = tr_tokenizer_piece(tok, step[j], &pl);
+            fwrite(piece, 1, pl, stdout);
+        }
+        fflush(stdout);
     }
+    free(hist);
     double t2 = tr_time_sec();
     printf("\n");
     if (context_full) fprintf(stderr, "run: context full\n");
@@ -715,6 +792,10 @@ static int cmd_run(int argc, char **argv) {
             t1 > t0 ? (double)n_prompt / (t1 - t0) : 0.0);
     fprintf(stderr, "generate: %" PRId64 " tokens in %.4fs (%.2f tok/s)\n", produced, t2 - t1,
             t2 > t1 ? (double)produced / (t2 - t1) : 0.0);
+    if (n_draft > 0)
+        fprintf(stderr, "speculation: %" PRIu64 " passes, %" PRIu64 "/%" PRIu64 " drafted tokens accepted (%.1f%%)\n",
+                g.n_steps, g.n_accepted, g.n_drafted,
+                g.n_drafted > 0 ? 100.0 * (double)g.n_accepted / (double)g.n_drafted : 0.0);
     rc = context_full ? 3 : 0;
 
 done:

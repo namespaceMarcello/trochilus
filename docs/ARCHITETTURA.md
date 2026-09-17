@@ -117,6 +117,7 @@ codice macchina con e senza, verificato): nella zona calda restano quelli che sp
 | `src/kv/` | cache KV, riuso del prefisso, checkpoint su disco con punteggio a decadimento | colibri `kv_prefix.h`, `kv_fp8.h`; ds4 `ds4_kvstore.c` |
 | `src/tokenizer/` | BPE byte-level dai metadati GGUF (famiglie di pretokenizer ammesse solo con oracolo), NFC e classi Unicode sondate da HF `tokenizers`, template di chat per architettura | idee: colibri `tok.h` (regex rigiocata in C), ds4 `vocab_load` (dal GGUF); codice nuovo |
 | `src/models/` | un grafo per famiglia, costruito dalle primitive | colibri `olmoe.c`, ds4 / colibri DeepSeek V4 |
+| `src/gen/` | come si sceglie il token dopo il modello: greedy, bozza dal prompt e verifica in una passata sola (poi campionamento e criteri di arresto) | idee: colibri `v4_ngram_draft`, llama.cpp `examples/lookup`; codice nuovo |
 | `src/app/` | CLI, poi server (API OpenAI e Anthropic) | entrambi |
 | `backends/cuda/`, `backends/metal/` | moduli GPU caricabili | ds4 `cuda/mmq` (ggml, MIT), `metal/*.metal` |
 | `tools/` | convertitore HF → GGUF, generatori dei modelli minuscoli (Python, fuori dal motore) | colibri `tools/make_*_tiny.py` |
@@ -136,9 +137,17 @@ codice macchina con e senza, verificato): nella zona calda restano quelli che sp
   identici al bit per ogni `n_batch`. Gli esperti lavorano sulle coppie (token, esperto) ordinate per
   esperto; le matrici si visitano a blocchi di token, e una riga di pesi va contro 4 token alla volta
   nei registri (`dot_row_x4`: un carico e una conversione per quattro prodotti, ognuno identico al suo
-  `dot_row`). Logit solo per l'ultimo token.
+  `dot_row`). Logit dell'ultimo token, o delle ultime `n` posizioni quando servono a verificare
+  una bozza (`tr_session_eval_rows`, al più `TR_LOGIT_ROWS_MAX`).
+- **Speculazione dal prompt** (`src/gen/`): la bozza è la continuazione dell'ultima occorrenza
+  dell'n-gramma di coda nel contesto; una passata sola verifica 1 + k posizioni e si tengono solo i
+  token che il modello avrebbe scelto comunque, gli altri spariscono con `tr_session_rewind`. Poiché
+  ogni riga di una passata è identica al bit alla passata da un token, i token generati sono gli
+  stessi con e senza speculazione: è velocità, mai un risultato diverso.
 - **Thread**: pool persistente dimensionato sui **core fisici** (colibri: +2.3x su Zen 3 contro i
-  core logici), `parallel_for` su intervalli di righe.
+  core logici), `parallel_for` su intervalli di righe. Contarli non basta: se non si fissano ai core,
+  Windows ne appoggia due sullo stesso core fisico e il prefill perde il 30% (`docs/MISURE.md`
+  §Dove vanno i thread).
 - **GPU**: tutto il token in un solo lotto di comandi, tensori che restano sul dispositivo (ds4).
 - **KV**: in memoria per sessione; riuso del prefisso per id di token; checkpoint su disco con
   punteggio `(hit decaduti + 1) × token / byte` (ds4).

@@ -27,6 +27,10 @@ typedef struct {
 typedef struct tr_model tr_model;
 typedef struct tr_session tr_session;
 
+/* Most token positions of one pass whose logits a session can keep (tr_session_eval_rows).
+ * The buffer costs this many rows of vocab floats, so it stays small on purpose. */
+#define TR_LOGIT_ROWS_MAX 16
+
 /* Opens `path`, loads every weight into memory (M0: no streaming yet) and
  * keeps `pool` for compute. NULL on failure with a message in err. */
 tr_model *tr_model_load(const char *path, tr_pool *pool, char *err, size_t err_len);
@@ -44,10 +48,24 @@ void tr_session_free(tr_session *s);
  * eval calls. -1 if the context is full or a token id is out of range (the session is
  * then unchanged). */
 int tr_session_eval(tr_session *s, const int32_t *tokens, int64_t n);
+/* Like tr_session_eval, but keeps the logits of the last n_logits tokens instead of the
+ * last one: tr_session_logits_back(s, j) is then valid for 0 <= j < n_logits. Needs the
+ * tokens to fit one pass, so 1 <= n_logits <= n <= n_batch and n_logits <= TR_LOGIT_ROWS_MAX;
+ * -1 otherwise (the session is unchanged). Every row is bit-identical to the logits the
+ * same token would give evaluated one at a time: that is what makes speculation exact. */
+int tr_session_eval_rows(tr_session *s, const int32_t *tokens, int64_t n, int64_t n_logits);
 /* vocab_size logits of the last evaluated token, valid until the next eval. */
 const float *tr_session_logits(const tr_session *s);
+/* vocab_size logits of the token `back` positions before the last one (back = 0: the last).
+ * Only the rows the previous eval kept are valid; NULL for any other `back`. */
+const float *tr_session_logits_back(const tr_session *s, int64_t back);
 /* Number of tokens already in the KV cache. */
 int64_t tr_session_pos(const tr_session *s);
+/* Tokens the session has room for (what tr_session_create settled on). */
+int64_t tr_session_n_ctx(const tr_session *s);
+/* Most rows tr_session_eval_rows can keep: min(n_batch, TR_LOGIT_ROWS_MAX). A small -b
+ * therefore caps how many tokens one pass can verify. */
+int64_t tr_session_max_logit_rows(const tr_session *s);
 /* Forgets every token after the first n (0 <= n <= pos): the next eval continues from
  * position n exactly as if only those n tokens had been evaluated. The logits are
  * not valid again until the next eval. -1 if n is out of range (nothing changes). */
@@ -67,9 +85,11 @@ typedef struct {
     const tr_model_info *(*info)(const void *model);
     void *(*session_create)(void *model, int64_t n_ctx, int64_t n_batch, char *err, size_t err_len);
     void (*session_free)(void *session);
-    int (*eval)(void *session, const int32_t *tokens, int64_t n);
-    const float *(*logits)(const void *session);
+    int (*eval)(void *session, const int32_t *tokens, int64_t n, int64_t n_logits);
+    const float *(*logits)(const void *session, int64_t back);
     int64_t (*pos)(const void *session);
+    int64_t (*n_ctx)(const void *session);
+    int64_t (*max_logit_rows)(const void *session);
     int (*rewind)(void *session, int64_t n);
     tr_prof *(*prof)(void *session);
 } tr_arch_vtable;

@@ -141,15 +141,31 @@ void tr_session_free(tr_session *s) {
 }
 
 int tr_session_eval(tr_session *s, const int32_t *tokens, int64_t n) {
-    return s->vt->eval(s->impl, tokens, n);
+    return s->vt->eval(s->impl, tokens, n, 1);
+}
+
+int tr_session_eval_rows(tr_session *s, const int32_t *tokens, int64_t n, int64_t n_logits) {
+    return s->vt->eval(s->impl, tokens, n, n_logits);
+}
+
+const float *tr_session_logits_back(const tr_session *s, int64_t back) {
+    return s->vt->logits(s->impl, back);
 }
 
 const float *tr_session_logits(const tr_session *s) {
-    return s->vt->logits(s->impl);
+    return s->vt->logits(s->impl, 0);
 }
 
 int64_t tr_session_pos(const tr_session *s) {
     return s->vt->pos(s->impl);
+}
+
+int64_t tr_session_n_ctx(const tr_session *s) {
+    return s->vt->n_ctx(s->impl);
+}
+
+int64_t tr_session_max_logit_rows(const tr_session *s) {
+    return s->vt->max_logit_rows(s->impl);
 }
 
 int tr_session_rewind(tr_session *s, int64_t n) {

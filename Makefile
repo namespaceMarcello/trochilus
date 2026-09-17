@@ -40,14 +40,25 @@ PY      ?= tools/.venv/bin/python
 endif
 
 CORE_SRC := $(wildcard src/base/*.c src/format/*.c src/kernels/*.c src/backend/*.c \
-                       src/memory/*.c src/kv/*.c src/tokenizer/*.c src/models/*.c)
+                       src/memory/*.c src/kv/*.c src/tokenizer/*.c src/models/*.c src/gen/*.c)
 CORE_OBJ := $(CORE_SRC:%.c=$(BUILD)/%.o)
 APP_OBJ  := $(BUILD)/src/app/main.o
 TEST_BIN := $(patsubst tests/%.c,$(BUILD)/tests/%$(EXE),$(wildcard tests/test_*.c))
 BENCH_BIN := $(BUILD)/tests/bench_kernels$(EXE)
 
-.PHONY: all test oracle oracle-tokenizer chat-check oracle-real bench lint profile check check-linux clean
+.PHONY: all test oracle oracle-tokenizer chat-check oracle-real spec-check bench lint profile check check-linux clean platform-guard
 all: $(BUILD)/trochilus$(EXE)
+
+# Objects of two platforms must never share a BUILD directory: a build in the container with
+# the default BUILD silently overwrites the native ones and the next link mixes them
+# (docs/LEZIONI.md #52). The stamp says who owns the directory.
+PLATFORM_TAG := $(if $(filter Windows_NT,$(OS)),windows,$(shell uname -s 2>/dev/null))-$(CC)
+platform-guard:
+	@mkdir -p $(BUILD)
+	@if [ -f $(BUILD)/.platform ] && [ "$$(cat $(BUILD)/.platform)" != "$(PLATFORM_TAG)" ]; then \
+		echo "error: $(BUILD) holds objects built by '$$(cat $(BUILD)/.platform)', this is '$(PLATFORM_TAG)'."; \
+		echo "       build elsewhere (make BUILD=build/linux-gcc ...) or run 'make clean'."; exit 1; fi
+	@echo "$(PLATFORM_TAG)" > $(BUILD)/.platform
 
 $(BUILD)/trochilus$(EXE): $(CORE_OBJ) $(APP_OBJ)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDLIBS)
@@ -58,7 +69,7 @@ $(BUILD)/trochilus$(EXE): LDLIBS += -municode
 endif
 
 # Makefile as a prerequisite: a changed flag recompiles everything (docs/LEZIONI.md #21)
-$(BUILD)/%.o: %.c Makefile
+$(BUILD)/%.o: %.c Makefile | platform-guard
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -146,6 +157,26 @@ oracle-real: $(BUILD)/trochilus$(EXE)
 		$(PY) tools/oracle.py $(REALFIX) $(REALFIX)/model.gguf --binary $(BUILD)/trochilus$(EXE) --expect exact --logit-tol 1e-3; \
 	fi
 
+# Speculation on the prompt must not move a single token: the same prompt with --spec 0 and with
+# every draft size gives the same text. It runs on the whole real model: the 2-layer cut writes
+# text that repeats nothing, so the drafter never fires there and the check would prove nothing
+# (docs/LEZIONI.md #54). The prompt holds the file the model is asked to write again, which is
+# where the drafter hits. Skipped without the real model.
+spec-check: $(BUILD)/trochilus$(EXE)
+	@if [ ! -f $(REAL_MODEL) ]; then echo "spec-check: SKIPPED, $(REAL_MODEL) not found"; else \
+		$(BUILD)/trochilus$(EXE) run -m $(REAL_MODEL) -f bench/prompts/code-edit.txt -n 64 --spec 0 \
+			> $(BUILD)/spec-0.txt 2>/dev/null && \
+		for k in 1 4 8 15; do \
+			$(BUILD)/trochilus$(EXE) run -m $(REAL_MODEL) -f bench/prompts/code-edit.txt -n 64 --spec $$k \
+				> $(BUILD)/spec-$$k.txt 2>$(BUILD)/spec-$$k.err || exit 1; \
+			cmp $(BUILD)/spec-0.txt $(BUILD)/spec-$$k.txt || exit 1; \
+			grep -qE "speculation: [0-9]+ passes, [1-9][0-9]*/[1-9][0-9]* drafted" $(BUILD)/spec-$$k.err || \
+				{ echo "spec-check: --spec $$k accepted no draft, it proves nothing"; \
+				  cat $(BUILD)/spec-$$k.err; exit 1; }; \
+		done; \
+		echo "== spec-check: same text with --spec 0, 1, 4, 8, 15, and drafts really accepted"; \
+	fi
+
 # The gate. Correctness runs in Linux (Docker image trochilus-dev, tools/docker/Dockerfile) so that
 # Windows Smart App Control, which blocks freshly built executables for minutes (docs/LEZIONI.md #12),
 # cannot make it flaky; on Windows the native build is still compiled with 0 warnings.
@@ -153,7 +184,11 @@ DOCKER_IMG := trochilus-dev:local
 ifeq ($(OS),Windows_NT)
 check: lint
 	$(MAKE) WERROR=1 all $(TEST_BIN) $(BENCH_BIN)
-	MSYS_NO_PATHCONV=1 docker run --rm --security-opt seccomp=unconfined -v "$(CURDIR):/src" -w /src $(DOCKER_IMG) make check-linux
+	@# the models volume, when it exists, replaces models/ read over the Windows bind mount:
+	@# the real-model checks load the same file from ext4 instead of 9p (docs/LEZIONI.md #41)
+	MSYS_NO_PATHCONV=1 docker run --rm --security-opt seccomp=unconfined -v "$(CURDIR):/src" \
+		$$(docker volume inspect trochilus-models > /dev/null 2>&1 && echo "-v trochilus-models:/src/models") \
+		-w /src $(DOCKER_IMG) make check-linux
 	@# give the Docker VM's file cache back to Windows (docs/LEZIONI.md #38)
 	MSYS_NO_PATHCONV=1 docker run --rm --privileged $(DOCKER_IMG) sh -c "sync; echo 3 > /proc/sys/vm/drop_caches"
 	sh tools/check_argv_utf8.sh $(BUILD)/trochilus$(EXE) $(TOKFIX)/vocab.gguf
@@ -181,6 +216,7 @@ check-linux:
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle-tokenizer
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} chat-check
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle-real
+	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} spec-check
 	$(PY) tools/profile_suite.py --binary build/linux-gcc/trochilus$(EXE) --smoke
 	@# -c is honoured: 6 + 4 tokens fit a context of 16, and do not fit one of 8
 	build/linux-gcc/trochilus generate -m $(FIX)/model-f32.gguf -p 6 -n 4 -c 16 > /dev/null

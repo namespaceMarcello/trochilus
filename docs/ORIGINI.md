@@ -47,6 +47,9 @@ Non richiedono attribuzione, si registrano per sapere dove guardare quando si mi
 | una riga di pesi contro più token nei registri (2 in ds4, 4 in Trochilus): un solo carico e una sola conversione per tutti | ds4 | `ds4.c` `dot_q8_0_row_2` | `kernels.c` `k_dot_row_x4_q8_0`, `kernels_x86.c` `avx512_dot_row_x4_q8_0` |
 | K e V del lotto scritti tutti, poi attenzione in parallelo per (testa, token) | colibri (ds4 in opzione) | `c/olmoe.c` `attention`; `ds4.c` `layer_attention_prefix_batch` | `olmoe.c` `attn_body` |
 | logit solo dell'ultimo token del prompt | tutte e tre | `c/olmoe.c` `step`; `ds4.c` `output_logits_one` | `olmoe_eval` |
+| bozza dal testo già nel prompt: cerca all'indietro l'ultima occorrenza dell'n-gramma di coda e propone ciò che la seguiva | colibri (scansione esatta, senza cache), llama.cpp (cache di n-grammi con conteggi) | `c/deepseek_v4.c` `v4_ngram_draft`; `common/ngram-cache.cpp` `common_ngram_cache_draft` | `src/gen/lookup.c` `tr_lookup_draft` (codice nuovo) |
+| verifica di 1 + k posizioni in una passata sola, accetta finché il token proposto è quello che il modello avrebbe scelto | tutte e tre | `examples/lookup/lookup.cpp`; `ds4.c` `metal_graph_verify_decode2_exact`; `c/deepseek_v4.c` (ciclo di accettazione) | `src/gen/greedy.c` `tr_greedy_step` |
+| annullare la bozza rifiutata troncando l'indice della cache | llama.cpp (ds4 e colibri non possono: attenzione ricorrente, devono ripristinare un'istantanea) | `llama_memory_seq_rm` | `tr_session_rewind` (`s->pos = n`) |
 
 ### Prefill a blocchi: le tre fonti (2026-09-17)
 
@@ -61,4 +64,21 @@ Non richiedono attribuzione, si registrano per sapere dove guardare quando si mi
 Non preso: le attivazioni int8 (non esatte: leva 2, opzione a parte) e la somma di ds4 per riga su
 tutti gli esperti, che a ogni riga di pesi rilegge le attivazioni intermedie di tutto il lotto (con 512
 token ~16 MB per riga): Trochilus tiene l'ordine per esperto a blocchi di token, e somma per token.
+
+### Speculazione sul prompt: le tre fonti (2026-09-17)
+
+| | llama.cpp | ds4 | colibri |
+|---|---|---|---|
+| da dove viene la bozza | tre cache di n-grammi (contesto, sessione precedente, corpus), n da 4 a 1, voto `conteggio × conteggio nel corpus` | nessun prompt lookup: DSpark e MTP, cioè teste addestrate (`docs/SPECULATIVE_DECODING.md`) | `v4_ngram_draft`: n-gramma 3 poi 2, scansione all'indietro, occorrenza più recente |
+| verifica | una `llama_decode` sul lotto della bozza, logit a ogni posizione | 2-3 righe per passata, `row0_top == draft1` | ciclo `predictions[i] == drafts[i]` |
+| annullare un rifiuto | troncamento della cache per indice | scambio di buffer con un'istantanea (stato ricorrente) | `spec_attention_restore` e riesecuzione del prefisso (misurata così cara da disattivare MTP) |
+| token identici alla generazione senza speculazione | algebricamente sì, bit a bit **non dichiarato** (il lotto può sommare in un altro ordine) | dichiarato **non** identico al bit sulle continuazioni lunghe | non dichiarato |
+
+Preso: l'idea della bozza dal contesto (colibri, la più semplice: nessuno stato) e la verifica in una
+passata sola con i logit di ogni posizione (tutte e tre). Non preso: le cache con conteggi di
+llama.cpp (allocazioni e stato, da valutare solo se le misure lo chiedono), le teste addestrate
+(DSpark, MTP, EAGLE3: sono altri modelli), il campionamento «opportunistico» di ds4. Il ripristino per
+istantanea non serve: la nostra cache è indicizzata per posizione, si torna indietro con `s->pos = n`.
+In più, qui i token sono **identici al bit**, perché ogni riga del lotto è lo stesso calcolo della
+passata da un token (`tests/test_prefill.c`, `tests/test_spec.c`): nessuna delle tre fonti lo prova.
 

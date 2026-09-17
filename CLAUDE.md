@@ -88,6 +88,9 @@ make oracle-real         # OLMoE vero tagliato a 2 layer contro transformers (sa
 build/trochilus run -m <file.gguf> -f prompt.txt -n 200    # testo in entrata, generazione greedy
 build/trochilus chat -m <file.gguf>                       # conversazione con il template del modello
 make chat-check          # chat sul modello vero: seconda risposta = run da zero (saltato senza modello)
+make spec-check          # `--spec 0/1/4/8/15` danno lo stesso testo sul modello vero a 2 layer
+build/trochilus run -m <f.gguf> -f prompt.txt -n 200 --spec 8   # speculazione dal prompt (stessi token)
+sh tools/ab_spec.sh <gguf> <binario> bench/prompts/code.txt 8   # quanto rende --spec, run alternate
 sh tools/build_llamacpp.sh; tools/compare_llamacpp.py ...   # nel container: llama.cpp e confronto dei logit
 tools/speed_compare.py ...   # nel container: velocità contro llama.cpp e colibri (modelli nel volume trochilus-models)
 sh tools/ab_speed.sh <gguf> <binario A> <binario B>   # due binari alternati run per run (LEZIONI #46)

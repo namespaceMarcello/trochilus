@@ -86,7 +86,9 @@ typedef struct {
     float *xg;        /* [B*U][n_embd] expert inputs, grouped by expert */
     float *h1, *h2;   /* [B*U][n_ff] gate and up outputs */
     float *h3;        /* [B*U][n_embd] down outputs */
-    float *logits;    /* [vocab] */
+    float *logits;    /* [n_logits_max][vocab], oldest kept position first */
+    int64_t n_logits_max; /* rows the buffer holds (TR_LOGIT_ROWS_MAX, never more than B) */
+    int64_t n_logits;     /* rows the last pass filled */
     float *scores;    /* attention scores, one row per pool worker: [n_workers][n_ctx] */
     int64_t n_workers;
 } olmoe_session;
@@ -573,7 +575,9 @@ static void *olmoe_session_create(void *model, int64_t n_ctx, int64_t n_batch, c
     s->h1 = alloc_f32(B * U * m->n_ff);
     s->h2 = alloc_f32(B * U * m->n_ff);
     s->h3 = alloc_f32(B * U * m->n_embd);
-    s->logits = alloc_f32(m->vocab);
+    s->n_logits_max = B < TR_LOGIT_ROWS_MAX ? B : TR_LOGIT_ROWS_MAX;
+    s->n_logits = 0;
+    s->logits = alloc_f32(s->n_logits_max * m->vocab);
     s->scores = alloc_f32(n_workers * actual_ctx);
 
     if (s->k_cache == NULL || s->v_cache == NULL || s->rope_cos == NULL || s->rope_sin == NULL || s->x == NULL ||
@@ -704,8 +708,8 @@ static void route_token(const olmoe_model *m, float *router, unsigned char *take
  * a matmul element is one dot_row, norms/RoPE/routing/mixing are per token, and a token's
  * attention reads only cache positions up to its own. So the logits and the cache are
  * bit-identical for every split of the input into passes (tests/test_prefill.c).
- * Logits (of the last token only) when want_logits. */
-static void forward_pass(olmoe_model *m, olmoe_session *s, const int32_t *tokens, int64_t n_tok, int want_logits) {
+ * Logits of the last n_logits tokens (0: none), one row each, oldest first. */
+static void forward_pass(olmoe_model *m, olmoe_session *s, const int32_t *tokens, int64_t n_tok, int64_t n_logits) {
     tr_prof *prof = &s->prof;
     uint64_t t_pass = tr_prof_begin(prof);
 
@@ -853,28 +857,34 @@ static void forward_pass(olmoe_model *m, olmoe_session *s, const int32_t *tokens
         tr_prof_end(prof, TR_PROF_EXPERT_MIX, t);
     }
 
-    if (want_logits) {
-        float *last = s->x + (n_tok - 1) * n_embd;
+    if (n_logits > 0) {
+        /* One row per kept position: every row is its own dot_row over the same weights, so
+         * a row is bit-identical to the logits that token gives alone (tests/test_spec.c). */
+        float *rows = s->x + (n_tok - n_logits) * n_embd;
         t = tr_prof_begin(prof);
-        tr_rmsnorm(last, m->output_norm, n_embd, m->rms_eps);
+        for (int64_t i = 0; i < n_logits; i++) tr_rmsnorm(rows + i * n_embd, m->output_norm, n_embd, m->rms_eps);
         tr_prof_end(prof, TR_PROF_OUTPUT_NORM, t);
 
         t = tr_prof_begin(prof);
-        tr_matmul(pool, &m->output, last, 1, s->logits);
+        tr_matmul(pool, &m->output, rows, n_logits, s->logits);
         tr_prof_end(prof, TR_PROF_LM_HEAD, t);
         tr_prof_count(prof, mat_bytes(&m->output), 0);
+        s->n_logits = n_logits;
     }
 
     tr_prof_end(prof, TR_PROF_TOKEN, t_pass);
     if (prof->enabled) prof->tokens[prof->phase] += (uint64_t)n_tok;
 }
 
-/* Passes of at most n_batch tokens; only the last one computes logits. */
-static int olmoe_eval(void *session, const int32_t *tokens, int64_t n) {
+/* Passes of at most n_batch tokens; only the last one computes logits. More than one row of
+ * logits needs them all in that pass, so the whole call must fit one pass. */
+static int olmoe_eval(void *session, const int32_t *tokens, int64_t n, int64_t n_logits) {
     olmoe_session *s = (olmoe_session *)session;
     olmoe_model *m = s->m;
 
     if (n <= 0) return -1;
+    if (n_logits < 1 || n_logits > n || n_logits > s->n_logits_max) return -1;
+    if (n_logits > 1 && n > s->n_batch) return -1;
     if (s->pos + n > s->n_ctx) return -1;
     for (int64_t i = 0; i < n; i++) {
         if (tokens[i] < 0 || tokens[i] >= m->vocab) return -1;
@@ -882,21 +892,32 @@ static int olmoe_eval(void *session, const int32_t *tokens, int64_t n) {
 
     for (int64_t off = 0; off < n; off += s->n_batch) {
         int64_t len = n - off < s->n_batch ? n - off : s->n_batch;
-        forward_pass(m, s, tokens + off, len, off + len == n);
+        forward_pass(m, s, tokens + off, len, off + len == n ? n_logits : 0);
         s->pos += len;
     }
     return 0;
 }
 /* hot: end */
 
-static const float *olmoe_logits(const void *session) {
+static const float *olmoe_logits(const void *session, int64_t back) {
     const olmoe_session *s = (const olmoe_session *)session;
-    return s->logits;
+    if (back < 0 || back >= s->n_logits) return NULL;
+    return s->logits + (s->n_logits - 1 - back) * s->m->vocab;
 }
 
 static int64_t olmoe_pos(const void *session) {
     const olmoe_session *s = (const olmoe_session *)session;
     return s->pos;
+}
+
+static int64_t olmoe_n_ctx(const void *session) {
+    const olmoe_session *s = (const olmoe_session *)session;
+    return s->n_ctx;
+}
+
+static int64_t olmoe_max_logit_rows(const void *session) {
+    const olmoe_session *s = (const olmoe_session *)session;
+    return s->n_logits_max;
 }
 
 /* The cache rows past n are simply overwritten by the next eval: attention only ever
@@ -905,6 +926,7 @@ static int olmoe_rewind(void *session, int64_t n) {
     olmoe_session *s = (olmoe_session *)session;
     if (n < 0 || n > s->pos) return -1;
     s->pos = n;
+    s->n_logits = 0; /* the kept rows describe positions that may no longer be in the cache */
     return 0;
 }
 
@@ -923,6 +945,8 @@ const tr_arch_vtable tr_olmoe_vtable = {
     olmoe_eval,
     olmoe_logits,
     olmoe_pos,
+    olmoe_n_ctx,
+    olmoe_max_logit_rows,
     olmoe_rewind,
     olmoe_prof,
 };

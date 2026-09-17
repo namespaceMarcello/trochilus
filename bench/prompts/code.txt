@@ -1,0 +1,36 @@
+/* ring.c — a fixed-capacity ring buffer of ints. */
+#include <stddef.h>
+
+typedef struct {
+    int *data;
+    size_t cap, head, len;
+} ring;
+
+void ring_init(ring *r, int *data, size_t cap) {
+    r->data = data;
+    r->cap = cap;
+    r->head = 0;
+    r->len = 0;
+}
+
+size_t ring_len(const ring *r) {
+    return r->len;
+}
+
+int ring_push(ring *r, int value) {
+    if (r->len == r->cap) return -1;
+    r->data[(r->head + r->len) % r->cap] = value;
+    r->len++;
+    return 0;
+}
+
+int ring_pop(ring *r, int *out) {
+    if (r->len == 0) return -1;
+    *out = r->data[r->head];
+    r->head = (r->head + 1) % r->cap;
+    r->len--;
+    return 0;
+}
+
+/* Returns the value at `i` positions from the head, or -1 when `i` is past the end. */
+int ring_peek(const ring *r, size_t i, int *out) {

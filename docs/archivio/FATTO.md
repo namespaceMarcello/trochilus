@@ -181,3 +181,31 @@ riga di compilazione. `tests/bench_kernels.c` misura `dot_row q8_0 x4` e `tr_mat
 due binari alternati run per run, perché il portatile che si scalda falsa i confronti in sequenza
 (LEZIONI #46). Prova: `make check`, `make bench`, e
 `sh tools/ab_speed.sh models/<gguf> build/base/b/trochilus build/linux-gcc/trochilus` nel container.
+
+### 2026-09-17 — Perché il prefill non scalava: dove Windows mette i thread
+Misurato sul nativo (in Docker la topologia non è quella vera, LEZIONI #47): il clock sotto carico
+dal contatore di Windows e il prefill con l'affinità del processo fissata, casi alternati a ogni giro.
+Il prefill a 16 thread non era limitato dalla potenza (il clock scende del 6-8% da 1 a 16 thread) né
+dal CCD (8 thread divisi 4+4 sui due chiplet vanno il 7-9% meglio di 8 su uno solo): lo scheduler
+appoggiava due dei 16 thread sullo stesso core fisico. Un thread per core fisico vale +30%
+(134 → 174 tok/s a 2048 token di prompt) e da 8 a 16 core il prefill rende 2.02×. Chiuse le domande
+20 e 2 di `docs/MISURE.md`, metà della 3; aperta la 22 (Linux, decode, macchina occupata).
+Prova: `docs/MISURE.md` §Dove vanno i thread ha tabelle, metodo e numeri.
+
+### 2026-09-17 — Decodifica speculativa dal prompt, esatta al bit
+`tr_session_eval_rows` tiene i logit delle ultime n posizioni di una passata invece che solo
+dell'ultima (`tr_session_logits_back`), e ogni riga è identica al bit ai logit che quel token dà da
+solo. Sopra ci stanno `src/gen/lookup.c` (l'n-gramma di coda cercato all'indietro nel contesto,
+proposta la continuazione della sua ultima occorrenza; da 4 a 2 token, niente stato, niente
+allocazioni) e `src/gen/greedy.c` (`tr_greedy_step`: emette il token già scelto, verifica 1 + k
+posizioni in una passata, tiene i token che il modello avrebbe scelto comunque e torna indietro con
+`tr_session_rewind` su quelli rifiutati). `generate` e `run` hanno `--spec <bozza>` e stampano
+quante bozze sono state accettate. Le fonti e cosa si è preso da ognuna: `docs/ORIGINI.md`
+§Speculazione sul prompt. Prova: `make check` (nuovo `tests/test_spec.c`: stessi token con bozza
+1..15, su due vocabolari perché con quello del modello nulla verrebbe mai rifiutato, LEZIONI #50;
+nuovo `make spec-check` sul modello vero tagliato a 2 layer: stesso testo con `--spec 0/1/4/8/15`),
+e `sh tools/ab_spec.sh <gguf> <binario> bench/prompts/code.txt 8` per la velocità a run alternate.
+Misurata sul modello intero (`docs/MISURE.md` §Speculazione dal prompt): 1.42× riscrivendo un file
+già nel prompt (64% di bozze accettate), 0.62× scrivendo codice nuovo (13%), pareggio intorno al 15%.
+`--spec` resta spento di default fino alla bozza adattiva. `make` rifiuta ora di mescolare oggetti di
+due piattaforme nella stessa cartella (LEZIONI #52).

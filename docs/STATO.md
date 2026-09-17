@@ -90,6 +90,25 @@ Sostituisci, non appendere. Tetto 40 KB. Lo storico sta in `archivio/FATTO.md`.
   tutto A e poi tutto B, la macchina che si scalda sposta i numeri del 10-25% e nasconde il vero
   guadagno (LEZIONI #46: una buona ottimizzazione era stata scartata così).
 
+- 2026-09-17 — **Il prefill non scalava per colpa del collocamento dei thread**, non della potenza né
+  del CCD (domanda 20, `docs/MISURE.md` §Dove vanno i thread). Il clock scende del 6-8% da 1 a 16
+  thread, e 8 thread divisi 4+4 sui due chiplet vanno meglio di 8 su uno solo: è Windows che appoggia
+  due dei 16 thread sullo stesso core fisico. Un thread per core fisico: **+30%** sul prefill, e da 8
+  a 16 core **2.02×**. Le prove di collocamento si fanno native: dentro Docker la topologia non è
+  quella della macchina (LEZIONI #47). Conseguenza: fissare i thread del pool ai core fisici e
+  rimisurare le righe di velocità con quella base.
+- 2026-09-17 — **Decodifica speculativa dal prompt** (leva del coding, passo 2): la bozza viene dal
+  testo già nel contesto (n-gramma di coda cercato all'indietro, idea di colibri; llama.cpp ha in più
+  cache con conteggi, non prese), la verifica è **una sola passata** su 1 + k posizioni, e si tiene
+  solo ciò che il modello avrebbe scelto comunque. A differenza di tutte e tre le fonti qui i token
+  sono **identici al bit** alla generazione senza speculazione, perché ogni riga del lotto è lo stesso
+  calcolo della passata da un token: è un invariante provato (`tests/test_spec.c`, `make spec-check`),
+  non una speranza. Il rifiuto costa `s->pos = n` (cache indicizzata per posizione: ds4 e colibri
+  devono ripristinare un'istantanea). Misurato (§Speculazione dal prompt): **1.42×** riscrivendo un
+  file già nel prompt (64% di bozze accettate), **0.62×** scrivendo codice nuovo (13%); il pareggio
+  è intorno al 15%. Perciò `--spec` resta **spento di default** finché la bozza non si accorcia da
+  sola dopo un rifiuto: con quella, il caso peggiore diventa «come senza».
+
 ## Problemi noti
 
 - Smart App Control di Windows blocca un .exe appena compilato anche per 20 minuti: correttezza in
@@ -122,19 +141,26 @@ esatto, profilo, kernel `dot_row_x4`. Prompt 512 a 16 thread: 30 → 197 tok/s (
 28; decode invariato; logit identici al bit al binario di prima e fra passate di ogni dimensione.
 llama.cpp avanti 1.97× a 16 thread e 1.57× a 1 (era 11.8×).
 
-1. Attivazioni int8/VNNI come opzione (leva 2, domanda 21): è quello che resta del divario per
+Fatto dopo (`docs/MISURE.md` §Dove vanno i thread, `docs/archivio/FATTO.md`): chiusa la domanda 20
+(era il collocamento dei thread, non la potenza), e decodifica speculativa dal prompt con `--spec`,
+esatta al bit e provata da `tests/test_spec.c` e `make spec-check`. Manca la sua misura di velocità
+sul modello vero: è il passo 2 qui sotto.
+
+1. **Thread fissati ai core fisici** nel pool (Windows `SetThreadAffinityMask`, Linux
+   `sched_setaffinity`): la misura dice +30% sul prefill e 2.02× da 8 a 16 core. Poi rimisurare
+   prefill e decode con quella base, e rispondere alla domanda 22 (Linux, decode, macchina occupata)
+   e alla seconda metà della 3 (32 thread SMT contro 16 fissati).
+2. **Bozza adattiva** (domanda 25): accorciarla dopo un rifiuto e allungarla dopo un'accettazione,
+   così il caso peggiore misurato (0.62× quando il modello inventa) diventa «come senza» e il
+   guadagno (1.42× quando ricopia) resta. Solo dopo si può accendere `--spec` di default.
+3. Attivazioni int8/VNNI come opzione (leva 2, domanda 21): è quello che resta del divario per
    elemento. Definizione scalare nuova, differenza dichiarata e misurata sul modello vero, attivabile;
    il default lo decide Marcello.
-2. Perché il prefill scala 1.16× da 8 a 16 thread (domanda 20): il profilo esclude il codice
-   (moltiplicazioni 90%, attenzione 2%, seriale 8%), resta da provare il limite di potenza del
-   portatile e i thread su un solo CCD. Misura prima di mettere mano.
-3. Prefill su prompt lunghi (2048-4096), dove l'attenzione per token cresce col quadrato: oggi è al 2%
-   con 512 token, va rimisurata lì prima di ottimizzarla.
-3. Confronto colibri/ds4 per componente (decisione sopra), poi le correzioni che ne escono.
+4. Prefill su prompt lunghi (2048-4096), dove l'attenzione per token cresce col quadrato: a 512 token
+   è al 2%, a 2048 il prefill è già sceso da 197 a 174 tok/s (domanda 7).
+5. Confronto colibri/ds4 per componente (decisione sopra), poi le correzioni che ne escono.
    Misure 13-16 di `docs/MISURE.md` (routing, cache esperti, SSD): ordine da confermare con Marcello.
-4. Decode a contesto lungo: Trochilus perde l'11-13% da 32 a 512 token, llama.cpp il 5-7% (domande
+6. Decode a contesto lungo: Trochilus perde l'11-13% da 32 a 512 token, llama.cpp il 5-7% (domande
    18-19 di `docs/MISURE.md`).
-5. Memoria: banda reale della RAM (domanda 4 in `docs/MISURE.md`), poi pagine da 2 MB e thread
-   fissati ai core (domande 2, 3, 5). 4 thread vanno come 16 (33 tok/s, 41 GB/s).
-6. Attivazioni in int8 con VNNI (leva 2 in `docs/MISURE.md`): nuova definizione scalare, differenza
-   dichiarata e misurata sul modello vero, attivabile; decisione di Marcello prima di farla default.
+7. Memoria: banda reale della RAM (domanda 4 in `docs/MISURE.md`), poi pagine da 2 MB (domanda 5).
+   4 thread vanno come 16 (33 tok/s, 41 GB/s): da rimisurare dopo il pin.
