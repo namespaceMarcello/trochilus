@@ -23,7 +23,7 @@ C11 + intrinseci (e assembly dove misurato), Makefile, gcc/clang/MinGW-w64; stru
   va in `docs/STATO.md`.
 - Logica e kernel: si sceglie, si costruisce, si consegna. Le domande si fanno prima, non a metà.
 - **Il commit lo chiede Marcello.** Si prepara tutto (test verdi, documenti) e ci si ferma.
-- Niente GitHub finché non lo chiede.
+- Repo privato `namespaceMarcello/trochilus`: push e visibilità li decide Marcello.
 
 ### Tieni tutto sotto controllo: il ciclo di ogni passo
 

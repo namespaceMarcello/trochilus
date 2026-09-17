@@ -41,6 +41,11 @@ Sostituisci, non appendere. Tetto 40 KB. Lo storico sta in `archivio/FATTO.md`.
   prima e di dopo, `cmp` dei file.
 - 2026-09-17 — Repository privato su GitHub (richiesta di Marcello), primo commit con tutto il lavoro
   fin qui.
+- 2026-09-17 — **Prima la correttezza, poi la velocità** (Marcello): tokenizer, stessi token di
+  llama.cpp sul modello vero e confronto di velocità vengono prima di altre ottimizzazioni; poi
+  prefill a blocchi, poi memoria e VNNI. Sì al download di llama.cpp (sorgente in `ref/`, build nel
+  container). Durante le misure si possono fermare i container Docker degli altri progetti, e si
+  riavviano alla fine.
 
 ## Problemi noti
 
@@ -59,16 +64,15 @@ Sostituisci, non appendere. Tetto 40 KB. Lo storico sta in `archivio/FATTO.md`.
 
 ## Prossimi passi
 
-1. Memoria: banda reale della RAM (domanda 4 in `docs/MISURE.md`), poi pagine da 2 MB e thread
-   fissati ai core (domande 2, 3, 5). Dopo la parte a thread singolo 4 thread vanno come 16
-   (33 tok/s, 41 GB/s): il decode è limitato dalla memoria.
-2. Hook contro le barre rovesciate anche sullo strumento PowerShell (LEZIONI #26): serve il sì di
-   Marcello, tocca la configurazione degli hook.
-3. Attivazioni in int8 con VNNI (leva 2 in `docs/MISURE.md`): nuova definizione scalare, differenza
+1. M0, passo 4: tokenizer BPE dai metadati GGUF, `trochilus run` con testo; token identici al
+   tokenizer di transformers su un banco di testi (codice, Unicode, spazi).
+2. Correttezza sul modello vero: stessi token greedy di llama.cpp (`ref/llama.cpp`, compilato nel
+   container) sullo stesso GGUF e prompt reale. Transformers non entra in RAM (7B in bf16 = 14 GB).
+3. M0, passo 5: confronto di velocità con llama.cpp e colibri, stesso modello e prompt →
+   `docs/MISURE.md`.
+4. Prefill a blocchi: più token nella stessa moltiplicazione (oggi prefill = decode = 33 tok/s; un
+   prompt da 10 000 token costa ~5 minuti).
+5. Memoria: banda reale della RAM (domanda 4 in `docs/MISURE.md`), poi pagine da 2 MB e thread
+   fissati ai core (domande 2, 3, 5). 4 thread vanno come 16 (33 tok/s, 41 GB/s).
+6. Attivazioni in int8 con VNNI (leva 2 in `docs/MISURE.md`): nuova definizione scalare, differenza
    dichiarata e misurata sul modello vero, attivabile; decisione di Marcello prima di farla default.
-   Meno byte per elemento: attacca proprio il limite della memoria.
-4. Prefill a blocchi: più token nella stessa moltiplicazione (oggi prefill = decode = 33 tok/s).
-5. Correttezza sul modello vero: stessi token di un riferimento su un prompt reale (llama.cpp in
-   Docker, o transformers se la RAM lo consente).
-6. M0, passo 4: tokenizer BPE dai metadati GGUF, `trochilus run` con testo.
-7. M0, passo 5: confronto con llama.cpp e colibri sullo stesso modello e prompt → `docs/MISURE.md`.
