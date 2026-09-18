@@ -4,6 +4,7 @@
 #   make            build/trochilus
 #   make test       C tests (every kernel variant against scalar, GGUF, pool, profiler)
 #   make oracle     tiny models against transformers (needs tools/.venv or the Docker image)
+#   make tier-check the engine under every kernel tier: model tests, and logits identical byte for byte
 #   make oracle-tokenizer  a real tokenizer against transformers (ids, pieces, NFC, decoding)
 #   make bench      kernel microbenchmark (median and noise), native
 #   make lint       docs and tables against the lessons in docs/LEZIONI.md
@@ -46,7 +47,7 @@ APP_OBJ  := $(BUILD)/src/app/main.o
 TEST_BIN := $(patsubst tests/%.c,$(BUILD)/tests/%$(EXE),$(wildcard tests/test_*.c))
 BENCH_BIN := $(BUILD)/tests/bench_kernels$(EXE)
 
-.PHONY: all test oracle oracle-tokenizer chat-check oracle-real spec-check bench lint profile check check-linux clean platform-guard
+.PHONY: all test oracle tier-check oracle-tokenizer chat-check oracle-real spec-check bench lint profile check check-linux clean platform-guard
 all: $(BUILD)/trochilus$(EXE)
 
 # Objects of two platforms must never share a BUILD directory: a build in the container with
@@ -122,6 +123,12 @@ oracle: $(BUILD)/trochilus$(EXE) $(FIX)/model-f32.gguf $(FIX)/model-f16.gguf $(F
 	$(PY) tools/oracle.py $(FIX) $(FIX)/model-f32.gguf --binary $(BUILD)/trochilus$(EXE) --expect exact
 	$(PY) tools/oracle.py $(FIX) $(FIX)/model-f16.gguf --binary $(BUILD)/trochilus$(EXE) --expect exact
 	$(PY) tools/oracle.py $(FIX) $(FIX)/model-q8_0.gguf --binary $(BUILD)/trochilus$(EXE) --expect report
+
+# Every kernel tier end to end, not only the best one this CPU has (tools/tier_check.sh): the model
+# tests under TR_CPU_MAX=scalar and avx2, and the logits of the tiny fixtures identical, byte for
+# byte, across tiers, thread counts and -b (docs/LEZIONI.md #64).
+tier-check: $(BUILD)/trochilus$(EXE) $(TEST_BIN) $(FIX)/model-f32.gguf $(FIX)/model-f16.gguf $(FIX)/model-q8_0.gguf
+	sh tools/tier_check.sh $(BUILD) $(FIX)
 
 # A real tokenizer against transformers: the model's tokenizer files pinned to a Hub revision
 # (downloaded once into fixtures/), a vocabulary-only GGUF written as llama.cpp's converter writes
@@ -213,6 +220,7 @@ check-linux:
 	@for i in $$(seq 20); do build/linux-gcc/tests/test_hot > /dev/null || exit 1; done; echo "== test_hot 20/20"
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 build/linux-gcc/tests/bench_kernels
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle
+	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} tier-check
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle-tokenizer
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} chat-check
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle-real

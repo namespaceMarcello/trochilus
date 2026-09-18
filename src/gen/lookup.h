@@ -23,7 +23,8 @@
 /* Proposes the continuation of the most recent earlier occurrence of the tail of
  * ctx[0..n_ctx-1], longest n-gram first, and writes at most max_draft tokens to out.
  * Returns how many it wrote (0 when nothing matches, or when max_draft <= 0).
- * A match never overlaps the tail itself, so the proposal is always text read before. */
+ * The earlier occurrence starts before the tail but may overlap it ("0 0 0 0" proposes 0):
+ * what is proposed is always text already in the context, never read past its end. */
 int64_t tr_lookup_draft(const int32_t *ctx, int64_t n_ctx, int32_t *out, int64_t max_draft);
 
 #endif

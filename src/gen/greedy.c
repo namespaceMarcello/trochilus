@@ -102,7 +102,8 @@ int64_t tr_greedy_step(tr_greedy *g, int32_t *out) {
                 g->back = 0;
             } else {
                 g->k_cur = 0;
-                g->back = g->back == 0 ? 1 : (g->back < 16 ? g->back * 2 + 1 : 16);
+                /* the cap applies to the doubled value: testing the old one let 15 become 31 */
+                g->back = g->back * 2 + 1 < 16 ? g->back * 2 + 1 : 16;
                 g->cool = g->back;
             }
         }

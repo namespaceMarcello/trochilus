@@ -294,6 +294,68 @@ static int64_t test_adaptive_pauses_after_a_wrong_draft(tr_model *model, const i
     return all_wrong;
 }
 
+/* The pause doubles only up to its cap: 1, 3, 7, 15, then 16 for good (greedy.h). Every draft
+ * here is forced to fail: before each step the history the drafter reads is rewritten so that
+ * the tail was once followed by a token the model will not choose (its real choice comes from a
+ * shadow session fed the same tokens). The session never sees that history, so the tokens are
+ * still the model's own; what is measured is how many steps pass between two drafts
+ * (docs/LEZIONI.md #60: the cap let 15 double to 31 before it applied). */
+static void test_adaptive_pause_is_capped(tr_model *model, const int32_t *prompt) {
+    enum { MAX_STEPS = 200, N_PAUSES = 6 };
+    static const int64_t want[N_PAUSES] = {1, 3, 7, 15, 16, 16};
+    tr_session *s = tr_session_create(model, ADAPT_CTX, 64, NULL, 0);
+    tr_session *shadow = tr_session_create(model, ADAPT_CTX, 64, NULL, 0);
+    TR_CHECK(s != NULL && shadow != NULL);
+    static int32_t hist[N_PROMPT + MAX_STEPS + TR_GREEDY_DRAFT_MAX + 1];
+    memcpy(hist, prompt, N_PROMPT * sizeof(int32_t));
+    tr_greedy g;
+    int rc = s != NULL && shadow != NULL ? 0 : -1;
+    if (rc == 0) rc = tr_session_eval(s, prompt, N_PROMPT);
+    if (rc == 0) rc = tr_session_eval(shadow, prompt, N_PROMPT);
+    if (rc == 0)
+        rc = tr_greedy_init(&g, s, VOCAB, tr_session_n_ctx(s), TR_GREEDY_DRAFT_MAX, TR_DRAFT_ADAPTIVE, hist,
+                            N_PROMPT);
+    TR_CHECK(rc == 0);
+
+    int64_t pauses[N_PAUSES], n_pauses = 0, pause = -1; /* -1: no draft has failed yet */
+    uint64_t prev_drafted = 0;
+    for (int step_i = 0; rc == 0 && step_i < MAX_STEPS && n_pauses < N_PAUSES; step_i++) {
+        int32_t next = g.next, step[1 + TR_GREEDY_DRAFT_MAX];
+        if (tr_session_eval(shadow, &next, 1) != 0) { rc = -1; break; }
+        int32_t choice = argmax(tr_session_logits(shadow), VOCAB);
+        int32_t wrong = (choice + 1) % VOCAB, filler = (next + 1) % VOCAB;
+        /* "F F F next wrong F F ... F" + next: the 4-gram tail "F F F next" occurred once, at 0 */
+        for (int64_t i = 0; i < g.n_hist; i++) hist[i] = filler;
+        hist[3] = next;
+        hist[4] = wrong;
+
+        int64_t got = tr_greedy_step(&g, step);
+        TR_CHECK_EQ_INT((int)got, 1);              /* nothing drafted here is ever right */
+        if (got != 1) { rc = -1; break; }
+        TR_CHECK_EQ_INT(step[0], next);
+        TR_CHECK_EQ_INT(g.next, choice);           /* and the tokens are still the model's */
+        uint64_t k = g.n_drafted - prev_drafted;
+        prev_drafted = g.n_drafted;
+        if (k > 0) {
+            if (pause >= 0) pauses[n_pauses++] = pause;
+            pause = 0;
+        } else if (pause >= 0) {
+            pause++;
+        }
+    }
+    TR_CHECK(rc == 0);
+    TR_CHECK_EQ_INT((int)n_pauses, N_PAUSES);
+    TR_CHECK_EQ_INT((int)g.n_accepted, 0);
+    for (int64_t i = 0; i < n_pauses; i++) {
+        TR_CHECK_EQ_INT((int)pauses[i], (int)want[i]);
+        if (pauses[i] != want[i])
+            printf("  adaptive/cap: pause %lld lasted %lld steps, expected %lld\n", (long long)i + 1,
+                   (long long)pauses[i], (long long)want[i]);
+    }
+    tr_session_free(shadow);
+    tr_session_free(s);
+}
+
 int main(int argc, char **argv) {
     int64_t pause_rule_seen = 0; /* drafts fully rejected across the suite: the pause rule needs one */
 
@@ -352,6 +414,7 @@ int main(int argc, char **argv) {
                     test_adaptive_shrinks_on_reject(model, prompt);
                     test_adaptive_grows_on_repeat(model, prompt);
                     pause_rule_seen += test_adaptive_pauses_after_a_wrong_draft(model, prompt);
+                    test_adaptive_pause_is_capped(model, prompt);
                 }
 
                 for (int pp = 0; pp < 2; pp++) {

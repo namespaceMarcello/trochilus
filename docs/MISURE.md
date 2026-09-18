@@ -28,7 +28,7 @@ si sposta nella sezione giusta con il numero quando è misurato.
 | 9 | Windows nativo e Linux sulla stessa macchina vanno alla stessa velocità? | stesso scenario nativo e in Docker/WSL | in Docker svegliare un thread costava ~20 µs |
 | 10 | Più corsie (32 o 64) sbloccano la catena delle somme su un thread? | kernel sperimentale, `make bench` | AVX-512 va come AVX2 per quel limite; cambierebbe i numeri (dichiarato) |
 | 11 | Quanto pesa la divisione per riga e la chiamata indiretta in `matmul_body`? | kernel che riceve tutta la matrice contro uno per riga | 1024 chiamate e 2 divisioni a 64 bit per matrice |
-| 12 | Gli esperti scelti in token consecutivi si ripetono? | contare gli esperti in comune fra token vicini | se sì, i loro pesi sono ancora in cache e si può prevedere cosa caricare |
+| 12 | Gli esperti scelti in token consecutivi si ripetono? **In parte sì** (§Revisione): una riga in più nella stessa passata fa leggere 2.3-4.7 esperti nuovi per layer su 8, cioè il 40-70% dei suoi esperti è già letto dalle altre righe. Resta la parte a tempo: quanto di una riga in più è lettura di pesi e quanto calcolo | zone del profiler native a macchina ferma, `generate --spec 0` contro `--spec k --spec-fixed` | dice se il costo di una bozza si attacca dal lato dei pesi (cache degli esperti) o del calcolo |
 | 13 | Il router del layer successivo, applicato allo stato del layer corrente, indovina gli esperti che verranno scelti? | traccia del routing sul modello vero (prompt di codice, ~1000 token): esperti previsti (primi 8, 12, 16) contro scelti | se prevedendone al massimo 12 se ne indovina almeno l'80%, gli esperti si precaricano dal disco prima che servano (M1) |
 | 14 | Quanti byte per token restano da leggere dal disco con una cache degli esperti grande il 25, 50, 75% del modello? | simulazione LRU sulla stessa traccia | decide il budget di RAM di default della M1 |
 | 15 | Streaming dal disco per layer interi (DeepSpeed) o per esperti: quanti byte per token? | stessa traccia: layer interi contro soli esperti scelti e non in cache | con un solo utente leggere tutto il modello a ogni token dà al massimo ~0.3 tok/s su 10 GB |
@@ -43,8 +43,11 @@ si sposta nella sezione giusta con il numero quando è misurato.
 | 23 | ~~Quante bozze vengono accettate su lavoro di codice vero?~~ Misurato: §Speculazione dal prompt. 64% riscrivendo un file già nel prompt (1.42×), 13% scrivendo codice nuovo (0.62×) | — | — |
 | 24 | ~~Una bozza sbagliata quanto costa?~~ **Molto più di quanto diceva la misura in container** (5.2 ms): nativo, col pin, una riga in più costa **15-27 ms** contro i ~35 di una passata, perché il token in bozza sceglie altri esperti e la passata legge anche i loro pesi. Il pareggio non è al 15% di bozze accettate ma intorno al **60-75%** (§Speculazione dal prompt, LEZIONI #59) | — | — |
 | 25 | ~~Una bozza che si accorcia dopo un rifiuto e si allunga dopo un'accettazione toglie il caso peggiore?~~ Accorciarla non basta (0.89×): serve **fermarla** dopo una bozza tutta sbagliata, con pausa che raddoppia. Con quella: **1.01×** quando il modello inventa e **1.15×** quando ricopia (§Speculazione dal prompt) | — | — |
-| 21 | ~~Quanto del divario col prefill di llama.cpp è il dot int8 VNNI contro il nostro float?~~ **Niente**: sulla stessa riga il dot int8 VNNI fa +1-8% sul nostro dot float, e il nostro kernel a 4 token è 2.7× più veloce di entrambi. La leva 2 non si scrive (§Attivazioni int8 con VNNI) | — | — |
-| 28 | Il divario di prefill che resta con llama.cpp dov'è, se non è nell'int8? | profilo per zone del prefill nostro contro il loro sullo stesso prompt; e un kernel che tiene più di 4 token nei registri (8, 16) contro il nostro `dot_row_x4` | il nostro x4 è 2.7× il dot a un token: la stessa strada, più larga, è dove può esserci il resto |
+| 21 | ~~Quanto del divario col prefill di llama.cpp è il dot int8 VNNI contro il nostro float?~~ **Quasi tutto** (§Revisione, LEZIONI #65; la prima risposta, «niente», confrontava una riga contro un token): con la struttura del nostro kernel a 4 token il dot int8 VNNI a 512 bit è **1.8-2.3×** il nostro x4 float, e llama.cpp è avanti 1.57× a un thread. L'int8 non è esatto: scriverlo o no, e come modo esplicito, lo decide Marcello | — | — |
+| 28 | ~~Il divario di prefill che resta con llama.cpp dov'è, se non è nell'int8?~~ Era nell'int8 (domanda 21). La strada esatta «più token nei registri» è misurata e non rende: una riga contro 8 token dà 1.13× a n=1024, **0.79×** a 2048 e 0.93× a 4096 (§Revisione) | — | — |
+
+| 29 | Quanto vale una variante SIMD per **F16**? Oggi non c'è: `dot_row f16` fa 824 M el/s in ogni tier (codice scalare) contro 21 044 di `dot_row q8_0` AVX-512, cioè 25× (revisione, `make bench`, n=2048) | kernel con `vcvtph2ps` (F16C: la conversione half→float è esatta, quindi resta bit-identico), stesso confronto di `test_tiers_match_scalar` | un GGUF in f16 gira molto più piano del necessario; è una leva esatta e piccola da scrivere |
+| 30 | La parte seriale del prefill (7.6% a 16 thread: copia per esperto, scrittura della KV, norme, RoPE) si può dividere per token? | `tr_parallel_for` sui token in quelle zone (ogni token è indipendente: stessi bit), profilo per zone prima e dopo | a 16 thread è il secondo pezzo dopo le moltiplicazioni; con l'int8 (domanda 21) il suo peso relativo raddoppia |
 
 Macchina di riferimento: Ryzen 9 7940HX (Zen 4, 16 core / 32 thread, AVX-512 VNNI/BF16), 31 GB
 RAM (2×16 GB DDR5-5200), NVMe Micron 1 TB, GPU RTX 4070 Laptop 8 GB e Radeon 610M (non usate fino
@@ -501,14 +504,18 @@ bit sono un altro numero, quindi non può essere bit-identico. `make bench`, 9 r
 Milioni di elementi al secondo per riga di attivazioni. Quantizzare le attivazioni costa 467 M
 elem/s (scalare), che un matmul paga una volta ogni 1024 righe: trascurabile.
 
-Letture:
-- **La leva 2 non si scrive.** Sulla stessa riga il dot int8 VNNI fa +1% a 1024 e +8% a 4096
-  rispetto al nostro dot float: dentro il rumore, e in cambio si perderebbe l'esattezza.
-- Il nostro kernel a 4 token è **2.6-2.7× più veloce di entrambi**: il guadagno del prefill non
-  stava nell'int8, stava nel riusare la riga di pesi su più token. Il divario che resta con
-  llama.cpp va cercato lì (blocchi più larghi, non VNNI), non nelle attivazioni a 8 bit.
+Letture (**corrette dalla revisione del 2026-09-18**, §Revisione avversariale e LEZIONI #65: la
+tabella è giusta, la conclusione che ne era stata tirata no):
+- Questa tabella confronta una riga contro **un** token, int8 contro float: lì l'int8 vale +1-8%.
+  Ma il candidato ha mezza riga di lavoro scalare per blocco (half→float, catena della
+  correzione), e il prefill non gira con quel kernel: gira col kernel a 4 token.
+- Il nostro kernel a 4 token è 2.6-2.7× più veloce di entrambi perché riusa la riga di pesi. La
+  domanda giusta era che cosa dà l'int8 **con quella stessa struttura**: misurato dopo, dà
+  **1.8-2.3×** in più, mentre «blocchi più larghi» in float (8 token) non rende. Il divario con
+  llama.cpp sta nelle attivazioni a 8 bit, non nei blocchi più larghi.
 - A questi n il dot non è limitato dalla memoria (12 GB/s contro i ~41 misurati): è latenza e
-  istruzioni per blocco, ed è per questo che una istruzione che fa 4 prodotti non cambia il totale.
+  istruzioni per blocco. Una istruzione che fa 4 prodotti non cambia il totale solo finché le
+  istruzioni per blocco restano quelle del candidato; tolte, lo cambia.
 
 ## SMT: 32 thread contro 16 (2026-09-18)
 
@@ -639,6 +646,91 @@ Una riga di esperto (2 KB) e il vettore (8 KB) stanno già in L1: nel decode un 
 volta per token, e non c'è niente da tenere in cache. Il blocking conta quando più token
 riusano le stesse righe (leve 3-6).
 
+## Revisione avversariale (2026-09-18)
+
+Rilettura di tutto il repository da parte di un altro modello (Fable 5.1), con l'ordine di
+portare prove e non opinioni. Errori e controlli nuovi: LEZIONI #60-#68. Qui i numeri.
+Container `trochilus-dev`, altri container accesi: per questo i confronti sono solo quelli con
+effetti molto sopra lo spread (kernel su un core, run alternate) o **senza cronometro**
+(contatori, replay). Niente di quello che segue è una misura di velocità del prodotto.
+
+**Invarianti: reggono.** `trochilus logits` su 40-70 token, 3 tier (`TR_CPU_MAX` scalar, avx2,
+avx512) × 3 numeri di thread (1, 5, 16) × 3 passate (`-b` 1, 7, 512): 27 file per modello,
+identici al byte sulle righe confrontabili, per i tre modelli minuscoli (f32, f16, q8_0) e per
+OLMoE vero tagliato a 2 layer (201 216 byte per riga). I test del modello passano anche sotto
+`scalar` e `avx2`. Ora è un controllo: `make tier-check`. Tokenizer: 90 000 stringhe costruite
+per rompere (tempeste di segni combinanti, jamo, ogni spazio Unicode, contrazioni, token aggiunti
+incollati a segni e spazi) × 2 modi contro HF `tokenizers`: 0 differenze, e 12 000 decodifiche
+uguali.
+
+**Attivazioni int8, seconda misura** (domanda 21, LEZIONI #65). `make bench`, sezione «one row,
+by»: i quattro kernel girano alternati sulla stessa riga, 9 run da 40 ms, un core. Nanosecondi
+per riga di input e rapporto col nostro kernel; il float x8 è verificato identico al bit al x4,
+gli int8 contro il loro dot in C puro.
+
+| kernel | n=1024 | n=2048 | n=4096 |
+|---|---|---|---|
+| `dot_row q8_0 x4` float, AVX-512 (il nostro) | 25.6 ns | 47.6 ns | 114.1 ns |
+| int8 VNNI x4, 256 bit, trucco del segno di ggml | 1.64× | 1.62× | 1.96× |
+| int8 VNNI x4, 512 bit, due blocchi per istruzione | **1.83×** | **1.79×** | **2.26×** |
+| float x8, esatto (la strada «blocchi più larghi») | 1.13× | **0.79×** | 0.93× |
+
+Spread 3-8% per riga; con clang 1.78× / 1.84× / 2.13× e 1.15× / 0.79× / 0.91×. Letture:
+- Il prefill è al 90% moltiplicazioni e llama.cpp è avanti 1.57× a un thread: è l'int8, quasi
+  per intero. Il float x8 a n=2048 (la larghezza di OLMoE) **perde**: 8 righe di attivazioni
+  float sono 64 KB e la L1 ne tiene 32; in int8 sono 16 KB.
+- Limite della misura: è un kernel su un core con tutto in cache; sul prefill intero il guadagno
+  sarà più basso (resta il 10% non matmul, e la quantizzazione delle attivazioni). E l'int8
+  **non è esatto**: i logit del prefill non sarebbero più quelli del token per token. Può
+  esistere solo come modo dichiarato; la decisione è di Marcello.
+
+**Quanto legge una riga di bozza** (domanda 12, LEZIONI #67). Contatore `weight_bytes` del
+profiler diviso per le passate: deterministico, modello vero, 200 token, `generate --spec k`.
+
+| prompt | bozza | righe/passata | MiB di pesi/passata | MiB per riga in più | esperti nuovi per layer (su 8) |
+|---|---|---|---|---|---|
+| tutti | 0 | 1.00 | 1200.4 | — | — |
+| `code-edit` | fissa 1 | 2.00 | 1675.8 | 475 | 4.7 |
+| `code-edit` | fissa 8 | 9.00 | 3221.3 | 253 | 2.5 |
+| `code-edit` | fissa 15 | 16.00 | 3891.0 | 179 | 1.8 |
+| `code-edit` | adattiva | 3.34 | 2001.0 | 342 | 3.4 |
+| `code` | fissa 1 | 1.46 | 1404.9 | 445 | 4.4 |
+| `code` | fissa 8 | 4.04 | 1916.7 | 236 | 2.3 |
+| `code` | adattiva | 1.38 | 1337.6 | 361 | 3.5 |
+
+Un esperto sono 6.375 MiB (tre matrici Q8_0 da 2048×1024). A 36 GB/s, 253 MiB sono 7 ms dei 15
+di una riga in più: la lettura degli esperti nuovi spiega **metà** del costo, non tutto. Nello
+stesso profilo (tempi in container, solo indicativi) una riga in più costa 4-5.6 ms anche nelle
+zone dense (`qkv_proj`, `attn_out_proj`, `lm_head`), dove non c'è nessun peso nuovo da leggere.
+
+**Le costanti della pausa, senza cronometro** (LEZIONI #60, #67). Che una bozza venga accettata
+dipende solo dai token, e i token sono gli stessi con ogni politica: ogni politica si può
+rigiocare sulla continuazione registrata. Il replay riproduce alla riga i contatori del motore
+(77 passate, 180 bozze, 125 accettate su `code-edit`; 172, 65, 28 su `code`). Tempo = passate ×
+35 ms + righe di bozza × C; guadagno su `--spec 0` per C = 15 e 20 ms:
+
+| politica (bozza 8) | `code-edit` passate / bozze | C=15 | C=20 | `code` passate / bozze | C=15 | C=20 |
+|---|---|---|---|---|---|---|
+| fissa | 33 / 264 | 1.37× | 1.09× | 143 / 435 | 0.61× | 0.51× |
+| adattiva, solo si accorcia | 66 / 189 | 1.36× | 1.15× | 155 / 109 | 0.99× | 0.92× |
+| pausa 1, 3, 7, 15, 16 (oggi) | 77 / 180 | 1.30× | 1.11× | 172 / 66 | 1.00× | 0.95× |
+| pausa 1, 3, 7, 15, 31, 16 (l'errore #60) | 77 / 180 | 1.30× | 1.11× | 172 / 65 | 1.00× | 0.96× |
+| pausa 1, 2, 4, 8, 16 | 71 / 183 | 1.34× | 1.14× | 165 / 83 | 1.00× | 0.94× |
+| pausa 2, 5, 11, 16 | 78 / 169 | 1.33× | 1.15× | 168 / 65 | 1.02× | 0.97× |
+| pausa sempre 4 | 77 / 168 | 1.34× | 1.16× | 173 / 68 | 0.99× | 0.94× |
+
+Letture: le costanti spostano il 2-3%, meno di quanto una misura a tempo su questa macchina
+possa vedere; restano quelle. Il caso peggiore «1.01×» misurato nativo su 3 giri corrisponde a
+C ≈ 15 ms; con C = 20-22 (il valore che la stessa sezione ricava per le bozze corte) il replay
+dà 0.94-0.96×. La domanda «`--spec` acceso di default» va decisa su una misura con più giri e
+un controllo A/A (`tools/ab_modes.sh`, LEZIONI #66).
+
+**Il pool con più di un pool** (LEZIONI #61-#63). Programma di prova, Linux: `H1` chiamante
+prima `[0-31]`, dopo due pool creati e distrutti nell'ordine di nascita `[0,1]`; `H2` processo
+ristretto a `[0,2]`, pool da 4: worker 2 e 3 su `[0]`; `H3` worker 1 di due pool vivi entrambi
+su `[2,3]`; `H4` pool interno da 2, id del worker arrivato al body: 3. H1 e H2 corretti e sotto
+test; H3 e H4 restano un debito dichiarato in `threads.h`.
+
 ## Tentativi
 
 | Data | Cosa | Prima | Dopo | Spread | Esito |
@@ -654,3 +746,6 @@ riusano le stesse righe (leve 3-6).
 | 2026-09-17 | kernel `dot_row_x4`: una riga di pesi contro 4 token nei registri (scalare, AVX2, AVX-512), risultati identici al bit a `dot_row` | prefill 124 tok/s (16 thread, run alternate) | 180 tok/s | 12% / 16% | tenuto; da solo il kernel vale 2.1× (44 contro 21 G elementi/s) |
 | 2026-09-17 | accumulatori del kernel a 4 token in un array `__m512 acc[4]` invece che in registri con nome | — | — | — | **scartato**: il compilatore li tiene sullo stack e il guadagno sparisce (LEZIONI #45) |
 | 2026-09-17 | blocco di token di `tr_matmul` a 32, 64, 128 invece di 16 | prefill 180.5 tok/s (16 thread, tile 16) | 176.9 / 183.3 / 172.5 | 10-13% | scartato: tutto dentro il rumore, resta 16 |
+| 2026-09-18 | una riga di pesi contro **8** token (float, identico al bit a x4), solo nel banco | x4: 25.6 / 47.6 / 114.1 ns per riga (n = 1024 / 2048 / 4096) | 1.13× / 0.79× / 0.93× | 3-8% | **scartato**: a n=2048 le attivazioni di 8 righe (64 KB) escono dalla L1 (§Revisione) |
+| 2026-09-18 | dot int8 VNNI con la struttura del x4 (256 bit col trucco del segno; 512 bit a due blocchi), solo nel banco, non esatto | x4 float come sopra | 256 bit 1.64× / 1.62× / 1.96×; 512 bit **1.83× / 1.79× / 2.26×** | 3-8% | misurato, non adottato: l'int8 non è bit-identico, può essere solo un modo dichiarato. Decisione aperta (§Revisione, LEZIONI #65) |
+| 2026-09-18 | tetto della pausa della bozza adattiva corretto (31 → 16) | replay esatto: 172 passate, 65 righe di bozza (`code`) | 172 passate, 66 righe | — | tenuto: è una correzione, non una leva; le costanti spostano ±2-3% (§Revisione) |

@@ -22,12 +22,18 @@ typedef void (*tr_range_fn)(void *ctx, int64_t begin, int64_t end, int worker);
 /* n_threads counts the calling thread. n_threads <= 0 means "physical cores"
  * (tr_cpu()->physical_cores; SMT siblings slow matmul down). Returns NULL on failure.
  *
- * Every thread of the pool, the calling one included, is pinned to a logical processor
- * of its own (tr_cpu()->slot, best placement first): left to itself Windows puts two of
+ * Every thread of the pool, the calling one included, is pinned to a physical core of its
+ * own (tr_cpu()->slot, best placement first; free between the SMT siblings of that core, or
+ * tied to the one logical processor with TR_POOL_PIN=1): left to itself Windows puts two of
  * 16 threads on one physical core and leaves cores idle, which costs 30% of the prefill
- * (docs/MISURE.md "Dove vanno i thread"). The calling thread is put back where it was by
- * tr_pool_destroy. Pinning is skipped where the platform or the topology does not allow
- * it, and TR_POOL_PIN=0 turns it off for A/B measurements. */
+ * (docs/MISURE.md "Dove vanno i thread"). Threads beyond the last slot are not pinned. The
+ * calling thread is put back where it was when the last live pool it created is destroyed,
+ * in any order, provided tr_pool_destroy runs on the thread that called tr_pool_create.
+ * Pinning is skipped where the platform or the topology does not allow it, and TR_POOL_PIN=0
+ * turns it off for A/B measurements.
+ *
+ * Two pools alive at once take the same slots, first core first: used at the same time they
+ * share cores and leave others idle (docs/LEZIONI.md #63, open). */
 tr_pool *tr_pool_create(int n_threads);
 void tr_pool_destroy(tr_pool *p);
 int tr_pool_size(const tr_pool *p);
@@ -35,8 +41,11 @@ int tr_pool_size(const tr_pool *p);
 /* Splits [0, n) into at most tr_pool_size contiguous chunks, each holding at
  * least min_chunk indices (except when n < min_chunk: one chunk), runs fn on
  * every chunk and returns when all are done. A call made from inside a body
- * runs serially on the calling thread. p == NULL runs serially. Not reentrant
- * from two unrelated threads on the same pool: one job at a time per pool. */
+ * runs serially on the calling thread, with the worker id of the body it was made
+ * from: that id belongs to the outer pool, so a body may only nest calls on its own
+ * pool (on another pool the id can exceed that pool's size, docs/LEZIONI.md #63).
+ * p == NULL runs serially. Not reentrant from two unrelated threads on the same
+ * pool: one job at a time per pool. */
 void tr_parallel_for(tr_pool *p, int64_t n, int64_t min_chunk, tr_range_fn fn, void *ctx);
 
 #endif

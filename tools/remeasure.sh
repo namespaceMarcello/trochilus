@@ -1,0 +1,86 @@
+#!/bin/sh
+# remeasure.sh — the conclusions of docs/STATO.md that sit inside their own spread, measured again
+# (docs/LEZIONI.md #66): native Windows, still machine, 8 rounds, rotating order, A/A control.
+# Run from the repo root in Git Bash; about 30 minutes. Results in build/remeasure/.
+#
+# The containers of the other projects are stopped for the duration and started again at the end,
+# also when the script fails or is interrupted (docs/STATO.md: measurements want a still machine).
+#
+#   sh tools/remeasure.sh [rounds]
+set -e
+R=${1:-8}
+B=build/trochilus.exe
+M=models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf
+PY=tools/.venv/Scripts/python.exe
+OUT=build/remeasure
+mkdir -p $OUT
+[ -f $B ] && [ -f $M ] || { echo "remeasure: $B or $M is missing"; exit 1; }
+
+RUNNING=$(docker ps -q 2>/dev/null || true)
+restart() { if [ -n "$RUNNING" ]; then docker start $RUNNING > /dev/null 2>&1 || true; echo "containers started again"; fi; }
+trap restart EXIT INT TERM
+if [ -n "$RUNNING" ]; then
+  # the VM's file cache goes back to Windows first (docs/LEZIONI.md #38), then everything stops
+  MSYS_NO_PATHCONV=1 docker run --rm --privileged trochilus-dev:local sh -c "sync; echo 3 > /proc/sys/vm/drop_caches" || true
+  docker stop $RUNNING > /dev/null
+  echo "containers stopped: $(echo $RUNNING | wc -w)"
+fi
+
+echo "##### 1. speculation, worst case (code.txt), with an A/A control"
+sh tools/ab_modes.sh $R \
+  "spec0=$B run -m $M -f bench/prompts/code.txt -n 200 -t 16 --spec 0" \
+  "spec8=$B run -m $M -f bench/prompts/code.txt -n 200 -t 16 --spec 8" \
+  "spec0again=$B run -m $M -f bench/prompts/code.txt -n 200 -t 16 --spec 0" > $OUT/1-spec-code.txt
+tail -4 $OUT/1-spec-code.txt
+
+echo "##### 2. speculation, good case (code-edit.txt)"
+sh tools/ab_modes.sh $R \
+  "spec0=$B run -m $M -f bench/prompts/code-edit.txt -n 200 -t 16 --spec 0" \
+  "spec8=$B run -m $M -f bench/prompts/code-edit.txt -n 200 -t 16 --spec 8" > $OUT/2-spec-code-edit.txt
+tail -3 $OUT/2-spec-code-edit.txt
+
+echo "##### 3. pin modes at 16 threads, with an A/A control"
+sh tools/ab_modes.sh $R \
+  "pin2=TR_POOL_PIN=2 $B generate -m $M -p 512 -n 24 -c 600 -t 16" \
+  "pin1=TR_POOL_PIN=1 $B generate -m $M -p 512 -n 24 -c 600 -t 16" \
+  "pin0=TR_POOL_PIN=0 $B generate -m $M -p 512 -n 24 -c 600 -t 16" \
+  "pin2again=TR_POOL_PIN=2 $B generate -m $M -p 512 -n 24 -c 600 -t 16" > $OUT/3-pin.txt
+tail -9 $OUT/3-pin.txt
+
+echo "##### 4. threads per phase: 8 against 16 (default pin), with an A/A control"
+sh tools/ab_modes.sh $R \
+  "t16=$B generate -m $M -p 512 -n 48 -c 600 -t 16" \
+  "t8=$B generate -m $M -p 512 -n 48 -c 600 -t 8" \
+  "t16again=$B generate -m $M -p 512 -n 48 -c 600 -t 16" > $OUT/4-threads.txt
+tail -7 $OUT/4-threads.txt
+
+echo "##### 5. question 12, the timed half: ms per pass by zone with 1, 2 and 9 rows (3 alternated rounds)"
+IDS=$($B tokenize -m $M -f bench/prompts/code-edit.txt)
+for round in 1 2 3; do
+  for mode in "0" "1 --spec-fixed" "8 --spec-fixed"; do
+    tag=$(echo "$mode" | tr -d ' -')
+    $B generate -m $M --tokens "$IDS" -n 200 -t 16 --spec $mode --profile-json $OUT/5-zones-$tag-$round.json > /dev/null 2>&1
+  done
+done
+$PY - $OUT <<'EOF' | tee $OUT/5-zones.txt
+import json, statistics, sys
+out = sys.argv[1]
+def load(tag):
+    rows = []
+    for r in (1, 2, 3):
+        d = json.load(open(f"{out}/5-zones-{tag}-{r}.json"))["engine"]["phases"]["decode"]
+        p = d["zones"]["token"]["calls"]
+        rows.append((d["tokens"] / p, {k: v["seconds"] / p * 1e3 for k, v in d["zones"].items()}))
+    return rows[0][0], {k: statistics.median(z[k] for _, z in rows) for k in rows[0][1]}
+_, z0 = load("0")
+print(f"one row: {z0['token']:.1f} ms per pass")
+for tag in ("1specfixed", "8specfixed"):
+    rows, z = load(tag)
+    extra = rows - 1.0
+    dense = sum(z[k] - z0[k] for k in ("qkv_proj", "attn_out_proj", "lm_head")) / extra
+    experts = sum(z[k] - z0[k] for k in ("expert_gate_up", "expert_down")) / extra
+    total = (z["token"] - z0["token"]) / extra
+    print(f"{tag}: {rows:.2f} rows/pass, {z['token']:.1f} ms/pass; one more row = {total:.1f} ms "
+          f"(dense matmul {dense:.1f}, experts {experts:.1f}, rest {total - dense - experts:.1f})")
+EOF
+echo "done: $OUT"

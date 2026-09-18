@@ -136,6 +136,132 @@ static float dot_q8_q8_vnni(const uint8_t *row, const int8_t *xq, const float *x
     s = _mm_hadd_ps(s, s);
     return _mm_cvtss_f32(s) - corr;
 }
+
+/* ---- question 21, second take (docs/LEZIONI.md #65) ------------------------------------
+ * The candidate above is one row against ONE token, with a scalar half->float and a scalar
+ * correction chain inside the loop, and it was compared with our one-token float dot: +1-8%,
+ * "lever 2 is not worth writing". But the kernel the prefill really runs is one row against
+ * FOUR tokens, so the honest question is what int8 gives with that same structure. Three
+ * candidates, measured alternately with the engine's own x4 kernel:
+ *   vnni256 x4   the weight block loaded and made unsigned once (ggml's sign trick), then one
+ *                dpbusd per token; scale by F16C
+ *   vnni512 x4   two weight blocks per 512-bit dpbusd; activations stored unsigned and the
+ *                +128 shift paid back in the integer domain, from a per-block constant that a
+ *                real kernel would keep beside the row together with the float scale
+ *   float x8     the exact lever (one row against 8 tokens, same arithmetic per token as x4,
+ *                bit-identical): what "wider blocks" buys without giving up exactness
+ * Still measurements, not kernels: int8 activations are another number, never bit-identical. */
+__attribute__((target("avx2,fma")))
+static inline float hsum256_ps(__m256 v) {
+    __m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    return _mm_cvtss_f32(s);
+}
+
+/* xq: 4 input rows of n int8 each, xd: their 4 x n/32 scales */
+__attribute__((target("avx2,fma,f16c,avx512f,avx512bw,avx512vl,avx512vnni")))
+static void dot_q8_q8_vnni256_x4(const uint8_t *row, const int8_t *xq, const float *xd, int64_t n, float *out) {
+    const int64_t nb = n / TR_Q8_0_BLOCK_ELEMS;
+    const __m256i zero = _mm256_setzero_si256();
+    __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+    const int8_t *q0 = xq, *q1 = xq + n, *q2 = xq + 2 * n, *q3 = xq + 3 * n;
+    const float *d0 = xd, *d1 = xd + nb, *d2 = xd + 2 * nb, *d3 = xd + 3 * nb;
+    for (int64_t b = 0; b < nb; b++) {
+        const uint8_t *blk = row + TR_Q8_0_BLOCK_BYTES * b;
+        uint16_t half;
+        memcpy(&half, blk, sizeof half);
+        __m256 dw = _mm256_set1_ps(_cvtsh_ss(half));
+        __m256i w = _mm256_loadu_si256((const __m256i *)(blk + TR_Q8_0_SCALE_BYTES));
+        __m256i aw = _mm256_sign_epi8(w, w);
+        int64_t at = b * TR_Q8_0_BLOCK_ELEMS;
+        __m256i p0 = _mm256_dpbusd_epi32(zero, aw, _mm256_sign_epi8(_mm256_loadu_si256((const __m256i *)(q0 + at)), w));
+        __m256i p1 = _mm256_dpbusd_epi32(zero, aw, _mm256_sign_epi8(_mm256_loadu_si256((const __m256i *)(q1 + at)), w));
+        __m256i p2 = _mm256_dpbusd_epi32(zero, aw, _mm256_sign_epi8(_mm256_loadu_si256((const __m256i *)(q2 + at)), w));
+        __m256i p3 = _mm256_dpbusd_epi32(zero, aw, _mm256_sign_epi8(_mm256_loadu_si256((const __m256i *)(q3 + at)), w));
+        a0 = _mm256_fmadd_ps(_mm256_mul_ps(dw, _mm256_broadcast_ss(d0 + b)), _mm256_cvtepi32_ps(p0), a0);
+        a1 = _mm256_fmadd_ps(_mm256_mul_ps(dw, _mm256_broadcast_ss(d1 + b)), _mm256_cvtepi32_ps(p1), a1);
+        a2 = _mm256_fmadd_ps(_mm256_mul_ps(dw, _mm256_broadcast_ss(d2 + b)), _mm256_cvtepi32_ps(p2), a2);
+        a3 = _mm256_fmadd_ps(_mm256_mul_ps(dw, _mm256_broadcast_ss(d3 + b)), _mm256_cvtepi32_ps(p3), a3);
+    }
+    out[0] = hsum256_ps(a0);
+    out[1] = hsum256_ps(a1);
+    out[2] = hsum256_ps(a2);
+    out[3] = hsum256_ps(a3);
+}
+
+/* xu: 4 input rows of n bytes, each int8 value + 128; dwf and wcorr (= -128 * sum of the block's
+ * weights) are the per-block side data of the row. n must hold an even number of blocks. */
+__attribute__((target("avx2,fma,avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")))
+static void dot_q8_q8_vnni512_x4(const uint8_t *row, const float *dwf, const int32_t *wcorr, const uint8_t *xu,
+                                 const float *xd, int64_t n, float *out) {
+    const int64_t nb = n / TR_Q8_0_BLOCK_ELEMS;
+    __m512 a0 = _mm512_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+    const uint8_t *q0 = xu, *q1 = xu + n, *q2 = xu + 2 * n, *q3 = xu + 3 * n;
+    const float *d0 = xd, *d1 = xd + nb, *d2 = xd + 2 * nb, *d3 = xd + 3 * nb;
+    for (int64_t b = 0; b + 1 < nb; b += 2) {
+        const uint8_t *blk = row + TR_Q8_0_BLOCK_BYTES * b;
+        __m512i w = _mm512_inserti64x4(
+            _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *)(blk + TR_Q8_0_SCALE_BYTES))),
+            _mm256_loadu_si256((const __m256i *)(blk + TR_Q8_0_BLOCK_BYTES + TR_Q8_0_SCALE_BYTES)), 1);
+        /* lane 0 of each half starts from its block's correction; the casts leave the other
+         * lanes undefined, the mask clears them */
+        __m512i corr = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_castsi128_si256(_mm_cvtsi32_si128(wcorr[b]))),
+                                          _mm256_castsi128_si256(_mm_cvtsi32_si128(wcorr[b + 1])), 1);
+        corr = _mm512_maskz_mov_epi32(0x0101, corr);
+        __m512 dw = _mm512_insertf32x8(_mm512_castps256_ps512(_mm256_broadcast_ss(dwf + b)),
+                                       _mm256_broadcast_ss(dwf + b + 1), 1);
+        int64_t at = b * TR_Q8_0_BLOCK_ELEMS;
+#define TR_BENCH_TOKEN(acc, q, d)                                                                         \
+    do {                                                                                                  \
+        __m512i p = _mm512_dpbusd_epi32(corr, _mm512_loadu_si512((const void *)((q) + at)), w);           \
+        __m512 dx = _mm512_insertf32x8(_mm512_castps256_ps512(_mm256_broadcast_ss((d) + b)),              \
+                                       _mm256_broadcast_ss((d) + b + 1), 1);                              \
+        acc = _mm512_fmadd_ps(_mm512_mul_ps(dw, dx), _mm512_cvtepi32_ps(p), acc);                         \
+    } while (0)
+        TR_BENCH_TOKEN(a0, q0, d0);
+        TR_BENCH_TOKEN(a1, q1, d1);
+        TR_BENCH_TOKEN(a2, q2, d2);
+        TR_BENCH_TOKEN(a3, q3, d3);
+#undef TR_BENCH_TOKEN
+    }
+    out[0] = _mm512_reduce_add_ps(a0);
+    out[1] = _mm512_reduce_add_ps(a1);
+    out[2] = _mm512_reduce_add_ps(a2);
+    out[3] = _mm512_reduce_add_ps(a3);
+}
+
+/* One weight row against 8 float input rows: the engine's avx512 x4 kernel with twice the
+ * accumulators, the same multiply and add per element, the same lane tree. */
+__attribute__((target("avx512f")))
+static void dot_row_x8_q8_0_float(const uint8_t *row, const float *x, int64_t stride, int64_t n, float *out) {
+    const int64_t nb = n / TR_Q8_0_BLOCK_ELEMS;
+    __m512 a0 = _mm512_setzero_ps(), a1 = a0, a2 = a0, a3 = a0, a4 = a0, a5 = a0, a6 = a0, a7 = a0;
+    for (int64_t b = 0; b < nb; b++) {
+        const uint8_t *blk = row + TR_Q8_0_BLOCK_BYTES * b;
+        const uint8_t *qs = blk + TR_Q8_0_SCALE_BYTES;
+        const float *xb = x + b * TR_Q8_0_BLOCK_ELEMS;
+        __m512 d = _mm512_set1_ps(tr_q8_0_block_scale(blk));
+        for (int j = 0; j < TR_Q8_0_BLOCK_ELEMS; j += TR_LANES) {
+            __m512 q = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(const void *)(qs + j))));
+            __m512 w = _mm512_mul_ps(d, q);
+            const float *p = xb + j;
+            a0 = _mm512_add_ps(a0, _mm512_mul_ps(w, _mm512_loadu_ps(p)));
+            a1 = _mm512_add_ps(a1, _mm512_mul_ps(w, _mm512_loadu_ps(p + stride)));
+            a2 = _mm512_add_ps(a2, _mm512_mul_ps(w, _mm512_loadu_ps(p + 2 * stride)));
+            a3 = _mm512_add_ps(a3, _mm512_mul_ps(w, _mm512_loadu_ps(p + 3 * stride)));
+            a4 = _mm512_add_ps(a4, _mm512_mul_ps(w, _mm512_loadu_ps(p + 4 * stride)));
+            a5 = _mm512_add_ps(a5, _mm512_mul_ps(w, _mm512_loadu_ps(p + 5 * stride)));
+            a6 = _mm512_add_ps(a6, _mm512_mul_ps(w, _mm512_loadu_ps(p + 6 * stride)));
+            a7 = _mm512_add_ps(a7, _mm512_mul_ps(w, _mm512_loadu_ps(p + 7 * stride)));
+        }
+    }
+    float lane[TR_LANES];
+#define TR_BENCH_OUT(i, a) do { _mm512_storeu_ps(lane, a); out[i] = tr_lane_combine(lane); } while (0)
+    TR_BENCH_OUT(0, a0); TR_BENCH_OUT(1, a1); TR_BENCH_OUT(2, a2); TR_BENCH_OUT(3, a3);
+    TR_BENCH_OUT(4, a4); TR_BENCH_OUT(5, a5); TR_BENCH_OUT(6, a6); TR_BENCH_OUT(7, a7);
+#undef TR_BENCH_OUT
+}
 #endif
 
 typedef struct {
@@ -250,6 +376,65 @@ static void measure_quant(const float *x, int64_t n, int8_t *q, float *d, int ru
     qsort(ns, (size_t)runs, sizeof ns[0], cmp_double);
     *ns_median = ns[runs / 2];
     *spread = (ns[runs - 1] - ns[0]) / ns[runs / 2];
+}
+
+/* The four kernels of the second take on one weight row, run ALTERNATELY (a b c d a b c d ...):
+ * a comparison measured one kernel after the other moves with the temperature of the core
+ * (docs/LEZIONI.md #46). ns are per input row, so the lines compare directly. */
+enum { CAND_X4_FLOAT = 0, CAND_VNNI256_X4, CAND_VNNI512_X4, CAND_X8_FLOAT, CAND_COUNT };
+
+typedef struct {
+    const tr_kernels *k;
+    const uint8_t *row;
+    const float *x;      /* 8 rows of n floats */
+    const int8_t *xq;    /* 4 rows of n int8 */
+    const uint8_t *xu;   /* the same + 128 */
+    const float *xd;     /* 4 rows of n/32 scales */
+    const float *dwf;    /* per block: the weight scale as float */
+    const int32_t *wcorr; /* per block: -128 * sum of the weights */
+    int64_t n;
+} cand_job;
+
+static volatile float cand_sink;
+
+static void cand_run(int which, const cand_job *j, long calls) {
+    float out[8], s = 0;
+    for (long c = 0; c < calls; c++) {
+        switch (which) {
+        case CAND_X4_FLOAT: j->k->dot_row_x4[TR_TYPE_Q8_0](j->row, j->x, j->n, j->n, out); break;
+        case CAND_VNNI256_X4: dot_q8_q8_vnni256_x4(j->row, j->xq, j->xd, j->n, out); break;
+        case CAND_VNNI512_X4: dot_q8_q8_vnni512_x4(j->row, j->dwf, j->wcorr, j->xu, j->xd, j->n, out); break;
+        default: dot_row_x8_q8_0_float(j->row, j->x, j->n, j->n, out); break;
+        }
+        s += out[0] + out[3];
+    }
+    cand_sink = s;
+}
+
+static void measure_candidates(const cand_job *j, int runs, double run_ms, double ns_median[CAND_COUNT],
+                               double spread[CAND_COUNT]) {
+    static const double rows_per_call[CAND_COUNT] = {4, 4, 4, 8};
+    static double ns[CAND_COUNT][MAX_RUNS];
+    long calls[CAND_COUNT];
+    for (int w = 0; w < CAND_COUNT; w++) {
+        long c = 1;
+        double t0 = tr_time_sec();
+        while (tr_time_sec() - t0 < 0.02) { cand_run(w, j, c); c *= 2; }
+        double per_call = (tr_time_sec() - t0) / (double)(c - 1);
+        calls[w] = (long)(run_ms / 1000.0 / (per_call > 0 ? per_call : 1e-9));
+        if (calls[w] < 1) calls[w] = 1;
+    }
+    for (int r = 0; r < runs; r++)
+        for (int w = 0; w < CAND_COUNT; w++) {
+            double a = tr_time_sec();
+            cand_run(w, j, calls[w]);
+            ns[w][r] = (tr_time_sec() - a) * 1e9 / (double)calls[w] / rows_per_call[w];
+        }
+    for (int w = 0; w < CAND_COUNT; w++) {
+        qsort(ns[w], (size_t)runs, sizeof ns[w][0], cmp_double);
+        ns_median[w] = ns[w][runs / 2];
+        spread[w] = (ns[w][runs - 1] - ns[w][0]) / ns[w][runs / 2];
+    }
 }
 #endif
 
@@ -392,6 +577,68 @@ int main(int argc, char **argv) {
         tr_free_aligned(xq);
         tr_free_aligned(xd);
         tr_free_aligned(wsums);
+    }
+
+    /* Question 21, second take: int8 with the structure of our best kernel (one row against 4
+     * tokens), and the exact alternative (one row against 8), alternated with the engine's x4. */
+    const tr_kernels *best = tr_kernels_tier("avx512");
+    if (tr_cpu()->avx512vnni && tr_cpu()->avx512bw && tr_cpu()->avx512dq && tr_cpu()->f16c && best != NULL) {
+        static const char *const cand_names[CAND_COUNT] = {"float x4 (ours)", "vnni256 x4", "vnni512 x4", "float x8 exact"};
+        int64_t nblk = max_n / TR_Q8_0_BLOCK_ELEMS;
+        float *x8 = tr_alloc_aligned((size_t)max_n * 8 * sizeof(float), 64);
+        int8_t *xq4 = tr_alloc_aligned((size_t)max_n * 4, 64);
+        uint8_t *xu4 = tr_alloc_aligned((size_t)max_n * 4, 64);
+        float *xd4 = tr_alloc_aligned((size_t)nblk * 4 * sizeof(float), 64);
+        float *dwf = tr_alloc_aligned((size_t)nblk * sizeof(float), 64);
+        int32_t *wcorr = tr_alloc_aligned((size_t)nblk * sizeof(int32_t), 64);
+        if (!x8 || !xq4 || !xu4 || !xd4 || !dwf || !wcorr) { fprintf(stderr, "out of memory\n"); return 1; }
+        for (int64_t i = 0; i < max_n * 8; i++) x8[i] = frand();
+        printf("\n%-16s %6s %12s %12s %8s %8s\n", "one row, by", "n", "ns/row", "M elem/s", "spread", "vs ours");
+        for (size_t s = 1; s < sizeof sizes / sizeof sizes[0]; s++) {
+            int64_t n = sizes[s], nb = n / TR_Q8_0_BLOCK_ELEMS;
+            fill_row(TR_TYPE_Q8_0, row, n);
+            q8_0_row_sums(row, n, wcorr);
+            for (int64_t b = 0; b < nb; b++) {
+                dwf[b] = tr_q8_0_block_scale(row + TR_Q8_0_BLOCK_BYTES * b);
+                wcorr[b] *= -128;
+            }
+            for (int t = 0; t < 4; t++) quantize_q8_0(x8 + t * n, n, xq4 + t * n, xd4 + t * nb);
+            for (int64_t i = 0; i < 4 * n; i++) xu4[i] = (uint8_t)(xq4[i] + 128);
+            cand_job j = {best, row, x8, xq4, xu4, xd4, dwf, wcorr, n};
+
+            /* the candidates must compute the dot they are timed for: x8 bit for bit, int8
+             * within the rounding of the activations */
+            float ref[8], got[8];
+            best->dot_row_x4[TR_TYPE_Q8_0](row, x8, n, n, ref);
+            dot_row_x8_q8_0_float(row, x8, n, n, got);
+            if (memcmp(ref, got, 4 * sizeof(float)) != 0) { fprintf(stderr, "float x8 is not bit-identical to x4\n"); return 1; }
+            double want = 0, mag = 0; /* the int8 dot of input row 3 in plain C, and the size of its terms */
+            for (int64_t e = 0; e < n; e++) {
+                int64_t b = e / TR_Q8_0_BLOCK_ELEMS;
+                double term = (double)dwf[b] * (double)(int8_t)row[TR_Q8_0_BLOCK_BYTES * b + TR_Q8_0_SCALE_BYTES + e % TR_Q8_0_BLOCK_ELEMS] *
+                              (double)xd4[3 * nb + b] * (double)xq4[3 * n + e];
+                want += term;
+                mag += term < 0 ? -term : term;
+            }
+            dot_q8_q8_vnni256_x4(row, xq4, xd4, n, got);
+            double off256 = (double)got[3] - want;
+            dot_q8_q8_vnni512_x4(row, dwf, wcorr, xu4, xd4, n, got);
+            double off512 = (double)got[3] - want;
+            if (off256 < 0) off256 = -off256;
+            if (off512 < 0) off512 = -off512;
+            if (off256 > 1e-4 * mag || off512 > 1e-4 * mag) {
+                fprintf(stderr, "an int8 candidate does not compute its dot (off by %g and %g, terms %g)\n", off256, off512, mag);
+                return 1;
+            }
+
+            double ns[CAND_COUNT], spread[CAND_COUNT];
+            measure_candidates(&j, runs, run_ms, ns, spread);
+            for (int w = 0; w < CAND_COUNT; w++)
+                printf("%-16s %6lld %12.1f %12.1f %7.1f%% %7.2fx\n", cand_names[w], (long long)n, ns[w],
+                       (double)n / ns[w] * 1e3, spread[w] * 100.0, ns[CAND_X4_FLOAT] / ns[w]);
+        }
+        tr_free_aligned(x8); tr_free_aligned(xq4); tr_free_aligned(xu4);
+        tr_free_aligned(xd4); tr_free_aligned(dwf); tr_free_aligned(wcorr);
     }
 #endif
 

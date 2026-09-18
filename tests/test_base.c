@@ -468,6 +468,130 @@ static void test_pool_pinned(void) {
     tr_pool_destroy(p);
 }
 
+/* The affinity of the calling thread as one comparable value; ok = 0 where it cannot be read. */
+typedef struct {
+    int ok;
+    unsigned group;
+    unsigned char mask[128];
+} thread_mask;
+
+static thread_mask current_mask(void) {
+    thread_mask m;
+    memset(&m, 0, sizeof m);
+#if defined(_WIN32)
+    GROUP_AFFINITY ga;
+    if (GetThreadGroupAffinity(GetCurrentThread(), &ga)) {
+        m.ok = 1;
+        m.group = ga.Group;
+        memcpy(m.mask, &ga.Mask, sizeof ga.Mask);
+    }
+#elif defined(__linux__)
+    cpu_set_t s;
+    if (sizeof s <= sizeof m.mask && sched_getaffinity(0, sizeof s, &s) == 0) {
+        m.ok = 1;
+        memcpy(m.mask, &s, sizeof s);
+    }
+#endif
+    return m;
+}
+
+static int same_mask(const thread_mask *a, const thread_mask *b) {
+    return a->ok && b->ok && a->group == b->group && memcmp(a->mask, b->mask, sizeof a->mask) == 0;
+}
+
+/* Two pools alive at once: whatever the order they are destroyed in, the calling thread ends
+ * where it started, and stays on its slot while one of them is still alive. Each pool used to
+ * save "where the caller was" for itself, so the second saved the first one's pin and, destroyed
+ * last, left the caller on one core for the rest of the process (docs/LEZIONI.md #61). */
+static void test_pool_caller_affinity_any_order(void) {
+    thread_mask before = current_mask();
+    if (!before.ok || tr_cpu()->n_slots == 0) return; /* platform without placement */
+
+    for (int order = 0; order < 2; order++) {
+        tr_pool *a = tr_pool_create(2), *b = tr_pool_create(2);
+        TR_CHECK(a != NULL && b != NULL);
+        if (a == NULL || b == NULL) {
+            tr_pool_destroy(a);
+            tr_pool_destroy(b);
+            return;
+        }
+        thread_mask pinned = current_mask();
+        tr_pool_destroy(order == 0 ? a : b);
+        thread_mask one_left = current_mask();
+        TR_CHECK(same_mask(&one_left, &pinned)); /* still worker 0 of the pool that is alive */
+        tr_pool_destroy(order == 0 ? b : a);
+        thread_mask after = current_mask();
+        TR_CHECK(same_mask(&after, &before));
+        if (!same_mask(&after, &before))
+            printf("  two pools destroyed %s: the caller is left pinned\n",
+                   order == 0 ? "in creation order" : "in reverse order");
+    }
+}
+
+#if defined(__linux__)
+static void mask_fn(void *ctx_, int64_t begin, int64_t end, int worker) {
+    thread_mask *masks = ctx_;
+    (void)begin;
+    (void)end;
+    masks[worker] = current_mask();
+}
+
+/* Runs in a process of its own (test_pool_oversubscribed below): tr_cpu() is detected once,
+ * so the process has to be confined to two processors before anything asks for it. */
+static int oversubscribed_child(void) {
+    cpu_set_t allowed, two;
+    if (sched_getaffinity(0, sizeof allowed, &allowed) != 0) return 0;
+    CPU_ZERO(&two);
+    int n = 0;
+    for (int c = 0; c < CPU_SETSIZE && n < 2; c++)
+        if (CPU_ISSET(c, &allowed)) {
+            CPU_SET(c, &two);
+            n++;
+        }
+    if (n < 2 || sched_setaffinity(0, sizeof two, &two) != 0) {
+        printf("  oversubscribed pool: fewer than 2 processors, skipped\n");
+        return 0;
+    }
+    setenv("TR_POOL_PIN", "1", 1); /* one processor per thread: the caller's pin is one cpu, not both */
+    thread_mask process = current_mask();
+
+    if (tr_cpu()->n_slots == 0) { /* no topology in /sys: nothing is pinned, nothing to inherit */
+        printf("  oversubscribed pool: no topology on this machine, skipped\n");
+        return 0;
+    }
+    TR_CHECK_EQ_INT(tr_cpu()->n_slots, 2);
+    tr_pool *p = tr_pool_create(4);
+    TR_CHECK(p != NULL);
+    if (p == NULL) return 1;
+    thread_mask masks[4];
+    memset(masks, 0, sizeof masks);
+    tr_parallel_for(p, 4, 1, mask_fn, masks);
+    tr_parallel_for(p, 4, 1, mask_fn, masks); /* again: every worker has started by now */
+    /* workers 0 and 1 have a slot each; 2 and 3 have none and belong to the scheduler, on
+     * every processor the process may use, not on the one the caller was pinned to */
+    TR_CHECK(!same_mask(&masks[0], &process));
+    TR_CHECK(!same_mask(&masks[1], &process));
+    TR_CHECK(!same_mask(&masks[0], &masks[1]));
+    TR_CHECK(same_mask(&masks[2], &process));
+    TR_CHECK(same_mask(&masks[3], &process));
+    tr_pool_destroy(p);
+    return tr_test_failures != 0;
+}
+#endif
+
+/* More threads than processors: the threads without a slot are left to the scheduler. On Linux
+ * a new thread inherits its creator's affinity, and the creator had just pinned itself to slot
+ * 0: they all piled up on the caller's core (docs/LEZIONI.md #62). */
+static void test_pool_oversubscribed(const char *argv0) {
+#if defined(__linux__)
+    char cmd[1024];
+    snprintf(cmd, sizeof cmd, "\"%s\" --oversubscribed", argv0);
+    TR_CHECK_EQ_INT(system(cmd), 0);
+#else
+    (void)argv0; /* Windows gives a new thread the affinity of the process, not of its creator */
+#endif
+}
+
 /* ---- cpu ----------------------------------------------------------------- */
 
 static void test_cpu(void) {
@@ -488,7 +612,10 @@ static void test_cpu(void) {
      * printed tr_cpu_describe line carries no SIMD flags after "threads,". */
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+#if defined(__linux__)
+    if (argc > 1 && strcmp(argv[1], "--oversubscribed") == 0) return oversubscribed_child();
+#endif
     test_file();
     test_alloc();
     test_time();
@@ -509,6 +636,8 @@ int main(void) {
     test_parallel_varying_chunks();
     test_cpu_slots();
     test_pool_pinned();
+    test_pool_caller_affinity_any_order();
+    test_pool_oversubscribed(argc > 0 ? argv[0] : "");
     test_cpu();
 
     TR_TEST_EXIT();

@@ -71,7 +71,8 @@ struct tr_pool {
     atomic_int remaining;
     atomic_int caller_sleeping;
     atomic_int shutdown;
-    tr_affinity caller_affinity; /* where the calling thread ran before it was pinned */
+    int caller_pinned;           /* this pool counts in t_pin_depth of the thread that made it */
+    tr_affinity caller_affinity; /* where the calling thread ran before any live pool pinned it */
 
 #if defined(_WIN32)
     HANDLE *workers;
@@ -88,6 +89,11 @@ struct tr_pool {
 
 static _Thread_local int t_worker_id = -1;  /* global-ok: per thread, not per model */
 static _Thread_local int t_depth = 0;       /* global-ok: per thread, not per model */
+/* Live pools that pinned this thread as their worker 0, and where it ran before the first of
+ * them. Per thread and counted, not per pool: with two pools alive the second would save the
+ * first one's pin as "before" and, destroyed last, leave the thread on one core for good. */
+static _Thread_local int t_pin_depth = 0;       /* global-ok: per thread, not per model */
+static _Thread_local tr_affinity t_pin_prev;    /* global-ok: per thread, not per model */
 
 #if defined(_WIN32)
 #  define POOL_LOCK(p)      AcquireSRWLockExclusive(&(p)->lock)
@@ -136,7 +142,10 @@ static void worker_loop(slot *w) {
 /* A worker pins itself, once, before it ever waits for work: affinity applies to the
  * calling thread, and this is the only moment the new thread is outside the hot loop. */
 static void worker_start(slot *w) {
+    /* A worker without a slot belongs to the scheduler, wherever the caller could run before it
+     * was pinned: on Linux a new thread inherits its creator's affinity, which by now is slot 0. */
     if (w->pin > 0) tr_thread_pin(w->pin_group, w->pin_cpu, w->pin, NULL);
+    else tr_thread_affinity_restore(&w->pool->caller_affinity);
     worker_loop(w);
 }
 
@@ -177,7 +186,8 @@ tr_pool *tr_pool_create(int n_threads) {
 
     /* One thread per slot, in the order cpu.c ranked them: physical cores first, spread
      * over the last-level caches. More threads than slots means the extra ones are left
-     * to the scheduler rather than doubled onto a core that already has one.
+     * to the scheduler rather than doubled onto a core that already has one (worker_start
+     * undoes the affinity they inherit from the pinned caller).
      * TR_POOL_PIN: 0 no pin, 1 one logical processor per thread, 2 (the default) the whole
      * physical core, which keeps one thread per core but lets the scheduler pick the sibling
      * (docs/MISURE.md §Il pin dei thread). */
@@ -208,11 +218,17 @@ tr_pool *tr_pool_create(int n_threads) {
         }
     }
     /* The calling thread runs chunk 0, so it takes slot 0 like any other worker; its
-     * previous affinity comes back in tr_pool_destroy. */
-    if (p->slots[0].s.pin > 0 &&
-        tr_thread_pin(p->slots[0].s.pin_group, p->slots[0].s.pin_cpu, p->slots[0].s.pin,
-                      &p->caller_affinity) != 0)
-        p->caller_affinity.valid = 0;
+     * previous affinity comes back when the last pool that pinned it is destroyed. */
+    if (p->slots[0].s.pin > 0) {
+        tr_affinity had;
+        had.valid = 0;
+        if (tr_thread_pin(p->slots[0].s.pin_group, p->slots[0].s.pin_cpu, p->slots[0].s.pin, &had) == 0) {
+            if (t_pin_depth == 0) t_pin_prev = had;
+            t_pin_depth++;
+            p->caller_pinned = 1;
+        }
+    }
+    if (t_pin_depth > 0) p->caller_affinity = t_pin_prev; /* where a worker without a slot goes back to */
 
 #if defined(_WIN32)
     InitializeSRWLock(&p->lock);
@@ -260,8 +276,9 @@ void tr_pool_destroy(tr_pool *p) {
     pthread_cond_destroy(&p->cond_done);
 #endif
     /* The caller outlives the pool: a process that creates pools of different sizes (the
-     * benchmarks do) must not be left pinned to one core by the first of them. */
-    tr_thread_affinity_restore(&p->caller_affinity);
+     * benchmarks do) must not be left pinned to one core by the first of them. While another
+     * pool made by this thread is alive, the thread stays its worker 0, on slot 0. */
+    if (p->caller_pinned && t_pin_depth > 0 && --t_pin_depth == 0) tr_thread_affinity_restore(&t_pin_prev);
     free(p->workers);
     tr_free_aligned(p->slots);
     free(p);

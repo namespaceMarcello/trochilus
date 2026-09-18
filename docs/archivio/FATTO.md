@@ -265,3 +265,23 @@ diventa un kernel: le attivazioni a 8 bit non sono lo stesso numero. Prova: `mak
 `tools/ab_speed.sh` e `tools/ab_spec.sh` si fermano alla prima run che non produce la riga dei tok/s
 e stampano le ultime righe di quella run: prima stampavano la tabella delle mediane su un file vuoto,
 e una misura muta sembrava una misura riuscita (LEZIONI #56).
+
+### 2026-09-18 — Revisione avversariale di tutto il repository
+Rilettura completa da parte di un altro modello (Fable 5.1): kernel, prefill, speculazione,
+tokenizer, pool, GGUF, piattaforma, riga di comando, strumenti e documenti. Esito: gli invarianti
+reggono; tre errori corretti, ognuno con un test rosso prima e verde dopo; una conclusione di misura
+rovesciata; due controlli e uno strumento nuovi (LEZIONI #60-#68, `docs/MISURE.md` §Revisione).
+- `src/gen/greedy.c`: il tetto della pausa della bozza adattiva valeva sul valore vecchio, quindi
+  15 raddoppiava a 31. Prova: `build/.../tests/test_spec` (`test_adaptive_pause_is_capped`).
+- `src/base/threads.c`: l'affinità di prima del chiamante sta nel thread con un contatore dei pool
+  vivi (due pool distrutti nell'ordine di nascita lo lasciavano sul core 0), e un worker senza slot
+  riprende quell'affinità invece di ereditare il pin (Linux). Prova: `tests/test_base`
+  (`test_pool_caller_affinity_any_order`, `test_pool_oversubscribed`), anche sotto TSan.
+- `src/base/cpu.c`: un `TR_CPU_MAX` che non è un tier è un avviso sul log, non più un silenzio.
+- `make tier-check` (`tools/tier_check.sh`, dentro `check-linux`): il motore sotto `scalar` e
+  `avx2`, e i logit dei modelli minuscoli identici al byte fra tier, thread e `-b`.
+- `tests/bench_kernels.c`, sezione «one row, by»: int8 VNNI con la struttura del kernel a 4 token
+  (1.8-2.3× il nostro float) e float a 8 token (0.79× a n=2048), alternati. Prova: `make bench`.
+- `tools/ab_modes.sh`: confronto fra modi dello stesso binario con rotazione dell'ordine e
+  controllo A/A. Prova: `sh tools/ab_modes.sh 3 "a=<comando>" "a2=<stesso comando>"`.
+- Commenti corretti dove dicevano il contrario del codice: `lookup.h`, `threads.h`, `threads.c`.

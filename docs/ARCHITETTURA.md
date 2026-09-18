@@ -157,8 +157,9 @@ codice macchina con e senza, verificato): nella zona calda restano quelli che sp
 | Livello | Cosa confronta | Dove |
 |---|---|---|
 | kernel | ogni variante SIMD/asm contro lo scalare, bit per bit, su input casuali | `tests/test_kernels.c` |
-| modello minuscolo | token greedy **identici** a transformers; logit entro tolleranza per posizione | `tools/make_tiny_<famiglia>.py` → `tests/oracle_<famiglia>.py` |
-| modello vero | token greedy contro transformers su un prompt fisso | a mano, fuori dalla CI |
+| tier | il motore intero sotto ogni tier (`TR_CPU_MAX`): test del modello, e logit identici al byte fra tier, thread e `-b` | `make tier-check` (`tools/tier_check.sh`) |
+| modello minuscolo | token greedy **identici** a transformers (f32, f16); logit entro tolleranza per posizione; q8_0 solo riportato, perché il riferimento non è quantizzato | `tools/make_tiny_olmoe.py` → `tools/oracle.py` (`make oracle`) |
+| modello vero | OLMoE vero tagliato a 2 layer contro transformers sugli stessi pesi Q8_0 dequantizzati: token identici, logit entro 1e-3 | `make oracle-real` (saltato senza il modello) |
 | ottimizzazione esatta | logit del modello vero prima e dopo, identici al bit, con più numeri di thread | `trochilus logits` + `cmp`, a mano |
 | prefill a blocchi | logit e cache con molti token per passata identici al bit a un token per passata: `n_batch`, divisione in chiamate, thread, f32/Q8_0, rewind | `tests/test_prefill.c`; `tools/oracle.py` (`logits -b 3/64/tutto` al byte) su tiny e OLMoE a 2 layer |
 

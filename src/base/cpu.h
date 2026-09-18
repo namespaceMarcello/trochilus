@@ -61,7 +61,8 @@ typedef struct {
 /* Detected on first call, then cached; thread-safe after the first call returns.
  * The environment variable TR_CPU_MAX (read once, here) caps the kernel tier for
  * testing and measurement: "scalar" clears every SIMD flag, "avx2" clears the
- * AVX-512 ones, "neon" clears dotprod/i8mm/sve. */
+ * AVX-512 ones, "neon" clears dotprod/i8mm/sve. Any other value is reported on the
+ * log and ignored (tools/tier_check.sh proves in the gate that a cap took effect). */
 const tr_cpu_info *tr_cpu(void);
 
 /* One line such as "x86-64 AMD Ryzen 9 7940HX, 16 cores / 32 threads, avx2 fma avx512f ... avx512vnni". */

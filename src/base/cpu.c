@@ -22,6 +22,7 @@
 #endif
 
 #include "cpu.h"
+#include "platform.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -474,6 +475,9 @@ static void apply_cpu_max(tr_cpu_info *c) {
         c->avx512vnni = c->avx512bf16 = 0;
     } else if (strcmp(v, "neon") == 0) {
         c->dotprod = c->i8mm = c->sve = 0;
+    } else if (strcmp(v, "avx512") != 0) { /* avx512 is the top x86 tier: nothing above it to clear */
+        /* a typo must not pass for a cap: the run would measure or test the best tier instead */
+        tr_log(TR_LOG_WARN, "TR_CPU_MAX='%s' is not a tier (scalar, avx2, avx512, neon): ignored", v);
     }
 }
 

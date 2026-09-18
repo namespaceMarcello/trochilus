@@ -118,14 +118,19 @@ Sostituisci, non appendere. Tetto 40 KB. Lo storico sta in `archivio/FATTO.md`.
   prefill). Su macOS non si pinna (non si può) e una maschera già imposta al processo viene
   rispettata. `TR_POOL_PIN=0/1/2` per i confronti.
 - 2026-09-18 — **Su un MoE una riga di bozza in più non è quasi gratis**: costa 15-27 ms contro i ~35
-  di una passata, perché il token in bozza sceglie altri esperti e la passata legge anche i loro pesi.
-  Il pareggio della speculazione è al 60-75% di bozze accettate, non al 15% misurato in container
-  (LEZIONI #59). Perciò la bozza adattiva non si limita ad accorciarsi: dopo una bozza tutta sbagliata
-  **si ferma** per 1, 3, 7, 15 passi. Caso peggiore 1.01× (era 0.60×), caso buono 1.15× (1.34× con
-  `--spec-fixed`, che resta per chi sa di star riscrivendo un file).
-- 2026-09-18 — **La leva 2 (attivazioni int8/VNNI) non si scrive** (domanda 21): misurata prima di
-  scriverla, dà +1-8% sul nostro dot float, mentre il nostro kernel a 4 token è 2.7× più veloce di
-  entrambi. Il divario col prefill di llama.cpp è da cercare in blocchi più larghi, non nell'int8.
+  di una passata. Metà è lettura di pesi: la riga in bozza fa leggere 2.3-4.7 esperti nuovi per layer
+  su 8 (contati, `docs/MISURE.md` §Revisione); l'altra metà è il suo calcolo. Il pareggio della
+  speculazione è al 60-75% di bozze accettate, non al 15% misurato in container (LEZIONI #59). Perciò
+  la bozza adattiva non si limita ad accorciarsi: dopo una bozza tutta sbagliata **si ferma** per 1,
+  3, 7, 15 e poi 16 passi (il tetto era rotto: faceva 31, LEZIONI #60). Caso peggiore 1.01× su 3 giri
+  (era 0.60×; da rimisurare, LEZIONI #66), caso buono 1.15× (1.34× con `--spec-fixed`, che resta per
+  chi sa di star riscrivendo un file). Le costanti della pausa spostano ±2-3%: restano quelle.
+- 2026-09-18 — **La leva 2 (attivazioni int8/VNNI) è la leva del prefill, ed è una decisione aperta**
+  (domanda 21, corretta dalla revisione, LEZIONI #65). La prima misura confrontava una riga contro un
+  token (+1-8%) e ne era uscito «non si scrive». Con la struttura del nostro kernel a 4 token l'int8
+  VNNI a 512 bit è **1.8-2.3×** il nostro x4 float, e il prefill è al 90% moltiplicazioni; la strada
+  esatta «8 token nei registri» invece non rende (0.79× a n=2048). Ma l'int8 non è bit-identico:
+  romperebbe «prefill a blocchi = token per token» e può esistere solo come modo dichiarato.
 
 ## Problemi noti
 
@@ -151,6 +156,13 @@ Sostituisci, non appendere. Tetto 40 KB. Lo storico sta in `archivio/FATTO.md`.
   permessi.
 - Sul PC non ci sono clang né CUDA toolkit: build Windows con MinGW-w64 gcc 15.2 (scoop), Linux
   nel container `trochilus-dev` (Ubuntu 24.04, gcc + clang; ASan, UBSan e TSan con gcc).
+- **Un pool alla volta** (LEZIONI #63): due pool vivi prendono gli stessi slot e si dividono gli
+  stessi core, e un `tr_parallel_for` annidato su un altro pool riceve un id di worker fuori dal suo
+  intervallo. Oggi il processo ha un solo pool e un solo modello: va risolto (slot da un registro di
+  processo, id per pool) prima del secondo modello nello stesso processo.
+- Core ibridi P/E (Intel) e più gruppi di processori su Windows: `cpu.c` li legge ma nessuna macchina
+  li ha provati. Il lavoro è diviso in parti uguali, quindi su P+E il passo lo dà il core più lento;
+  `EfficiencyClass` di Windows non viene letta.
 
 - Le misure di velocità native vogliono la macchina ferma: i container degli altri progetti vanno
   fermati e riavviati dopo (il guard di memoria rifiuta di caricare il modello sotto i ~10 GB liberi),
@@ -171,16 +183,29 @@ esatta al bit e provata da `tests/test_spec.c` e `make spec-check`.
 Fatto il 2026-09-18 (`docs/MISURE.md` §Il pin dei thread, §SMT, §Bozza adattiva, §Attivazioni int8):
 pin dei thread al core fisico (prefill +24-30%, decode invariato), bozza adattiva con pausa (caso
 peggiore da 0.60× a 1.01×, caso buono 1.15×), e la leva 2 chiusa con un microbenchmark invece che con
-del codice. Chiuse le domande 3, 21, 22 (tranne Linux), 24, 25, 27; aperte la 26 e la 28.
+del codice. Chiuse le domande 3, 21, 22 (tranne Linux), 24, 25, 27; aperta la 26. La revisione ha poi
+riaperto e richiuso la 21 con la risposta opposta, chiuso la 28 e contato metà della 12.
 
-1. **Accendere `--spec` di default?** La condizione posta il 2026-09-17 è soddisfatta: il caso
-   peggiore è «come senza» (1.01×) e quello buono 1.15×. Lo decide Marcello; oggi resta spento.
-2. **Thread per fase** (domanda 26): il prefill vuole tutti i core (217.8 tok/s a 16), il decode ne
-   vuole 8 (31.0 contro 28.7 a 16). Oggi il numero è uno solo per tutte e due: usare i primi n slot
-   del pool nel decode è esatto per costruzione (i logit non dipendono dal numero di thread) e vale
-   circa l'8% del decode.
-3. **Dov'è il resto del divario col prefill di llama.cpp** (domanda 28), visto che non è l'int8: un
-   kernel che tiene 8 o 16 token nei registri invece di 4, e il profilo per zone contro il loro.
+Fatto il 2026-09-18, revisione avversariale di tutto il repository (`docs/MISURE.md` §Revisione,
+LEZIONI #60-#68): gli invarianti reggono (logit identici al byte fra tier, thread e `-b`, anche sul
+modello vero a 2 layer; tokenizer 90 000 stringhe contro HF, 0 differenze). Corretti con un test
+rosso prima e verde dopo: il tetto della pausa, l'affinità del chiamante con due pool, i thread senza
+slot su Linux. Nuovo nel cancello: `make tier-check`. Nuovo per le misure: `tools/ab_modes.sh`.
+
+0. **Rimisurare nativo, a macchina ferma, con controllo A/A** (`sh tools/remeasure.sh`, ~30 minuti:
+   ferma e riavvia da solo i container, risultati in `build/remeasure/`; LEZIONI #66) le
+   tre conclusioni che decidono qualcosa e stanno dentro lo spread: il caso peggiore di `--spec`
+   (1.01× su 3 giri; il replay dà 0.94-1.00×), pin al core contro pin al processore, decode a 8
+   contro 16 thread. Con le zone del profiler chiude anche la domanda 12.
+1. **Accendere `--spec` di default?** Dipende dal punto 0: la condizione era «caso peggiore come
+   senza». Lo decide Marcello; oggi resta spento.
+2. **Thread per fase** (domanda 26): il prefill vuole tutti i core (217.8 tok/s a 16), il decode
+   sembra volerne 8 (31.0 contro 28.7 a 16, ma gli intervalli si sovrappongono: punto 0). Usare i
+   primi n slot del pool nel decode è esatto per costruzione.
+3. **Int8/VNNI nel prefill, sì o no** (domande 21 e 28, LEZIONI #65): è dove sta il divario con
+   llama.cpp (1.8-2.3× sul kernel), ma non è esatto. Se sì: un modo dichiarato (`--fast-prefill`),
+   spento di default, con l'oracolo che misura di quanto si spostano i logit. La strada esatta «8
+   token nei registri» è misurata e scartata. Lo decide Marcello.
 4. Prefill su prompt lunghi (2048-4096), dove l'attenzione per token cresce col quadrato: a 512 token
    è al 2%, a 2048 il prefill è già sceso da 217.8 a 159.2 tok/s col pin (domanda 7).
 5. Confronto colibri/ds4 per componente (decisione sopra), poi le correzioni che ne escono.

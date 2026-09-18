@@ -83,6 +83,7 @@ make check               # il cancello: lint, build 0 warning, test, ASan, TSan,
 make                     # build/trochilus (nucleo, senza dipendenze)
 make test                # test C: kernel SIMD = scalare, GGUF malformati, pool, profiler
 make oracle              # modelli minuscoli: genera, converte, confronta con transformers
+make tier-check          # il motore sotto ogni tier (TR_CPU_MAX): test del modello e logit identici al byte
 make oracle-tokenizer    # tokenizer di OLMoE contro transformers: id, pezzi, NFC, decodifica
 make oracle-real         # OLMoE vero tagliato a 2 layer contro transformers (saltato senza modello)
 build/trochilus run -m <file.gguf> -f prompt.txt -n 200    # testo in entrata, generazione greedy
@@ -94,6 +95,7 @@ sh tools/ab_spec.sh <gguf> <binario> bench/prompts/code.txt 8   # quanto rende -
 sh tools/build_llamacpp.sh; tools/compare_llamacpp.py ...   # nel container: llama.cpp e confronto dei logit
 tools/speed_compare.py ...   # nel container: velocità contro llama.cpp e colibri (modelli nel volume trochilus-models)
 sh tools/ab_speed.sh <gguf> <binario A> <binario B>   # due binari alternati run per run (LEZIONI #46)
+sh tools/ab_modes.sh <giri> "a=<comando>" "b=<comando>"   # modi di un binario (env, flag), ordine a rotazione, A/A (LEZIONI #66)
 make bench               # microbenchmark dei kernel (mediana + rumore)
 make profile             # scenari col profiler, mediana di N, token identici, confronto col precedente
 make profile SCENARIOS=bench/scenarios-olmoe-1b-7b.json   # modello vero, 16/8/4/1 thread
