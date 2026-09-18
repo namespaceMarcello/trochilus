@@ -238,7 +238,10 @@ script di shell che non si rompono se modificati mentre girano.
    costo della riga di bozza, che per le bozze corte sta al 91% negli esperti (domanda 12). Lo
    decide Marcello: acceso accettando −5% / +17.5%, o spento come oggi. Coi thread per fase i due
    rapporti vanno rimisurati: `--spec 0` prende il 9% dal decode stretto, il caso peggiore di
-   `--spec 8` il 6.4%, il caso buono il 2%.
+   `--spec 8` il 6.4%, il caso buono il 2%. **Prima di decidere** (Marcello, 2026-09-19: «una
+   ramificazione che eviti il −5 e tenga il +17»): la pausa è già quella ramificazione, e il −5% è
+   il costo di scoprirlo sbagliando; la strada è decidere prima di provare, dalla lunghezza del
+   match (domanda 32: si conta senza cronometro, poi replay).
 2. **La larghezza misurata, su altre macchine e con uno stimatore migliore** (domanda 31): su questa
    macchina a contesto 2048 il default prende metà del guadagno di `--decode-threads 8` (1.02-1.03×
    contro 1.05×), perché il «migliore di tre passate» ha il 2% di rumore e 16 sta al 2.5-4% da 8.
@@ -247,13 +250,32 @@ script di shell che non si rompono se modificati mentre girano.
 3. **Int8/VNNI nel prefill, sì o no** (domande 21 e 28, LEZIONI #65): è dove sta il divario con
    llama.cpp (1.8-2.3× sul kernel), ma non è esatto. Se sì: un modo dichiarato (`--fast-prefill`),
    spento di default, con l'oracolo che misura di quanto si spostano i logit. La strada esatta «8
-   token nei registri» è misurata e scartata. Lo decide Marcello.
+   token nei registri» è misurata e scartata. Lo decide Marcello, che il 2026-09-19 ha chiesto se
+   esiste altro fra float e int8: si misura nel banco la via di mezzo a 16 bit (domanda 33) prima
+   di decidere; le strade esatte che restano sono la parte seriale del prefill (domanda 30) e, per
+   il decode, i modelli a 4 bit. Ogni modo non esatto (int8, e la KV a 16 bit se il punto 6 la
+   chiama in causa) si decide coi numeri di qualità davanti: token uguali e KL sul modello vero
+   contro il modo esatto (`tools/compare_llamacpp.py` la calcola già: llama.cpp sta a 9e-3).
 4. Prefill su prompt lunghi (2048-4096), dove l'attenzione per token cresce col quadrato: a 512 token
    è al 2%, a 2048 il prefill scende da 235 a 193 tok/s (domanda 7).
-5. Confronto colibri/ds4 per componente (decisione sopra), poi le correzioni che ne escono.
+5. Confronto per componente (decisione sopra), poi le correzioni che ne escono. **Sì di Marcello il
+   2026-09-19, su tre fonti**: colibri, ds4 e llama.cpp. È una revisione di ciò che è già costruito
+   (kernel, grafo OLMoE, GGUF, pool), una cartella per volta.
    Misure 13-16 di `docs/MISURE.md` (routing, cache esperti, SSD): ordine da confermare con Marcello.
 6. Decode a contesto lungo: Trochilus perde l'11-13% da 32 a 512 token, llama.cpp il 5-7% (domande
-   18-19 di `docs/MISURE.md`); da 512 a 2048 il decode scende da 33.5 a 24.4 tok/s.
+   18-19 di `docs/MISURE.md`); da 512 a 2048 il decode scende da 33.5 a 24.4 tok/s. **Sì di Marcello
+   il 2026-09-19**, con la sua regola: più test, più controllo. Ogni contesto misurato (32, 512,
+   2048, 4096) diventa uno scenario di `bench/` e ogni correzione un test esatto al bit.
+   Ipotesi da verificare per prima (un conto, non una misura): la KV è in f32 e OLMoE non ha GQA
+   (16 teste KV su 16), quindi ogni token generato rilegge 262 KB di KV per token di contesto: a
+   2048 sono 537 MB oltre ai 1.2 GB di pesi, e 1.74 GB a 41 GB/s fanno 23.6 tok/s (misurati 24.4).
+   Se regge, il calo col contesto è ancora banda di memoria, e su un modello con GQA pesa molto meno.
+   La formula `tok/s = banda / (pesi + KV per token × contesto)` **non torna a 512**: dice 30.7, ne
+   misuriamo 33.5-34. O la KV si legge a banda più alta dei pesi (lettura in fila contro lettura
+   sparsa degli esperti), o i 41 GB/s sono vecchi (17/09, senza pin, contesto 32, altra sessione).
+   Quindi la prima misura è il decode a contesto 32, 512, 2048, 4096 **nella stessa sessione** con
+   A/A e i byte letti per zona dal profiler, insieme alla banda vera della RAM (domanda 4); poi il
+   confronto con llama.cpp rifatto a run alternate dopo pin e thread per fase (domanda 19).
 7. Memoria: banda reale della RAM (domanda 4 in `docs/MISURE.md`), poi pagine da 2 MB (domanda 5).
    Il decode va uguale da 4 a 8 thread (34 tok/s, 41 GB/s) e scende sopra gli 8: la banda è il
    tetto, e la domanda 4 dice quanto manca.
