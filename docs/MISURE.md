@@ -28,7 +28,7 @@ si sposta nella sezione giusta con il numero quando è misurato.
 | 9 | Windows nativo e Linux sulla stessa macchina vanno alla stessa velocità? | stesso scenario nativo e in Docker/WSL | in Docker svegliare un thread costava ~20 µs |
 | 10 | Più corsie (32 o 64) sbloccano la catena delle somme su un thread? | kernel sperimentale, `make bench` | AVX-512 va come AVX2 per quel limite; cambierebbe i numeri (dichiarato) |
 | 11 | Quanto pesa la divisione per riga e la chiamata indiretta in `matmul_body`? | kernel che riceve tutta la matrice contro uno per riga | 1024 chiamate e 2 divisioni a 64 bit per matrice |
-| 12 | Gli esperti scelti in token consecutivi si ripetono? **In parte sì** (§Revisione): una riga in più nella stessa passata fa leggere 2.3-4.7 esperti nuovi per layer su 8, cioè il 40-70% dei suoi esperti è già letto dalle altre righe. Resta la parte a tempo: quanto di una riga in più è lettura di pesi e quanto calcolo | zone del profiler native a macchina ferma, `generate --spec 0` contro `--spec k --spec-fixed` | dice se il costo di una bozza si attacca dal lato dei pesi (cache degli esperti) o del calcolo |
+| 12 | ~~Gli esperti scelti in token consecutivi si ripetono?~~ **In parte sì** (§Revisione): una riga in più nella stessa passata fa leggere 2.3-4.7 esperti nuovi per layer su 8, cioè il 40-70% dei suoi esperti è già letto dalle altre righe. A tempo (zone native, macchina ferma): una riga in più costa **17.6 ms** se è la sola e **13.7 ms** l'una se sono otto, contro 31.3 di una passata; negli esperti sta il **91%** e il **61%**, e lì il tempo segue i MiB di esperti nuovi (30 MiB/ms ai due punti); le moltiplicazioni dense sono gratis per la prima riga e valgono 4.1 ms per riga a nove. Il costo di una bozza si attacca dal lato dei pesi | — | — |
 | 13 | Il router del layer successivo, applicato allo stato del layer corrente, indovina gli esperti che verranno scelti? | traccia del routing sul modello vero (prompt di codice, ~1000 token): esperti previsti (primi 8, 12, 16) contro scelti | se prevedendone al massimo 12 se ne indovina almeno l'80%, gli esperti si precaricano dal disco prima che servano (M1) |
 | 14 | Quanti byte per token restano da leggere dal disco con una cache degli esperti grande il 25, 50, 75% del modello? | simulazione LRU sulla stessa traccia | decide il budget di RAM di default della M1 |
 | 15 | Streaming dal disco per layer interi (DeepSpeed) o per esperti: quanti byte per token? | stessa traccia: layer interi contro soli esperti scelti e non in cache | con un solo utente leggere tutto il modello a ogni token dà al massimo ~0.3 tok/s su 10 GB |
@@ -37,12 +37,12 @@ si sposta nella sezione giusta con il numero quando è misurato.
 | 18 | Perché il decode perde l'11-13% da 32 a 512 token di contesto, e llama.cpp solo il 5-7%? | profilo per zone a contesto 32, 512, 2048: quota dell'attenzione e della sua parte a thread singolo | nel coding il contesto è lungo: è la differenza che cresce di più dopo il prefill |
 | 19 | Decode a 4-16 thread: llama.cpp è davvero avanti dell'8-12%? | `tools/speed_compare.py` con i due motori alternati run per run nella stessa sessione (fra due sessioni la mediana di llama.cpp si è spostata del 3-7%) | dice se c'è una leva nel decode a più thread o solo rumore |
 | 20 | ~~Il prefill rende 1.16× da 8 a 16 thread: è il limite di potenza del portatile?~~ No, e nemmeno il CCD: è lo scheduler che mette due thread sullo stesso core fisico. Misurato: §Dove vanno i thread | — | — |
-| 22 | Fissare i thread ai core fisici vale anche **sul decode** e **con la macchina occupata**? Misurato (§Il pin dei thread): sul decode **no a 16 thread** (0.82×) e **sì a 4-8** (1.14-1.32×); con la macchina occupata il prefill tiene (1.19×) e il decode perde (0.67×). Resta la sola parte **Linux**: su questa macchina non è misurabile (niente Linux nativo, e in WSL2 la topologia è sintetica, LEZIONI #47); il codice Linux gira ed è provato in `make check`, i numeri no | una macchina Linux vera, stessi scenari | il pin è una decisione di prodotto: sulle altre righe è già presa (acceso) |
-| 26 | Quanti thread vuole **ogni fase**? Il prefill scala fino a 16 core (231.9 tok/s), il decode è al massimo a 4-8 thread pinnati (32.7) e a 16 scende a 25.1 | scenari di decode e prefill a 1/4/8/16 thread pinnati, contesto 512 e 2048; poi un pool che nel decode usa meno worker (i primi n slot, che sono già core distinti sui due chiplet) | oggi il numero di thread è uno solo per tutte e due le fasi: il decode lascia circa il 30% sul tavolo |
-| 27 | ~~Perché il decode a 16 thread pinnati va il 17% più piano che senza pin?~~ Perché era pinnato a **un processore**: legando ogni thread al suo **core** (i due fratelli SMT) il decode torna alla pari e il prefill resta 1.24×. Non è la latenza di risveglio (spin da 2 a 20 ms: peggio). Misurato: §Il pin dei thread | — | — |
+| 22 | Fissare i thread ai core fisici vale anche **sul decode** e **con la macchina occupata**? Misurato (§Il pin dei thread): sul decode a 16 thread **non distinguibile** da nessun pin (rimisura con A/A: −1.8%, soglia 2.2%; il vecchio 0.82× del pin al processore non si riproduce) e **sì a 4-8** (1.14-1.32×, pin al processore, 3 giri); con la macchina occupata il prefill tiene (1.19×) e il decode perde (0.67×, 3 giri, non rimisurato). Resta la sola parte **Linux**: su questa macchina non è misurabile (niente Linux nativo, e in WSL2 la topologia è sintetica, LEZIONI #47); il codice Linux gira ed è provato in `make check`, i numeri no | una macchina Linux vera, stessi scenari | il pin è una decisione di prodotto: sulle altre righe è già presa (acceso) |
+| 26 | Quanti thread vuole **ogni fase**? Rimisurato con A/A (§Revisione, pin al core): il prefill vuole 16 thread (242.5 tok/s contro 170.9 a 8, **1.42×**), il decode ne vuole 8 (34.7 contro 31.0-31.7 a 16, **1.09-1.12×**, intervalli disgiunti). Restano 4 e 12 thread nel decode, e il contesto 2048 | scenari di decode a 4/8/12/16 thread con `tools/ab_modes.sh` e controllo A/A, contesto 512 e 2048; poi un pool che nel decode usa meno worker (i primi n slot, che sono già core distinti sui due chiplet) | oggi il numero di thread è uno solo per tutte e due le fasi: a 16 thread il decode lascia il 9-12% sul tavolo |
+| 27 | ~~Perché il decode a 16 thread pinnati va il 17% più piano che senza pin?~~ **La premessa non regge**: con 8 giri e controllo A/A il pin a un processore sta a −3.4% da nessun pin e a −1.6% dal pin al core (non distinguibile), non a −17%. Il pin al **core** resta il default per il prefill (1.27× su nessun pin, +9% sul pin al processore). Misurato: §Il pin dei thread, §Revisione | — | — |
 | 23 | ~~Quante bozze vengono accettate su lavoro di codice vero?~~ Misurato: §Speculazione dal prompt. 64% riscrivendo un file già nel prompt (1.42×), 13% scrivendo codice nuovo (0.62×) | — | — |
-| 24 | ~~Una bozza sbagliata quanto costa?~~ **Molto più di quanto diceva la misura in container** (5.2 ms): nativo, col pin, una riga in più costa **15-27 ms** contro i ~35 di una passata, perché il token in bozza sceglie altri esperti e la passata legge anche i loro pesi. Il pareggio non è al 15% di bozze accettate ma intorno al **60-75%** (§Speculazione dal prompt, LEZIONI #59) | — | — |
-| 25 | ~~Una bozza che si accorcia dopo un rifiuto e si allunga dopo un'accettazione toglie il caso peggiore?~~ Accorciarla non basta (0.89×): serve **fermarla** dopo una bozza tutta sbagliata, con pausa che raddoppia. Con quella: **1.01×** quando il modello inventa e **1.15×** quando ricopia (§Speculazione dal prompt) | — | — |
+| 24 | ~~Una bozza sbagliata quanto costa?~~ **Molto più di quanto diceva la misura in container** (5.2 ms): nativo, col pin, una riga in più costa **13.7-17.6 ms** contro i 31.3 di una passata (zone del profiler, §Revisione; dai tok/s usciva 15-27), perché il token in bozza sceglie altri esperti e la passata legge anche i loro pesi. Il pareggio non è al 15% di bozze accettate ma al **44-56%** (§Bozza adattiva, LEZIONI #59) | — | — |
+| 25 | ~~Una bozza che si accorcia dopo un rifiuto e si allunga dopo un'accettazione toglie il caso peggiore?~~ **Lo riduce, non lo toglie.** Accorciarla non basta (0.89×): serve **fermarla** dopo una bozza tutta sbagliata, con pausa che raddoppia. Con quella, rimisurato con A/A su 8 giri: **0.953×** quando il modello inventa (i 3 giri di prima dicevano 1.01×) e **1.175×** quando ricopia (§Bozza adattiva, §Revisione) | — | — |
 | 21 | ~~Quanto del divario col prefill di llama.cpp è il dot int8 VNNI contro il nostro float?~~ **Quasi tutto** (§Revisione, LEZIONI #65; la prima risposta, «niente», confrontava una riga contro un token): con la struttura del nostro kernel a 4 token il dot int8 VNNI a 512 bit è **1.8-2.3×** il nostro x4 float, e llama.cpp è avanti 1.57× a un thread. L'int8 non è esatto: scriverlo o no, e come modo esplicito, lo decide Marcello | — | — |
 | 28 | ~~Il divario di prefill che resta con llama.cpp dov'è, se non è nell'int8?~~ Era nell'int8 (domanda 21). La strada esatta «più token nei registri» è misurata e non rende: una riga contro 8 token dà 1.13× a n=1024, **0.79×** a 2048 e 0.93× a 4096 (§Revisione) | — | — |
 
@@ -454,7 +454,8 @@ disco di Windows, prompt 512, 24 token generati.
 | 8 | **147.3** (141.9-151.4) | 113.4 (105.6-117.3) | **1.30×** | 31.0 (28.4-31.5) | 30.4 (26.4-30.9) | 1.02× |
 
 **I due modi di pin** (2 contro 1), 3 giri: a 16 thread il core intero dà prefill 212.5 contro 178.6
-e decode 27.2 contro 21.5; a 8 thread 145.9 contro 141.4 e 29.4 contro 31.1.
+e decode 27.2 contro 21.5; a 8 thread 145.9 contro 141.4 e 29.4 contro 31.1. *I numeri a 16 thread
+sono superati dalla rimisura con A/A più sotto.*
 
 **Il pin al singolo processore contro nessun pin** (1 contro 0), 3 giri, la strada scartata:
 
@@ -470,21 +471,31 @@ decode 19.5 contro 23.4 (0.83×); 8 thread prefill 130.1 contro 86.7 (1.50×) e 
 22.0. Macchina occupata (4 processi che girano a vuoto, prompt 512, 16 thread): prefill 206.5 contro
 173.6 (**1.19×**), decode 20.3 contro 30.4 (0.67×).
 
+**Rimisura a 16 thread con controllo A/A** (8 giri, ordine a rotazione, `tools/ab_modes.sh`; tabella
+e soglie in §Revisione). Prefill: al core **242.9**, al processore 223.3 (0.92×, e instabile:
+185-240), senza pin 190.8 (0.79×); differenze tutte sopra la soglia (1.2%). Decode: 31.26, 30.74 e
+31.82; fra il pin al core e gli altri due **non distinguibile** (−1.6% e +1.8%, soglia 2.2%). Il
+decode a 16 thread del pin al processore (25.1 e 21.5 nelle tabelle sopra, 0.82×) **non si
+riproduce**: contro nessun pin è 0.97×.
+
 Letture:
 - **Il prefill guadagna sempre**, e tanto più quanto meno thread ci sono: a 4 thread vale 1.50×,
   perché senza affinità Windows appoggia quei 4 thread su 2 core fisici. Col default (pin al core) a
-  16 thread è 1.24×. Anche con la macchina occupata il guadagno resta (1.19×): il pin non è fragile
-  sotto contesa (domanda 22).
-- **Il modo di pinnare decide il decode.** Legare un thread a **un processore** costa il 17-18% sul
-  decode a 16 thread (0.82×, e 0.67× con la macchina occupata); legarlo al **suo core** lo riporta
-  alla pari (0.96× e 1.02×, dentro lo spread) e tiene il guadagno del prefill. Quello che serve non
-  è inchiodare un thread, è impedire che **due** thread finiscano sullo stesso core: il fratello
-  libero è una valvola che il decode usa e il prefill no. Chiude la domanda 27.
+  16 thread è 1.24× (**1.27×** nella rimisura con A/A). Anche con la macchina occupata il guadagno
+  resta (1.19×): il pin non è fragile sotto contesa (domanda 22).
+- **Il modo di pinnare si vede nel prefill, non nel decode** (corretto dalla rimisura con A/A). La
+  prima misura (3 giri, ordine fisso) dava al pin a **un processore** un costo del 17-18% sul decode
+  a 16 thread: con 8 giri e controllo A/A non si riproduce (−3.4% contro nessun pin; −1.6% contro
+  il pin al core, non distinguibile). Quello che il pin al **core** dà in più è prefill: **+9%** sul
+  pin al processore, in 8 giri su 8, e stabile (spread 5% contro 25%). Resta il default: impedisce
+  che due thread finiscano sullo stesso core senza inchiodarli. Il dato a macchina occupata (0.67×)
+  non è stato rimisurato. Domanda 27: la premessa non regge.
 - Non era la latenza di risveglio: allungando lo spin da 2 a 20 ms il decode a 16 thread pinnati al
   processore andava 21.0 invece di 23.6, cioè peggio.
-- **Il decode preferisce 8 thread a 16** in ogni modo (31.0 contro 28.7 col default): il prefill
-  vuole tutti i core, il decode no. Oggi il numero di thread è uno solo per tutte e due le fasi:
-  è una leva aperta (domanda 26).
+- **Il decode preferisce 8 thread a 16**: col default 34.7 contro 31.0-31.7 nella rimisura con A/A
+  (**1.09-1.12×**, intervalli disgiunti, soglia 2.2%; prima 31.0 contro 28.7 con intervalli
+  sovrapposti). Il prefill vuole tutti i core (242.5 contro 170.9 a 8, 1.42×), il decode no. Oggi il
+  numero di thread è uno solo per tutte e due le fasi: è una leva aperta (domanda 26).
 - A 1 thread il pin non cambia il prefill (non c'è niente da collocare) e dà +14% sul decode.
 
 ## Attivazioni int8 con VNNI: quanto darebbe la leva 2 (2026-09-18)
@@ -537,7 +548,8 @@ Container, volume `trochilus-models`, OLMoE-1B-7B Q8_0 intero, `run -f <prompt> 
 `--spec 0` e `--spec k` **alternati run per run** (`tools/ab_spec.sh`, LEZIONI #46), mediana di 3
 giri dopo uno di riscaldamento. Il testo generato è identico in ogni giro: lo script si ferma se
 non lo è. Nessun pin dei thread e misure in container: rifatte native e col pin in §Bozza adattiva,
-dove il costo di una riga in più risulta 3-5 volte quello scritto qui sotto (LEZIONI #59).
+dove il costo di una riga in più risulta circa 3 volte quello scritto qui sotto (13.7-17.6 ms
+misurati per zona contro 5.2; LEZIONI #59).
 
 | Prompt | Bozza | Decode tok/s (min-max) | Bozze accettate | Contro `--spec 0` |
 |---|---|---|---|---|
@@ -566,32 +578,39 @@ Letture:
 
 Windows **nativo**, macchina ferma, pin al core (il default), 16 thread, `run -f <prompt> -n 200`,
 `--spec 0` e `--spec 8` **alternati run per run** (`tools/ab_spec.sh`), mediana di 3 giri dopo uno
-di riscaldamento, testo identico in ogni giro. `--spec-fixed` sceglie la bozza fissa.
+di riscaldamento, testo identico in ogni giro. `--spec-fixed` sceglie la bozza fissa. Le due righe
+«con pausa» sono la **rimisura a 8 giri con controllo A/A** (`tools/ab_modes.sh`, §Revisione): i 3
+giri di prima davano 1.15× (28.63 → 32.98) e 1.01× (27.49 → 27.76), e il secondo era sbagliato.
 
 | Prompt | Politica della bozza | `--spec 0` | `--spec 8` | | Accettate | Bozza media |
 |---|---|---|---|---|---|---|
 | `code-edit.txt` (il file è già nel prompt) | fissa 8 | 27.99 | **37.61** | **1.34×** | 64.4% | 8.00 |
 | | adattiva, solo si accorcia | 26.96 | 32.81 | 1.22× | 70.9% | 2.86 |
-| | adattiva con pausa (oggi) | 28.63 | 32.98 | **1.15×** | 69.4% | 2.34 |
+| | adattiva con pausa (oggi), 8 giri con A/A | 31.87 | 37.45 | **1.175×** | 69.4% | 2.34 |
 | `code.txt` (codice nuovo) | fissa 8 | 29.65 | 17.67 | **0.60×** | 13.1% | 3.04 |
 | | adattiva, solo si accorcia | 29.61 | 26.22 | 0.89× | 41.3% | 0.70 |
-| | adattiva con pausa (oggi) | 27.49 | 27.76 | **1.01×** | 43.1% | 0.38 |
+| | adattiva con pausa (oggi), 8 giri con A/A | 32.67 | 31.15 | **0.953×** | 42.4% | 0.38 |
 
 Il costo di una riga in più, ricavato dai passaggi stampati (ms per passata = 1000 · token / tok·s⁻¹
 / passaggi, meno i ~35 ms di una passata da un token, diviso la bozza media): **15 ms** con bozza
-fissa 8, **20 ms** con bozza media 2.3, **27 ms** con bozza media 0.4.
+fissa 8, **20 ms** con bozza media 2.3, **27 ms** con bozza media 0.4. Misurato poi per zona
+(§Revisione): **17.6 ms** se è la sola riga in più, **13.7 ms** l'una se sono otto, contro i 31.3
+di una passata.
 
 Letture:
 - **Su un MoE una riga in più non è quasi gratis, come sarebbe su un modello denso.** Il decode
   costa perché legge i pesi degli 8 esperti scelti in ogni strato; il token in bozza ne sceglie
   altri, e la passata legge anche quelli. Una riga in più costa così mezza passata o più, e il
-  pareggio sta intorno al **60-75% di bozze accettate**, non al 15% che diceva la misura fatta in
-  container (LEZIONI #59). È anche il motivo per cui la bozza lunga rende solo dove il testo è già
-  nel prompt: lì gli esperti scelti sono gli stessi, perché i token sono gli stessi.
+  pareggio sta al **44-56% di bozze accettate** (costo della riga / costo della passata, misurati
+  per zona in §Revisione; la stima dai tok/s diceva 60-75%), non al 15% che diceva la misura fatta
+  in container (LEZIONI #59). È anche il motivo per cui la bozza lunga rende solo dove il testo è
+  già nel prompt: lì gli esperti scelti sono gli stessi, perché i token sono gli stessi.
 - **Accorciare la bozza non bastava**: con il 41% di accettate si perdeva ancora l'11%. Fermarla del
   tutto dopo una bozza tutta sbagliata (pausa 1, 3, 7, 15 passi, capped 16) porta il caso peggiore a
-  **1.01×**, cioè «come senza», al prezzo di 1.22× → 1.15× nel caso buono. Chiude la domanda 25:
-  `--spec` può diventare il default.
+  **0.95×** (rimisura con A/A: −4.7%, sopra la soglia, 8 giri su 8; i 3 giri di prima dicevano
+  1.01×) e lascia il caso buono a **1.175×**. «Come senza» **non è raggiunto**: accendere `--spec`
+  di default vuol dire accettare −5% dove il modello inventa per +17.5% dove ricopia. La domanda
+  25 resta chiusa (la pausa è misurata), la scelta del default è di Marcello.
 - La bozza fissa resta la più veloce dove il modello ricopia (1.34×): chi sa che sta riscrivendo un
   file può ancora chiedere `--spec 8 --spec-fixed`.
 
@@ -652,7 +671,8 @@ Rilettura di tutto il repository da parte di un altro modello (Fable 5.1), con l
 portare prove e non opinioni. Errori e controlli nuovi: LEZIONI #60-#68. Qui i numeri.
 Container `trochilus-dev`, altri container accesi: per questo i confronti sono solo quelli con
 effetti molto sopra lo spread (kernel su un core, run alternate) o **senza cronometro**
-(contatori, replay). Niente di quello che segue è una misura di velocità del prodotto.
+(contatori, replay). Niente di quello che segue è una misura di velocità del prodotto, tranne
+l'ultimo blocco (**Rimisura nativa con controllo A/A**), che è nativo e a macchina ferma.
 
 **Invarianti: reggono.** `trochilus logits` su 40-70 token, 3 tier (`TR_CPU_MAX` scalar, avx2,
 avx512) × 3 numeri di thread (1, 5, 16) × 3 passate (`-b` 1, 7, 512): 27 file per modello,
@@ -702,6 +722,8 @@ Un esperto sono 6.375 MiB (tre matrici Q8_0 da 2048×1024). A 36 GB/s, 253 MiB s
 di una riga in più: la lettura degli esperti nuovi spiega **metà** del costo, non tutto. Nello
 stesso profilo (tempi in container, solo indicativi) una riga in più costa 4-5.6 ms anche nelle
 zone dense (`qkv_proj`, `attn_out_proj`, `lm_head`), dove non c'è nessun peso nuovo da leggere.
+La parte a tempo è misurata nativa più sotto (**Quanto costa una riga di bozza, a zone**): negli
+esperti sta il 61-91% del costo, e le zone dense pesano solo con le bozze lunghe.
 
 **Le costanti della pausa, senza cronometro** (LEZIONI #60, #67). Che una bozza venga accettata
 dipende solo dai token, e i token sono gli stessi con ogni politica: ogni politica si può
@@ -723,13 +745,104 @@ Letture: le costanti spostano il 2-3%, meno di quanto una misura a tempo su ques
 possa vedere; restano quelle. Il caso peggiore «1.01×» misurato nativo su 3 giri corrisponde a
 C ≈ 15 ms; con C = 20-22 (il valore che la stessa sezione ricava per le bozze corte) il replay
 dà 0.94-0.96×. La domanda «`--spec` acceso di default» va decisa su una misura con più giri e
-un controllo A/A (`tools/ab_modes.sh`, LEZIONI #66).
+un controllo A/A (`tools/ab_modes.sh`, LEZIONI #66): fatta, è il blocco **Rimisura nativa** più
+sotto, e dà **0.953×**.
 
 **Il pool con più di un pool** (LEZIONI #61-#63). Programma di prova, Linux: `H1` chiamante
 prima `[0-31]`, dopo due pool creati e distrutti nell'ordine di nascita `[0,1]`; `H2` processo
 ristretto a `[0,2]`, pool da 4: worker 2 e 3 su `[0]`; `H3` worker 1 di due pool vivi entrambi
 su `[2,3]`; `H4` pool interno da 2, id del worker arrivato al body: 3. H1 e H2 corretti e sotto
 test; H3 e H4 restano un debito dichiarato in `threads.h`.
+
+**Rimisura nativa con controllo A/A** (LEZIONI #66 e #67; `sh tools/remeasure.sh`, ogni run in
+`build/remeasure/`). Windows nativo, macchina ferma: lo script ferma i 9 container degli altri
+progetti e li riavvia alla fine. Binario del commit 87297b4, OLMoE-1B-7B Q8_0, 16 thread dove non
+è detto altro. `tools/ab_modes.sh`: 8 giri dopo uno di riscaldamento, il primo modo del giro
+ruota, un modo dato due volte fa da controllo A/A. Mediana (min-max), rapporto col primo modo.
+
+| misura | modo | prefill tok/s | | decode tok/s | |
+|---|---|---|---|---|---|
+| 1. `--spec`, caso peggiore: `run -f code.txt -n 200` | `--spec 0` | 215.1 (210.1-221.9) | — | 32.67 (31.93-33.00) | — |
+| | `--spec 0`, copia A/A | 217.6 (212.2-227.4) | 1.012× | 32.39 (31.72-33.26) | 0.991× |
+| | `--spec 8` | 219.2 (211.6-227.6) | 1.019× | 31.15 (30.68-31.44) | **0.953×** |
+| 2. `--spec`, caso buono: `run -f code-edit.txt -n 200` | `--spec 0` | 229.2 (221.2-232.5) | — | 31.87 (31.06-32.22) | — |
+| | `--spec 8` | 229.4 (222.8-232.8) | 1.001× | 37.45 (36.98-38.09) | **1.175×** |
+| 3. pin: `generate -p 512 -n 24` | al core (2, il default) | 242.9 (234.7-246.7) | — | 31.26 (30.54-32.02) | — |
+| | al core, copia A/A | 241.0 (235.3-246.1) | 0.992× | 31.11 (30.24-31.58) | 0.995× |
+| | al processore (1) | 223.3 (185.3-240.4) | **0.919×** | 30.74 (29.63-31.35) | 0.984× |
+| | nessuno (0) | 190.8 (187.7-193.1) | **0.785×** | 31.82 (30.98-32.38) | 1.018× |
+| 4. thread: `generate -p 512 -n 48` | 16 | 242.5 (236.3-247.0) | — | 31.70 (30.37-31.89) | — |
+| | 16, copia A/A | 240.9 (236.9-243.2) | 0.994× | 31.00 (30.39-32.10) | 0.978× |
+| | 8 | 170.9 (165.5-172.6) | **0.705×** | 34.67 (33.94-35.04) | **1.094×** |
+
+**Il rumore A/A della sessione** (due modi identici, differenza fra le mediane): decode 0.9%,
+0.5%, 2.2%; prefill 1.2%, 0.8%, 0.6%. Lo stesso decode a 16 thread dà 0.5% nel blocco 3 e 2.2%
+nel blocco 4: una coppia A/A sola è essa stessa una misura rumorosa. La soglia usata qui è il
+**peggiore A/A della sessione per quella fase** (decode 2.2%, prefill 1.2%), e una differenza
+conta solo se la supera contro **tutte e due** le copie del controllo. Sotto: «non distinguibile».
+
+Letture:
+- **Caso peggiore di `--spec`: 0.95×, non 1.01×.** −4.7% contro `--spec 0` e −3.8% contro la sua
+  copia (soglia 2.2%), intervalli disgiunti, `--spec 8` sotto tutte e due in 8 giri su 8.
+  Contatori: 172 passate, 28/66 bozze accettate (42.4%), bozza media 0.38. La pausa porta la
+  perdita da 0.60× a 0.95×, non la toglie: la condizione «caso peggiore come senza» **non è
+  soddisfatta**. Sul prefill +1.9% e +0.8% contro le due copie: non distinguibile.
+- **Caso buono: 1.175×** (era 1.15× su 3 giri), intervalli disgiunti; 77 passate, 125/180 bozze
+  accettate (69.4%), bozza media 2.34. Prefill 1.001×: non distinguibile.
+- **Pin al core contro nessun pin: prefill 1.27×** (1.26× dalla copia), intervalli disgiunti.
+  Decode −1.8% e −2.2% dalle due copie, a cavallo della soglia: **non distinguibile**.
+- **Pin al core contro pin al processore: la differenza è nel prefill, non nel decode.** Il
+  prefill del pin al processore sta a −8.1% e −7.3% (soglia 1.2%), sotto il pin al core in 8 giri
+  su 8, ed è instabile: spread 24.7% (185-240) contro 5.0%. Decode −1.6% e −1.2%: **non
+  distinguibile**. Il «−17-18% sul decode» del pin al processore (3 giri, §Il pin dei thread)
+  **non si riproduce**: contro nessun pin è −3.4% (sopra la soglia, 7 giri su 8, intervalli
+  sovrapposti). Il percorso a un pool e 16 thread è lo stesso nei due binari (il diff di
+  `threads.c` in 87297b4 tocca il chiamante con più pool e i worker senza slot): la differenza
+  non viene dal codice. La causa non è stata cercata; quella misura aveva 3 giri, ordine fisso e
+  nessun A/A.
+- **Il decode vuole 8 thread: 1.09× contro 16 e 1.12× contro la sua copia** (soglia 2.2%),
+  intervalli disgiunti (33.9-35.0 contro 30.4-32.1), 8 giri su 8. Il prefill vuole 16: 1.42×
+  contro 8. Conferma la premessa della domanda 26, che prima stava dentro lo spread.
+
+**Quanto costa una riga di bozza, a zone** (domanda 12, la metà a tempo; LEZIONI #67). Stessa
+sessione: `generate --tokens <code-edit> -n 200 --profile-json`, tre modi alternati per 3 giri
+(`--spec 0`, `--spec 1 --spec-fixed`, `--spec 8 --spec-fixed`). Millisecondi per passata, mediana
+(min-max). «Dense» sono `qkv_proj`, `attn_out_proj`, `lm_head`; «esperti» sono `expert_gate_up`
+ed `expert_down`. Il costo di una riga in più è la differenza con la passata da una riga dello
+stesso giro, divisa per le righe in più. Senza A/A, ma i tre giri di ogni modo stanno entro lo 0.9%.
+
+| righe per passata | ms per passata | dense | esperti | MiB di pesi |
+|---|---|---|---|---|
+| 1 | 31.27 (31.20-31.34) | 9.23 | 16.37 | 1200.4 |
+| 2 | 48.84 (48.55-48.89) | 9.16 | 32.35 | 1675.8 |
+| 9 | 141.06 (140.10-141.33) | 42.25 | 83.42 | 3221.3 |
+
+| una riga in più costa | totale | esperti | dense | attenzione | MiB di esperti nuovi |
+|---|---|---|---|---|---|
+| se è la sola (2 righe) | **17.6 ms** (17.4-17.6) | 16.0 (91%) | −0.1 | 1.1 | 475 |
+| se sono otto (9 righe) | **13.7 ms** (13.6-13.8) | 8.4 (61%) | 4.1 (30%) | 0.5 | 253 |
+
+Letture:
+- Una riga di bozza costa **più di mezza passata** quando è la sola (17.6 ms su 31.3) e 13.7 ms
+  l'una quando sono otto. Prima era ricavato dai tok/s (15-27 ms, §Bozza adattiva); ora è misurato
+  per zona. Il pareggio è costo della riga / costo della passata: **56% di bozze accettate** per le
+  bozze corte, **44%** per quelle da otto. Torna coi due prompt: 42.4% accettate perde (0.953×),
+  69.4% guadagna (1.175×).
+- **Il costo sta negli esperti**: il 91% con una riga in più, il 61% con otto. Ai due punti
+  misurati il tempo degli esperti per riga segue i MiB di esperti nuovi contati sopra (475 MiB in
+  16.0 ms, 253 in 8.4: 29.8 e 30.2 MiB/ms). Il costo di una bozza si attacca dal lato dei pesi
+  (quali esperti si leggono), non del calcolo: chiude la domanda 12. Limite: per MiB gli esperti
+  nuovi costano 1.65 volte quelli della passata da una riga (816 MiB in 16.4 ms, 49.8 MiB/ms), e
+  il perché non è misurato.
+- **Le moltiplicazioni dense sono gratis per la prima riga in più** (−0.1 ms: il kernel a 4 token
+  legge la riga di pesi una volta sola) e costano 4.1 ms per riga a nove righe: i 4-5.6 ms visti
+  in container valgono per le bozze lunghe, non per le corte.
+- **Il replay regge alla prova del cronometro**: passate × 31.3 ms + righe di bozza × 17.6 ms dà
+  0.95-0.96× per la politica di oggi su `code` (172 passate, 66 righe, contro 199-200 passate
+  senza bozza); la misura a tempo del blocco 1 dà 0.953× e 0.962× contro le due copie. Con gli
+  stessi costi nessuna delle politiche della tabella del replay arriva a 1.00× su `code` (la
+  migliore, pausa 2, 5, 11, 16, dà 0.97-0.98×): le costanti della pausa non bastano, la leva è il
+  costo della riga.
 
 ## Tentativi
 

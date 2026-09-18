@@ -285,3 +285,12 @@ rovesciata; due controlli e uno strumento nuovi (LEZIONI #60-#68, `docs/MISURE.m
 - `tools/ab_modes.sh`: confronto fra modi dello stesso binario con rotazione dell'ordine e
   controllo A/A. Prova: `sh tools/ab_modes.sh 3 "a=<comando>" "a2=<stesso comando>"`.
 - Commenti corretti dove dicevano il contrario del codice: `lookup.h`, `threads.h`, `threads.c`.
+
+### 2026-09-18 — Rimisura nativa con controllo A/A
+Nessun codice cambiato: `sh tools/remeasure.sh` (14 minuti, macchina ferma, 8 giri, ordine a
+rotazione, A/A) sulle tre conclusioni che stavano dentro lo spread, più le zone del profiler per la
+domanda 12. Caso peggiore di `--spec` **0.953×** (non 1.01×) e caso buono 1.175×; il −17% sul decode
+del pin al processore non si riproduce (la differenza fra i due pin è nel prefill, +9%); decode a 8
+thread 1.09-1.12× su 16. Una riga di bozza costa 13.7-17.6 ms su 31.3, per il 61-91% negli esperti.
+Numeri in `docs/MISURE.md` §Revisione, decisioni in `docs/STATO.md`, LEZIONI #58, #59, #66, #67.
+Prova: `sh tools/remeasure.sh`, poi `build/remeasure/` (ogni run e le mediane).

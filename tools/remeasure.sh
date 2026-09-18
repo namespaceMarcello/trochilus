@@ -1,7 +1,7 @@
 #!/bin/sh
 # remeasure.sh — the conclusions of docs/STATO.md that sit inside their own spread, measured again
 # (docs/LEZIONI.md #66): native Windows, still machine, 8 rounds, rotating order, A/A control.
-# Run from the repo root in Git Bash; about 30 minutes. Results in build/remeasure/.
+# Run from the repo root in Git Bash; about 15 minutes. Results in build/remeasure/.
 #
 # The containers of the other projects are stopped for the duration and started again at the end,
 # also when the script fails or is interrupted (docs/STATO.md: measurements want a still machine).

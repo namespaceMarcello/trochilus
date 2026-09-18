@@ -111,20 +111,31 @@ Sostituisci, non appendere. Tetto 40 KB. Lo storico sta in `archivio/FATTO.md`.
 
 - 2026-09-18 — **I thread del pool si fissano al core fisico, non al processore logico** (domande 22,
   27 e 3). Uno per core, i core presi a giro sui due chiplet, i fratelli SMT solo se i thread sono più
-  dei core; ogni thread è libero fra i due fratelli del **suo** core. Prefill +24% a 16 thread (+30%
-  a 8), decode invariato. Legare invece ogni thread a un processore solo costava il 17% sul decode:
-  quello che serve è impedire che due thread finiscano sullo stesso core, non inchiodarli. 32 thread
-  (SMT) affondano: prefill -33%, decode -90%. Il pin regge anche a macchina occupata (+19% sul
-  prefill). Su macOS non si pinna (non si può) e una maschera già imposta al processo viene
-  rispettata. `TR_POOL_PIN=0/1/2` per i confronti.
-- 2026-09-18 — **Su un MoE una riga di bozza in più non è quasi gratis**: costa 15-27 ms contro i ~35
-  di una passata. Metà è lettura di pesi: la riga in bozza fa leggere 2.3-4.7 esperti nuovi per layer
-  su 8 (contati, `docs/MISURE.md` §Revisione); l'altra metà è il suo calcolo. Il pareggio della
-  speculazione è al 60-75% di bozze accettate, non al 15% misurato in container (LEZIONI #59). Perciò
-  la bozza adattiva non si limita ad accorciarsi: dopo una bozza tutta sbagliata **si ferma** per 1,
-  3, 7, 15 e poi 16 passi (il tetto era rotto: faceva 31, LEZIONI #60). Caso peggiore 1.01× su 3 giri
-  (era 0.60×; da rimisurare, LEZIONI #66), caso buono 1.15× (1.34× con `--spec-fixed`, che resta per
-  chi sa di star riscrivendo un file). Le costanti della pausa spostano ±2-3%: restano quelle.
+  dei core; ogni thread è libero fra i due fratelli del **suo** core. Rimisurato con controllo A/A
+  (8 giri, `docs/MISURE.md` §Revisione): a 16 thread prefill **1.27×** su nessun pin e **+9%** sul
+  pin al processore, che è anche instabile (spread 25% contro 5%); sul decode il pin al core non è
+  distinguibile dagli altri due (soglia 2.2%). Il «−17% sul decode» del pin al processore, da cui
+  era nata la scelta, **non si riproduce** (−3.4% contro nessun pin): la scelta resta, per il
+  prefill. 32 thread (SMT) affondano: prefill -33%, decode -90%. Il pin regge anche a macchina
+  occupata (+19% sul prefill, 3 giri). Su macOS non si pinna (non si può) e una maschera già imposta
+  al processo viene rispettata. `TR_POOL_PIN=0/1/2` per i confronti.
+- 2026-09-18 — **Su un MoE una riga di bozza in più non è quasi gratis**: misurata per zona, nativa
+  (`docs/MISURE.md` §Revisione), costa **17.6 ms** se è la sola e **13.7 ms** l'una se sono otto,
+  contro i 31.3 di una passata. Il costo sta negli esperti (91% e 61%): la riga in bozza fa leggere
+  2.3-4.7 esperti nuovi per layer su 8 e il tempo segue quei MiB; le moltiplicazioni dense sono
+  gratis per la prima riga in più. Il pareggio della speculazione è al **44-56%** di bozze
+  accettate, non al 15% misurato in container (LEZIONI #59). Perciò la bozza adattiva non si limita
+  ad accorciarsi: dopo una bozza tutta sbagliata **si ferma** per 1, 3, 7, 15 e poi 16 passi
+  (LEZIONI #60). Rimisurato con controllo A/A, 8 giri: caso peggiore **0.953×** (i 3 giri di prima
+  dicevano 1.01×: sbagliato, LEZIONI #66), caso buono **1.175×** (1.34× con `--spec-fixed`, 3 giri,
+  per chi sa di star riscrivendo un file). «Caso peggiore come senza» **non è raggiunto**, e le
+  costanti della pausa non ci arrivano (replay coi costi misurati: al massimo 0.97-0.98×): `--spec`
+  resta **spento di default**.
+- 2026-09-18 — **Quando una differenza è una conclusione**: confronti con `tools/ab_modes.sh` (8
+  giri, ordine a rotazione, un modo dato due volte come controllo A/A). Una coppia A/A sola è
+  rumorosa (lo stesso decode: 0.5% in un blocco, 2.2% in un altro): la soglia è il peggiore A/A
+  della sessione per quella fase, e la differenza deve superarla contro tutte e due le copie. Sotto
+  la soglia si scrive «non distinguibile» (LEZIONI #66).
 - 2026-09-18 — **La leva 2 (attivazioni int8/VNNI) è la leva del prefill, ed è una decisione aperta**
   (domanda 21, corretta dalla revisione, LEZIONI #65). La prima misura confrontava una riga contro un
   token (+1-8%) e ne era uscito «non si scrive». Con la struttura del nostro kernel a 4 token l'int8
@@ -151,9 +162,9 @@ Sostituisci, non appendere. Tetto 40 KB. Lo storico sta in `archivio/FATTO.md`.
   `q_norm` su tutta la proiezione (hidden), `k_norm` su kv_heads × head_dim, RoPE stile neox
   (`rotate_half`), softmax su tutti gli esperti poi top-k, normalizzazione solo con `norm_topk_prob`.
 - Misure di velocità nel container: modelli nel volume Docker `trochilus-models` (GGUF + conversione
-  colibri, 14 GB), non dal disco di Windows (LEZIONI #41). Fermare i container degli altri progetti è
-  bloccato dal controllo automatico dei permessi di Claude Code: o li ferma Marcello, o una regola nei
-  permessi.
+  colibri, 14 GB), non dal disco di Windows (LEZIONI #41). I container degli altri progetti li ferma
+  e li riavvia da solo `tools/remeasure.sh` (2026-09-18: 9 fermati, 9 ripartiti); un `docker stop`
+  lanciato a mano era bloccato dal controllo automatico dei permessi di Claude Code.
 - Sul PC non ci sono clang né CUDA toolkit: build Windows con MinGW-w64 gcc 15.2 (scoop), Linux
   nel container `trochilus-dev` (Ubuntu 24.04, gcc + clang; ASan, UBSan e TSan con gcc).
 - **Un pool alla volta** (LEZIONI #63): due pool vivi prendono gli stessi slot e si dividono gli
@@ -182,8 +193,8 @@ esatta al bit e provata da `tests/test_spec.c` e `make spec-check`.
 
 Fatto il 2026-09-18 (`docs/MISURE.md` §Il pin dei thread, §SMT, §Bozza adattiva, §Attivazioni int8):
 pin dei thread al core fisico (prefill +24-30%, decode invariato), bozza adattiva con pausa (caso
-peggiore da 0.60× a 1.01×, caso buono 1.15×), e la leva 2 chiusa con un microbenchmark invece che con
-del codice. Chiuse le domande 3, 21, 22 (tranne Linux), 24, 25, 27; aperta la 26. La revisione ha poi
+peggiore da 0.60× a 0.95×, caso buono 1.175×: numeri della rimisura con A/A), e la leva 2 chiusa con
+un microbenchmark invece che con del codice. Chiuse le domande 3, 21, 22 (tranne Linux), 24, 25, 27; aperta la 26. La revisione ha poi
 riaperto e richiuso la 21 con la risposta opposta, chiuso la 28 e contato metà della 12.
 
 Fatto il 2026-09-18, revisione avversariale di tutto il repository (`docs/MISURE.md` §Revisione,
@@ -192,16 +203,22 @@ modello vero a 2 layer; tokenizer 90 000 stringhe contro HF, 0 differenze). Corr
 rosso prima e verde dopo: il tetto della pausa, l'affinità del chiamante con due pool, i thread senza
 slot su Linux. Nuovo nel cancello: `make tier-check`. Nuovo per le misure: `tools/ab_modes.sh`.
 
-0. **Rimisurare nativo, a macchina ferma, con controllo A/A** (`sh tools/remeasure.sh`, ~30 minuti:
-   ferma e riavvia da solo i container, risultati in `build/remeasure/`; LEZIONI #66) le
-   tre conclusioni che decidono qualcosa e stanno dentro lo spread: il caso peggiore di `--spec`
-   (1.01× su 3 giri; il replay dà 0.94-1.00×), pin al core contro pin al processore, decode a 8
-   contro 16 thread. Con le zone del profiler chiude anche la domanda 12.
-1. **Accendere `--spec` di default?** Dipende dal punto 0: la condizione era «caso peggiore come
-   senza». Lo decide Marcello; oggi resta spento.
-2. **Thread per fase** (domanda 26): il prefill vuole tutti i core (217.8 tok/s a 16), il decode
-   sembra volerne 8 (31.0 contro 28.7 a 16, ma gli intervalli si sovrappongono: punto 0). Usare i
-   primi n slot del pool nel decode è esatto per costruzione.
+Fatto il 2026-09-18, rimisura nativa a macchina ferma con controllo A/A (`sh tools/remeasure.sh`, 14
+minuti, ogni run in `build/remeasure/`; `docs/MISURE.md` §Revisione, LEZIONI #66-#67). Delle tre
+conclusioni che stavano dentro lo spread: una era **sbagliata** (caso peggiore di `--spec` 0.953×,
+non 1.01×), una **non si riproduce** (il −17% sul decode del pin al processore: è −3.4%) e una è
+**confermata e più netta** (decode a 8 thread 1.09-1.12× su 16, intervalli disgiunti). Chiusa la
+domanda 12 (il costo di una riga di bozza sta negli esperti), riscritte la 26 e la 27.
+
+1. **Accendere `--spec` di default?** La condizione «caso peggiore come senza» **non è
+   soddisfatta**: 0.953× dove il modello inventa, 1.175× dove ricopia (A/A, 8 giri). Cambiare le
+   costanti della pausa non basta (replay coi costi misurati: al massimo 0.97-0.98×); la leva è il
+   costo della riga di bozza, che per le bozze corte sta al 91% negli esperti (domanda 12). Lo
+   decide Marcello: acceso accettando −5% / +17.5%, o spento come oggi.
+2. **Thread per fase** (domanda 26): premessa confermata con A/A. Il prefill vuole 16 thread (242.5
+   tok/s contro 170.9 a 8), il decode 8 (34.7 contro 31.0-31.7 a 16: **1.09-1.12×**, intervalli
+   disgiunti). Usare i primi n slot del pool nel decode è esatto per costruzione. Prima di scegliere
+   n: decode a 4 e 12 thread con `tools/ab_modes.sh` e controllo A/A.
 3. **Int8/VNNI nel prefill, sì o no** (domande 21 e 28, LEZIONI #65): è dove sta il divario con
    llama.cpp (1.8-2.3× sul kernel), ma non è esatto. Se sì: un modo dichiarato (`--fast-prefill`),
    spento di default, con l'oracolo che misura di quanto si spostano i logit. La strada esatta «8
