@@ -38,7 +38,8 @@ si sposta nella sezione giusta con il numero quando è misurato.
 | 19 | Decode a 4-16 thread: llama.cpp è davvero avanti dell'8-12%? | `tools/speed_compare.py` con i due motori alternati run per run nella stessa sessione (fra due sessioni la mediana di llama.cpp si è spostata del 3-7%) | dice se c'è una leva nel decode a più thread o solo rumore |
 | 20 | ~~Il prefill rende 1.16× da 8 a 16 thread: è il limite di potenza del portatile?~~ No, e nemmeno il CCD: è lo scheduler che mette due thread sullo stesso core fisico. Misurato: §Dove vanno i thread | — | — |
 | 22 | Fissare i thread ai core fisici vale anche **sul decode** e **con la macchina occupata**? Misurato (§Il pin dei thread): sul decode a 16 thread **non distinguibile** da nessun pin (rimisura con A/A: −1.8%, soglia 2.2%; il vecchio 0.82× del pin al processore non si riproduce) e **sì a 4-8** (1.14-1.32×, pin al processore, 3 giri); con la macchina occupata il prefill tiene (1.19×) e il decode perde (0.67×, 3 giri, non rimisurato). Resta la sola parte **Linux**: su questa macchina non è misurabile (niente Linux nativo, e in WSL2 la topologia è sintetica, LEZIONI #47); il codice Linux gira ed è provato in `make check`, i numeri no | una macchina Linux vera, stessi scenari | il pin è una decisione di prodotto: sulle altre righe è già presa (acceso) |
-| 26 | Quanti thread vuole **ogni fase**? Rimisurato con A/A (§Revisione, pin al core): il prefill vuole 16 thread (242.5 tok/s contro 170.9 a 8, **1.42×**), il decode ne vuole 8 (34.7 contro 31.0-31.7 a 16, **1.09-1.12×**, intervalli disgiunti). Restano 4 e 12 thread nel decode, e il contesto 2048 | scenari di decode a 4/8/12/16 thread con `tools/ab_modes.sh` e controllo A/A, contesto 512 e 2048; poi un pool che nel decode usa meno worker (i primi n slot, che sono già core distinti sui due chiplet) | oggi il numero di thread è uno solo per tutte e due le fasi: a 16 thread il decode lascia il 9-12% sul tavolo |
+| 26 | ~~Quanti thread vuole **ogni fase**?~~ Il prefill tutti (16 contro 8: 1.37×), il decode **8 su 16**: è il solo numero sopra la soglia a contesto 512 (1.10×) e a 2048 (1.03×); 4 vince di poco a 512 (+1.8% su 8) e perde il 3.6% a 2048, 12 non rende; fra 4 e 8 la curva è piatta. Il motore non porta il numero scritto: ogni sessione misura la sua larghezza e `--decode-threads` la forza. Misurato: §Thread per fase | — | — |
+| 31 | La larghezza **misurata dalla sessione** regge sulle altre macchine (4-8 core, più canali di memoria, Apple Silicon senza pin, core P/E)? E uno stimatore più robusto del «migliore di tre passate» (eliminare subito le larghezze lontane e dare più giri alle vicine) toglie le scelte sbagliate dove due larghezze distano il 2-4%? | `sh tools/threads_phase.sh after <binario>` su un'altra macchina: colonna `width` e larghezze forzate; qui, contare le scelte a contesto 2048 con lo stimatore nuovo | la regola è fatta per valere ovunque, ma l'ha provata una macchina sola; su questa a 2048 sceglie ancora 16 in qualche run e lì perde il 4% |
 | 27 | ~~Perché il decode a 16 thread pinnati va il 17% più piano che senza pin?~~ **La premessa non regge**: con 8 giri e controllo A/A il pin a un processore sta a −3.4% da nessun pin e a −1.6% dal pin al core (non distinguibile), non a −17%. Il pin al **core** resta il default per il prefill (1.27× su nessun pin, +9% sul pin al processore). Misurato: §Il pin dei thread, §Revisione | — | — |
 | 23 | ~~Quante bozze vengono accettate su lavoro di codice vero?~~ Misurato: §Speculazione dal prompt. 64% riscrivendo un file già nel prompt (1.42×), 13% scrivendo codice nuovo (0.62×) | — | — |
 | 24 | ~~Una bozza sbagliata quanto costa?~~ **Molto più di quanto diceva la misura in container** (5.2 ms): nativo, col pin, una riga in più costa **13.7-17.6 ms** contro i 31.3 di una passata (zone del profiler, §Revisione; dai tok/s usciva 15-27), perché il token in bozza sceglie altri esperti e la passata legge anche i loro pesi. Il pareggio non è al 15% di bozze accettate ma al **44-56%** (§Bozza adattiva, LEZIONI #59) | — | — |
@@ -844,6 +845,143 @@ Letture:
   migliore, pausa 2, 5, 11, 16, dà 0.97-0.98×): le costanti della pausa non bastano, la leva è il
   costo della riga.
 
+## Thread per fase (2026-09-18)
+
+Domanda 26. Windows nativo, macchina ferma (`tools/threads_phase.sh` ferma i 9 container degli
+altri progetti e li riavvia alla fine), OLMoE-1B-7B Q8_0, pin al core, `tools/ab_modes.sh`: 8 giri
+dopo uno di riscaldamento, il primo modo del giro ruota, controllo A/A. Mediana (min-max),
+rapporto col primo modo. Ogni run in `build/threads_phase/`.
+
+**1. Quanti thread vuole ogni fase** (`sh tools/threads_phase.sh sweep`: un solo `-t` per tutte e
+due le fasi, binario del commit b231b28, `generate -p <contesto> -n 48`).
+
+| contesto | thread | prefill tok/s | | decode tok/s | |
+|---|---|---|---|---|---|
+| 512 | 16 | 231.2 (228.7-237.4) | — | 30.77 (29.31-31.67) | — |
+| | 16, copia A/A | 233.4 (228.5-236.3) | 1.009× | 30.70 (30.39-31.12) | 0.998× |
+| | 12 | 210.5 (204.5-212.2) | 0.910× | 31.50 (30.34-31.79) | 1.024× |
+| | 8 | 168.4 (167.5-170.6) | 0.728× | 33.79 (33.36-34.67) | **1.098×** |
+| | 4 | 92.1 (91.5-92.8) | 0.398× | 34.39 (33.34-34.97) | **1.118×** |
+| 2048 | 16 | 186.5 (183.2-188.0) | — | 24.06 (22.19-24.45) | — |
+| | 16, copia A/A | 187.2 (184.9-189.8) | 1.004× | 23.91 (23.42-24.51) | 0.994× |
+| | 12 | 166.4 (162.3-170.2) | 0.892× | 23.20 (21.72-24.05) | 0.964× |
+| | 8 | 134.9 (133.2-137.2) | 0.723× | 24.65 (24.17-25.12) | **1.025×** |
+| | 4 | 74.3 (73.8-74.4) | 0.398× | 23.77 (23.32-24.27) | 0.988× |
+
+Soglia, il peggiore A/A della sessione: decode 0.6%, prefill 0.9%.
+
+- **Il prefill vuole tutti i thread**, a ogni contesto: 16 contro 8 fa 1.37× a 512 e 1.38× a 2048.
+- **Il decode a contesto 512**: 8 e 4 thread battono 16 del 9.8% e dell'11.8% (10.1% e 12.0% contro
+  la copia), con intervalli disgiunti da quello dei 16. Fra loro 4 è avanti dell'1.8%, con gli
+  intervalli uno dentro l'altro (33.3-35.0 e 33.4-34.7). 12 rende il 2.4%.
+- **A contesto 2048** 8 è il solo numero sopra la soglia contro tutte e due le copie (+2.5%, +3.1%).
+  4 torna indietro (−1.2% e −0.6%: non distinguibile da 16, e −3.6% da 8) e 12 è il peggiore
+  (−3.6%, −3.0%).
+- **Scelta: n = 8**, il solo numero sopra la soglia a tutti e due i contesti. 4 vince di poco dove
+  il contesto è corto e perde dove è lungo, e nel coding il contesto è lungo (LEZIONI #70).
+- Perché: il decode legge 1.2 GB di pesi per token e 4 thread riempiono già il bus (34 tok/s sono
+  41 GB/s); oltre quel punto ogni thread in più aggiunge solo attesa alla barriera di ogni
+  `parallel_for`. Col contesto cresce l'attenzione, che è calcolo e si divide per testa: lì i
+  thread in più tornano a servire, e l'ottimo si sposta da 4-6 verso 8.
+
+**2. Il decode a larghezza forzata** (motore nuovo, `--decode-threads n`: prompt sempre su 16
+thread, passate corte sui primi n slot; contesto 512; sessione con la regola al 2%, che conta solo
+per l'ultima riga). Il prefill sta fra 233.6 e 236.7 tok/s in tutti i modi (A/A 1.3%): la
+larghezza del decode non lo tocca.
+
+| decode su | decode tok/s | |
+|---|---|---|
+| 16 | 30.88 (29.75-31.60) | — |
+| 16, copia A/A | 31.13 (30.56-31.75) | 1.008× |
+| 12 | 31.63 (30.16-32.63) | 1.025× |
+| 8 | 34.07 (33.54-34.81) | **1.103×** |
+| 6 | 34.63 (31.41-35.19) | **1.122×** |
+| 4 | 33.84 (33.29-34.67) | **1.096×** |
+| misurata dalla sessione (8 in 7 run, 4 in una) | 33.82 (32.04-34.15) | **1.095×** |
+
+Fra 4 e 8 thread la curva è piatta (33.8-34.6, differenze sotto la soglia della sessione, 1.4%) e
+cade sopra gli 8. `-t 16 --decode-threads 8` va come `-t 8` (34.07 contro 33.79 dello sweep): i
+worker lasciati fuori dormono e non costano.
+
+**3. La regola del default è una misura, non un numero.** Quanti thread riempiono il bus è un
+fatto della macchina (canali di memoria, banda per core), e da una macchina sola non si ricava
+una formula che valga sulle altre: `min(core, 8)` e `core/2` danno tutti e due 8 qui, e sbagliano
+in direzioni opposte su un portatile a 4 core e su una macchina a molti canali. Quindi ogni
+sessione misura la sua: le prime 9 passate da un token girano a turno su tutto il pool, su metà e
+su un quarto (16, 8, 4), tre volte ciascuna; tiene il tempo migliore di ogni larghezza e sceglie
+la più ampia entro l'1% dalla più veloce; rimisura ogni 1024 token, perché l'ottimo si sposta col
+contesto. Una passata è «corta» fino a 4 righe (quelle che il kernel a 4 token copre con una sola
+lettura della riga di pesi); le altre usano tutto il pool. `--decode-threads n` forza la larghezza
+e non misura niente. Token identici al bit per costruzione (il contratto del pool) e per prova:
+`tests/test_phase.c`, `tests/test_base.c`, `make tier-check`.
+
+Il margine è stato misurato tre volte, contando quale larghezza sceglie ogni run (colonna `width`
+di `ab_modes.sh`, 16 run per contesto):
+
+| margine | scelte a 512 | scelte a 2048 | decode dopo/prima a 512 | a 2048 |
+|---|---|---|---|---|
+| 3% | 8 in 15, 4 in 1 | **16 in 10**, 8 in 6 | 1.096× e 1.091× | 0.996× e 1.012× |
+| 2% | 8 in 15, 4 in 1 | 16 in 5, 8 in 11 | 1.081× e 1.092× | 1.014× e 1.026× |
+| **1%** (adottato) | 8 in 11, 4 in 5 | 16 in 2, **8 in 14** | 1.085× e 1.088× | **1.027× e 1.019×** |
+
+A 2048 le run che scelgono 8 fanno 24.0-25.1 tok/s e quelle che scelgono 16 fanno 23.4-23.8: ogni
+scelta sbagliata costa il 4%, e succede perché il tempo migliore di tre passate ha un rumore del
+2% circa, quanto la distanza fra 16 e 8 a quel contesto (LEZIONI #71). Con l'1% a 512 la scelta
+cade su 4 una volta su tre: lì 4 e 8 vanno uguale, e la rimisura ogni 1024 token la riporta su 8
+quando il contesto cresce. Uno stimatore più robusto è la domanda 31.
+
+**4. `--spec 8` col motore nuovo** (`run -f <prompt> -n 200 --spec 8 -t 16`; «16 righe» è
+`TR_DECODE_ROWS=16`: ogni passata di verifica sulla larghezza del decode, non solo quelle fino a 4
+righe). Regola al 2%.
+
+| prompt | modo | decode tok/s | |
+|---|---|---|---|
+| `code-edit` (la bozza viene accettata) | prima | 37.11 (36.63-37.51) | — |
+| | prima, copia A/A | 37.03 (36.73-37.79) | 0.998× |
+| | dopo | 37.91 (36.60-38.29) | 1.021× |
+| | dopo, 16 righe | 37.75 (36.54-38.49) | 1.017× |
+| `code` (il modello inventa) | prima | 31.01 (30.55-31.58) | — |
+| | prima, copia A/A | 30.98 (30.13-31.41) | 0.999× |
+| | dopo | 33.00 (32.55-33.41) | **1.064×** |
+| | dopo, 16 righe | 33.05 (32.45-33.51) | **1.066×** |
+
+- Dove la bozza viene accettata le passate hanno quasi tutte più di 4 righe e girano come prima:
+  +2.1%, a cavallo della soglia. Dove il modello inventa le passate sono corte e prendono il
+  guadagno del decode: **+6.4%**, intervalli disgiunti. In quel caso la sessione sceglie 4 thread
+  in 8 run su 8.
+- **Il confine a 4 o a 16 righe non si distingue** (−0.4% e +0.2%): resta a 4, che lascia le
+  passate lunghe di verifica esattamente come erano (nessun rischio dove il calcolo conta di più).
+- Il rapporto fra `--spec 8` e `--spec 0` sul caso peggiore non è stato rimisurato: tutti e due
+  ora prendono il guadagno del decode stretto, il primo il 6.4% e il secondo il 9% circa.
+
+**5. Prima e dopo** (`sh tools/threads_phase.sh change build/trochilus-before.exe`: il binario di
+b231b28 contro il motore nuovo con la regola all'1%, tutti e due a `-t 16`, ognuno con la sua
+copia A/A, più il motore nuovo con `--decode-threads 8`; `generate -p <contesto> -n 48`).
+
+| contesto | binario | prefill tok/s | | decode tok/s | |
+|---|---|---|---|---|---|
+| 512 | prima | 235.3 (227.3-238.6) | — | 30.82 (30.03-31.29) | — |
+| | prima, copia A/A | 233.8 (229.5-236.7) | 0.994× | 30.71 (29.76-31.64) | 0.996× |
+| | dopo | 233.6 (227.0-236.1) | 0.993× | 33.45 (32.46-34.19) | **1.085×** |
+| | dopo, copia A/A | 235.7 (230.7-239.1) | 1.002× | 33.53 (32.85-34.13) | **1.088×** |
+| | dopo, `--decode-threads 8` | 236.3 (233.4-237.7) | 1.004× | 33.50 (31.91-34.41) | **1.087×** |
+| 2048 | prima | 193.4 (189.7-194.0) | — | 23.79 (23.45-24.43) | — |
+| | prima, copia A/A | 192.5 (191.3-195.8) | 0.995× | 23.55 (23.29-24.47) | 0.990× |
+| | dopo | 192.6 (189.3-193.7) | 0.996× | 24.43 (24.09-24.79) | **1.027×** |
+| | dopo, copia A/A | 192.8 (190.8-194.2) | 0.997× | 24.24 (23.34-25.04) | **1.019×** |
+| | dopo, `--decode-threads 8` | 193.3 (192.2-194.1) | 0.999× | 24.98 (24.14-25.21) | **1.050×** |
+
+Soglia della sessione: decode 1.0%, prefill 0.6%.
+
+- **Decode a contesto 512: 1.085× e 1.088×** (1.089× e 1.092× contro la copia), intervalli
+  disgiunti (32.5-34.2 contro 29.8-31.6). Il default misurato va come la larghezza forzata.
+- **Decode a contesto 2048: 1.027× e 1.019×** (1.037× e 1.029× contro la copia), sopra la soglia
+  contro tutte e due le copie; con 8 forzato **1.050×**. La metà che manca al default sta nelle 2
+  run su 16 che scelgono 16 e nelle 9 passate di misura (3 su 16 thread e 3 su 4, tutte e due più
+  lente di 8 a questo contesto) su 47.
+- **Prefill: non distinguibile** a nessuno dei due contesti (da −0.7% a +0.4%).
+- Su una risposta di 48 token la misura pesa; su una di 200 sono 9 passate su 200, e poi 9 ogni 1024.
+
 ## Tentativi
 
 | Data | Cosa | Prima | Dopo | Spread | Esito |
@@ -862,3 +1000,4 @@ Letture:
 | 2026-09-18 | una riga di pesi contro **8** token (float, identico al bit a x4), solo nel banco | x4: 25.6 / 47.6 / 114.1 ns per riga (n = 1024 / 2048 / 4096) | 1.13× / 0.79× / 0.93× | 3-8% | **scartato**: a n=2048 le attivazioni di 8 righe (64 KB) escono dalla L1 (§Revisione) |
 | 2026-09-18 | dot int8 VNNI con la struttura del x4 (256 bit col trucco del segno; 512 bit a due blocchi), solo nel banco, non esatto | x4 float come sopra | 256 bit 1.64× / 1.62× / 1.96×; 512 bit **1.83× / 1.79× / 2.26×** | 3-8% | misurato, non adottato: l'int8 non è bit-identico, può essere solo un modo dichiarato. Decisione aperta (§Revisione, LEZIONI #65) |
 | 2026-09-18 | tetto della pausa della bozza adattiva corretto (31 → 16) | replay esatto: 172 passate, 65 righe di bozza (`code`) | 172 passate, 66 righe | — | tenuto: è una correzione, non una leva; le costanti spostano ±2-3% (§Revisione) |
+| 2026-09-18 | thread per fase: prompt su tutto il pool, passate corte (fino a 4 righe) sui primi n slot, n misurato dalla sessione (16/8/4, la più ampia entro l'1% dalla più veloce, di nuovo ogni 1024 token), `--decode-threads` lo forza; token identici al bit | decode 30.82 tok/s a contesto 512, 23.79 a 2048 (16 thread) | 33.45 (**1.085×**) e 24.43 (**1.027×**); con 8 forzato 33.50 e 24.98 (1.050×); prefill invariato; `--spec 8` caso peggiore 1.064× | A/A 1.0% | **tenuto**, acceso di default. Margine del 3% e del 2% misurati e scartati (a 2048 tenevano 16 thread in 10 e in 5 run su 16); confine a 16 righe invece di 4: non distinguibile (§Thread per fase) |

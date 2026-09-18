@@ -13,4 +13,14 @@
  * allocation (nothing to check against) and logs a warning. */
 int tr_mem_guard(uint64_t needed_bytes, char *err, size_t err_len);
 
+/* Threads per phase (model.h): the widths a pool of pool_size threads is measured on, widest
+ * first and distinct (the whole pool, half, a quarter), and the choice among them. Both are
+ * here for the tests: the choice must not depend on the clock of the machine that runs them. */
+#define TR_DECODE_TUNE_WIDTHS 3
+int tr_decode_tune_widths(int pool_size, int width[TR_DECODE_TUNE_WIDTHS]);
+/* best_sec[i]: the fastest one-token pass seen on width[i] threads. Returns the index of the
+ * widest width within TR_DECODE_TUNE_MARGIN of the fastest: on the flat part of the curve more
+ * threads cost nothing on a one-token pass and help the passes with more rows or more context. */
+int tr_decode_tune_pick(const double *best_sec, int n_widths);
+
 #endif

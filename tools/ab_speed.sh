@@ -12,6 +12,9 @@
 #   docker run --rm -v "$PWD:/src" -v trochilus-models:/src/models -w /src trochilus-dev:local \
 #       sh tools/ab_speed.sh models/<file>.gguf build/base/b/trochilus build/linux-gcc/trochilus
 set -e
+# The body is one function, called on the last line: the shell parses all of it before it runs
+# any, so editing this file while it runs cannot change a run under way (docs/LEZIONI.md #69).
+main() {
 MODEL=$1
 A=$2
 B=$3
@@ -54,3 +57,5 @@ awk '$4 > 0 { key = $1 " " $2 " " $3; v[key] = v[key] " " $5 }
              if (a[j] + 0 < a[i] + 0) { t = a[i]; a[i] = a[j]; a[j] = t }
            printf "%-16s median %8.2f  min %8.2f  max %8.2f  (n=%d)\n", k, a[int((n + 1) / 2)], a[1], a[n], n } }' "$OUT" | sort
 rm -f "$OUT"
+}
+main "$@"; exit

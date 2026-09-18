@@ -74,6 +74,34 @@ int tr_session_rewind(tr_session *s, int64_t n);
  * default: set ->enabled and ->phase to turn it on. Never NULL. */
 tr_prof *tr_session_prof(tr_session *s);
 
+/* ---- threads per phase (docs/MISURE.md "Thread per fase") ----
+ * A long pass (a prompt) is bound by compute and runs on the whole pool. A short pass, of at
+ * most TR_DECODE_ROWS tokens (decoding, a short draft to verify), is bound by reading the
+ * weights: once the memory bus is full more threads only add waiting, and how many fill it is
+ * a fact of the machine, not of the model. So it is measured, not configured: the first
+ * one-token passes of a session run in turn on the whole pool, on half and on a quarter of it
+ * (tr_pool_set_active: the first slots, distinct cores), three times each, and the session
+ * keeps the widest of the widths within TR_DECODE_TUNE_MARGIN of the fastest. Until then its
+ * other short passes use the whole pool. The answer moves with the context (on the reference
+ * machine 4 threads are as fast as 8 at 512 tokens and lose 4% at 2048) and with the heat, so
+ * the session measures again every TR_DECODE_TUNE_AGAIN one-token passes, keeping its choice
+ * in the meantime. The width changes the speed, never a logit.
+ * TR_DECODE_ROWS in the environment, read at load, moves where a short pass ends, for
+ * measurements (0: no pass is short, which is the engine before threads per phase). */
+#define TR_DECODE_ROWS 4              /* what the dense kernel covers with one read of a weight row */
+#define TR_DECODE_TUNE_ROUNDS 3
+#define TR_DECODE_TUNE_MARGIN 0.01    /* a tie; measured at 0.03 and 0.02: 16 threads kept too often at 2048 tokens */
+#define TR_DECODE_TUNE_AGAIN 1024
+
+/* Forces the threads of every short pass of every session of this model (clamped to the
+ * pool), measuring nothing; n_threads <= 0 goes back to measuring. */
+void tr_model_set_decode_threads(tr_model *m, int n_threads);
+/* Threads the short passes of this session run on: the forced number, or the measured one, or
+ * 0 until the session has measured for the first time. */
+int tr_session_decode_threads(const tr_session *s);
+/* Threads the last eval of this session ran on (0 before the first). */
+int tr_session_last_threads(const tr_session *s);
+
 /* ---- implemented once per architecture ----
  * model.c wraps the architecture's own objects: struct tr_model is
  * { const tr_arch_vtable *vt; void *impl; } and struct tr_session likewise, so an

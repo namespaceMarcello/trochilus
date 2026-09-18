@@ -9,6 +9,9 @@
 # this into the best tier tested three times: the first check is that the cap really capped
 # (docs/LEZIONI.md #64).
 set -e
+# The body is one function, called on the last line: the shell parses all of it before it runs
+# any, so editing this file while it runs cannot change a run under way (docs/LEZIONI.md #69).
+main() {
 B=$1
 FIX=$2
 OUT=$B/tier-check
@@ -22,7 +25,7 @@ for tier in scalar avx2; do
         echo "$kernels" | grep -q "tier avx2 *not available" ||
             { echo "tier-check: TR_CPU_MAX=scalar did not cap the tier"; exit 1; }
     fi
-    for t in test_prefill test_spec test_session; do
+    for t in test_prefill test_spec test_session test_phase; do
         TR_CPU_MAX=$tier "$B/tests/$t" > "$OUT/$t-$tier.log" 2>&1 ||
             { echo "tier-check: $t fails under TR_CPU_MAX=$tier"; tail -5 "$OUT/$t-$tier.log"; exit 1; }
     done
@@ -36,14 +39,16 @@ for type in f32 f16 q8_0; do
     for b in 1 7 64; do
         first=""
         for tier in scalar avx2 best; do
-            for t in 1 5; do
-                f=$OUT/$type-b$b-$tier-t$t.bin
+            # 5 threads measure their own decode width (5, 2, 1 in turn, then one of them); the
+            # last mode forces it: the short passes must give the same bytes on any of them
+            for t in "1" "5" "5 --decode-threads 2"; do
+                f=$OUT/$type-b$b-$tier-t$(echo "$t" | tr -d ' -').bin
                 if [ "$tier" = best ]; then
                     "$B/trochilus" logits -m "$model" --tokens "$TOKENS" --out "$f" -t $t -b $b > /dev/null 2>&1
                 else
                     TR_CPU_MAX=$tier "$B/trochilus" logits -m "$model" --tokens "$TOKENS" --out "$f" -t $t -b $b > /dev/null 2>&1
                 fi
-                [ -s "$f" ] || { echo "tier-check: no logits from $model ($tier, $t threads, -b $b)"; exit 1; }
+                [ -s "$f" ] || { echo "tier-check: no logits from $model ($tier, -t $t, -b $b)"; exit 1; }
                 if [ -z "$first" ]; then first=$f; else
                     cmp -s "$first" "$f" || { echo "tier-check: $f differs from $first"; exit 1; }
                 fi
@@ -59,3 +64,5 @@ for type in f32 f16 q8_0; do
     done
 done
 echo "== tier-check: model tests pass under scalar and avx2; logits identical across tiers, threads and -b (f32, f16, q8_0)"
+}
+main "$@"; exit

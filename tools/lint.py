@@ -94,7 +94,7 @@ def check_tests_no_tmpfile():
 
 # Hot zone (docs/ARCHITETTURA.md §Zona calda): code that runs for every token, between
 # /* hot: begin */ and /* hot: end */. A line may allow a name with /* hot-ok: name -- reason */.
-HOT_FILES = ["src/models/olmoe.c", "src/kernels/kernels.c", "src/kernels/kernels_x86.c",
+HOT_FILES = ["src/models/olmoe.c", "src/models/model.c", "src/kernels/kernels.c", "src/kernels/kernels_x86.c",
              "src/kernels/kernels_internal.h", "src/base/threads.c", "src/base/prof.h"]
 HOT_RULES = [
     ("allocazione", re.compile(r"\b(malloc|calloc|realloc|free|tr_alloc_aligned|tr_free_aligned|"
@@ -236,10 +236,21 @@ def check_makefile_recipes_ascii():
                      "mettilo in uno script in tools/")
 
 
+def check_shell_scripts_whole():
+    """#69: a shell reads its script while it runs it, so a script edited during a long run (a
+    measurement) goes on from shifted text. A body inside main(), called on the last line and
+    followed by exit, is parsed whole before anything runs."""
+    for f in sorted((ROOT / "tools").glob("*.sh")):
+        lines = [l for l in f.read_text(encoding="utf-8").split("\n") if l.strip()]
+        if "main() {" not in lines or lines[-1] != 'main "$@"; exit':
+            fail(69, f"tools/{f.name}: il corpo va dentro main() {{ ... }} e l'ultima riga è "
+                     'main "$@"; exit (uno script modificato mentre gira si rompe)')
+
+
 def main():
     for check in (check_docs_control_chars, check_doc_limits, check_lessons_table,
                   check_type_table, check_tests_no_tmpfile, check_hot_zones, check_global_state,
-                  check_makefile_recipes_ascii):
+                  check_makefile_recipes_ascii, check_shell_scripts_whole):
         check()
     for f in failures:
         print(f)

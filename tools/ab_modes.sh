@@ -20,6 +20,9 @@
 # Round 0 is dropped as warm-up. Prints every run, then per mode and phase: median, min, max,
 # spread and the ratio to the first mode. Native runs on a still machine only (LEZIONI #47, #57).
 set -e
+# The body is one function, called on the last line: the shell parses all of it before it runs
+# any, so editing this file while it runs cannot change a run under way (docs/LEZIONI.md #69).
+main() {
 ROUNDS=$1
 if [ -z "$ROUNDS" ] || [ $# -lt 3 ]; then
   echo "usage: ab_modes.sh <rounds> \"label=command\" \"label=command\" [...]" >&2
@@ -37,9 +40,12 @@ while [ "$R" -le "$ROUNDS" ]; do
     LABEL=${MODE%%=*}
     CMD=${MODE#*=}
     ERR=$(sh -c "$CMD" 2>&1 >/dev/null) || true
+    # "width": the decode threads the run settled on, where the binary says it (measured per
+    # session, so min and max across the rounds say how stable that choice is)
     LINES=$(printf '%s\n' "$ERR" |
       sed -n "s/^prompt: [0-9]* tokens in .* (\([0-9.]*\) tok.s)/$LABEL prefill $R \1/p;
-              s/^generate: .* in .* (\([0-9.]*\) tok.s)/$LABEL decode $R \1/p")
+              s/^generate: .* in .* (\([0-9.]*\) tok.s)/$LABEL decode $R \1/p;
+              s/^threads: [0-9]* prompt, \([0-9]*\) decode.*/$LABEL width $R \1/p")
     # a run that measured nothing must stop the comparison, not leave a hole in the table (#56)
     if [ -z "$LINES" ]; then
       echo "ab_modes: '$LABEL' round $R produced no tok/s line, stopping. The run said:" >&2
@@ -71,3 +77,5 @@ awk -v first="$FIRST" '
     }
   }' "$OUT" | sort
 rm -f "$OUT"
+}
+main "$@"; exit

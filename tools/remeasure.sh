@@ -8,6 +8,9 @@
 #
 #   sh tools/remeasure.sh [rounds]
 set -e
+# The body is one function, called on the last line: the shell parses all of it before it runs
+# any, so editing this file while it runs cannot change a run under way (docs/LEZIONI.md #69).
+main() {
 R=${1:-8}
 B=build/trochilus.exe
 M=models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf
@@ -25,6 +28,18 @@ if [ -n "$RUNNING" ]; then
   docker stop $RUNNING > /dev/null
   echo "containers stopped: $(echo $RUNNING | wc -w)"
 fi
+
+# The model takes 7 GiB and the memory guard wants 3 more left free; after a `make check` Windows
+# needs minutes to take back what the VM has released (docs/LEZIONI.md #72). Up to 15 minutes.
+TRY=0
+while :; do
+  AVAIL=$($B cpu 2>&1 | sed -n 's/^ram: .* total, \([0-9]*\)\.[0-9]* GiB available.*/\1/p')
+  [ "${AVAIL:-0}" -lt 12 ] || break
+  TRY=$((TRY + 1))
+  [ "$TRY" -le 30 ] || { echo "remeasure: only ${AVAIL:-?} GiB available after 15 minutes, 12 wanted"; exit 1; }
+  echo "remeasure: ${AVAIL:-?} GiB available, 12 wanted: waiting 30 s"
+  sleep 30
+done
 
 echo "##### 1. speculation, worst case (code.txt), with an A/A control"
 sh tools/ab_modes.sh $R \
@@ -84,3 +99,5 @@ for tag in ("1specfixed", "8specfixed"):
           f"(dense matmul {dense:.1f}, experts {experts:.1f}, rest {total - dense - experts:.1f})")
 EOF
 echo "done: $OUT"
+}
+main "$@"; exit

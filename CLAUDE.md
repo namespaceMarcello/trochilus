@@ -96,6 +96,8 @@ sh tools/build_llamacpp.sh; tools/compare_llamacpp.py ...   # nel container: lla
 tools/speed_compare.py ...   # nel container: velocità contro llama.cpp e colibri (modelli nel volume trochilus-models)
 sh tools/ab_speed.sh <gguf> <binario A> <binario B>   # due binari alternati run per run (LEZIONI #46)
 sh tools/ab_modes.sh <giri> "a=<comando>" "b=<comando>"   # modi di un binario (env, flag), ordine a rotazione, A/A (LEZIONI #66)
+build/trochilus run -m <f.gguf> -f prompt.txt --decode-threads 8   # forza i thread del decode (default: li misura la sessione)
+sh tools/threads_phase.sh sweep | after <binario prima>   # thread per fase: -t 4/8/12/16, prima e dopo, larghezze forzate, --spec
 make bench               # microbenchmark dei kernel (mediana + rumore)
 make profile             # scenari col profiler, mediana di N, token identici, confronto col precedente
 make profile SCENARIOS=bench/scenarios-olmoe-1b-7b.json   # modello vero, 16/8/4/1 thread

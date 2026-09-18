@@ -142,6 +142,18 @@ Sostituisci, non appendere. Tetto 40 KB. Lo storico sta in `archivio/FATTO.md`.
   VNNI a 512 bit è **1.8-2.3×** il nostro x4 float, e il prefill è al 90% moltiplicazioni; la strada
   esatta «8 token nei registri» invece non rende (0.79× a n=2048). Ma l'int8 non è bit-identico:
   romperebbe «prefill a blocchi = token per token» e può esistere solo come modo dichiarato.
+- 2026-09-18 — **Thread per fase, e il numero lo misura il motore** (domanda 26, `docs/MISURE.md`
+  §Thread per fase). Misurato a 4, 8, 12, 16 thread e a due contesti: il prefill vuole tutto il pool,
+  il decode **8**, il solo numero sopra la soglia a contesto 512 (1.10×) e 2048 (1.03×); 4 vince di
+  poco a 512 e perde a 2048 (LEZIONI #70). Ma 8 è un fatto di questa macchina (quanti thread
+  riempiono il bus della memoria), e una formula sui core ricavata da una macchina sola sbaglia sulle
+  altre. Quindi il default è una **misura**, come vuole il principio 0: ogni sessione prova tutto il
+  pool, metà e un quarto sulle sue prime 9 passate da un token, tiene la più ampia entro l'1% dalla
+  più veloce e rimisura ogni 1024 token; `--decode-threads n` forza. Passata corta = fino a 4 righe
+  (16 non si distingue); il resto usa tutto il pool. Esatto per costruzione (il contratto del pool:
+  il risultato non dipende dai thread) e per prova. Dopo contro prima, A/A: decode **1.085×** a 512
+  e **1.02-1.03×** a 2048 (8 forzato: 1.05×), prefill invariato, `--spec 8` caso peggiore 1.064×.
+  Il margine è stato scelto contando le scelte di ogni run (3%, 2%, 1%: LEZIONI #71).
 
 ## Problemi noti
 
@@ -178,7 +190,9 @@ Sostituisci, non appendere. Tetto 40 KB. Lo storico sta in `archivio/FATTO.md`.
 - Le misure di velocità native vogliono la macchina ferma: i container degli altri progetti vanno
   fermati e riavviati dopo (il guard di memoria rifiuta di caricare il modello sotto i ~10 GB liberi),
   e nessun agente deve compilare in Docker nel frattempo (LEZIONI #57). `tools/ab_speed.sh` e
-  `ab_spec.sh` ora si fermano se una run non produce un numero, invece di stampare una tabella vuota.
+  `ab_spec.sh` ora si fermano se una run non produce un numero, invece di stampare una tabella vuota;
+  `threads_phase.sh` e `remeasure.sh` aspettano che il motore veda 12 GiB liberi prima della prima
+  run, perché dopo un `make check` Windows si riprende la memoria con minuti di ritardo (LEZIONI #72).
 
 ## Prossimi passi
 
@@ -210,27 +224,38 @@ non 1.01×), una **non si riproduce** (il −17% sul decode del pin al processor
 **confermata e più netta** (decode a 8 thread 1.09-1.12× su 16, intervalli disgiunti). Chiusa la
 domanda 12 (il costo di una riga di bozza sta negli esperti), riscritte la 26 e la 27.
 
+Fatto il 2026-09-18, thread per fase (`docs/MISURE.md` §Thread per fase, LEZIONI #69-#72; ogni run
+in `build/threads_phase/`): il prompt gira su tutto il pool, le passate corte sui primi n slot, e n
+lo misura ogni sessione (decisione sopra). Decode 1.085× a contesto 512 e 1.02-1.03× a 2048 contro
+il binario di prima, prefill invariato, token identici al bit (`tests/test_phase.c`,
+`test_pool_active`, `make tier-check`). Chiusa la domanda 26, aperta la 31. Nuovo per le misure:
+`tools/threads_phase.sh`, la colonna `width` di `ab_modes.sh`, l'attesa della memoria libera, e gli
+script di shell che non si rompono se modificati mentre girano.
+
 1. **Accendere `--spec` di default?** La condizione «caso peggiore come senza» **non è
    soddisfatta**: 0.953× dove il modello inventa, 1.175× dove ricopia (A/A, 8 giri). Cambiare le
    costanti della pausa non basta (replay coi costi misurati: al massimo 0.97-0.98×); la leva è il
    costo della riga di bozza, che per le bozze corte sta al 91% negli esperti (domanda 12). Lo
-   decide Marcello: acceso accettando −5% / +17.5%, o spento come oggi.
-2. **Thread per fase** (domanda 26): premessa confermata con A/A. Il prefill vuole 16 thread (242.5
-   tok/s contro 170.9 a 8), il decode 8 (34.7 contro 31.0-31.7 a 16: **1.09-1.12×**, intervalli
-   disgiunti). Usare i primi n slot del pool nel decode è esatto per costruzione. Prima di scegliere
-   n: decode a 4 e 12 thread con `tools/ab_modes.sh` e controllo A/A.
+   decide Marcello: acceso accettando −5% / +17.5%, o spento come oggi. Coi thread per fase i due
+   rapporti vanno rimisurati: `--spec 0` prende il 9% dal decode stretto, il caso peggiore di
+   `--spec 8` il 6.4%, il caso buono il 2%.
+2. **La larghezza misurata, su altre macchine e con uno stimatore migliore** (domanda 31): su questa
+   macchina a contesto 2048 il default prende metà del guadagno di `--decode-threads 8` (1.02-1.03×
+   contro 1.05×), perché il «migliore di tre passate» ha il 2% di rumore e 16 sta al 2.5-4% da 8.
+   Da provare: scartare subito le larghezze lontane e dare più giri alle vicine. E `sh
+   tools/threads_phase.sh after <binario>` su una macchina diversa, appena ce n'è una.
 3. **Int8/VNNI nel prefill, sì o no** (domande 21 e 28, LEZIONI #65): è dove sta il divario con
    llama.cpp (1.8-2.3× sul kernel), ma non è esatto. Se sì: un modo dichiarato (`--fast-prefill`),
    spento di default, con l'oracolo che misura di quanto si spostano i logit. La strada esatta «8
    token nei registri» è misurata e scartata. Lo decide Marcello.
 4. Prefill su prompt lunghi (2048-4096), dove l'attenzione per token cresce col quadrato: a 512 token
-   è al 2%, a 2048 il prefill è già sceso da 217.8 a 159.2 tok/s col pin (domanda 7).
+   è al 2%, a 2048 il prefill scende da 235 a 193 tok/s (domanda 7).
 5. Confronto colibri/ds4 per componente (decisione sopra), poi le correzioni che ne escono.
    Misure 13-16 di `docs/MISURE.md` (routing, cache esperti, SSD): ordine da confermare con Marcello.
 6. Decode a contesto lungo: Trochilus perde l'11-13% da 32 a 512 token, llama.cpp il 5-7% (domande
-   18-19 di `docs/MISURE.md`).
+   18-19 di `docs/MISURE.md`); da 512 a 2048 il decode scende da 33.5 a 24.4 tok/s.
 7. Memoria: banda reale della RAM (domanda 4 in `docs/MISURE.md`), poi pagine da 2 MB (domanda 5).
-   Col pin il decode a 4 e a 8 thread va uguale (31 tok/s) e a 16 scende: la banda è il tetto, e
-   la domanda 4 dice quanto manca.
+   Il decode va uguale da 4 a 8 thread (34 tok/s, 41 GB/s) e scende sopra gli 8: la banda è il
+   tetto, e la domanda 4 dice quanto manca.
 8. Il pin su Linux: il codice c'è e `make check` lo prova, i numeri no (serve una macchina Linux
    vera, in WSL2 la topologia è sintetica). Resta l'ultima metà della domanda 22.

@@ -294,3 +294,35 @@ del pin al processore non si riproduce (la differenza fra i due pin è nel prefi
 thread 1.09-1.12× su 16. Una riga di bozza costa 13.7-17.6 ms su 31.3, per il 61-91% negli esperti.
 Numeri in `docs/MISURE.md` §Revisione, decisioni in `docs/STATO.md`, LEZIONI #58, #59, #66, #67.
 Prova: `sh tools/remeasure.sh`, poi `build/remeasure/` (ogni run e le mediane).
+
+### 2026-09-18 — Thread per fase: il prompt su tutto il pool, il decode sulla larghezza che la sessione misura
+Domanda 26 chiusa. Misura (nativo, macchina ferma, 8 giri, A/A, contesti 512 e 2048): il prefill
+vuole 16 thread, il decode 8 (4 vince di poco a 512 e perde a 2048, 12 non rende). Il numero non è
+scritto nel motore: ogni sessione lo misura. Dopo contro prima: decode **1.085×** a 512,
+**1.02-1.03×** a 2048, prefill invariato, `--spec 8` caso peggiore 1.064×; token identici al bit.
+Numeri in `docs/MISURE.md` §Thread per fase, decisione in `docs/STATO.md`, LEZIONI #69-#72.
+- `src/base/threads.{h,c}`: `tr_pool_set_active(p, n)` e `tr_pool_active`: i `parallel_for`
+  seguenti usano i primi n thread (i primi n slot: core distinti sui due chiplet), gli altri
+  dormono. Prova: `tests/test_base` (`test_pool_active`: 5000 cambi di larghezza, anche sotto TSan).
+- `src/models/model.{h,c}`: ogni eval passa da `session_eval` (zona calda, ora sotto `tools/lint.py`):
+  passata lunga su tutto il pool; passata corta (fino a `TR_DECODE_ROWS` = 4 righe) sulla larghezza
+  del decode, che la sessione misura sulle prime 9 passate da un token (tutto il pool, metà, un
+  quarto; la più ampia entro l'1% dalla più veloce; di nuovo ogni 1024) o che
+  `tr_model_set_decode_threads` forza. `TR_DECODE_ROWS` nell'ambiente sposta il confine per le
+  misure (0: il motore di prima). Prova: `tests/test_phase` (le larghezze e la scelta su tempi
+  finti, la sequenza delle larghezze su una sessione vera, larghezza forzata 1..8 e oltre, ogni
+  logit identico a un thread solo, f32 e Q8_0; rosso prima, verde dopo, rimisura provata per
+  mutazione).
+- `src/app/main.c`: `--decode-threads <n>` in `generate`, `run`, `chat`, `logits`; dopo le righe di
+  velocità `threads: 16 prompt, 8 decode (measured)` (o `forced`); `decode_threads` nel JSON del
+  profilo. Prova: `build/trochilus generate -m <gguf> -p 64 -n 24` e lo stesso con
+  `--decode-threads 8`.
+- `tools/tier_check.sh`: `test_phase` sotto `scalar` e `avx2`, e i logit identici al byte anche con
+  la larghezza misurata (5 thread) e con `--decode-threads 2`. Prova: `make tier-check`.
+- `tools/threads_phase.sh` (`sweep`, `change <binario prima>`, `after <binario prima>`): aspetta un
+  exe bloccato da Smart App Control invece di ricompilare, ferma e riavvia i container, aspetta 12
+  GiB liberi. `tools/ab_modes.sh` raccoglie la colonna `width` (la larghezza che ogni run si è
+  misurata). Prova: `sh tools/threads_phase.sh change build/trochilus-before.exe`.
+- Ogni `tools/*.sh` ha il corpo dentro `main()` chiamata dall'ultima riga: uno script modificato
+  mentre gira non si rompe più (LEZIONI #69); `tools/lint.py` lo pretende. `tools/remeasure.sh`
+  aspetta anche lui la memoria libera (LEZIONI #72). Prova: `make lint`.

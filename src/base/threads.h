@@ -38,6 +38,16 @@ tr_pool *tr_pool_create(int n_threads);
 void tr_pool_destroy(tr_pool *p);
 int tr_pool_size(const tr_pool *p);
 
+/* How many of the pool's threads the next tr_parallel_for calls use: the first n, which sit on
+ * the first n slots of tr_cpu(), so on distinct physical cores spread over the last-level
+ * caches. n outside [1, tr_pool_size] means all of them, which is how a pool starts. The
+ * threads left out get no work and go to sleep. Work bound by memory bandwidth wants fewer
+ * threads than work bound by compute (docs/MISURE.md "Thread per fase"); by the determinism
+ * contract above the width changes the speed of a result, never the result. Called by the
+ * thread that calls tr_parallel_for, between two calls and never from inside a body. */
+void tr_pool_set_active(tr_pool *p, int n);
+int tr_pool_active(const tr_pool *p);
+
 /* Splits [0, n) into at most tr_pool_size contiguous chunks, each holding at
  * least min_chunk indices (except when n < min_chunk: one chunk), runs fn on
  * every chunk and returns when all are done. A call made from inside a body

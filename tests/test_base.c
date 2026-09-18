@@ -390,6 +390,46 @@ static void test_parallel_varying_chunks(void) {
     }
 }
 
+/* A pool narrowed to w threads gives work to workers 0..w-1 only and really uses all w of them,
+ * still covers every index once, and takes a width out of range as "every thread". A generation
+ * switches width thousands of times (prompt wide, decode narrow), so the width changes on every
+ * call here: that is where a worker left on a stale job would show (a hang fails by timeout). */
+static void test_pool_active(void) {
+    static const int widths[] = {3, 8, 1, 5, 2, 8, 4};
+    unsigned char count[64], worker_id[64];
+    tr_pool *p = tr_pool_create(8);
+    TR_CHECK(p != NULL);
+    if (p == NULL) return;
+    TR_CHECK_EQ_INT(tr_pool_active(p), 8);
+
+    for (int iter = 0; iter < 5000; iter++) {
+        int w = widths[iter % 7];
+        int64_t n = 1 + (iter * 7) % 64;
+        tr_pool_set_active(p, w);
+        TR_CHECK_EQ_INT(tr_pool_active(p), w);
+        memset(count, 0, sizeof count);
+        memset(worker_id, 0, sizeof worker_id);
+        cov_ctx ctx = { count, worker_id };
+        tr_parallel_for(p, n, 1, cov_fn, &ctx);
+        check_coverage(n, count, worker_id, w);
+        int last = 0;
+        for (int64_t i = 0; i < n; i++)
+            if (worker_id[i] > last) last = worker_id[i];
+        TR_CHECK_EQ_INT(last, (n < w ? (int)n : w) - 1);
+    }
+
+    static const int all[] = {0, -3, 9, 99};
+    for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) {
+        tr_pool_set_active(p, 2);
+        tr_pool_set_active(p, all[i]);
+        TR_CHECK_EQ_INT(tr_pool_active(p), 8);
+    }
+    TR_CHECK_EQ_INT(tr_pool_size(p), 8); /* the width never changes the pool itself */
+    tr_pool_set_active(NULL, 3);          /* no pool: nothing to narrow */
+    TR_CHECK_EQ_INT(tr_pool_active(NULL), 1);
+    tr_pool_destroy(p);
+}
+
 /* ---- thread placement ---------------------------------------------------- */
 
 /* Every slot names a different logical processor, and the first physical_cores of them
@@ -634,6 +674,7 @@ int main(int argc, char **argv) {
     }
 
     test_parallel_varying_chunks();
+    test_pool_active();
     test_cpu_slots();
     test_pool_pinned();
     test_pool_caller_affinity_any_order();

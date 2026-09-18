@@ -12,7 +12,10 @@
  *     Atomics are sequentially consistent, so a store followed by the other side's
  *     load cannot miss a wake-up.
  *   - The calling thread runs chunk 0. A call from inside a body, or with p == NULL,
- *     runs serially (t_depth). */
+ *     runs serially (t_depth).
+ *   - A narrowed pool (tr_pool_set_active) publishes to the first `active` slots only: a
+ *     worker past the width never sees READY, spins out its budget and sleeps until a wider
+ *     call finds it sleeping and broadcasts. */
 
 #if defined(__linux__) && !defined(_POSIX_C_SOURCE)
 #define _POSIX_C_SOURCE 200809L
@@ -66,6 +69,7 @@ typedef union {
 
 struct tr_pool {
     int size; /* includes the calling thread */
+    int active; /* threads a parallel_for may use, 1..size: the dispatcher's own, no worker reads it */
     double spin_sec;
     slot_line *slots; /* size entries, slot 0 unused */
     atomic_int remaining;
@@ -169,6 +173,7 @@ tr_pool *tr_pool_create(int n_threads) {
     tr_pool *p = calloc(1, sizeof *p);
     if (p == NULL) return NULL;
     p->size = n_threads;
+    p->active = n_threads;
     p->slots = tr_alloc_aligned(sizeof(slot_line) * (size_t)n_threads, 64);
     p->workers = n_threads > 1 ? malloc(sizeof *p->workers * (size_t)(n_threads - 1)) : NULL;
     if (p->slots == NULL || (n_threads > 1 && p->workers == NULL)) {
@@ -249,6 +254,7 @@ tr_pool *tr_pool_create(int n_threads) {
 #endif
         if (failed) {
             p->size = i; /* best effort: keep the threads that started */
+            p->active = i;
             break;
         }
     }
@@ -288,6 +294,15 @@ int tr_pool_size(const tr_pool *p) {
     return p->size;
 }
 
+void tr_pool_set_active(tr_pool *p, int n) {
+    if (p == NULL) return;
+    p->active = n >= 1 && n <= p->size ? n : p->size;
+}
+
+int tr_pool_active(const tr_pool *p) {
+    return p != NULL ? p->active : 1;
+}
+
 /* hot: begin */
 void tr_parallel_for(tr_pool *p, int64_t n, int64_t min_chunk, tr_range_fn fn, void *ctx) {
     if (n <= 0) return;
@@ -296,7 +311,7 @@ void tr_parallel_for(tr_pool *p, int64_t n, int64_t min_chunk, tr_range_fn fn, v
     int chunks = 1;
     if (p != NULL && t_depth == 0 && n >= min_chunk) {
         int64_t max_chunks = n / min_chunk;
-        chunks = p->size < max_chunks ? p->size : (int)max_chunks;
+        chunks = p->active < max_chunks ? p->active : (int)max_chunks;
     }
     if (chunks <= 1) {
         int worker = t_worker_id >= 0 ? t_worker_id : 0;

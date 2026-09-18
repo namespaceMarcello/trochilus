@@ -13,6 +13,9 @@
 #       trochilus-dev:local sh tools/ab_spec.sh models/<file>.gguf build/linux-gcc/trochilus \
 #       bench/prompts/code.txt 8 16 200 5
 set -e
+# The body is one function, called on the last line: the shell parses all of it before it runs
+# any, so editing this file while it runs cannot change a run under way (docs/LEZIONI.md #69).
+main() {
 MODEL=$1
 BIN=$2
 PROMPT=$3
@@ -61,3 +64,5 @@ awk '$3 > 0 { key = $1 " " $2; v[key] = v[key] " " $4 }
              if (a[j] + 0 < a[i] + 0) { t = a[i]; a[i] = a[j]; a[j] = t }
            printf "%-14s median %8.2f  min %8.2f  max %8.2f  (n=%d)\n", k, a[int((n + 1) / 2)], a[1], a[n], n } }' "$OUT" | sort
 rm -f "$OUT" "$OUT.err" "$TXT0" "$TXT1"
+}
+main "$@"; exit

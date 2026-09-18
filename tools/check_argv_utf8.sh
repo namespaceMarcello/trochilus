@@ -4,6 +4,9 @@
 # shell in the local code page and would mangle it before the engine sees it (#36).
 # The expected ids are transformers' for this text with the OLMoE tokenizer.
 #   tools/check_argv_utf8.sh <trochilus binary> <vocab.gguf>
+# The body is one function, called on the last line: the shell parses all of it before it runs
+# any, so editing this file while it runs cannot change a run under way (docs/LEZIONI.md #69).
+main() {
 bin="$1"
 vocab="$2"
 ids=$("$bin" tokenize -m "$vocab" -p "città è perché" 2>&1)
@@ -16,3 +19,5 @@ else
     echo "argv UTF-8 broken (docs/LEZIONI.md #13): got '$ids'"
     exit 1
 fi
+}
+main "$@"; exit

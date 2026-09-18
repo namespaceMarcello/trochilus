@@ -201,10 +201,25 @@ static void write_json_string(FILE *out, const char *s) {
     fputc('"', out);
 }
 
+/* --decode-threads, in every command that runs a model: 0 (the default) lets the session
+ * measure how many threads its short passes want, n forces n (src/models/model.h). */
+static const char DECODE_THREADS_RANGE[] = "--decode-threads must be 1 or more (0, the default: measured)";
+
+/* After the speed lines: how many threads each phase ran on, and who chose the decode's. */
+static void print_threads(const tr_pool *pool, const tr_session *sess, int forced) {
+    int decode = tr_session_decode_threads(sess);
+    if (decode > 0)
+        fprintf(stderr, "threads: %d prompt, %d decode (%s)\n", tr_pool_size(pool), decode,
+                forced > 0 ? "forced" : "measured");
+    else
+        fprintf(stderr, "threads: %d prompt, decode not measured yet\n", tr_pool_size(pool));
+}
+
 /* {"engine": <tr_prof_write_json output>, "model", "n_prompt", "n_gen", "threads"
- * (actual pool size), "cpu", "kernel_tier"} — the raw material for tools/profile_suite.py. */
+ * (actual pool size), "decode_threads" (0: the session had not finished measuring), "cpu",
+ * "kernel_tier"} — the raw material for tools/profile_suite.py. */
 static int write_profile_json(const char *path, tr_prof *prof, const char *model_path, int64_t n_prompt,
-                               int64_t n_gen, int actual_threads) {
+                               int64_t n_gen, int actual_threads, int decode_threads) {
     FILE *out = fopen(path, "w");
     if (out == NULL) return -1;
 
@@ -216,8 +231,8 @@ static int write_profile_json(const char *path, tr_prof *prof, const char *model
 
     fprintf(out, ",\"model\":");
     write_json_string(out, model_path);
-    fprintf(out, ",\"n_prompt\":%" PRId64 ",\"n_gen\":%" PRId64 ",\"threads\":%d,\"cpu\":", n_prompt, n_gen,
-            actual_threads);
+    fprintf(out, ",\"n_prompt\":%" PRId64 ",\"n_gen\":%" PRId64 ",\"threads\":%d,\"decode_threads\":%d,\"cpu\":",
+            n_prompt, n_gen, actual_threads, decode_threads);
     write_json_string(out, cpu_line);
     fprintf(out, ",\"kernel_tier\":");
     write_json_string(out, tr_kernels_get()->tier);
@@ -232,10 +247,11 @@ static int write_profile_json(const char *path, tr_prof *prof, const char *model
 static int cmd_generate(int argc, char **argv) {
     const char *model_path = NULL, *tokens_str = NULL, *profile_json_path = NULL;
     int64_t n_gen = -1, n_prompt_synth = -1, n_ctx = 0, n_batch = 0, n_draft = 0;
-    int n_threads = 0, do_profile = 0, spec_fixed = 0;
+    int n_threads = 0, decode_threads = 0, do_profile = 0, spec_fixed = 0;
 
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--spec") == 0 && i + 1 < argc) { n_draft = atoll(argv[++i]); continue; }
+        if (strcmp(argv[i], "--decode-threads") == 0 && i + 1 < argc) { decode_threads = atoi(argv[++i]); continue; }
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) model_path = argv[++i];
         else if (strcmp(argv[i], "--tokens") == 0 && i + 1 < argc) tokens_str = argv[++i];
         else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) n_prompt_synth = atoll(argv[++i]);
@@ -256,12 +272,17 @@ static int cmd_generate(int argc, char **argv) {
         fprintf(stderr,
                 "usage: trochilus generate -m <file.gguf> (--tokens id,id,... | -p <n>) -n <count>\n"
                 "                   [-t threads] [-c context] [-b batch] [--spec <draft>]\n"
+                "                   [--decode-threads <n>]  (threads of the decode; default: measured)\n"
                 "                   [--spec-fixed]  (fixed draft length instead of adaptive, for measurement)\n"
                 "                   [--profile] [--profile-json <file>]\n");
         return 2;
     }
     if (n_draft < 0 || n_draft > TR_GREEDY_DRAFT_MAX) {
         fprintf(stderr, "generate: --spec must be between 0 and %d\n", TR_GREEDY_DRAFT_MAX);
+        return 2;
+    }
+    if (decode_threads < 0) {
+        fprintf(stderr, "generate: %s\n", DECODE_THREADS_RANGE);
         return 2;
     }
 
@@ -277,6 +298,7 @@ static int cmd_generate(int argc, char **argv) {
         tr_pool_destroy(pool);
         return 1;
     }
+    tr_model_set_decode_threads(model, decode_threads);
     /* -c: KV cache size in tokens, 0 = model default. A small context keeps the cache and
      * the memory guard small when profiling a real model. */
     tr_session *sess = tr_session_create(model, n_ctx, n_batch, err, sizeof err);
@@ -417,12 +439,14 @@ static int cmd_generate(int argc, char **argv) {
                 g.n_steps > 0 ? (double)(g.n_steps + g.n_accepted) / (double)g.n_steps : 0.0,
                 g.n_steps > 0 ? (double)g.n_drafted / (double)g.n_steps : 0.0);
     }
+    print_threads(pool, sess, decode_threads);
 
     if (do_profile) tr_prof_print(prof, stderr);
     /* fewer tokens than asked is a failure, not a success with short output (LEZIONI #17) */
     int rc = context_full ? 3 : 0;
     if (profile_json_path != NULL &&
-        write_profile_json(profile_json_path, prof, model_path, n_prompt, produced, tr_pool_size(pool)) != 0) {
+        write_profile_json(profile_json_path, prof, model_path, n_prompt, produced, tr_pool_size(pool),
+                           tr_session_decode_threads(sess)) != 0) {
         fprintf(stderr, "generate: could not write --profile-json '%s'\n", profile_json_path);
         rc = 1;
     }
@@ -440,7 +464,7 @@ static int cmd_generate(int argc, char **argv) {
 
 static int cmd_logits(int argc, char **argv) {
     const char *model_path = NULL, *tokens_str = NULL, *out_path = NULL;
-    int n_threads = 0;
+    int n_threads = 0, decode_threads = 0;
     int64_t chunk = 1;
 
     for (int i = 0; i < argc; i++) {
@@ -448,6 +472,7 @@ static int cmd_logits(int argc, char **argv) {
         else if (strcmp(argv[i], "--tokens") == 0 && i + 1 < argc) tokens_str = argv[++i];
         else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) out_path = argv[++i];
         else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) n_threads = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--decode-threads") == 0 && i + 1 < argc) decode_threads = atoi(argv[++i]);
         else if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) chunk = atoll(argv[++i]);
         else {
             fprintf(stderr, "logits: unknown argument '%s'\n", argv[i]);
@@ -457,7 +482,12 @@ static int cmd_logits(int argc, char **argv) {
     /* -b k: tokens evaluated k at a time (one forward pass each), one logits row per
      * evaluation, for the last token of each; -b 1 gives every position */
     if (model_path == NULL || tokens_str == NULL || out_path == NULL || chunk <= 0) {
-        fprintf(stderr, "usage: trochilus logits -m <file.gguf> --tokens id,id,... --out <file> [-t threads] [-b batch]\n");
+        fprintf(stderr, "usage: trochilus logits -m <file.gguf> --tokens id,id,... --out <file> [-t threads] [-b batch]\n"
+                        "                       [--decode-threads <n>]\n");
+        return 2;
+    }
+    if (decode_threads < 0) {
+        fprintf(stderr, "logits: %s\n", DECODE_THREADS_RANGE);
         return 2;
     }
 
@@ -482,6 +512,7 @@ static int cmd_logits(int argc, char **argv) {
         tr_pool_destroy(pool);
         return 1;
     }
+    tr_model_set_decode_threads(model, decode_threads);
     tr_session *sess = tr_session_create(model, 0, chunk, err, sizeof err);
     if (sess == NULL) {
         fprintf(stderr, "error: %s\n", err);
@@ -679,9 +710,10 @@ static int cmd_tokenize(int argc, char **argv) {
 static int cmd_run(int argc, char **argv) {
     const char *model_path = NULL, *text = NULL, *file = NULL;
     int64_t n_max = 256, n_ctx = 0, n_batch = 0, n_draft = 0;
-    int n_threads = 0, flags = TR_TOK_ADD_SPECIAL | TR_TOK_PARSE_SPECIAL, spec_fixed = 0;
+    int n_threads = 0, decode_threads = 0, flags = TR_TOK_ADD_SPECIAL | TR_TOK_PARSE_SPECIAL, spec_fixed = 0;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--spec") == 0 && i + 1 < argc) { n_draft = atoll(argv[++i]); continue; }
+        if (strcmp(argv[i], "--decode-threads") == 0 && i + 1 < argc) { decode_threads = atoi(argv[++i]); continue; }
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) model_path = argv[++i];
         else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) text = argv[++i];
         else if (strcmp(argv[i], "-f") == 0 && i + 1 < argc) file = argv[++i];
@@ -700,9 +732,14 @@ static int cmd_run(int argc, char **argv) {
         n_draft > TR_GREEDY_DRAFT_MAX) {
         fprintf(stderr, "usage: trochilus run -m <file.gguf> (-p <text> | -f <file>) [-n <max tokens>]\n"
                         "                     [-t threads] [-c context] [-b batch] [--spec <draft>]\n"
+                        "                     [--decode-threads <n>]  (threads of the decode; default: measured)\n"
                         "                     [--spec-fixed]  (fixed draft length instead of adaptive, for "
                         "measurement)\n"
                         "                     [--no-parse-special]\n");
+        return 2;
+    }
+    if (decode_threads < 0) {
+        fprintf(stderr, "run: %s\n", DECODE_THREADS_RANGE);
         return 2;
     }
 
@@ -747,6 +784,7 @@ static int cmd_run(int argc, char **argv) {
         fprintf(stderr, "error: %s\n", err);
         goto done;
     }
+    tr_model_set_decode_threads(model, decode_threads);
     const tr_model_info *info = tr_model_get_info(model);
 
     double t0 = tr_time_sec();
@@ -808,6 +846,7 @@ static int cmd_run(int argc, char **argv) {
                 g.n_steps, g.n_accepted, g.n_drafted,
                 g.n_drafted > 0 ? 100.0 * (double)g.n_accepted / (double)g.n_drafted : 0.0,
                 g.n_steps > 0 ? (double)g.n_drafted / (double)g.n_steps : 0.0);
+    print_threads(pool, sess, decode_threads);
     rc = context_full ? 3 : 0;
 
 done:
@@ -966,12 +1005,13 @@ static int cmd_chat_template(int argc, char **argv) {
 static int cmd_chat(int argc, char **argv) {
     const char *model_path = NULL, *system = NULL;
     int64_t n_max = 1024, n_ctx = 0, n_batch = 0;
-    int n_threads = 0;
+    int n_threads = 0, decode_threads = 0;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) model_path = argv[++i];
         else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) system = argv[++i];
         else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) n_max = atoll(argv[++i]);
         else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) n_threads = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--decode-threads") == 0 && i + 1 < argc) decode_threads = atoi(argv[++i]);
         else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) n_ctx = atoll(argv[++i]);
         else if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) n_batch = atoll(argv[++i]);
         else {
@@ -981,7 +1021,12 @@ static int cmd_chat(int argc, char **argv) {
     }
     if (model_path == NULL || n_max <= 0) {
         fprintf(stderr, "usage: trochilus chat -m <file.gguf> [-s <system prompt>] [-n <max tokens per reply>]\n"
-                        "                      [-t threads] [-c context] [-b batch]\n");
+                        "                      [-t threads] [-c context] [-b batch]\n"
+                        "                      [--decode-threads <n>]  (threads of the decode; default: measured)\n");
+        return 2;
+    }
+    if (decode_threads < 0) {
+        fprintf(stderr, "chat: %s\n", DECODE_THREADS_RANGE);
         return 2;
     }
 
@@ -1015,6 +1060,7 @@ static int cmd_chat(int argc, char **argv) {
         fprintf(stderr, "error: %s\n", err);
         goto done;
     }
+    tr_model_set_decode_threads(model, decode_threads);
     const tr_model_info *info = tr_model_get_info(model);
     /* Without -c the chat takes the training context, and halves it (down to 512 tokens)
      * while the memory guard refuses the cache: a shorter conversation beats no conversation. */

@@ -147,7 +147,12 @@ codice macchina con e senza, verificato): nella zona calda restano quelli che sp
 - **Thread**: pool persistente dimensionato sui **core fisici** (colibri: +2.3x su Zen 3 contro i
   core logici), `parallel_for` su intervalli di righe. Contarli non basta: se non si fissano ai core,
   Windows ne appoggia due sullo stesso core fisico e il prefill perde il 30% (`docs/MISURE.md`
-  §Dove vanno i thread).
+  §Dove vanno i thread). **Thread per fase**: una passata lunga (il prompt) è limitata dal calcolo e
+  usa tutto il pool; una passata corta (decode, bozza corta: fino a 4 righe) è limitata dalla lettura
+  dei pesi e usa i primi n slot del pool. n non è una costante: ogni sessione lo **misura** sulle sue
+  prime passate da un token (tutto il pool, metà, un quarto), tiene la larghezza più ampia entro
+  l'1% dalla più veloce e rimisura ogni 1024 token; `--decode-threads` lo forza. La larghezza cambia
+  la velocità, mai un logit (`docs/MISURE.md` §Thread per fase).
 - **GPU**: tutto il token in un solo lotto di comandi, tensori che restano sul dispositivo (ds4).
 - **KV**: in memoria per sessione; riuso del prefisso per id di token; checkpoint su disco con
   punteggio `(hit decaduti + 1) × token / byte` (ds4).
@@ -162,6 +167,7 @@ codice macchina con e senza, verificato): nella zona calda restano quelli che sp
 | modello vero | OLMoE vero tagliato a 2 layer contro transformers sugli stessi pesi Q8_0 dequantizzati: token identici, logit entro 1e-3 | `make oracle-real` (saltato senza il modello) |
 | ottimizzazione esatta | logit del modello vero prima e dopo, identici al bit, con più numeri di thread | `trochilus logits` + `cmp`, a mano |
 | prefill a blocchi | logit e cache con molti token per passata identici al bit a un token per passata: `n_batch`, divisione in chiamate, thread, f32/Q8_0, rewind | `tests/test_prefill.c`; `tools/oracle.py` (`logits -b 3/64/tutto` al byte) su tiny e OLMoE a 2 layer |
+| thread per fase | ogni logit identico al bit a un thread solo con la larghezza misurata e con ogni larghezza forzata; il pool ristretto usa solo i primi n worker; la scelta fra le larghezze su tempi finti | `tests/test_phase.c`, `tests/test_base.c` (`test_pool_active`), `make tier-check` (`--decode-threads`) |
 
 ## Scala dei modelli
 

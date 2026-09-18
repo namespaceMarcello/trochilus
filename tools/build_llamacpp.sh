@@ -4,6 +4,9 @@
 #   MSYS_NO_PATHCONV=1 docker run --rm -v "$PWD:/src" -w /src trochilus-dev:local sh tools/build_llamacpp.sh
 # Output: ref/llama.cpp/build-trochilus/bin/{llamacpp_logits,llama-tokenize,llama-bench}
 set -e
+# The body is one function, called on the last line: the shell parses all of it before it runs
+# any, so editing this file while it runs cannot change a run under way (docs/LEZIONI.md #69).
+main() {
 command -v cmake >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq cmake >/dev/null; }
 B=ref/llama.cpp/build-trochilus
 cmake -S ref/llama.cpp -B "$B" -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DLLAMA_CURL=OFF \
@@ -17,3 +20,5 @@ g++ -O2 -x c tools/llamacpp_logits.c -x none -Iref/llama.cpp/include -Iref/llama
     -Wl,--start-group "$B/src/libllama.a" $(find "$B/ggml/src" -name 'libggml*.a') -Wl,--end-group \
     -lpthread -lm -o "$B/bin/llamacpp_logits"
 ls -la "$B/bin/llamacpp_logits" "$B/bin/llama-tokenize" "$B/bin/llama-bench"
+}
+main "$@"; exit
