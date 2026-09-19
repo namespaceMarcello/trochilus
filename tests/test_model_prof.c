@@ -83,6 +83,26 @@ int main(int argc, char **argv) {
         TR_CHECK_EQ_INT(prof2->acc[TR_PHASE_DECODE][TR_PROF_TOKEN].calls, 0);
         TR_CHECK(prof2->weight_bytes_touched[TR_PHASE_PREFILL] > 0);
 
+        /* bytes per zone: token i of the pass reads i + 1 cached positions of K and of V, once
+         * per query head (2 heads of 4 floats: 8 floats a position), so 1 + 2 + 3 positions;
+         * and what the zones read adds up to the totals of the phase */
+        const tr_prof_acc *acc = prof2->acc[TR_PHASE_PREFILL];
+        uint64_t kv_pass = (uint64_t)(1 + 2 + 3) * 8 * 2 * sizeof(float);
+        TR_CHECK_EQ_INT(prof2->kv_bytes_read[TR_PHASE_PREFILL], kv_pass);
+        TR_CHECK_EQ_INT(acc[TR_PROF_ATTENTION].bytes, kv_pass);
+        /* F32 weights: wq 8x8, wk and wv 4x8 (1 kv head), one expert of 3 matrices 4x8 */
+        TR_CHECK_EQ_INT(acc[TR_PROF_QKV_PROJ].bytes, (64 + 32 + 32) * sizeof(float));
+        TR_CHECK_EQ_INT(acc[TR_PROF_EXPERT_DOWN].bytes * 2, acc[TR_PROF_EXPERT_GATE_UP].bytes);
+        uint64_t zones = 0;
+        for (int z = 0; z < TR_PROF_ZONE_COUNT; z++) zones += acc[z].bytes;
+        TR_CHECK_EQ_INT(zones, prof2->weight_bytes_touched[TR_PHASE_PREFILL] + kv_pass);
+
+        /* a decode pass at position 3 reads 4 positions */
+        prof2->phase = TR_PHASE_DECODE;
+        TR_CHECK(tr_session_eval(sess2, tokens, 1) == 0);
+        TR_CHECK_EQ_INT(prof2->kv_bytes_read[TR_PHASE_DECODE], (uint64_t)4 * 8 * 2 * sizeof(float));
+        TR_CHECK_EQ_INT(prof2->kv_bytes_read[TR_PHASE_PREFILL], kv_pass);
+
         tr_session_free(sess2);
     }
 

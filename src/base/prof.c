@@ -46,6 +46,7 @@ void tr_prof_reset(tr_prof *p) {
     memset(p->acc, 0, sizeof p->acc);
     memset(p->tokens, 0, sizeof p->tokens);
     memset(p->weight_bytes_touched, 0, sizeof p->weight_bytes_touched);
+    memset(p->kv_bytes_read, 0, sizeof p->kv_bytes_read);
     memset(p->io_bytes, 0, sizeof p->io_bytes);
 }
 
@@ -106,6 +107,12 @@ void tr_prof_print(const tr_prof *p, FILE *out) {
             fprintf(out, "   weights touched: %.1f MiB per token, %.2f GB/s of memory traffic\n",
                     per_tok / (1024.0 * 1024.0), token_s > 0 ? (double)p->weight_bytes_touched[ph] / token_s / 1e9 : 0.0);
         }
+        if (p->tokens[ph] > 0 && p->kv_bytes_read[ph] > 0) {
+            double total = (double)(p->weight_bytes_touched[ph] + p->kv_bytes_read[ph]);
+            fprintf(out, "   KV cache read: %.1f MiB per token; weights + KV: %.2f GB/s of memory traffic\n",
+                    (double)p->kv_bytes_read[ph] / (double)p->tokens[ph] / (1024.0 * 1024.0),
+                    token_s > 0 ? total / token_s / 1e9 : 0.0);
+        }
         if (p->io_bytes[ph] > 0)
             fprintf(out, "   read from disk: %.1f MiB\n", (double)p->io_bytes[ph] / (1024.0 * 1024.0));
 
@@ -117,13 +124,18 @@ void tr_prof_print(const tr_prof *p, FILE *out) {
                 int t = order[j]; order[j] = order[j - 1]; order[j - 1] = t;
             }
 
-        fprintf(out, "   %-16s %10s %11s %7s %11s\n", "zone", "calls", "total ms", "%", "us/call");
+        fprintf(out, "   %-16s %10s %11s %7s %11s %10s %8s\n", "zone", "calls", "total ms", "%", "us/call",
+                "MiB/token", "GB/s");
         for (int i = 0; i < n; i++) {
             const tr_prof_acc *a = &acc[order[i]];
             double s = (double)a->ticks / rate;
-            fprintf(out, "   %-16s %10llu %11.3f %6.1f%% %11.3f\n", zone_names[order[i]],
+            fprintf(out, "   %-16s %10llu %11.3f %6.1f%% %11.3f", zone_names[order[i]],
                     (unsigned long long)a->calls, s * 1e3,
                     token_s > 0 ? 100.0 * s / token_s : 0.0, s * 1e6 / (double)a->calls);
+            if (a->bytes > 0 && p->tokens[ph] > 0)
+                fprintf(out, " %10.1f %8.2f", (double)a->bytes / (double)p->tokens[ph] / (1024.0 * 1024.0),
+                        s > 0 ? (double)a->bytes / s / 1e9 : 0.0);
+            fprintf(out, "\n");
         }
     }
 }
@@ -135,15 +147,17 @@ void tr_prof_write_json(const tr_prof *p, FILE *out) {
         const tr_prof_acc *acc = p->acc[ph];
         double token_s = (double)acc[TR_PROF_TOKEN].ticks / rate;
         fprintf(out, "%s\"%s\":{\"tokens\":%llu,\"seconds\":%.9f,\"tokens_per_sec\":%.6f,"
-                     "\"weight_bytes\":%llu,\"io_bytes\":%llu,\"zones\":{",
+                     "\"weight_bytes\":%llu,\"kv_bytes\":%llu,\"io_bytes\":%llu,\"zones\":{",
                 ph ? "," : "", phase_names[ph], (unsigned long long)p->tokens[ph], token_s,
                 token_s > 0 ? (double)p->tokens[ph] / token_s : 0.0,
-                (unsigned long long)p->weight_bytes_touched[ph], (unsigned long long)p->io_bytes[ph]);
+                (unsigned long long)p->weight_bytes_touched[ph], (unsigned long long)p->kv_bytes_read[ph],
+                (unsigned long long)p->io_bytes[ph]);
         int first = 1;
         for (int z = 0; z < TR_PROF_ZONE_COUNT; z++) {
             if (acc[z].calls == 0) continue;
-            fprintf(out, "%s\"%s\":{\"calls\":%llu,\"seconds\":%.9f}", first ? "" : ",", zone_names[z],
-                    (unsigned long long)acc[z].calls, (double)acc[z].ticks / rate);
+            fprintf(out, "%s\"%s\":{\"calls\":%llu,\"seconds\":%.9f,\"bytes\":%llu}", first ? "" : ",",
+                    zone_names[z], (unsigned long long)acc[z].calls, (double)acc[z].ticks / rate,
+                    (unsigned long long)acc[z].bytes);
             first = 0;
         }
         fprintf(out, "}}");

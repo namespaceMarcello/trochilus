@@ -1,0 +1,98 @@
+[
+  {
+    "name": "olmoe-1b-7b-q8_0-decode-ctx32-auto",
+    "model": "models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf",
+    "prompt_tokens": 32,
+    "gen_tokens": 48,
+    "context": 128,
+    "threads": 16,
+    "runs": 5
+  },
+  {
+    "name": "olmoe-1b-7b-q8_0-decode-ctx32-d8",
+    "model": "models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf",
+    "prompt_tokens": 32,
+    "gen_tokens": 48,
+    "context": 128,
+    "threads": 16,
+    "decode_threads": 8,
+    "runs": 5
+  },
+  {
+    "name": "olmoe-1b-7b-q8_0-decode-ctx512-auto",
+    "model": "models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf",
+    "prompt_tokens": 512,
+    "gen_tokens": 48,
+    "context": 600,
+    "threads": 16,
+    "runs": 5
+  },
+  {
+    "name": "olmoe-1b-7b-q8_0-decode-ctx512-d8",
+    "model": "models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf",
+    "prompt_tokens": 512,
+    "gen_tokens": 48,
+    "context": 600,
+    "threads": 16,
+    "decode_threads": 8,
+    "runs": 5
+  },
+  {
+    "name": "olmoe-1b-7b-q8_0-decode-ctx2048-auto",
+    "model": "models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf",
+    "prompt_tokens": 2048,
+    "gen_tokens": 48,
+    "context": 2200,
+    "threads": 16,
+    "runs": 5
+  },
+  {
+    "name": "olmoe-1b-7b-q8_0-decode-ctx2048-d8",
+    "model": "models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf",
+    "prompt_tokens": 2048,
+    "gen_tokens": 48,
+    "context": 2200,
+    "threads": 16,
+    "decode_threads": 8,
+    "runs": 5
+  },
+  {
+    "name": "olmoe-1b-7b-q8_0-decode-ctx2048-d16",
+    "model": "models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf",
+    "prompt_tokens": 2048,
+    "gen_tokens": 48,
+    "context": 2200,
+    "threads": 16,
+    "decode_threads": 16,
+    "runs": 5
+  },
+  {
+    "name": "olmoe-1b-7b-q8_0-decode-ctx4000-auto",
+    "model": "models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf",
+    "prompt_tokens": 4000,
+    "gen_tokens": 48,
+    "context": 4096,
+    "threads": 16,
+    "runs": 5
+  },
+  {
+    "name": "olmoe-1b-7b-q8_0-decode-ctx4000-d8",
+    "model": "models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf",
+    "prompt_tokens": 4000,
+    "gen_tokens": 48,
+    "context": 4096,
+    "threads": 16,
+    "decode_threads": 8,
+    "runs": 5
+  },
+  {
+    "name": "olmoe-1b-7b-q8_0-decode-ctx4000-d16",
+    "model": "models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf",
+    "prompt_tokens": 4000,
+    "gen_tokens": 48,
+    "context": 4096,
+    "threads": 16,
+    "decode_threads": 16,
+    "runs": 5
+  }
+]

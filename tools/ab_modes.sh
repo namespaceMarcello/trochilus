@@ -19,6 +19,11 @@
 #
 # Round 0 is dropped as warm-up. Prints every run, then per mode and phase: median, min, max,
 # spread and the ratio to the first mode. Native runs on a still machine only (LEZIONI #47, #57).
+#
+# AB_GUARD, when set, is a shell command run before every run: if it fails the machine is no
+# longer the one the comparison started on, and the comparison stops there instead of mixing
+# runs of two machines (docs/LEZIONI.md #73: another session started its containers again
+# seven minutes into a measurement). Example: AB_GUARD='[ -z "$(docker ps -q)" ]'.
 set -e
 # The body is one function, called on the last line: the shell parses all of it before it runs
 # any, so editing this file while it runs cannot change a run under way (docs/LEZIONI.md #69).
@@ -39,6 +44,11 @@ while [ "$R" -le "$ROUNDS" ]; do
     eval "MODE=\${$K}"
     LABEL=${MODE%%=*}
     CMD=${MODE#*=}
+    if [ -n "$AB_GUARD" ] && ! sh -c "$AB_GUARD" > /dev/null 2>&1; then
+      echo "ab_modes: the guard '$AB_GUARD' failed before '$LABEL' round $R: the machine changed, stopping." >&2
+      rm -f "$OUT"
+      exit 3
+    fi
     ERR=$(sh -c "$CMD" 2>&1 >/dev/null) || true
     # "width": the decode threads the run settled on, where the binary says it (measured per
     # session, so min and max across the rounds say how stable that choice is)

@@ -20,10 +20,10 @@ si sposta nella sezione giusta con il numero quando è misurato.
 | 1 | ~~Quanto costa svegliare i thread su Windows nativo?~~ Misurato: §Pool di thread | — | — |
 | 2 | ~~8 thread vincono perché stanno in un solo gruppo di core (CCD, L3 da 32 MB)?~~ No: 4+4 sui due CCD vanno **meglio** di 8 su uno solo. Misurato: §Dove vanno i thread | — | — |
 | 3 | ~~Le copie SMT aiutano o peggiorano?~~ **Peggiorano**: 32 thread pinnati (i due fratelli di ogni core) contro 16 (uno per core) danno prefill 110 contro 164 e decode 2.2 contro 22.9. Misurato: §SMT | — | — |
-| 4 | Qual è la banda reale della RAM di questa macchina? | microbenchmark di lettura sequenziale e `memcpy` da 1 GB, 1-16 thread | il tetto del decode (1.2 GB per token) si calcola da qui, non dai ~83 GB/s teorici (2×16 GB DDR5-5200); dal 2026-09-17 4 thread vanno come 16 a 41 GB/s |
+| 4 | ~~Qual è la banda reale della RAM di questa macchina?~~ **~54 GB/s** in lettura da 4 thread in su (52-58; un thread 22-25, due 43-49), uguale in fila e a blocchi sparsi da 2 MiB o 256 KiB; a pagine sparse da 4 KiB 7 GB/s a un thread e 34-41 a 6-16. Il matmul del motore ne tira 46-58. I «41 GB/s» erano la velocità del motore del 17/09, non il tetto. Il `memcpy` non è stato misurato: il decode legge, non scrive. Misurato: §Decode a contesto lungo | — | — |
 | 5 | Quanti TLB miss per token, e quanto valgono le pagine da 2 MB? | Linux: pesi con `madvise(MADV_HUGEPAGE)` contro senza, stessi token/s mediani | 300 000 pagine da 4 KB toccate per token |
 | 6 | Il portatile rallenta quando si scalda? | 60 s di decode continuo, token/s ogni 5 s | una misura breve può non valere per un uso reale |
-| 7 | Quanto costa l'attenzione quando il contesto cresce (128, 1024, 4096 token)? | scenari con prompt lungo, zona `attention` | il coding usa contesti lunghi |
+| 7 | Quanto costa l'attenzione quando il contesto cresce (128, 1024, 4096 token)? **Nel decode** misurato (§Decode a contesto lungo): 0.5 ms a contesto 32, 2.9 a 512, 11.5 a 2048, 22.6 a 4000 su 25-48 ms di token, cioè byte di KV letti a 47 GB/s. **Nel prefill** la zona vale il 5% a 512, il 18% a 2048 e il 34% a 4000 (era 6%, 28%, 52% prima della KV per testa): resta da attaccare lì | scenari `bench/scenarios-decode-context.json`, zona `attention` del prefill | il coding usa contesti lunghi |
 | 8 | Quanto costa il profiler acceso sul modello vero? | stessi scenari con e senza `--profile` | per fidarsi delle percentuali delle zone |
 | 9 | Windows nativo e Linux sulla stessa macchina vanno alla stessa velocità? | stesso scenario nativo e in Docker/WSL | in Docker svegliare un thread costava ~20 µs |
 | 10 | Più corsie (32 o 64) sbloccano la catena delle somme su un thread? | kernel sperimentale, `make bench` | AVX-512 va come AVX2 per quel limite; cambierebbe i numeri (dichiarato) |
@@ -34,7 +34,7 @@ si sposta nella sezione giusta con il numero quando è misurato.
 | 15 | Streaming dal disco per layer interi (DeepSpeed) o per esperti: quanti byte per token? | stessa traccia: layer interi contro soli esperti scelti e non in cache | con un solo utente leggere tutto il modello a ogni token dà al massimo ~0.3 tok/s su 10 GB |
 | 16 | Quanto legge davvero l'NVMe in blocchi grandi quanto un esperto, a posizioni casuali, senza cache? | microbenchmark `pread` senza cache del sistema (`FILE_FLAG_NO_BUFFERING`, `O_DIRECT`), al massimo 60 s | con 14 e 15 dà i token/s attesi (M1 per esperti se ≥ 5 tok/s al 50%); decide anche la KV vecchia su SSD, attesa no con attenzione piena |
 | 17 | Ricaricare dal disco la KV di un file già letto costa meno del prefill? La KV in q8 cambia i token? | checkpoint: logit identici al bit dopo il ricaricamento, tempo almeno 10 volte sotto il prefill; q8: token greedy uguali ≥ 99% su 1000 token di codice | leve del coding (file già letti, contesti lunghi), M5 |
-| 18 | Perché il decode perde l'11-13% da 32 a 512 token di contesto, e llama.cpp solo il 5-7%? | profilo per zone a contesto 32, 512, 2048: quota dell'attenzione e della sua parte a thread singolo | nel coding il contesto è lungo: è la differenza che cresce di più dopo il prefill |
+| 18 | ~~Perché il decode perde l'11-13% da 32 a 512 token di contesto, e llama.cpp solo il 5-7%?~~ Perché la KV si leggeva **più piano dei pesi**: 32-36 GB/s contro 47-54, con una testa che leggeva 512 byte ogni 8 KiB. Con le posizioni di una testa in fila la KV si legge a 47 GB/s e da 32 a 512 il decode perde l'8.8% (38.9 → 35.5), che è il costo dei byte in più. Misurato: §Decode a contesto lungo. Il confronto con llama.cpp a run alternate resta la domanda 19 | — | — |
 | 19 | Decode a 4-16 thread: llama.cpp è davvero avanti dell'8-12%? | `tools/speed_compare.py` con i due motori alternati run per run nella stessa sessione (fra due sessioni la mediana di llama.cpp si è spostata del 3-7%) | dice se c'è una leva nel decode a più thread o solo rumore |
 | 20 | ~~Il prefill rende 1.16× da 8 a 16 thread: è il limite di potenza del portatile?~~ No, e nemmeno il CCD: è lo scheduler che mette due thread sullo stesso core fisico. Misurato: §Dove vanno i thread | — | — |
 | 22 | Fissare i thread ai core fisici vale anche **sul decode** e **con la macchina occupata**? Misurato (§Il pin dei thread): sul decode a 16 thread **non distinguibile** da nessun pin (rimisura con A/A: −1.8%, soglia 2.2%; il vecchio 0.82× del pin al processore non si riproduce) e **sì a 4-8** (1.14-1.32×, pin al processore, 3 giri); con la macchina occupata il prefill tiene (1.19×) e il decode perde (0.67×, 3 giri, non rimisurato). Resta la sola parte **Linux**: su questa macchina non è misurabile (niente Linux nativo, e in WSL2 la topologia è sintetica, LEZIONI #47); il codice Linux gira ed è provato in `make check`, i numeri no | una macchina Linux vera, stessi scenari | il pin è una decisione di prodotto: sulle altre righe è già presa (acceso) |
@@ -50,7 +50,10 @@ si sposta nella sezione giusta con il numero quando è misurato.
 | 28 | ~~Il divario di prefill che resta con llama.cpp dov'è, se non è nell'int8?~~ Era nell'int8 (domanda 21). La strada esatta «più token nei registri» è misurata e non rende: una riga contro 8 token dà 1.13× a n=1024, **0.79×** a 2048 e 0.93× a 4096 (§Revisione) | — | — |
 
 | 29 | Quanto vale una variante SIMD per **F16**? Oggi non c'è: `dot_row f16` fa 824 M el/s in ogni tier (codice scalare) contro 21 044 di `dot_row q8_0` AVX-512, cioè 25× (revisione, `make bench`, n=2048) | kernel con `vcvtph2ps` (F16C: la conversione half→float è esatta, quindi resta bit-identico), stesso confronto di `test_tiers_match_scalar` | un GGUF in f16 gira molto più piano del necessario; è una leva esatta e piccola da scrivere |
-| 30 | La parte seriale del prefill (7.6% a 16 thread: copia per esperto, scrittura della KV, norme, RoPE) si può dividere per token? | `tr_parallel_for` sui token in quelle zone (ogni token è indipendente: stessi bit), profilo per zone prima e dopo | a 16 thread è il secondo pezzo dopo le moltiplicazioni; con l'int8 (domanda 21) il suo peso relativo raddoppia |
+| 30 | La parte seriale del prefill (7.6% a 16 thread: copia per esperto, scrittura della KV, norme, RoPE) si può dividere per token? Dal 2026-09-19 la scrittura della KV va testa per testa e costa 25.7 ms su un prompt da 512 invece di 15.7 (1.2% del prefill invece di 0.7%): è il primo pezzo da dividere | `tr_parallel_for` sui token in quelle zone (ogni token è indipendente: stessi bit), profilo per zone prima e dopo | a 16 thread è il secondo pezzo dopo le moltiplicazioni; con l'int8 (domanda 21) il suo peso relativo raddoppia |
+| 34 | **Larghezza per zona**: l'attenzione del decode su tutto il pool e il resto sulla larghezza del decode (esatto: il contratto del pool). Potenziale misurato per zona (§Decode a contesto lungo): a contesto 4000 l'attenzione fa 21.6 ms su 16 thread e 22.6 su 8, mentre esperti e proiezioni su 16 perdono 1.3 ms; tenendo il meglio dei due si toglie **1.0 ms su 48.1 (2.1%)**, a 2048 0.24 ms su 36.4 (0.7%) | `tr_pool_set_active` attorno alla zona `attention` nelle passate corte; serve una soglia più bassa del 3.8% di questa notte (più giri, o 200 token generati invece di 48) | cresce col contesto: oltre 4000 l'attenzione supera metà del token. Sotto la soglia oggi, quindi non scritta |
+| 35 | Cosa resta sotto il tetto nel decode, dal lato esatto? `attn_out_proj` legge a 43-52 GB/s dove le altre moltiplicazioni stanno a 52-55 (0.2-0.3 ms per token); le zone senza byte (norme, RoPE, copia per esperto, attivazione, somma, scelta del token) valgono **1.1 ms per token**, il 4.4% a contesto corto; l'attenzione legge a 47 GB/s dove la sola lettura degli stessi byte fa 52-56 (il calcolo di prodotto, softmax e somma pesata vale il 12% della zona) | profilo per zona con le zone piccole divise; `bench_mem kv` con il kernel a pezzi | in tutto il 6-11% che separa i 48-51 GB/s del decode dai 54 della RAM |
+| 36 | **KV a 16 bit** (non esatta, decide Marcello): di quanto si spostano i logit? Guadagno stimato dai byte (§Decode a contesto lungo): +5% a contesto 512, +16-19% a 2048, +26-31% a 4000, e metà memoria della KV | modo dichiarato e spento di default; contro il modo esatto sul modello vero: KL media e primo token uguale su ≥ 1000 posizioni di codice fino a contesto 4000 (`trochilus logits` nei due modi, `tools/compare_llamacpp.py` calcola già la KL: llama.cpp sta a 9e-3), token greedy uguali su 1000 generati (soglia della domanda 17: ≥ 99%), e nessun valore di K o V oltre il massimo dei 16 bit (65504) | è la sola leva grande che resta al decode a contesto lungo: dopo la KV per testa l'attenzione legge già alla banda della RAM |
 
 Macchina di riferimento: Ryzen 9 7940HX (Zen 4, 16 core / 32 thread, AVX-512 VNNI/BF16), 31 GB
 RAM (2×16 GB DDR5-5200), NVMe Micron 1 TB, GPU RTX 4070 Laptop 8 GB e Radeon 610M (non usate fino
@@ -884,7 +887,10 @@ Soglia, il peggiore A/A della sessione: decode 0.6%, prefill 0.9%.
 - Perché: il decode legge 1.2 GB di pesi per token e 4 thread riempiono già il bus (34 tok/s sono
   41 GB/s); oltre quel punto ogni thread in più aggiunge solo attesa alla barriera di ogni
   `parallel_for`. Col contesto cresce l'attenzione, che è calcolo e si divide per testa: lì i
-  thread in più tornano a servire, e l'ottimo si sposta da 4-6 verso 8.
+  thread in più tornano a servire, e l'ottimo si sposta da 4-6 verso 8. (Corretto il 2026-09-19,
+  §Decode a contesto lungo: il bus si riempie a ~54 GB/s, non a 41, e l'attenzione non era calcolo
+  ma lettura della KV a salti; con la KV per testa a contesto 4000 la sessione sceglie 16 thread in
+  13 run su 16.)
 
 **2. Il decode a larghezza forzata** (motore nuovo, `--decode-threads n`: prompt sempre su 16
 thread, passate corte sui primi n slot; contesto 512; sessione con la regola al 2%, che conta solo
@@ -984,6 +990,165 @@ Soglia della sessione: decode 1.0%, prefill 0.6%.
 - **Prefill: non distinguibile** a nessuno dei due contesti (da −0.7% a +0.4%).
 - Su una risposta di 48 token la misura pesa; su una di 200 sono 9 passate su 200, e poi 9 ogni 1024.
 
+## Decode a contesto lungo e banda della RAM (2026-09-19)
+
+Domande 4 e 18, punto 6 dei prossimi passi. Windows nativo, macchina ferma, OLMoE-1B-7B Q8_0, pin al
+core, tutto in **una finestra sola** (`sh tools/decode_context.sh change build/trochilus-before.exe`,
+105 minuti, ogni run in `build/decode_context/`): `tools/ab_modes.sh`, 8 giri dopo uno di
+riscaldamento, `generate -p <contesto> -n 48 -t 16`. I quattro contesti stanno nella **stessa
+sessione**, 16 modi in un ordine che mette ogni contesto dopo ogni altro una volta sola (sequenza di
+de Bruijn): una run sulla macchina scaldata da un prompt da 4000 non è sempre lo stesso contesto, e
+un modo e la sua copia A/A non seguono mai lo stesso contesto. «Prima» è il binario del commit
+6734910; «dopo» ha la KV con le posizioni di una testa in fila (sotto). Le tabelle escono da
+`tools/decode_context_report.py speed | model | zones`.
+
+**1. La banda della RAM** (`make bench-mem`, `tests/bench_mem.c`: 2 GiB letti dai thread del pool,
+pinnati come nel motore; mediana di 7; due run nella stessa notte, a due ore di distanza, concordi
+entro il 5-10%). GB/s:
+
+| lettura | 1 thread | 2 | 4 | 6 | 8 | 12 | 16 |
+|---|---|---|---|---|---|---|---|
+| in fila | 24.8 | 47.8 | 57.6 | 52.7 | 53.0 | 52.5 | 53.0 |
+| sparsa, blocchi da 2 MiB (una matrice di un esperto) | 24.6 | 49.1 | 57.0 | 56.2 | 54.7 | 53.2 | 52.0 |
+| sparsa, blocchi da 256 KiB | 24.0 | 37.3 | 54.4 | 55.3 | 53.7 | 52.0 | 49.9 |
+| sparsa, pagine da 4 KiB | 7.2 | 14.0 | 29.1 | 33.5 | 39.1 | 36.6 | 34.2 |
+| il matmul del motore, Q8_0, 8 matrici da esperto a caso per chiamata | 19.1 | 32.9 | 58.1 | 53.0 | 46.3 | 50.4 | 50.0 |
+
+- **Il tetto è ~54 GB/s** (52-58) e si raggiunge con 4 thread; un thread ne tira 22-25. Non sono
+  gli 83 GB/s teorici della DDR5-5200 a due canali, e non sono i «41 GB/s» scritti finora: quelli
+  erano la velocità del motore del 17/09 (senza pin, senza thread per fase), non un limite della RAM.
+- **Leggere sparso non costa**, finché i pezzi sono grandi: blocchi da 2 MiB o da 256 KiB vanno come
+  la lettura in fila. Gli esperti scelti a caso non pagano niente per essere sparsi. Costa leggere a
+  pagine sparse (7 GB/s a un thread, 34-41 da 6 in su): è il caso della KV di prima, sotto.
+- Il matmul del motore a un thread è limitato dal calcolo (19 GB/s); da 4 thread in su tira tutta
+  la banda (46-58, la riga più rumorosa: spread fino al 30%).
+
+**2. Un token di attenzione sui due modi di tenere la KV** (`bench_mem kv <posizioni>`: cache con la
+forma di OLMoE, 16 layer × 16 teste × 128, f32, K e V, 1 GiB; fra un layer e l'altro 64 MiB di altra
+memoria passano nelle cache, come i pesi nel motore; kernel vero `tr_attention_head`). «Righe» è il
+modo di prima, `[posizione][testa]`: una testa legge 512 byte ogni 8 KiB, una pagina nuova a ogni
+posizione. «Teste» è `[testa][posizione]`: una testa legge le sue posizioni in fila. 8 thread, ms per
+token (GB/s di KV):
+
+| posizioni | righe | teste | | teste, 16 thread | sola lettura degli stessi byte: righe / teste |
+|---|---|---|---|---|---|
+| 512 | 4.17 (32.1) | 2.90 (46.3) | **1.44×** | 2.69 (49.9) | 21.5 / 52.9 GB/s |
+| 2048 | 15.93 (33.7) | 11.52 (46.6) | **1.38×** | 10.61 (50.6) | 20.0 / 54.1 GB/s |
+| 4000 | 29.54 (35.5) | 22.01 (47.6) | **1.34×** | 20.97 (50.0) | 19.6 / 53.7 GB/s |
+
+Gli stessi byte, letti a salti, passano a 20-22 GB/s; in fila a 53-54, cioè al tetto. Col kernel vero
+la differenza è 32-35 contro 46-48 GB/s (nella prima run della notte a 4000 le righe facevano 28.0).
+
+**3. Il decode ai quattro contesti, prima e dopo** (tok/s, mediana (min-max) di 8, poi dopo/prima
+contro le due copie).
+
+Con `--decode-threads 8` (`speed-d8`; soglia della sessione, il peggiore A/A: decode 3.8%, prefill 2.8%):
+
+| contesto | prima | prima, copia A/A | dopo | dopo, copia A/A | dopo / prima |
+|---|---|---|---|---|---|
+| 32 | 38.00 (37.31-38.69) | 37.95 (35.65-39.01) | 38.30 (35.64-39.58) | 39.55 (37.20-40.09) | 1.008-1.042×: non distinguibile (A/A 3.3%) |
+| 512 | 32.30 (31.15-34.16) | 33.52 (32.58-34.14) | 35.48 (34.25-36.49) | 35.47 (33.15-36.33) | **1.058-1.098×** |
+| 2048 | 24.18 (23.68-24.61) | 24.30 (22.92-25.03) | 27.32 (25.34-27.88) | 27.62 (26.73-27.95) | **1.124-1.142×** |
+| 4000 | 17.91 (15.66-18.50) | 18.16 (16.87-18.42) | 20.84 (19.83-21.33) | 21.04 (20.46-21.32) | **1.147-1.175×** |
+
+Col default, la larghezza misurata dalla sessione (`speed-auto`; soglia decode 3.6%, prefill 4.8%;
+sessione più rumorosa dell'altra, spread 9-29% contro 4-16%: l'altra finestra di Claude lavorava, senza
+container; le mediane concordano con la tabella sopra):
+
+| contesto | prima | prima, copia A/A | dopo | dopo, copia A/A | dopo / prima | larghezze scelte (dopo, 16 run) |
+|---|---|---|---|---|---|---|
+| 32 | 38.05 | 37.55 | 38.83 | 38.63 | 1.015-1.034×: non distinguibile | 4 in 13, 8 in 3 |
+| 512 | 32.16 | 32.77 | 33.13 | 32.47 | 0.991-1.030×: non distinguibile | 4 in 8, 8 in 4, 16 in 4 |
+| 2048 | 22.27 | 22.75 | 25.93 | 26.20 | **1.140-1.176×** | 8 in 10, 16 in 6 |
+| 4000 | 17.09 | 16.86 | 19.44 | 20.13 | **1.137-1.195×** | 16 in 13, 8 in 3 |
+
+Il prefill, negli stessi run (tok/s, `speed-d8`): a 512 **non distinguibile** (234.9 e 234.9 prima,
+232.9 e 235.5 dopo); a 2048 **1.096-1.109×** (185.7 → 204.8); a 4000 **1.392-1.430×** (119.4 → 166.1).
+Anche l'attenzione del prompt legge una testa alla volta: la sua zona passa da 17.8 a 8.5 s su 4000
+token (dal 52% al 34% del prefill) e da 3.15 a 1.86 s su 2048. La scrittura della KV, ora testa per
+testa, costa 25.7 ms su un prompt da 512 invece di 15.7 (domanda 30).
+
+**4. L'ipotesi di STATO: regge la forma, non i numeri.** L'ipotesi era `tok/s = banda / (pesi + KV
+per token × contesto)` con 41 GB/s, 1.2 GB di pesi e 262 KB di KV per token di contesto. Il decode è
+davvero byte diviso banda, ma le bande **erano due**, e nessuna era 41:
+
+| contesto (a metà risposta) | misurato prima | formula a 41 GB/s | byte al secondo, prima | misurato dopo | formula a 48.2 GB/s | byte al secondo, dopo |
+|---|---|---|---|---|---|---|
+| 56 | 37.97 | 33.11 (−13%) | 47.0 GB/s | 38.91 | 38.91 | 48.2 GB/s |
+| 536 | 33.00 | 30.06 (−9%) | 45.0 | 35.48 | 35.32 (−0.5%) | 48.4 |
+| 2072 | 24.19 | 23.21 (−4%) | 42.7 | 27.50 | 27.27 (−0.8%) | 48.6 |
+| 4024 | 18.04 | 17.99 (−0.3%) | 41.1 | 20.91 | 21.15 (+1.2%) | 47.7 |
+
+(`--decode-threads 8`, un modo e la sua copia insieme: 16 run per punto.)
+
+- **Prima**: la retta per i quattro punti dice 26.2 ms a contesto zero e 7.29 ms ogni 1000 token di
+  contesto, cioè i pesi letti a **47 GB/s** e la KV a **36 GB/s** (31.6 col default). La KV si
+  leggeva più piano dei pesi, il contrario della prima ipotesi di STATO («la KV si legge a banda più
+  alta»). La formula a 41 GB/s tornava a 4000 **per caso**: troppo bassa sui pesi, troppo alta sulla
+  KV, i due errori si compensano solo lì.
+- **Dopo**: 25.2 ms e 5.57 ms ogni 1000 token, pesi a 48.6 e KV a **47.1 GB/s**: una banda sola.
+  `tok/s = 48.2 / (1.2236 + 0.000262 × contesto)` (GB) sbaglia al più dell'1.2% a ogni contesto.
+- Su un modello con GQA la KV per token è più piccola e il calo col contesto si accorcia in
+  proporzione; la formula resta quella.
+
+**5. Dove va il token, per zona** (`tools/profile_suite.py` su `bench/scenarios-decode-context.json`,
+mediana di 5, `--decode-threads 8`; il «prima» è il gemello del binario di prima compilato coi byte
+per zona, stesso layout; i due profili non sono alternati, quindi fra prima e dopo contano solo le
+differenze grandi). ms per token, e GB/s letti dentro la zona:
+
+| zona | MiB per token | prima, a 32 / 512 / 2048 / 4000 | dopo, a 32 / 512 / 2048 / 4000 |
+|---|---|---|---|
+| `attention` | 14 / 134 / 518 / 1006 | 0.64 / 4.36 / 15.79 / **30.53** ms (22.9 / 32.3 / 34.4 / 34.6 GB/s) | 0.48 / 2.90 / 11.52 / **22.64** ms (30.5 / 48.4 / 47.1 / 46.6 GB/s) |
+| `expert_gate_up` | 544 | 10.6-10.9 ms (52.2-53.6) | 10.5-10.8 ms (52.6-54.5) |
+| `expert_down` | 272 | 5.4-5.6 ms (51.2-52.8) | 5.3-5.6 ms (51.3-53.3) |
+| `qkv_proj` | 204 | 4.1-4.2 ms (50.6-52.3) | 4.0-4.2 ms (50.4-53.4) |
+| `lm_head` | 104 | 2.0-2.1 ms (52.7-53.7) | 2.0-2.1 ms (53.2-54.8) |
+| `attn_out_proj` | 68 | 2.0-2.2 ms (32.5-36.2) | 1.4-1.6 ms (43.2-52.0) |
+| `router` | 8 | 0.24-0.26 ms | 0.23-0.24 ms |
+| zone senza byte (norme, RoPE, scrittura KV, copia per esperto, attivazione, somma, scelta) | — | 1.06-1.10 ms | 1.09-1.15 ms |
+| **token** | 1214 / 1334 / 1718 / 2206 | 26.8 / 29.6 / 41.4 / **56.3** ms (47.5 / 47.3 / 43.5 / 41.1 GB/s) | 25.0 / 27.5 / 36.4 / **48.1** ms (50.9 / 50.9 / 49.5 / 48.1 GB/s) |
+
+- **Le moltiplicazioni sui pesi stavano già al tetto** (50-55 GB/s su 54): lì non c'è niente da
+  prendere senza leggere meno byte. Sotto il tetto c'era **solo l'attenzione** (32-35 GB/s), e con
+  lei `attn_out_proj`, la zona che viene subito dopo (32-36 GB/s: le letture a salti le lasciavano
+  TLB e cache da rifare).
+- **Dopo, l'attenzione legge a 47-48 GB/s**: a 4000 token −7.9 ms su 56.3.
+- **Quanto manca al tetto della RAM**: il decode muove **48-51 GB/s su ~54**, il 6-11%. Quel che
+  resta dal lato esatto è piccolo e sparso (domanda 35): 1.1 ms di zone senza byte, l'attenzione a 47
+  invece di 52-56 (il calcolo vale il 12% della zona), `attn_out_proj`. Da qui in poi si va più
+  forte solo leggendo **meno byte**.
+- **8 thread o 16 per l'attenzione** (dopo, contesto 4000): su 16 la zona fa 21.6 ms invece di 22.6,
+  ma esperti e proiezioni perdono 1.3 ms e il token va uguale (48.4 contro 48.1). Una larghezza per
+  zona prenderebbe 1.0 ms su 48.1 (2.1%; a 2048 lo 0.7%): sotto la soglia di questa notte, non
+  scritta (domanda 34).
+
+**6. La leva esatta: le posizioni di una testa in fila** (`src/kv/kv.h`). La KV era
+`[layer][posizione][testa]`: a ogni token generato ogni testa leggeva 512 byte ogni 8 KiB, una pagina
+nuova a ogni posizione, e il prefetcher non aveva niente da seguire. Ora è
+`[layer][testa][posizione]`: due flussi in fila per testa, le chiavi e poi i valori. Cambia dove sta
+un numero, non il numero: stesse chiamate a `dot_f32` e `axpy_f32` sugli stessi float nello stesso
+ordine. Prova: `tests/test_kv.c` (il layout e le scritture; 5 mutazioni su 5 viste dai test, tre da
+`test_kv`, tutte dall'oracolo), `make check`, e sul modello vero lo stadio `exact` di
+`tools/decode_context.sh`: logit identici al byte al binario di prima su 600 posizioni un token per
+passata (120 MB) e a passate da 64 su 8 thread, token identici dopo un prompt da 4000.
+
+**7. Le leve non esatte: i numeri per decidere.** Dopo la KV per testa l'attenzione legge alla banda
+della RAM: per andare più forte a contesto lungo restano solo meno byte. Stime dai byte, con la zona
+`attention` di oggi (2.90 / 11.52 / 22.64 ms a 512 / 2048 / 4000) e il 12% della zona che è calcolo e
+non si dimezza (per gli 8 bit, fra il 12% e il doppio: c'è la decodifica):
+
+| leva | byte di KV | decode a 512 | a 2048 | a 4000 | memoria della KV a 4096 |
+|---|---|---|---|---|---|
+| oggi, f32 (esatta) | 262 KB per token di contesto | 36.4 tok/s | 27.5 | 20.8 | 1.07 GB |
+| KV a 16 bit | metà | ~38 (+5%) | ~32 (+16-19%) | ~26-27 (+26-31%) | 0.54 GB |
+| KV a 8 bit (blocchi tipo Q8_0) | 27% | ~39 (+6-7%) | ~33-34 (+20-25%) | ~28-30 (+33-43%) | 0.28 GB |
+
+Come si misurerebbe la qualità è scritto nella domanda 36 (KL e primo token contro il modo esatto sul
+modello vero, token greedy uguali, nessun valore oltre il massimo dei 16 bit). Riferimento: llama.cpp,
+che tiene la KV a 16 bit **e** le attivazioni a 8, sta a KL 9e-3 da noi. Non implementate: decide
+Marcello. Il confronto col decode di llama.cpp a contesto lungo (domanda 19) va rifatto adesso: il suo
+vantaggio lì era anche questo.
+
 ## Tentativi
 
 | Data | Cosa | Prima | Dopo | Spread | Esito |
@@ -1003,3 +1168,5 @@ Soglia della sessione: decode 1.0%, prefill 0.6%.
 | 2026-09-18 | dot int8 VNNI con la struttura del x4 (256 bit col trucco del segno; 512 bit a due blocchi), solo nel banco, non esatto | x4 float come sopra | 256 bit 1.64× / 1.62× / 1.96×; 512 bit **1.83× / 1.79× / 2.26×** | 3-8% | misurato, non adottato: l'int8 non è bit-identico, può essere solo un modo dichiarato. Decisione aperta (§Revisione, LEZIONI #65) |
 | 2026-09-18 | tetto della pausa della bozza adattiva corretto (31 → 16) | replay esatto: 172 passate, 65 righe di bozza (`code`) | 172 passate, 66 righe | — | tenuto: è una correzione, non una leva; le costanti spostano ±2-3% (§Revisione) |
 | 2026-09-18 | thread per fase: prompt su tutto il pool, passate corte (fino a 4 righe) sui primi n slot, n misurato dalla sessione (16/8/4, la più ampia entro l'1% dalla più veloce, di nuovo ogni 1024 token), `--decode-threads` lo forza; token identici al bit | decode 30.82 tok/s a contesto 512, 23.79 a 2048 (16 thread) | 33.45 (**1.085×**) e 24.43 (**1.027×**); con 8 forzato 33.50 e 24.98 (1.050×); prefill invariato; `--spec 8` caso peggiore 1.064× | A/A 1.0% | **tenuto**, acceso di default. Margine del 3% e del 2% misurati e scartati (a 2048 tenevano 16 thread in 10 e in 5 run su 16); confine a 16 righe invece di 4: non distinguibile (§Thread per fase) |
+| 2026-09-19 | KV con le posizioni di una testa in fila (`[layer][testa][posizione]`, `src/kv/`), logit identici al byte | decode a contesto 512 / 2048 / 4000: 32.30 / 24.18 / 17.91 tok/s (8 thread forzati) | 35.48 (**1.06-1.10×**) / 27.32 (**1.12-1.14×**) / 20.84 (**1.15-1.18×**); prefill a 2048 **1.10×**, a 4000 **1.39-1.43×**; a contesto 32 non distinguibile | A/A 3.8% | **tenuto**: la zona `attention` passa da 32-35 a 47-48 GB/s letti, su 54 della RAM (§Decode a contesto lungo) |
+| 2026-09-19 | larghezza per zona: l'attenzione del decode su 16 thread e il resto su 8 (esatto), stimata dalle zone di due profili | token a contesto 4000: 48.1 ms | 47.1 ms stimati (−2.1%); a 2048 −0.7% | A/A 3.8% | **non scritta**: sotto la soglia della sessione; domanda 34 |

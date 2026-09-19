@@ -19,6 +19,7 @@
 
 #include "../base/platform.h"
 #include "../kernels/kernels.h"
+#include "../kv/kv.h"
 
 /* ---- weights ---------------------------------------------------------- */
 
@@ -67,8 +68,7 @@ typedef struct {
     int64_t pos;
     tr_prof prof; /* disabled by default (zero-initialized in olmoe_session_create) */
 
-    float *k_cache; /* [n_layers][n_ctx][n_kv] */
-    float *v_cache;  /* [n_layers][n_ctx][n_kv] */
+    tr_kv kv; /* [n_layers][n_head_kv][n_ctx][head_dim]: one head's positions in a row (src/kv/kv.h) */
 
     /* RoPE cos/sin per position: [n_ctx][head_dim / 2] each (tr_rope_table) */
     float *rope_cos, *rope_sin;
@@ -490,8 +490,7 @@ static const tr_model_info *olmoe_info(const void *model) {
 static void olmoe_session_free(void *session) {
     olmoe_session *s = (olmoe_session *)session;
     if (s == NULL) return;
-    tr_free_aligned(s->k_cache);
-    tr_free_aligned(s->v_cache);
+    tr_kv_free(&s->kv);
     tr_free_aligned(s->rope_cos);
     tr_free_aligned(s->rope_sin);
     tr_free_aligned(s->x);
@@ -532,8 +531,7 @@ static void *olmoe_session_create(void *model, int64_t n_ctx, int64_t n_batch, c
 
     int64_t n_workers = m->pool != NULL ? tr_pool_size(m->pool) : 1;
     int64_t U = m->n_expert_used;
-    uint64_t kv_elems = (uint64_t)m->n_layers * (uint64_t)actual_ctx * (uint64_t)m->n_kv;
-    uint64_t kv_bytes = kv_elems * 2 * sizeof(float);
+    uint64_t kv_bytes = tr_kv_bytes(m->n_layers, m->n_head_kv, m->head_dim, actual_ctx);
     uint64_t rope_elems = (uint64_t)actual_ctx * (uint64_t)(m->head_dim / 2);
     uint64_t scratch_f32 = (uint64_t)B * (uint64_t)(m->n_embd * 4 + m->n_qkv * 2 + m->n_kv * 2 + m->n_expert + U) +
                            (uint64_t)B * (uint64_t)U * (uint64_t)(m->n_embd * 2 + m->n_ff * 2) +
@@ -552,8 +550,7 @@ static void *olmoe_session_create(void *model, int64_t n_ctx, int64_t n_batch, c
     s->n_batch = B;
     s->pos = 0;
 
-    s->k_cache = (float *)tr_alloc_aligned((size_t)kv_elems * sizeof(float), 64);
-    s->v_cache = (float *)tr_alloc_aligned((size_t)kv_elems * sizeof(float), 64);
+    int kv_rc = tr_kv_init(&s->kv, m->n_layers, m->n_head_kv, m->head_dim, actual_ctx);
     s->rope_cos = (float *)tr_alloc_aligned((size_t)rope_elems * sizeof(float), 64);
     s->rope_sin = (float *)tr_alloc_aligned((size_t)rope_elems * sizeof(float), 64);
     s->n_workers = n_workers;
@@ -580,7 +577,7 @@ static void *olmoe_session_create(void *model, int64_t n_ctx, int64_t n_batch, c
     s->logits = alloc_f32(s->n_logits_max * m->vocab);
     s->scores = alloc_f32(n_workers * actual_ctx);
 
-    if (s->k_cache == NULL || s->v_cache == NULL || s->rope_cos == NULL || s->rope_sin == NULL || s->x == NULL ||
+    if (kv_rc != 0 || s->rope_cos == NULL || s->rope_sin == NULL || s->x == NULL ||
         s->normed == NULL || s->attn_out == NULL || s->ffn_out == NULL || s->q == NULL || s->attn_concat == NULL ||
         s->k == NULL || s->v == NULL || s->router == NULL || s->sel_id == NULL || s->sel_w == NULL ||
         s->place == NULL || s->offsets == NULL || s->taken == NULL || s->xg == NULL || s->h1 == NULL ||
@@ -595,10 +592,6 @@ static void *olmoe_session_create(void *model, int64_t n_ctx, int64_t n_batch, c
 
 /* ---- forward pass --------------------------------------------------------- */
 /* hot: begin */
-
-static float *kv_slot(float *cache, int64_t n_ctx, int64_t n_kv, int64_t layer, int64_t pos) {
-    return cache + ((size_t)layer * (size_t)n_ctx + (size_t)pos) * (size_t)n_kv;
-}
 
 static void clamp_inplace(float *x, int64_t n, float c) {
     for (int64_t i = 0; i < n; i++) {
@@ -617,22 +610,24 @@ static uint64_t mat_bytes(const tr_mat *w) {
  * head first: a chunk holds whole heads, so the tokens at the end of a pass (the longest
  * contexts) are spread over every chunk. Token i sits at position pos0 + i and attends to
  * positions 0..pos0+i, all already in the cache; an item writes only its own slice of
- * attn_concat and uses the score row of the worker running it. */
+ * attn_concat and uses the score row of the worker running it. The keys and the values of a
+ * head are contiguous in the cache (src/kv/kv.h): stride head_dim, no offset. */
 typedef struct {
-    const float *q, *keys, *values;
+    const float *q;
+    const tr_kv *kv;
     float *scores, *out;
     float scale;
-    int64_t n_ctx, n_kv, n_qkv, head_dim, group, n_tok, pos0;
+    int64_t layer, n_qkv, head_dim, group, n_tok, pos0;
 } attn_ctx;
 
 static void attn_body(void *ctx_, int64_t begin, int64_t end, int worker) {
     const attn_ctx *c = (const attn_ctx *)ctx_;
-    float *scores = c->scores + (int64_t)worker * c->n_ctx;
+    float *scores = c->scores + (int64_t)worker * c->kv->n_ctx;
     for (int64_t idx = begin; idx < end; idx++) {
         int64_t h = idx / c->n_tok, i = idx % c->n_tok;
-        tr_attention_head(c->q + i * c->n_qkv + h * c->head_dim, c->keys, c->values, c->n_kv,
-                          (h / c->group) * c->head_dim, c->pos0 + i + 1, c->head_dim, c->scale, scores,
-                          c->out + i * c->n_qkv + h * c->head_dim);
+        tr_attention_head(c->q + i * c->n_qkv + h * c->head_dim, tr_kv_keys(c->kv, c->layer, h / c->group),
+                          tr_kv_values(c->kv, c->layer, h / c->group), c->head_dim, 0, c->pos0 + i + 1,
+                          c->head_dim, c->scale, scores, c->out + i * c->n_qkv + h * c->head_dim);
     }
 }
 
@@ -725,7 +720,8 @@ static void forward_pass(olmoe_model *m, olmoe_session *s, const int32_t *tokens
     uint64_t t = tr_prof_begin(prof);
     for (int64_t i = 0; i < n_tok; i++) tr_get_row(&m->token_embd, tokens[i], s->x + i * n_embd);
     tr_prof_end(prof, TR_PROF_EMBED, t);
-    tr_prof_count(prof, (uint64_t)n_tok * (uint64_t)tr_row_bytes(m->token_embd.type, m->token_embd.cols), 0);
+    tr_prof_count(prof, TR_PROF_EMBED,
+                  (uint64_t)n_tok * (uint64_t)tr_row_bytes(m->token_embd.type, m->token_embd.cols), 0);
 
     for (int64_t L = 0; L < m->n_layers; L++) {
         olmoe_layer *layer = &m->layers[L];
@@ -741,7 +737,8 @@ static void forward_pass(olmoe_model *m, olmoe_session *s, const int32_t *tokens
         tr_matmul(pool, &layer->wk, s->normed, n_tok, s->k);
         tr_matmul(pool, &layer->wv, s->normed, n_tok, s->v);
         tr_prof_end(prof, TR_PROF_QKV_PROJ, t);
-        tr_prof_count(prof, mat_bytes(&layer->wq) + mat_bytes(&layer->wk) + mat_bytes(&layer->wv), 0);
+        tr_prof_count(prof, TR_PROF_QKV_PROJ, mat_bytes(&layer->wq) + mat_bytes(&layer->wk) + mat_bytes(&layer->wv),
+                      0);
 
         t = tr_prof_begin(prof);
         for (int64_t i = 0; i < n_tok; i++) {
@@ -765,20 +762,17 @@ static void forward_pass(olmoe_model *m, olmoe_session *s, const int32_t *tokens
         tr_prof_end(prof, TR_PROF_ROPE, t);
 
         t = tr_prof_begin(prof);
-        memcpy(kv_slot(s->k_cache, s->n_ctx, n_kv, L, pos0), s->k, (size_t)(n_tok * n_kv) * sizeof(float));
-        memcpy(kv_slot(s->v_cache, s->n_ctx, n_kv, L, pos0), s->v, (size_t)(n_tok * n_kv) * sizeof(float));
+        tr_kv_write(&s->kv, L, pos0, n_tok, s->k, s->v);
         tr_prof_end(prof, TR_PROF_KV_WRITE, t);
 
         t = tr_prof_begin(prof);
         attn_ctx ac;
         ac.q = s->q;
-        ac.keys = kv_slot(s->k_cache, s->n_ctx, n_kv, L, 0);
-        ac.values = kv_slot(s->v_cache, s->n_ctx, n_kv, L, 0);
+        ac.kv = &s->kv;
         ac.scores = s->scores;
         ac.out = s->attn_concat;
         ac.scale = scale;
-        ac.n_ctx = s->n_ctx;
-        ac.n_kv = n_kv;
+        ac.layer = L;
         ac.n_qkv = n_qkv;
         ac.head_dim = head_dim;
         ac.group = n_head / n_head_kv;
@@ -787,12 +781,16 @@ static void forward_pass(olmoe_model *m, olmoe_session *s, const int32_t *tokens
         /* an item costs ~30 ns per cached position: short contexts keep several per chunk */
         tr_parallel_for(pool, n_head * n_tok, 1 + 256 / (pos0 + n_tok), attn_body, &ac);
         tr_prof_end(prof, TR_PROF_ATTENTION, t);
+        /* token i reads positions 0..pos0+i of K and of V, once per query head */
+        tr_prof_count_kv(prof, TR_PROF_ATTENTION,
+                         (uint64_t)(n_tok * pos0 + n_tok * (n_tok + 1) / 2) * (uint64_t)(n_head * head_dim) * 2 *
+                             sizeof(float));
 
         t = tr_prof_begin(prof);
         tr_matmul(pool, &layer->wo, s->attn_concat, n_tok, s->attn_out);
         for (int64_t j = 0; j < n_tok * n_embd; j++) s->x[j] += s->attn_out[j];
         tr_prof_end(prof, TR_PROF_ATTN_OUT_PROJ, t);
-        tr_prof_count(prof, mat_bytes(&layer->wo), 0);
+        tr_prof_count(prof, TR_PROF_ATTN_OUT_PROJ, mat_bytes(&layer->wo), 0);
 
         /* ---- MoE FFN ---- */
         t = tr_prof_begin(prof);
@@ -815,7 +813,7 @@ static void forward_pass(olmoe_model *m, olmoe_session *s, const int32_t *tokens
         for (int64_t e = n_expert; e > 0; e--) s->offsets[e] = s->offsets[e - 1];
         s->offsets[0] = 0;
         tr_prof_end(prof, TR_PROF_ROUTER, t);
-        tr_prof_count(prof, mat_bytes(&layer->gate_inp), 0);
+        tr_prof_count(prof, TR_PROF_ROUTER, mat_bytes(&layer->gate_inp), 0);
 
         /* experts in stages, each one job over every (token, slot) row grouped by expert */
         t = tr_prof_begin(prof);
@@ -837,9 +835,11 @@ static void forward_pass(olmoe_model *m, olmoe_session *s, const int32_t *tokens
         tr_prof_end(prof, TR_PROF_EXPERT_DOWN, t);
         if (prof->enabled) {
             for (int64_t e = 0; e < n_expert; e++)
-                if (s->offsets[e + 1] > s->offsets[e])
-                    tr_prof_count(prof, mat_bytes(&layer->gate_exps[e]) + mat_bytes(&layer->up_exps[e]) +
-                                            mat_bytes(&layer->down_exps[e]), 0);
+                if (s->offsets[e + 1] > s->offsets[e]) {
+                    tr_prof_count(prof, TR_PROF_EXPERT_GATE_UP,
+                                  mat_bytes(&layer->gate_exps[e]) + mat_bytes(&layer->up_exps[e]), 0);
+                    tr_prof_count(prof, TR_PROF_EXPERT_DOWN, mat_bytes(&layer->down_exps[e]), 0);
+                }
         }
 
         t = tr_prof_begin(prof);
@@ -868,7 +868,7 @@ static void forward_pass(olmoe_model *m, olmoe_session *s, const int32_t *tokens
         t = tr_prof_begin(prof);
         tr_matmul(pool, &m->output, rows, n_logits, s->logits);
         tr_prof_end(prof, TR_PROF_LM_HEAD, t);
-        tr_prof_count(prof, mat_bytes(&m->output), 0);
+        tr_prof_count(prof, TR_PROF_LM_HEAD, mat_bytes(&m->output), 0);
         s->n_logits = n_logits;
     }
 

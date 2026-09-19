@@ -38,9 +38,12 @@ int main(int argc, char **argv) {
     /* disabled: nothing is recorded */
     uint64_t s = tr_prof_begin(&p);
     tr_prof_end(&p, TR_PROF_ROPE, s);
-    tr_prof_count(&p, 100, 10);
+    tr_prof_count(&p, TR_PROF_ROPE, 100, 10);
+    tr_prof_count_kv(&p, TR_PROF_ROPE, 100);
     TR_CHECK_EQ_INT(p.acc[TR_PHASE_PREFILL][TR_PROF_ROPE].calls, 0);
+    TR_CHECK_EQ_INT(p.acc[TR_PHASE_PREFILL][TR_PROF_ROPE].bytes, 0);
     TR_CHECK_EQ_INT(p.weight_bytes_touched[TR_PHASE_PREFILL], 0);
+    TR_CHECK_EQ_INT(p.kv_bytes_read[TR_PHASE_PREFILL], 0);
     TR_CHECK(tr_prof_begin(NULL) == 0);
     tr_prof_end(NULL, TR_PROF_ROPE, 0);
 
@@ -52,7 +55,8 @@ int main(int argc, char **argv) {
         uint64_t z = tr_prof_begin(&p);
         busy(0.01);
         tr_prof_end(&p, TR_PROF_ATTENTION, z);
-        tr_prof_count(&p, 1u << 20, 0);
+        tr_prof_count(&p, TR_PROF_LM_HEAD, 1u << 20, 0);
+        tr_prof_count_kv(&p, TR_PROF_ATTENTION, 1u << 10);
         tr_prof_end(&p, TR_PROF_TOKEN, tok);
         p.tokens[p.phase]++;
     }
@@ -64,6 +68,11 @@ int main(int argc, char **argv) {
     TR_CHECK(att_s > 0.029 && att_s < 0.2);
     TR_CHECK_EQ_INT(p.acc[TR_PHASE_PREFILL][TR_PROF_ATTENTION].calls, 0);
     TR_CHECK_EQ_INT(p.weight_bytes_touched[TR_PHASE_DECODE], 3u << 20);
+    /* bytes land in the zone that read them, weights and KV cache apart in the phase totals */
+    TR_CHECK_EQ_INT(p.kv_bytes_read[TR_PHASE_DECODE], 3u << 10);
+    TR_CHECK_EQ_INT(att->bytes, 3u << 10);
+    TR_CHECK_EQ_INT(p.acc[TR_PHASE_DECODE][TR_PROF_LM_HEAD].bytes, 3u << 20);
+    TR_CHECK_EQ_INT(p.acc[TR_PHASE_PREFILL][TR_PROF_LM_HEAD].bytes, 0);
 
     TR_CHECK(strcmp(tr_prof_zone_name(TR_PROF_LM_HEAD), "lm_head") == 0);
     TR_CHECK(strcmp(tr_prof_zone_name((tr_prof_zone)999), "?") == 0);
@@ -83,6 +92,8 @@ int main(int argc, char **argv) {
         remove(path);
         TR_CHECK(strstr(buf, "\"decode\":{\"tokens\":3,") != NULL);
         TR_CHECK(strstr(buf, "\"attention\":{\"calls\":3,") != NULL);
+        TR_CHECK(strstr(buf, "\"weight_bytes\":3145728,\"kv_bytes\":3072,") != NULL);
+        TR_CHECK(strstr(buf, ",\"bytes\":3072}") != NULL);
         TR_CHECK(buf[0] == '{' && buf[n - 2] == '}');
     }
 

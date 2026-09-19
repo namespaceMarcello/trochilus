@@ -80,12 +80,14 @@ def launch(binary, args):
 
 
 def run_generate(binary, model, prompt_tokens, gen_tokens, threads, profile_json=None, also_profile_flag=False,
-                 context=0, batch=0):
+                 context=0, batch=0, decode_threads=0):
     args = ["generate", "-m", model, "-p", str(prompt_tokens), "-n", str(gen_tokens)]
     if batch:
         args += ["-b", str(batch)]
     if threads:
         args += ["-t", str(threads)]
+    if decode_threads:
+        args += ["--decode-threads", str(decode_threads)]
     if context:
         args += ["-c", str(context)]
     if profile_json:
@@ -140,16 +142,28 @@ def aggregate(records):
             secs = [d["zones"].get(z, {"seconds": 0.0})["seconds"] for d in phase_records]
             token_secs = [d["seconds"] for d in phase_records]
             shares = [(s / t) if t > 0 else 0.0 for s, t in zip(secs, token_secs)]
-            zones[z] = {"seconds_median": med(secs), "share_median": med(shares)}
+            # bytes of weights and KV cache the zone read: per token, and over the zone's own time
+            zbytes = [d["zones"].get(z, {}).get("bytes", 0) for d in phase_records]
+            ztoks = [d["tokens"] for d in phase_records]
+            zones[z] = {"seconds_median": med(secs), "share_median": med(shares),
+                        "ms_per_token_median": med([(s / n * 1000.0) if n else 0.0 for s, n in zip(secs, ztoks)]),
+                        "mib_per_token_median": med([(b / n / (1024.0 * 1024.0)) if n else 0.0
+                                                     for b, n in zip(zbytes, ztoks)]),
+                        "gb_per_sec_median": med([(b / s / 1e9) if s > 0 else 0.0 for b, s in zip(zbytes, secs)])}
         agg[phase]["zones"] = zones
 
-        mibs, gbps = [], []
+        mibs, gbps, kv_mibs, all_gbps = [], [], [], []
         for d in phase_records:
             toks, wb, secs = d["tokens"], d["weight_bytes"], d["seconds"]
+            kvb = d.get("kv_bytes", 0)
             mibs.append((wb / toks / (1024.0 * 1024.0)) if toks else 0.0)
             gbps.append((wb / secs / 1e9) if secs > 0 else 0.0)
+            kv_mibs.append((kvb / toks / (1024.0 * 1024.0)) if toks else 0.0)
+            all_gbps.append(((wb + kvb) / secs / 1e9) if secs > 0 else 0.0)
         agg[phase]["mib_per_token_median"] = med(mibs)
         agg[phase]["gb_per_sec_median"] = med(gbps)
+        agg[phase]["kv_mib_per_token_median"] = med(kv_mibs)
+        agg[phase]["weights_kv_gb_per_sec_median"] = med(all_gbps)
     return agg
 
 
@@ -187,8 +201,9 @@ def print_report(results, prev_name, prev_scenarios):
         print("comparing with %s\n" % prev_name)
     for res in results:
         agg = res["aggregate"]
-        print("== %s (model=%s prompt=%d gen=%d threads=%s)" %
-              (res["name"], res["model"], res["prompt_tokens"], res["gen_tokens"], res["threads"] or "default"))
+        print("== %s (model=%s prompt=%d gen=%d threads=%s decode_threads=%s)" %
+              (res["name"], res["model"], res["prompt_tokens"], res["gen_tokens"], res["threads"] or "default",
+               res.get("decode_threads") or "measured"))
         for phase in ("prefill", "decode"):
             tps = agg[phase]["tokens_per_sec_median"]
             sp = agg[phase]["tokens_per_sec_spread"]
@@ -204,12 +219,18 @@ def print_report(results, prev_name, prev_scenarios):
             zones = sorted(agg[phase]["zones"].items(), key=lambda kv: kv[1]["seconds_median"], reverse=True)
             if not zones:
                 continue
-            print("  %s zones by share:" % phase)
+            print("  %s zones by share (ms per token; MiB of weights and KV read per token, GB/s in the zone):" % phase)
             for zname, zinfo in zones:
-                print("    %-16s %8.3f ms  %5.1f%%" %
-                      (zname, zinfo["seconds_median"] * 1000.0, zinfo["share_median"] * 100.0))
+                line = "    %-16s %8.3f ms  %5.1f%%  %8.4f ms/tok" % (
+                    zname, zinfo["seconds_median"] * 1000.0, zinfo["share_median"] * 100.0,
+                    zinfo["ms_per_token_median"])
+                if zinfo["mib_per_token_median"] > 0:
+                    line += "  %9.2f MiB/tok  %6.2f GB/s" % (zinfo["mib_per_token_median"], zinfo["gb_per_sec_median"])
+                print(line)
             print("  %s weights: %.2f MiB/token, %.2f GB/s of memory traffic" %
                   (phase, agg[phase]["mib_per_token_median"], agg[phase]["gb_per_sec_median"]))
+            print("  %s KV cache: %.2f MiB/token read; weights + KV: %.2f GB/s" %
+                  (phase, agg[phase]["kv_mib_per_token_median"], agg[phase]["weights_kv_gb_per_sec_median"]))
         print("")
 
 
@@ -231,6 +252,7 @@ def run_scenario(binary, sc, runs_override, smoke):
     model = resolve_model(sc["model"])
     prompt_tokens, gen_tokens, threads = sc["prompt_tokens"], sc["gen_tokens"], sc.get("threads", 0)
     context, batch = sc.get("context", 0), sc.get("batch", 0)
+    decode_threads = sc.get("decode_threads", 0)  # 0: the session measures its own (the default)
     n_runs = 1 if smoke else (runs_override if runs_override is not None else sc.get("runs", 1))
 
     tmp_dir = tempfile.mkdtemp(prefix="trprof_")
@@ -239,13 +261,13 @@ def run_scenario(binary, sc, runs_override, smoke):
 
         if not smoke:
             run_generate(binary, model, prompt_tokens, gen_tokens, threads, profile_json=tmp_json,
-                         context=context, batch=batch)  # warm-up, discarded
+                         context=context, batch=batch, decode_threads=decode_threads)  # warm-up, discarded
 
         records, tokens = [], []
         smoke_ok = True
         for _ in range(n_runs):
             r = run_generate(binary, model, prompt_tokens, gen_tokens, threads, profile_json=tmp_json,
-                             also_profile_flag=True, context=context, batch=batch)
+                             also_profile_flag=True, context=context, batch=batch, decode_threads=decode_threads)
             if r.returncode != 0:
                 print("error: scenario '%s' failed (exit %d):\n%s" % (name, r.returncode, r.stderr), file=sys.stderr)
                 sys.exit(1)
@@ -254,7 +276,8 @@ def run_scenario(binary, sc, runs_override, smoke):
             tokens.append(parse_tokens_line(r.stdout))
 
             if smoke:
-                r2 = run_generate(binary, model, prompt_tokens, gen_tokens, threads, context=context, batch=batch)
+                r2 = run_generate(binary, model, prompt_tokens, gen_tokens, threads, context=context, batch=batch,
+                                  decode_threads=decode_threads)
                 if r2.returncode != 0:
                     print("error: scenario '%s' (no profile) failed (exit %d):\n%s" %
                           (name, r2.returncode, r2.stderr), file=sys.stderr)
@@ -269,7 +292,8 @@ def run_scenario(binary, sc, runs_override, smoke):
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     result = {"name": name, "model": sc["model"], "prompt_tokens": prompt_tokens, "gen_tokens": gen_tokens,
-              "threads": threads, "context": context, "batch": batch, "runs": records, "aggregate": aggregate(records),
+              "threads": threads, "decode_threads": decode_threads, "context": context, "batch": batch,
+              "runs": records, "aggregate": aggregate(records),
               "tokens": tokens[0] if tokens else None, "tokens_stable": all(t == tokens[0] for t in tokens)}
     return result, smoke_ok
 

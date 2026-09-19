@@ -70,7 +70,8 @@ I dati decidono dove si lavora. Tre livelli, dal più fine al più largo:
 | Livello | Strumento | Risponde a |
 |---|---|---|
 | kernel | `tests/bench_kernels.c` (`make bench`) | quanto è veloce un singolo kernel per tier, con il rumore |
-| motore | profiler interno, `trochilus generate --profile` / `--profile-json <file>` | dove va il tempo di un token: per fase (embedding, proiezioni, norme, rope, attenzione, router, esperti, lm_head, campionamento), prefill e decode separati, attese del pool di thread, letture dal disco; byte di pesi toccati per token e banda di memoria effettiva, cioè se si è limitati dalla memoria o dal calcolo |
+| memoria | `tests/bench_mem.c` (`make bench-mem`) | cosa dà la RAM della macchina, il tetto del decode: letture in fila e sparse a 1-16 thread, il matmul del motore su matrici da esperto a caso, un token di attenzione sulla KV; i thread sono quelli del pool, pinnati come nel motore |
+| motore | profiler interno, `trochilus generate --profile` / `--profile-json <file>` | dove va il tempo di un token: per fase (embedding, proiezioni, norme, rope, attenzione, router, esperti, lm_head, campionamento), prefill e decode separati, attese del pool di thread, letture dal disco; **per ogni zona i byte letti (pesi e KV) e i GB/s**: una zona al tetto della RAM è limitata dalla memoria, una sotto da altro |
 | scenari | `tools/profile_suite.py` (`make profile`), scenari in `bench/scenarios.json` | come va un uso reale (prompt corto → risposta lunga; file lungo → risposta corta; contesto che cresce), mediana di N run con spread, confronto automatico con la misura precedente sulla stessa macchina: migliorato, peggiorato o rumore |
 
 Il profiler non è globale (vive nella sessione), costa un solo salto condizionato quando è spento,
@@ -114,7 +115,7 @@ codice macchina con e senza, verificato): nella zona calda restano quelli che sp
 | `src/kernels/` | kernel CPU per tipo quantizzato: scalare + AVX2 + AVX-512 (+VNNI) + NEON, tabella di dispatch | colibri `quant.h`, `expert_ffn.h`; ds4 riferimenti K-quant |
 | `src/backend/` | interfaccia backend (tensori residenti sul dispositivo, grafo per token) e backend CPU | ds4 `ds4_gpu.h` (modello di esecuzione), ridotto alle primitive generiche |
 | `src/memory/` | archivio esperti a livelli (VRAM / RAM / disco), lease, LRU O(1), pool I/O, pin appresi dall'uso | colibri `expert_store.h`, `st.h`, `route_trace.h`; ds4 streaming su VRAM |
-| `src/kv/` | cache KV, riuso del prefisso, checkpoint su disco con punteggio a decadimento | colibri `kv_prefix.h`, `kv_fp8.h`; ds4 `ds4_kvstore.c` |
+| `src/kv/` | cache KV `[layer][testa][posizione]`: le posizioni di una testa in fila, perché l'attenzione le legga alla banda della RAM (`docs/MISURE.md` §Decode a contesto lungo); poi riuso del prefisso, checkpoint su disco con punteggio a decadimento | layout: codice nuovo, dalle misure; idee per il resto: colibri `kv_prefix.h`, `kv_fp8.h`; ds4 `ds4_kvstore.c` |
 | `src/tokenizer/` | BPE byte-level dai metadati GGUF (famiglie di pretokenizer ammesse solo con oracolo), NFC e classi Unicode sondate da HF `tokenizers`, template di chat per architettura | idee: colibri `tok.h` (regex rigiocata in C), ds4 `vocab_load` (dal GGUF); codice nuovo |
 | `src/models/` | un grafo per famiglia, costruito dalle primitive | colibri `olmoe.c`, ds4 / colibri DeepSeek V4 |
 | `src/gen/` | come si sceglie il token dopo il modello: greedy, bozza dal prompt e verifica in una passata sola (poi campionamento e criteri di arresto) | idee: colibri `v4_ngram_draft`, llama.cpp `examples/lookup`; codice nuovo |

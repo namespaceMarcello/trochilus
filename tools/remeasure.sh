@@ -28,6 +28,10 @@ if [ -n "$RUNNING" ]; then
   docker stop $RUNNING > /dev/null
   echo "containers stopped: $(echo $RUNNING | wc -w)"
 fi
+# from here on a running container means somebody else is using the machine: ab_modes.sh stops
+# at the next run instead of going on (docs/LEZIONI.md #73)
+AB_GUARD='[ -z "$(docker ps -q 2>/dev/null)" ]'
+export AB_GUARD
 
 # The model takes 7 GiB and the memory guard wants 3 more left free; after a `make check` Windows
 # needs minutes to take back what the VM has released (docs/LEZIONI.md #72). Up to 15 minutes.

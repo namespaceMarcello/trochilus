@@ -154,6 +154,23 @@ Sostituisci, non appendere. Tetto 40 KB. Lo storico sta in `archivio/FATTO.md`.
   il risultato non dipende dai thread) e per prova. Dopo contro prima, A/A: decode **1.085×** a 512
   e **1.02-1.03×** a 2048 (8 forzato: 1.05×), prefill invariato, `--spec 8` caso peggiore 1.064×.
   Il margine è stato scelto contando le scelte di ogni run (3%, 2%, 1%: LEZIONI #71).
+- 2026-09-19 — **La KV tiene in fila le posizioni di una testa** (`src/kv/`, primo pezzo dello strato
+  KV; `docs/MISURE.md` §Decode a contesto lungo). La RAM di questa macchina dà **~54 GB/s** in
+  lettura (domanda 4: non 41, che era la velocità del motore del 17/09). Le moltiplicazioni sui pesi
+  ci stavano già (50-55 GB/s per zona); sotto c'era solo l'attenzione, a 32-35, perché con la KV
+  `[layer][posizione][testa]` ogni testa leggeva 512 byte ogni 8 KiB. Con `[layer][testa][posizione]`
+  legge a 47-48: decode **1.06-1.10×** a contesto 512, **1.12-1.14×** a 2048, **1.15-1.18×** a 4000,
+  prefill **1.10×** a 2048 e **1.39-1.43×** a 4000, non distinguibile a contesto 32 (A/A 3.8%); logit
+  identici al byte sul modello vero. L'ipotesi del calo col contesto regge nella forma e non nei
+  numeri: le bande erano due (pesi 47, KV 36 GB/s); ora è una, e `tok/s = 48.2 / (1.2236 + 0.000262 ×
+  contesto)` sbaglia al più dell'1.2% da 32 a 4000 token. Il decode muove 48-51 GB/s su 54: dal lato
+  esatto resta il 6-11%, sparso (domande 34-35); **da qui il decode a contesto lungo va più forte
+  solo leggendo meno byte**, cioè con leve non esatte (KV a 16 o 8 bit, domanda 36), che decide
+  Marcello.
+- 2026-09-19 — **Un tetto si misura con uno strumento suo** (`make bench-mem`), e il profiler dice
+  per ogni zona quanti byte legge e a quanti GB/s: una zona al tetto è limitata dalla memoria, una
+  sotto da altro (LEZIONI #75-#76). Le misure a più contesti stanno in **una** sessione di
+  `ab_modes.sh`, in un ordine che mette ogni contesto dopo ogni altro (`tools/decode_context.sh`).
 
 ## Problemi noti
 
@@ -193,6 +210,12 @@ Sostituisci, non appendere. Tetto 40 KB. Lo storico sta in `archivio/FATTO.md`.
   `ab_spec.sh` ora si fermano se una run non produce un numero, invece di stampare una tabella vuota;
   `threads_phase.sh` e `remeasure.sh` aspettano che il motore veda 12 GiB liberi prima della prima
   run, perché dopo un `make check` Windows si riprende la memoria con minuti di ritardo (LEZIONI #72).
+- **Un'altra finestra di Claude può riaccendere i container a metà misura** (2026-09-19: OpenEMR al
+  95% di CPU e 6.4 GiB, sette minuti dopo l'inizio; LEZIONI #73). Gli script di misura ora si fermano
+  alla run successiva se vedono un container acceso (`AB_GUARD` in `ab_modes.sh`), invece di
+  proseguire su una macchina occupata; il lavoro **senza** container dell'altra finestra non si vede,
+  e alza lo spread (sessione `speed-auto`: 9-29% contro 4-16%). Le misure lunghe si lanciano quando
+  le altre finestre sono ferme.
 
 ## Prossimi passi
 
@@ -232,6 +255,15 @@ il binario di prima, prefill invariato, token identici al bit (`tests/test_phase
 `tools/threads_phase.sh`, la colonna `width` di `ab_modes.sh`, l'attesa della memoria libera, e gli
 script di shell che non si rompono se modificati mentre girano.
 
+Fatto il 2026-09-19, decode a contesto lungo e banda della RAM (`docs/MISURE.md` §Decode a contesto
+lungo, LEZIONI #73-#76; ogni run in `build/decode_context/`): misurata la RAM (~54 GB/s), il decode a
+contesto 32, 512, 2048 e 4000 in una sessione sola con A/A, ms e byte letti per zona; corretta
+l'ipotesi del punto 6; trovata e scritta la leva esatta, la KV con le posizioni di una testa in fila
+(decisione sopra). Chiuse le domande 4 e 18, aperte la 34, la 35 e la 36. Nuovo per le misure:
+`make bench-mem`, i byte per zona nel profiler, `bench/scenarios-decode-context.json`,
+`tools/decode_context.sh` (che prima di misurare prova che i due binari diano gli stessi logit al
+byte), `tools/decode_context_report.py`, e la guardia dei container in `ab_modes.sh`.
+
 1. **Accendere `--spec` di default?** La condizione «caso peggiore come senza» **non è
    soddisfatta**: 0.953× dove il modello inventa, 1.175× dove ricopia (A/A, 8 giri). Cambiare le
    costanti della pausa non basta (replay coi costi misurati: al massimo 0.97-0.98×); la leva è il
@@ -253,31 +285,32 @@ script di shell che non si rompono se modificati mentre girano.
    token nei registri» è misurata e scartata. Lo decide Marcello, che il 2026-09-19 ha chiesto se
    esiste altro fra float e int8: si misura nel banco la via di mezzo a 16 bit (domanda 33) prima
    di decidere; le strade esatte che restano sono la parte seriale del prefill (domanda 30) e, per
-   il decode, i modelli a 4 bit. Ogni modo non esatto (int8, e la KV a 16 bit se il punto 6 la
-   chiama in causa) si decide coi numeri di qualità davanti: token uguali e KL sul modello vero
+   il decode, i modelli a 4 bit. Ogni modo non esatto (int8, e la KV a 16 bit che il punto 6
+   ora chiama in causa) si decide coi numeri di qualità davanti: token uguali e KL sul modello vero
    contro il modo esatto (`tools/compare_llamacpp.py` la calcola già: llama.cpp sta a 9e-3).
-4. Prefill su prompt lunghi (2048-4096), dove l'attenzione per token cresce col quadrato: a 512 token
-   è al 2%, a 2048 il prefill scende da 235 a 193 tok/s (domanda 7).
+4. Prefill su prompt lunghi (2048-4096), dove l'attenzione per token cresce col quadrato. Con la KV
+   per testa il prefill fa 235 tok/s a 512, 205 a 2048 e 166 a 4000 (erano 186 e 119), e la zona
+   dell'attenzione vale il 5%, il 18% e il 34% (domanda 7): è il prossimo pezzo da attaccare lì.
 5. Confronto per componente (decisione sopra), poi le correzioni che ne escono. **Sì di Marcello il
    2026-09-19, su tre fonti**: colibri, ds4 e llama.cpp. È una revisione di ciò che è già costruito
-   (kernel, grafo OLMoE, GGUF, pool), una cartella per volta.
+   (kernel, grafo OLMoE, GGUF, pool), una cartella per volta. Nel grafo guardare anche come le tre
+   fonti tengono la KV: se è per posizione come era la nostra, la misura del 2026-09-19 (attenzione
+   da 32-35 a 47-48 GB/s con le posizioni di una testa in fila) è una segnalazione per `UPSTREAM.md`.
    Misure 13-16 di `docs/MISURE.md` (routing, cache esperti, SSD): ordine da confermare con Marcello.
-6. Decode a contesto lungo: Trochilus perde l'11-13% da 32 a 512 token, llama.cpp il 5-7% (domande
-   18-19 di `docs/MISURE.md`); da 512 a 2048 il decode scende da 33.5 a 24.4 tok/s. **Sì di Marcello
-   il 2026-09-19**, con la sua regola: più test, più controllo. Ogni contesto misurato (32, 512,
-   2048, 4096) diventa uno scenario di `bench/` e ogni correzione un test esatto al bit.
-   Ipotesi da verificare per prima (un conto, non una misura): la KV è in f32 e OLMoE non ha GQA
-   (16 teste KV su 16), quindi ogni token generato rilegge 262 KB di KV per token di contesto: a
-   2048 sono 537 MB oltre ai 1.2 GB di pesi, e 1.74 GB a 41 GB/s fanno 23.6 tok/s (misurati 24.4).
-   Se regge, il calo col contesto è ancora banda di memoria, e su un modello con GQA pesa molto meno.
-   La formula `tok/s = banda / (pesi + KV per token × contesto)` **non torna a 512**: dice 30.7, ne
-   misuriamo 33.5-34. O la KV si legge a banda più alta dei pesi (lettura in fila contro lettura
-   sparsa degli esperti), o i 41 GB/s sono vecchi (17/09, senza pin, contesto 32, altra sessione).
-   Quindi la prima misura è il decode a contesto 32, 512, 2048, 4096 **nella stessa sessione** con
-   A/A e i byte letti per zona dal profiler, insieme alla banda vera della RAM (domanda 4); poi il
-   confronto con llama.cpp rifatto a run alternate dopo pin e thread per fase (domanda 19).
-7. Memoria: banda reale della RAM (domanda 4 in `docs/MISURE.md`), poi pagine da 2 MB (domanda 5).
-   Il decode va uguale da 4 a 8 thread (34 tok/s, 41 GB/s) e scende sopra gli 8: la banda è il
-   tetto, e la domanda 4 dice quanto manca.
+6. Decode a contesto lungo: **la parte esatta è fatta** (decisione del 2026-09-19 sopra: 38.9 tok/s a
+   contesto 32, 35.5 a 512, 27.5 a 2048, 20.9 a 4000, a 8 thread). Restano, in ordine:
+   - **KV a 16 bit, sì o no** (domanda 36, decide Marcello): è la sola leva grande rimasta a contesto
+     lungo, stimata dai byte **+5% a 512, +16-19% a 2048, +26-31% a 4000** e metà memoria della KV
+     (a 8 bit: +6-7%, +20-25%, +33-43%). Non è esatta: solo come modo dichiarato e spento di
+     default, deciso coi numeri di qualità davanti (KL e primo token contro il modo esatto sul
+     modello vero, token greedy uguali su 1000 generati; llama.cpp, che fa questo e le attivazioni a
+     8 bit, sta a KL 9e-3).
+   - il confronto col decode di llama.cpp a run alternate (domanda 19), che ora va rifatto anche a
+     contesto lungo: parte del suo vantaggio lì era la nostra KV letta a salti;
+   - dal lato esatto, poco e sparso: larghezza per zona (domanda 34: 2.1% stimato a contesto 4000,
+     sotto la soglia di questa notte) e le zone sotto il tetto (domanda 35: 6-11% in tutto).
+7. Memoria: la banda è misurata (~54 GB/s, domanda 4) e il decode ne usa l'89-94%. Restano le pagine
+   da 2 MB (domanda 5): 300 000 pagine da 4 KB toccate per token, più le 260 000 della KV a contesto
+   4000; su Windows chiedono un privilegio che un utente normale non ha.
 8. Il pin su Linux: il codice c'è e `make check` lo prova, i numeri no (serve una macchina Linux
    vera, in WSL2 la topologia è sintetica). Resta l'ultima metà della domanda 22.

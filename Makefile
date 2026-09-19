@@ -7,6 +7,7 @@
 #   make tier-check the engine under every kernel tier: model tests, and logits identical byte for byte
 #   make oracle-tokenizer  a real tokenizer against transformers (ids, pieces, NFC, decoding)
 #   make bench      kernel microbenchmark (median and noise), native
+#   make bench-mem  what the RAM gives: plain reads, the engine's matmul, attention on two KV layouts
 #   make lint       docs and tables against the lessons in docs/LEZIONI.md
 #   make WERROR=1   warnings are errors
 # Extra flags without losing the defaults: EXTRA_CFLAGS, EXTRA_LDFLAGS.
@@ -46,8 +47,9 @@ CORE_OBJ := $(CORE_SRC:%.c=$(BUILD)/%.o)
 APP_OBJ  := $(BUILD)/src/app/main.o
 TEST_BIN := $(patsubst tests/%.c,$(BUILD)/tests/%$(EXE),$(wildcard tests/test_*.c))
 BENCH_BIN := $(BUILD)/tests/bench_kernels$(EXE)
+MEM_BIN := $(BUILD)/tests/bench_mem$(EXE)
 
-.PHONY: all test oracle tier-check oracle-tokenizer chat-check oracle-real spec-check bench lint profile check check-linux clean platform-guard
+.PHONY: all test oracle tier-check oracle-tokenizer chat-check oracle-real spec-check bench bench-mem lint profile check check-linux clean platform-guard
 all: $(BUILD)/trochilus$(EXE)
 
 # Objects of two platforms must never share a BUILD directory: a build in the container with
@@ -97,6 +99,14 @@ test: $(TEST_BIN)
 
 bench: $(BENCH_BIN)
 	./$(BENCH_BIN)
+
+# Each group is one run, under 60 s (docs/ARCHITETTURA.md, safety). Native, on a still machine.
+bench-mem: $(MEM_BIN)
+	./$(MEM_BIN) ram
+	./$(MEM_BIN) weights
+	./$(MEM_BIN) kv 512
+	./$(MEM_BIN) kv 2048
+	./$(MEM_BIN) kv 4000
 
 # Scenarios with the engine profiler (bench/scenarios.json), compared with the
 # previous run on this machine. See docs/ARCHITETTURA.md §Profilazione.
@@ -190,7 +200,7 @@ spec-check: $(BUILD)/trochilus$(EXE)
 DOCKER_IMG := trochilus-dev:local
 ifeq ($(OS),Windows_NT)
 check: lint
-	$(MAKE) WERROR=1 all $(TEST_BIN) $(BENCH_BIN)
+	$(MAKE) WERROR=1 all $(TEST_BIN) $(BENCH_BIN) $(MEM_BIN)
 	@# the models volume, when it exists, replaces models/ read over the Windows bind mount:
 	@# the real-model checks load the same file from ext4 instead of 9p (docs/LEZIONI.md #41)
 	MSYS_NO_PATHCONV=1 docker run --rm --security-opt seccomp=unconfined -v "$(CURDIR):/src" \
@@ -218,7 +228,7 @@ check-linux:
 	TSAN_OPTIONS=halt_on_error=1 setarch $$(uname -m) -R build/linux-tsan/tests/test_hot
 	@# a race shows up once in many runs: the threaded model test runs 20 times
 	@for i in $$(seq 20); do build/linux-gcc/tests/test_hot > /dev/null || exit 1; done; echo "== test_hot 20/20"
-	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 build/linux-gcc/tests/bench_kernels
+	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 build/linux-gcc/tests/bench_kernels build/linux-gcc/tests/bench_mem
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} tier-check
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle-tokenizer

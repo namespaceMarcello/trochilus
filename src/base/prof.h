@@ -9,10 +9,17 @@
  * two tick reads (RDTSC on x86-64 with an invariant TSC, the OS monotonic clock
  * otherwise). Nested zones are allowed; each zone accounts its own inclusive time.
  *
+ * Bytes: a zone also counts what its kernels read from memory, weights (every row of a
+ * matmul, once per pass) and KV cache (every cached position an attention reads, once per
+ * query head and query token). Bytes over the zone's time is the memory traffic of that
+ * zone, to hold against what the RAM of the machine gives (tests/bench_mem.c): a zone at
+ * that ceiling is bound by memory, one far below it by something else.
+ *
  * Usage:
  *     uint64_t t = tr_prof_begin(p);
  *     ... work ...
- *     tr_prof_end(p, TR_PROF_ROPE, t);
+ *     tr_prof_end(p, TR_PROF_QKV_PROJ, t);
+ *     tr_prof_count(p, TR_PROF_QKV_PROJ, weight_bytes, 0);
  */
 #ifndef TR_PROF_H
 #define TR_PROF_H
@@ -50,6 +57,7 @@ typedef enum { TR_PHASE_PREFILL = 0, TR_PHASE_DECODE = 1, TR_PHASE_COUNT = 2 } t
 typedef struct {
     uint64_t calls;
     uint64_t ticks;
+    uint64_t bytes;           /* weights and KV cache read by the zone's kernels */
 } tr_prof_acc;
 
 typedef struct tr_prof {
@@ -58,6 +66,7 @@ typedef struct tr_prof {
     tr_prof_acc acc[TR_PHASE_COUNT][TR_PROF_ZONE_COUNT];
     uint64_t tokens[TR_PHASE_COUNT];
     uint64_t weight_bytes_touched[TR_PHASE_COUNT];  /* bytes of weights read by kernels */
+    uint64_t kv_bytes_read[TR_PHASE_COUNT];         /* bytes of KV cache read by attention */
     uint64_t io_bytes[TR_PHASE_COUNT];              /* bytes read from disk */
 } tr_prof;
 
@@ -84,16 +93,25 @@ static inline void tr_prof_end(tr_prof *p, tr_prof_zone z, uint64_t start) {
     }
 }
 
-static inline void tr_prof_count(tr_prof *p, uint64_t weight_bytes, uint64_t io_bytes) {
+static inline void tr_prof_count(tr_prof *p, tr_prof_zone z, uint64_t weight_bytes, uint64_t io_bytes) {
     if (p != NULL && p->enabled) {
+        p->acc[p->phase][z].bytes += weight_bytes;
         p->weight_bytes_touched[p->phase] += weight_bytes;
         p->io_bytes[p->phase] += io_bytes;
     }
 }
+
+static inline void tr_prof_count_kv(tr_prof *p, tr_prof_zone z, uint64_t kv_bytes) {
+    if (p != NULL && p->enabled) {
+        p->acc[p->phase][z].bytes += kv_bytes;
+        p->kv_bytes_read[p->phase] += kv_bytes;
+    }
+}
 /* hot: end */
 
-/* Human-readable table per phase: zone, calls, total ms, % of token time, µs per
- * call; then tokens/s and weight bytes per token (GB/s of effective memory traffic). */
+/* Human-readable table per phase: tokens/s, weight and KV bytes per token (GB/s of effective
+ * memory traffic); then zone, calls, total ms, % of token time, µs per call and, for the
+ * zones that read weights or KV cache, MiB per token and GB/s over the zone's own time. */
 void tr_prof_print(const tr_prof *p, FILE *out);
 
 /* The same numbers as one JSON object (seconds, not ticks), for tools/profile_suite.py. */

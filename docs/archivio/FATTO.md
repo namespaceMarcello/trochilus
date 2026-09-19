@@ -326,3 +326,49 @@ Numeri in `docs/MISURE.md` §Thread per fase, decisione in `docs/STATO.md`, LEZI
 - Ogni `tools/*.sh` ha il corpo dentro `main()` chiamata dall'ultima riga: uno script modificato
   mentre gira non si rompe più (LEZIONI #69); `tools/lint.py` lo pretende. `tools/remeasure.sh`
   aspetta anche lui la memoria libera (LEZIONI #72). Prova: `make lint`.
+
+### 2026-09-19 — Decode a contesto lungo: la banda della RAM, e la KV con le posizioni di una testa in fila
+
+Punto 6 dei prossimi passi e domanda 4. Misurato prima (RAM ~54 GB/s; il decode perdeva col contesto
+perché la KV si leggeva a 32-36 GB/s, a salti), poi la leva esatta: decode 1.06-1.10× a contesto
+512, 1.12-1.14× a 2048, 1.15-1.18× a 4000, prefill 1.39-1.43× a 4000, logit identici al byte.
+Numeri in `docs/MISURE.md` §Decode a contesto lungo.
+
+- `src/kv/kv.{h,c}` (strato nuovo): `tr_kv`, cache `[layer][testa KV][posizione][head_dim]`, K e V in
+  due blocchi; `tr_kv_bytes` per la guardia di memoria, `tr_kv_init`/`tr_kv_free`, `tr_kv_keys` e
+  `tr_kv_values` (posizione 0 di una testa; la posizione t sta `t * head_dim` float più avanti),
+  `tr_kv_write` (una passata di un layer, testa per testa; riscrive dopo un rewind). Zona calda sotto
+  `tools/lint.py`. Prova: `tests/test_kv.c` (layout, scritture in più passate, riscrittura, ultimo
+  elemento; nessun altro float toccato), rosso prima (non c'era) e verde dopo, e per mutazione
+  (`tools/mutate_kv.sh` nel container: 5 indici sbagliati su 5 visti, tre da `test_kv`, tutti
+  dall'oracolo).
+- `src/models/olmoe.c`: la sessione tiene un `tr_kv`; l'attenzione chiama `tr_attention_head` con
+  passo `head_dim` e scostamento 0 sulle chiavi e sui valori della sua testa KV (`h / group`): stesse
+  chiamate sugli stessi float. Prova: `make check` (test_prefill, test_spec, test_session, test_phase,
+  oracoli, `tier-check`, `spec-check`), e sul modello vero lo stadio `exact` qui sotto.
+- `src/base/prof.{h,c}`: byte letti **per zona** (`tr_prof_count(p, zona, pesi, disco)`,
+  `tr_prof_count_kv` per la KV letta dall'attenzione: ogni posizione, una volta per testa e per token),
+  `kv_bytes_read` per fase; la tabella stampa MiB per token e GB/s della zona, il JSON `bytes` per
+  zona e `kv_bytes` per fase. Gli esperti contano `gate_up` e `down` separati. Prova:
+  `tests/test_prof.c`, `tests/test_model_prof.c` (KV di una passata da 3 token e di un token a
+  posizione 3, pesi di `qkv_proj`, somma delle zone = totali della fase);
+  `build/trochilus generate -m <gguf> -p 512 -n 48 --profile`.
+- `tests/bench_mem.c`, `make bench-mem` (compilato con 0 warning in `make check`, nativo e Linux):
+  `ram` (letture in fila e sparse a blocchi da 2 MiB, 256 KiB, 4 KiB, 1-16 thread), `weights` (il
+  matmul del motore su matrici da esperto a caso), `kv <posizioni>` (un token di attenzione sui due
+  layout, kernel vero e sola lettura). Stampa data e ora di compilazione (LEZIONI #24). Ogni gruppo
+  sta sotto i 60 s.
+- `tools/profile_suite.py`: chiave `decode_threads` negli scenari; per zona ms per token, MiB per
+  token e GB/s; KV letta per token e traffico pesi + KV. `bench/scenarios-decode-context.json`:
+  contesto 32, 512, 2048, 4000, larghezza misurata e 8 forzati (16 forzati ai due contesti lunghi).
+  Prova: `make profile SCENARIOS=bench/scenarios-decode-context.json`.
+- `tools/decode_context.sh` (`measure`, `change <binario prima>`; `PROF_BEFORE=<binario>` profila
+  anche quello): ferma e riavvia i container, aspetta un exe bloccato e 12 GiB liberi; stadio `exact`
+  (logit al byte prima contro dopo su 600 posizioni, un token per passata e a passate da 64, e token
+  dopo un prompt da 4000: se differiscono non misura); i quattro contesti in **una** sessione di
+  `ab_modes.sh`, 16 modi in ordine di de Bruijn, ogni modo con la sua copia A/A; poi `bench_mem` e i
+  profili. `tools/decode_context_report.py speed | model | zones` fa le tabelle di MISURE dai file
+  delle run. Prova: `sh tools/decode_context.sh change build/trochilus-before.exe` (105 minuti).
+- `tools/ab_modes.sh`: `AB_GUARD`, un comando eseguito prima di ogni run; se fallisce la misura si
+  ferma (uscita 3). `decode_context.sh`, `threads_phase.sh` e `remeasure.sh` lo impostano a «nessun
+  container acceso» (LEZIONI #73). Prova: `AB_GUARD=false sh tools/ab_modes.sh 1 "a=true" "b=true"`.
