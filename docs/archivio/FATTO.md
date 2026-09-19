@@ -372,3 +372,84 @@ Numeri in `docs/MISURE.md` §Decode a contesto lungo.
 - `tools/ab_modes.sh`: `AB_GUARD`, un comando eseguito prima di ogni run; se fallisce la misura si
   ferma (uscita 3). `decode_context.sh`, `threads_phase.sh` e `remeasure.sh` lo impostano a «nessun
   container acceso» (LEZIONI #73). Prova: `AB_GUARD=false sh tools/ab_modes.sh 1 "a=true" "b=true"`.
+
+### 2026-09-19 — Prefill su prompt lunghi: attenzione a gruppi, lavoro per token sul pool, righe F32 col kernel del tier
+
+Punto 4 dei prossimi passi, domande 7 e 30. Misurato prima (il softmax, cioè `expf` della libreria
+C, è il 51-72% dell'attenzione del prompt; la lettura ripetuta di chiavi e valori fra l'1% e il
+21-39% a 4000 token, secondo la run, e niente sotto; l'8% del prefill girava su un thread solo), poi
+le tre leve esatte. Numeri in
+`docs/MISURE.md` §Prefill su prompt lunghi. Prefill **1.05-1.08× a 512, 1.07-1.08× a 2048,
+1.11-1.14× a 4000** (A/A 2.1%), decode non distinguibile (A/A 2.4%), logit identici al byte sul
+modello vero (600 posizioni un token per passata, passate da 64, prompt da 4000 a passate da 512 e
+da 100). `expf` nostro, la leva grande che resta, non è scritto: lo decide Marcello (domanda 37).
+
+- `src/kernels/kernels.{h,c}`, `kernels_x86.c`: `tr_attention_group` (l'attenzione di un gruppo di
+  token consecutivi di una testa: blocchi di `TR_ATTN_BLOCK` = 64 posizioni contro tutte le query
+  del gruppo, poi il softmax di ogni riga, poi i valori a blocchi; ogni uscita identica al bit a
+  `tr_attention_head`, che resta come definizione) e due kernel nuovi nella tabella, `dot_f32_x4`
+  (una query contro 4 chiavi, un accumulatore per chiave in un registro con nome) e `axpy_f32_x4` (4
+  valori sommati a un'uscita, in ordine, un carico e una scrittura dell'uscita per 4): scalare (la
+  definizione: 4 chiamate), AVX2, AVX-512 con le code a maschera. Le righe di pesi **F32** (il
+  router) usano i kernel del tier (`dot_row` = `dot_f32`, `dot_row_x4` = `dot_f32_x4`) invece del
+  ciclo scalare. Prova: `tests/test_kernels.c` (x4 contro scalare e contro 4 chiamate del proprio
+  tier, ogni lunghezza fino a 200 e code; 525 gruppi contro `tr_attention_head` query per query,
+  punteggi compresi, con sentinelle oltre l'uscita e oltre la riga di punteggi; ogni tier deve avere
+  kernel suoi), sotto ogni tier in `make tier-check`.
+- `src/models/olmoe.c`: l'attenzione corre a gruppi di `OLMOE_ATTN_QUERIES` = 16 token per testa (il
+  decode è un gruppo da uno: un solo percorso), con 16 righe di punteggi per worker a passo non
+  multiplo di 4 KiB; il lavoro di un token solo (embedding, norme, norme di q e k, RoPE, scrittura
+  della KV, somma del residuo, scelta del router con uno scratch per worker, righe copiate per gli
+  esperti, somma degli esperti) si divide sul pool per token, almeno `OLMOE_TOKENS_PER_CHUNK` = 8 a
+  pezzo: una passata corta resta sul thread che chiama. Il profiler conta i byte di KV per gruppo (le
+  posizioni che vede l'ultimo token del gruppo), non più per token. Prova: `tests/test_prefill.c`
+  (prompt da 141 token, contesto 160, passate fino a 141: 108 casi identici a un token per passata),
+  `tests/test_hot.c` (passate da 1, 4 e 20 token, anche sotto ThreadSanitizer), `tests/test_model_prof.c`
+  (byte di una passata da 3, da 20 e da 5 a posizione 20), `make check`.
+- `tools/mutate_prefill.sh` (nel container; con un argomento solo le mutazioni che lo contengono):
+  20 errori plausibili (17 nelle tre leve, 3 sul tier usato), 20 visti dai test; le due corse critiche le vede solo
+  ThreadSanitizer. Una mutazione non era vista (un punteggio calcolato oltre il contesto della query):
+  il test ora mette sentinelle dopo la riga (LEZIONI #80).
+- `tests/bench_attn.c`, `make bench-attn` (0 warning in `make check`, nativo e Linux): l'attenzione di
+  un prompt intero su un layer, una query alla volta (tutto, senza softmax, solo prodotti, solo
+  softmax, solo somma pesata), a gruppi con i kernel di oggi, a gruppi con x4, e il kernel del motore
+  (`grp full`); hash di tutte le uscite, i gruppi devono dare i bit di «una query alla volta»;
+  `--threads`, `--heads`, `--group`, `--block`, `--only`. `tests/bench_mem.c kv` chiama
+  `tr_attention_group` come il motore. `tests/bench_expf.c`, `make bench-expf` (nativo e nel
+  container: le due librerie C non sono lo stesso codice): costo di `expf` e confronto con
+  l'arrotondamento corretto su tutti i 2^32 float, 13 s a 16 thread.
+- `tools/prefill_context.sh` (`bench`, `measure`, `change <binario prima>`; `TROCHILUS=<binario>`
+  misura un motore che non è `build/trochilus.exe`, LEZIONI #81): come `decode_context.sh`, per il
+  prefill a 512, 2048 e 4000 in **una** sessione (ordine che mette ogni lunghezza dopo ogni altra,
+  copie A/A), stadio `exact` esteso a un prompt da 4000 a passate da 512 e da 100 su 16 thread,
+  `bench_attn`, profilo su `bench/scenarios-prefill-context.json` (512, 2048, 4000 a 16 thread e 512
+  a un thread: quanto di una zona non si divide). `tools/prefill_context_report.py attn | zones` fa le
+  tabelle; `tools/decode_context_report.py speed` legge anche le etichette `p512`. Prova: `sh
+  tools/prefill_context.sh change build/trochilus-before.exe`.
+- **Il tier viene usato** (LEZIONI #78, quarta volta di un verde che non vede il ramo):
+  `tests/test_tier_used.c`, in `make test` e sotto `TR_CPU_MAX=scalar` e `avx2` in `make tier-check`.
+  La tabella: ogni voce della zona calda di ogni tier è una funzione sua, per ogni tipo di peso che
+  il motore accetta. Il motore: un modello per tipo (F32, F16, Q8_0, router F32 accanto) gira con la
+  tabella attiva avvolta in contatori (`tr_kernels_set_active`, solo per i test, in
+  `kernels_internal.h`) e i prodotti contati per tipo sono esattamente righe × token. Rosso prima
+  (F16 scalare in ogni tier), verde dopo i **kernel F16** di AVX2 (F16C) e AVX-512 (`dot_row`,
+  `dot_row_x4`: conversione esatta, bit-identici, 49× sullo scalare in `make bench`);
+  `tests/synth_olmoe.h` scrive anche modelli F16 e col router F32 (`synth_f32_router`). Tre
+  mutazioni nuove in `tools/mutate_prefill.sh`: due le vede solo questo test. Regola generale in
+  `CLAUDE.md`. Prova: `make test`, `make tier-check`, `make bench`.
+- **`expf` nostro: preparato, non scritto** (decide Marcello; MISURE §Prefill su prompt lunghi, punto
+  7). `tests/bench_expf.c` prova un candidato dato alla compilazione (`-DTR_EXPF_CANDIDATE=<funzione>`)
+  su tutti i 2^32 float contro la libreria e contro il riferimento; senza candidato prova uno schizzo
+  scalare che vive solo nel banco (0 differenze da MinGW, 3.7 ns contro 30, 8 argomenti sulla strada
+  lenta); `--hard <file>` scrive i casi al confine e `tools/expf_hard_cases.py` li ricalcola a 200
+  bit con mpmath (369 casi, 0 errori del riferimento, sulle due piattaforme).
+  `tools/expf_quality.sh` (container, volume dei modelli) compila un motore di sola misura con ogni
+  `expf` arrotondato correttamente (`tools/cr_expf_emul.h`) e lo confronta col binario normale sul
+  modello vero (`tools/expf_quality.py`): KL media 3.9e-13, 0 token diversi su 1000. Il motore non
+  è stato toccato. Prova: `make bench-expf`; `sh tools/expf_quality.sh` nel container.
+- `tools/measure_guard.lib` e `tools/stay_awake.ps1`, usati da `prefill_context.sh`,
+  `decode_context.sh`, `threads_phase.sh` e `remeasure.sh` (LEZIONI #82): una misura alla volta
+  (`build/.measuring.lock` col pid; una seconda esce con 5, il lock di uno script morto si riprende)
+  e la macchina tenuta sveglia finché il lock esiste (una richiesta di alimentazione, nessuna
+  impostazione cambiata). Prova: due `sh tools/prefill_context.sh bench` insieme, il secondo si
+  rifiuta.

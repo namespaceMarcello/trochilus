@@ -38,6 +38,11 @@
 #endif
 /* Input rows a dot_row_x4 kernel handles in one pass over the weight row. */
 #define TR_DOT_TOKENS 4
+/* Cache positions a dot_f32_x4 or axpy_f32_x4 kernel handles per load of the query or the output. */
+#define TR_ATTN_X 4
+/* Cache positions per block in tr_attention_group: a block of keys (then of values) stays in the
+ * cache while every query of the group uses it. Changes speed only, never a result. */
+#define TR_ATTN_BLOCK 64
 
 /* A 2-D weight in ggml layout: `rows` output rows, each `cols` input elements,
  * stored as consecutive rows of type `type` (row bytes = tr_row_bytes). */
@@ -60,6 +65,12 @@ typedef struct {
     float (*dot_f32)(const float *a, const float *b, int64_t n);
     /* y[k] = y[k] + a * x[k], element-wise (x and y do not overlap) */
     void (*axpy_f32)(float *y, const float *x, float a, int64_t n);
+    /* TR_ATTN_X dots of a with b, b+stride, ...: out[j] = dot_f32(a, b + j*stride, n), each under
+     * the lane contract, with a loaded once for all of them (one query against 4 keys) */
+    void (*dot_f32_x4)(const float *a, const float *b, int64_t stride, int64_t n, float *out);
+    /* TR_ATTN_X axpys on the same y, one after the other: axpy_f32(y, x + j*stride, a[j], n) for
+     * j = 0, 1, 2, 3 in this order, with y loaded and stored once for all of them */
+    void (*axpy_f32_x4)(float *y, const float *x, int64_t stride, const float *a, int64_t n);
     /* dot of one quantized row (n elements) with f32 x, under the lane contract
      * applied to the dequantized weights: w_k = d_block * q_k computed as a
      * float product first, then w_k * x_k into lane k % 16 */
@@ -118,5 +129,19 @@ void tr_swiglu(tr_pool *pool, float *x, const float *y, int64_t n);
  * scores: n_pos floats of scratch owned by the caller. */
 void tr_attention_head(const float *q, const float *keys, const float *values, int64_t stride, int64_t offset,
                        int64_t n_pos, int64_t head_dim, float scale, float *scores, float *out);
+/* Causal attention of n_q consecutive tokens of one query head, a group: query j, at
+ * q + j*q_stride, sees the first first_n_pos + j positions of keys and values (head_dim floats
+ * per position, the positions in a row) and writes head_dim floats at out + j*out_stride.
+ * Every output is bit for bit tr_attention_head's for that query: the same dot_f32 per
+ * position, the same softmax of the same row, the same axpy_f32 in increasing position. What
+ * changes is the order in memory: a block of TR_ATTN_BLOCK positions meets every query of the
+ * group while it sits in the cache, so the keys and the values come from memory once per group
+ * instead of once per query (docs/MISURE.md "Prefill su prompt lunghi"). A decode token is a
+ * group of one.
+ * scores: n_q rows of scratch owned by the caller, row j at scores + j*score_stride and at
+ * least first_n_pos + j floats long. */
+void tr_attention_group(const float *q, int64_t q_stride, const float *keys, const float *values, int64_t n_q,
+                        int64_t first_n_pos, int64_t head_dim, float scale, float *scores, int64_t score_stride,
+                        float *out, int64_t out_stride);
 
 #endif

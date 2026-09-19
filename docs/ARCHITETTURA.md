@@ -70,7 +70,7 @@ I dati decidono dove si lavora. Tre livelli, dal più fine al più largo:
 | Livello | Strumento | Risponde a |
 |---|---|---|
 | kernel | `tests/bench_kernels.c` (`make bench`) | quanto è veloce un singolo kernel per tier, con il rumore |
-| memoria | `tests/bench_mem.c` (`make bench-mem`) | cosa dà la RAM della macchina, il tetto del decode: letture in fila e sparse a 1-16 thread, il matmul del motore su matrici da esperto a caso, un token di attenzione sulla KV; i thread sono quelli del pool, pinnati come nel motore |
+| memoria | `tests/bench_mem.c` (`make bench-mem`), `tests/bench_attn.c` (`make bench-attn`) | cosa dà la RAM della macchina, il tetto del decode: letture in fila e sparse a 1-16 thread, il matmul del motore su matrici da esperto a caso, un token di attenzione sulla KV; e l'attenzione di un prompt intero su un layer, smontata: prodotti, softmax e somma pesata da soli, una query alla volta contro un gruppo di query per blocco di chiavi, con controllo dei bit. I thread sono quelli del pool, pinnati come nel motore |
 | motore | profiler interno, `trochilus generate --profile` / `--profile-json <file>` | dove va il tempo di un token: per fase (embedding, proiezioni, norme, rope, attenzione, router, esperti, lm_head, campionamento), prefill e decode separati, attese del pool di thread, letture dal disco; **per ogni zona i byte letti (pesi e KV) e i GB/s**: una zona al tetto della RAM è limitata dalla memoria, una sotto da altro |
 | scenari | `tools/profile_suite.py` (`make profile`), scenari in `bench/scenarios.json` | come va un uso reale (prompt corto → risposta lunga; file lungo → risposta corta; contesto che cresce), mediana di N run con spread, confronto automatico con la misura precedente sulla stessa macchina: migliorato, peggiorato o rumore |
 
@@ -138,8 +138,14 @@ codice macchina con e senza, verificato): nella zona calda restano quelli che sp
   identici al bit per ogni `n_batch`. Gli esperti lavorano sulle coppie (token, esperto) ordinate per
   esperto; le matrici si visitano a blocchi di token, e una riga di pesi va contro 4 token alla volta
   nei registri (`dot_row_x4`: un carico e una conversione per quattro prodotti, ognuno identico al suo
-  `dot_row`). Logit dell'ultimo token, o delle ultime `n` posizioni quando servono a verificare
-  una bozza (`tr_session_eval_rows`, al più `TR_LOGIT_ROWS_MAX`).
+  `dot_row`). L'attenzione di una testa corre a **gruppi di 16 token** (`tr_attention_group`): un
+  blocco di 64 posizioni incontra tutte le query del gruppo mentre sta in cache, 4 posizioni per
+  carico della query (`dot_f32_x4`, `axpy_f32_x4`), così chiavi e valori si leggono una volta per
+  gruppo e non una per token; il decode è un gruppo da una query. Il lavoro che è di un token solo
+  (norme, RoPE, scrittura della KV, scelta del router, righe per gli esperti) si divide sul pool
+  per token, almeno 8 a pezzo: sotto, resta sul thread che chiama. Logit dell'ultimo token, o delle
+  ultime `n` posizioni quando servono a verificare una bozza (`tr_session_eval_rows`, al più
+  `TR_LOGIT_ROWS_MAX`).
 - **Speculazione dal prompt** (`src/gen/`): la bozza è la continuazione dell'ultima occorrenza
   dell'n-gramma di coda nel contesto; una passata sola verifica 1 + k posizioni e si tengono solo i
   token che il modello avrebbe scelto comunque, gli altri spariscono con `tr_session_rewind`. Poiché
@@ -164,6 +170,7 @@ codice macchina con e senza, verificato): nella zona calda restano quelli che sp
 |---|---|---|
 | kernel | ogni variante SIMD/asm contro lo scalare, bit per bit, su input casuali | `tests/test_kernels.c` |
 | tier | il motore intero sotto ogni tier (`TR_CPU_MAX`): test del modello, e logit identici al byte fra tier, thread e `-b` | `make tier-check` (`tools/tier_check.sh`) |
+| il tier viene usato | numeri uguali non dicono quale codice ha girato: ogni voce calda di ogni tier è una funzione sua, per ogni tipo di peso; e nel motore i prodotti contati sulla tabella attiva, tipo per tipo, sono esattamente righe × token | `tests/test_tier_used.c`, anche sotto ogni tier in `make tier-check` |
 | modello minuscolo | token greedy **identici** a transformers (f32, f16); logit entro tolleranza per posizione; q8_0 solo riportato, perché il riferimento non è quantizzato | `tools/make_tiny_olmoe.py` → `tools/oracle.py` (`make oracle`) |
 | modello vero | OLMoE vero tagliato a 2 layer contro transformers sugli stessi pesi Q8_0 dequantizzati: token identici, logit entro 1e-3 | `make oracle-real` (saltato senza il modello) |
 | ottimizzazione esatta | logit del modello vero prima e dopo, identici al bit, con più numeri di thread | `trochilus logits` + `cmp`, a mano |

@@ -13,8 +13,12 @@
 
 typedef struct {
     uint32_t layers, n_embd, n_head, n_head_kv, n_ff, n_expert, n_used, vocab, ctx;
-    tr_type type; /* of the 2-D and 3-D tensors: TR_TYPE_F32 or TR_TYPE_Q8_0 */
+    tr_type type; /* of the 2-D and 3-D tensors: TR_TYPE_F32, TR_TYPE_F16 or TR_TYPE_Q8_0 */
 } synth_params;
+
+/* Set to 1 before synth_write: the router's matrix is F32 whatever `type` is, as in every real
+ * GGUF, so one model holds weights of two types (tests/test_tier_used.c). */
+static int synth_f32_router = 0;
 
 typedef struct {
     uint8_t *data;
@@ -41,9 +45,10 @@ static void synth_kv_u32(synth_buf *b, const char *key, uint32_t v) {
     synth_u32(b, v);
 }
 
-/* Small pseudo-random weights, same file every run, no NaN/Inf: f32 in [-0.1, 0.1], or Q8_0
- * blocks with an f16 scale in [2^-10, 2^-9) (exponent bits 5, random mantissa) and random
- * quants in [-127, 127]. */
+/* Small pseudo-random weights, same file every run, no NaN/Inf: f32 in [-0.1, 0.1], f16 with a
+ * random sign, exponent bits 8..11 (2^-7 .. 2^-4) and a random mantissa, or Q8_0 blocks with an
+ * f16 scale in [2^-10, 2^-9) (exponent bits 5, random mantissa) and random quants in
+ * [-127, 127]. */
 static void synth_tensor(synth_buf *hdr, synth_buf *data, const char *name, int ndims, uint64_t ne[3], uint32_t seed,
                          tr_type type) {
     synth_pad(data, 32);
@@ -66,6 +71,15 @@ static void synth_tensor(synth_buf *hdr, synth_buf *data, const char *name, int 
                 int8_t q = (int8_t)((int)((seed >> 16) % 255u) - 127);
                 synth_put(data, &q, 1);
             }
+        }
+        return;
+    }
+    if (type == TR_TYPE_F16) {
+        for (uint64_t i = 0; i < n; i++) {
+            seed = seed * 1103515245u + 12345u;
+            uint32_t r = seed >> 16;
+            uint16_t h = (uint16_t)(((r & 1u) << 15) | ((8u + ((r >> 1) & 3u)) << 10) | ((r >> 3) & 0x3FFu));
+            synth_put(data, &h, sizeof h);
         }
         return;
     }
@@ -107,7 +121,14 @@ static synth_buf synth_olmoe(const synth_params *P) {
     n_kv_count++;
 
     uint32_t seed = 1;
-#define T(nm, nd, a, b, c) do { uint64_t ne[3] = {(a), (b), (c)}; synth_tensor(&hdr, &data, (nm), (nd), ne, seed++, (nd) >= 2 ? P->type : TR_TYPE_F32); n_tensors++; } while (0)
+#define T(nm, nd, a, b, c) do { \
+        uint64_t ne[3] = {(a), (b), (c)}; \
+        const char *nm_ = (nm); \
+        tr_type tt = (nd) >= 2 ? P->type : TR_TYPE_F32; \
+        if (synth_f32_router && strstr(nm_, "ffn_gate_inp") != NULL) tt = TR_TYPE_F32; \
+        synth_tensor(&hdr, &data, nm_, (nd), ne, seed++, tt); \
+        n_tensors++; \
+    } while (0)
     T("token_embd.weight", 2, P->n_embd, P->vocab, 0);
     T("output_norm.weight", 1, P->n_embd, 0, 0);
     T("output.weight", 2, P->n_embd, P->vocab, 0);

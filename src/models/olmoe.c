@@ -60,6 +60,14 @@ typedef struct {
 
 /* Tokens in one forward pass when the caller does not choose (llama.cpp's n_ubatch). */
 #define OLMOE_DEFAULT_BATCH 512
+/* Consecutive tokens of a head whose attention runs as one group (tr_attention_group): the keys
+ * and the values come from memory once per group. Measured at 4, 16 and 64 on a prompt of 4000:
+ * the same speed (docs/MISURE.md "Prefill su prompt lunghi"); 16 rows of scores stay in L2. */
+#define OLMOE_ATTN_QUERIES 16
+/* The work of a pass that belongs to one token alone (norms, RoPE, the write into the cache, the
+ * router's choice, the rows copied for the experts) is split over the pool by token, at least
+ * this many to a chunk: a decode token or a short pass stays on the calling thread. */
+#define OLMOE_TOKENS_PER_CHUNK 8
 
 typedef struct {
     olmoe_model *m; /* not owned */
@@ -82,14 +90,15 @@ typedef struct {
     float *sel_w;     /* [B][U] their weights */
     int64_t *place;   /* [B][U] row of each (token, slot) in the grouped buffers below */
     int64_t *offsets; /* [n_expert + 1] grouped rows of each expert */
-    unsigned char *taken; /* [n_expert] */
+    unsigned char *taken; /* [n_workers][n_expert] scratch of the router's choice, a row per pool worker */
     float *xg;        /* [B*U][n_embd] expert inputs, grouped by expert */
     float *h1, *h2;   /* [B*U][n_ff] gate and up outputs */
     float *h3;        /* [B*U][n_embd] down outputs */
     float *logits;    /* [n_logits_max][vocab], oldest kept position first */
     int64_t n_logits_max; /* rows the buffer holds (TR_LOGIT_ROWS_MAX, never more than B) */
     int64_t n_logits;     /* rows the last pass filled */
-    float *scores;    /* attention scores, one row per pool worker: [n_workers][n_ctx] */
+    float *scores;    /* attention scores, a group of rows per pool worker: [n_workers][OLMOE_ATTN_QUERIES][score_stride] */
+    int64_t score_stride; /* floats from a row of scores to the next: n_ctx and some (score_row_stride) */
     int64_t n_workers;
 } olmoe_session;
 
@@ -520,6 +529,13 @@ static float *alloc_f32(int64_t n) {
     return (float *)tr_alloc_aligned((size_t)n * sizeof(float), 64);
 }
 
+/* Floats from a row of attention scores to the next: n_ctx rounded up to 4 KiB of floats, plus
+ * one cache line. With rows a multiple of 4 KiB apart, position t of every row of a group would
+ * fall in the same set of the L1 cache. */
+static int64_t score_row_stride(int64_t n_ctx) {
+    return (n_ctx + 1023) / 1024 * 1024 + TR_LANES;
+}
+
 static void *olmoe_session_create(void *model, int64_t n_ctx, int64_t n_batch, char *err, size_t err_len) {
     olmoe_model *m = (olmoe_model *)model;
 
@@ -535,9 +551,11 @@ static void *olmoe_session_create(void *model, int64_t n_ctx, int64_t n_batch, c
     uint64_t rope_elems = (uint64_t)actual_ctx * (uint64_t)(m->head_dim / 2);
     uint64_t scratch_f32 = (uint64_t)B * (uint64_t)(m->n_embd * 4 + m->n_qkv * 2 + m->n_kv * 2 + m->n_expert + U) +
                            (uint64_t)B * (uint64_t)U * (uint64_t)(m->n_embd * 2 + m->n_ff * 2) +
-                           (uint64_t)(n_workers * actual_ctx + m->vocab) + rope_elems * 2;
+                           (uint64_t)(n_workers * OLMOE_ATTN_QUERIES * score_row_stride(actual_ctx) + m->vocab) +
+                           rope_elems * 2;
     uint64_t scratch_i64 = (uint64_t)B * (uint64_t)U * 2 + (uint64_t)m->n_expert + 1;
-    uint64_t scratch_bytes = scratch_f32 * sizeof(float) + scratch_i64 * sizeof(int64_t) + (uint64_t)m->n_expert;
+    uint64_t scratch_bytes = scratch_f32 * sizeof(float) + scratch_i64 * sizeof(int64_t) +
+                             (uint64_t)(n_workers * m->n_expert);
     if (tr_mem_guard(kv_bytes + scratch_bytes, err, err_len) != 0) return NULL;
 
     olmoe_session *s = (olmoe_session *)calloc(1, sizeof *s);
@@ -567,7 +585,7 @@ static void *olmoe_session_create(void *model, int64_t n_ctx, int64_t n_batch, c
     s->sel_w = alloc_f32(B * U);
     s->place = (int64_t *)tr_alloc_aligned((size_t)(B * U) * sizeof(int64_t), 64);
     s->offsets = (int64_t *)tr_alloc_aligned((size_t)(m->n_expert + 1) * sizeof(int64_t), 64);
-    s->taken = (unsigned char *)tr_alloc_aligned((size_t)m->n_expert, 64);
+    s->taken = (unsigned char *)tr_alloc_aligned((size_t)(n_workers * m->n_expert), 64);
     s->xg = alloc_f32(B * U * m->n_embd);
     s->h1 = alloc_f32(B * U * m->n_ff);
     s->h2 = alloc_f32(B * U * m->n_ff);
@@ -575,7 +593,8 @@ static void *olmoe_session_create(void *model, int64_t n_ctx, int64_t n_batch, c
     s->n_logits_max = B < TR_LOGIT_ROWS_MAX ? B : TR_LOGIT_ROWS_MAX;
     s->n_logits = 0;
     s->logits = alloc_f32(s->n_logits_max * m->vocab);
-    s->scores = alloc_f32(n_workers * actual_ctx);
+    s->score_stride = score_row_stride(actual_ctx);
+    s->scores = alloc_f32(n_workers * OLMOE_ATTN_QUERIES * s->score_stride);
 
     if (kv_rc != 0 || s->rope_cos == NULL || s->rope_sin == NULL || s->x == NULL ||
         s->normed == NULL || s->attn_out == NULL || s->ffn_out == NULL || s->q == NULL || s->attn_concat == NULL ||
@@ -610,25 +629,124 @@ static uint64_t mat_bytes(const tr_mat *w) {
  * head first: a chunk holds whole heads, so the tokens at the end of a pass (the longest
  * contexts) are spread over every chunk. Token i sits at position pos0 + i and attends to
  * positions 0..pos0+i, all already in the cache; an item writes only its own slice of
- * attn_concat and uses the score row of the worker running it. The keys and the values of a
- * head are contiguous in the cache (src/kv/kv.h): stride head_dim, no offset. */
+ * attn_concat. The keys and the values of a head are contiguous in the cache (src/kv/kv.h).
+ * The tokens of a head that fall in a chunk run in groups of OLMOE_ATTN_QUERIES
+ * (tr_attention_group): every token gets the bits it would get alone, and the head's keys and
+ * values are read once per group instead of once per token. The rows of scores are the
+ * worker's. */
 typedef struct {
     const float *q;
     const tr_kv *kv;
     float *scores, *out;
     float scale;
-    int64_t layer, n_qkv, head_dim, group, n_tok, pos0;
+    int64_t layer, n_qkv, head_dim, group, n_tok, pos0, score_stride;
 } attn_ctx;
 
 static void attn_body(void *ctx_, int64_t begin, int64_t end, int worker) {
     const attn_ctx *c = (const attn_ctx *)ctx_;
-    float *scores = c->scores + (int64_t)worker * c->kv->n_ctx;
-    for (int64_t idx = begin; idx < end; idx++) {
-        int64_t h = idx / c->n_tok, i = idx % c->n_tok;
-        tr_attention_head(c->q + i * c->n_qkv + h * c->head_dim, tr_kv_keys(c->kv, c->layer, h / c->group),
-                          tr_kv_values(c->kv, c->layer, h / c->group), c->head_dim, 0, c->pos0 + i + 1,
-                          c->head_dim, c->scale, scores, c->out + i * c->n_qkv + h * c->head_dim);
+    float *scores = c->scores + (int64_t)worker * OLMOE_ATTN_QUERIES * c->score_stride;
+    int64_t idx = begin;
+    while (idx < end) {
+        /* the tokens [i0, i1) of head h: what this chunk holds of the head */
+        int64_t h = idx / c->n_tok, i0 = idx % c->n_tok;
+        int64_t i1 = (h + 1) * c->n_tok <= end ? c->n_tok : end - h * c->n_tok;
+        const float *keys = tr_kv_keys(c->kv, c->layer, h / c->group);
+        const float *values = tr_kv_values(c->kv, c->layer, h / c->group);
+        for (int64_t i = i0; i < i1; i += OLMOE_ATTN_QUERIES) {
+            int64_t n_q = i1 - i < OLMOE_ATTN_QUERIES ? i1 - i : OLMOE_ATTN_QUERIES;
+            tr_attention_group(c->q + i * c->n_qkv + h * c->head_dim, c->n_qkv, keys, values, n_q, c->pos0 + i + 1,
+                               c->head_dim, c->scale, scores, c->score_stride,
+                               c->out + i * c->n_qkv + h * c->head_dim, c->n_qkv);
+        }
+        idx = h * c->n_tok + i1;
     }
+}
+
+/* Bytes of K and V the attention of a pass pulls from the cache, for the profiler: a group of
+ * OLMOE_ATTN_QUERIES tokens reads the positions its last token sees, once per query head. A
+ * decode token is a group of one, every position up to its own. (A chunk border inside a head
+ * cuts one group in two: not counted.) */
+static uint64_t attn_kv_bytes(int64_t n_tok, int64_t pos0, int64_t n_head, int64_t head_dim) {
+    uint64_t positions = 0;
+    for (int64_t i = 0; i < n_tok; i += OLMOE_ATTN_QUERIES)
+        positions += (uint64_t)(pos0 + (i + OLMOE_ATTN_QUERIES < n_tok ? i + OLMOE_ATTN_QUERIES : n_tok));
+    return positions * (uint64_t)(n_head * head_dim) * 2 * sizeof(float);
+}
+
+/* ---- the work of one token alone, split over the pool by token ------------------------ */
+/* Each body runs the same calls on the same numbers as the loop over the tokens it replaces, so
+ * the thread count changes nothing (tests/test_prefill.c, tests/test_hot.c). */
+
+typedef struct {
+    const tr_mat *w;
+    const int32_t *tokens;
+    float *x;
+    int64_t n_embd;
+} embed_ctx;
+
+static void embed_body(void *ctx_, int64_t begin, int64_t end, int worker) {
+    (void)worker;
+    const embed_ctx *c = (const embed_ctx *)ctx_;
+    for (int64_t i = begin; i < end; i++) tr_get_row(c->w, c->tokens[i], c->x + i * c->n_embd);
+}
+
+/* dst = rmsnorm(src) token by token; dst == src norms in place */
+typedef struct {
+    const float *src, *weight;
+    float *dst;
+    int64_t n;
+    float eps;
+} norm_ctx;
+
+static void norm_body(void *ctx_, int64_t begin, int64_t end, int worker) {
+    (void)worker;
+    const norm_ctx *c = (const norm_ctx *)ctx_;
+    if (c->dst != c->src)
+        memcpy(c->dst + begin * c->n, c->src + begin * c->n, (size_t)((end - begin) * c->n) * sizeof(float));
+    for (int64_t i = begin; i < end; i++) tr_rmsnorm(c->dst + i * c->n, c->weight, c->n, c->eps);
+}
+
+typedef struct {
+    float *q, *k;
+    const float *rope_cos, *rope_sin;
+    int64_t n_qkv, n_kv, n_head, n_head_kv, head_dim, pos0;
+} rope_ctx;
+
+static void rope_body(void *ctx_, int64_t begin, int64_t end, int worker) {
+    (void)worker;
+    const rope_ctx *c = (const rope_ctx *)ctx_;
+    int64_t half = c->head_dim / 2;
+    for (int64_t i = begin; i < end; i++) {
+        const float *cos_p = c->rope_cos + (c->pos0 + i) * half, *sin_p = c->rope_sin + (c->pos0 + i) * half;
+        tr_rope_neox(c->q + i * c->n_qkv, c->n_head, c->head_dim, cos_p, sin_p);
+        tr_rope_neox(c->k + i * c->n_kv, c->n_head_kv, c->head_dim, cos_p, sin_p);
+    }
+}
+
+/* a chunk of tokens goes into the cache as a pass of its own: distinct positions, no overlap */
+typedef struct {
+    tr_kv *kv;
+    const float *k, *v;
+    int64_t layer, pos0, n_kv;
+} kv_write_ctx;
+
+static void kv_write_body(void *ctx_, int64_t begin, int64_t end, int worker) {
+    (void)worker;
+    const kv_write_ctx *c = (const kv_write_ctx *)ctx_;
+    tr_kv_write(c->kv, c->layer, c->pos0 + begin, end - begin, c->k + begin * c->n_kv, c->v + begin * c->n_kv);
+}
+
+/* y[j] += x[j] over the elements of tokens [begin, end) */
+typedef struct {
+    float *y;
+    const float *x;
+    int64_t n;
+} add_ctx;
+
+static void add_body(void *ctx_, int64_t begin, int64_t end, int worker) {
+    (void)worker;
+    const add_ctx *c = (const add_ctx *)ctx_;
+    for (int64_t j = begin * c->n; j < end * c->n; j++) c->y[j] += c->x[j];
 }
 
 /* Each token's expert outputs weighted and summed in increasing expert id, then added to
@@ -698,6 +816,39 @@ static void route_token(const olmoe_model *m, float *router, unsigned char *take
     }
 }
 
+/* The router's choice of tokens [begin, end); the scratch is the worker's row of `taken`. */
+typedef struct {
+    const olmoe_model *m;
+    float *router, *sel_w;
+    unsigned char *taken;
+    int64_t *sel_id;
+} route_ctx;
+
+static void route_body(void *ctx_, int64_t begin, int64_t end, int worker) {
+    const route_ctx *c = (const route_ctx *)ctx_;
+    int64_t n_expert = c->m->n_expert, n_used = c->m->n_expert_used;
+    for (int64_t i = begin; i < end; i++)
+        route_token(c->m, c->router + i * n_expert, c->taken + (int64_t)worker * n_expert, c->sel_id + i * n_used,
+                    c->sel_w + i * n_used);
+}
+
+/* Rows [begin, end) of the (token, slot) pairs copied to their place in the grouped buffer:
+ * every pair has a row of its own, so no two items write the same floats. */
+typedef struct {
+    const float *normed;
+    const int64_t *place;
+    float *xg;
+    int64_t n_embd, n_used;
+} gather_ctx;
+
+static void gather_body(void *ctx_, int64_t begin, int64_t end, int worker) {
+    (void)worker;
+    const gather_ctx *c = (const gather_ctx *)ctx_;
+    for (int64_t j = begin; j < end; j++)
+        memcpy(c->xg + c->place[j] * c->n_embd, c->normed + (j / c->n_used) * c->n_embd,
+               (size_t)c->n_embd * sizeof(float));
+}
+
 /* One forward pass over n_tok tokens (1 <= n_tok <= n_batch) at positions pos..pos+n_tok-1.
  * Every value is computed with the same kernel call as when the tokens run one per pass:
  * a matmul element is one dot_row, norms/RoPE/routing/mixing are per token, and a token's
@@ -712,13 +863,23 @@ static void forward_pass(olmoe_model *m, olmoe_session *s, const int32_t *tokens
     tr_pool *pool = m->pool;
     const int64_t pos0 = s->pos;
     int64_t n_embd = m->n_embd, n_qkv = m->n_qkv, n_kv = m->n_kv;
-    int64_t n_head = m->n_head, n_head_kv = m->n_head_kv, head_dim = m->head_dim, half = head_dim / 2;
+    int64_t n_head = m->n_head, n_head_kv = m->n_head_kv, head_dim = m->head_dim;
     int64_t n_ff = m->n_ff, n_expert = m->n_expert, n_used = m->n_expert_used;
     int64_t n_rows = n_tok * n_used; /* (token, slot) pairs = rows of the grouped expert buffers */
     float scale = 1.0f / sqrtf((float)head_dim);
 
+    /* the jobs of one token alone (see the bodies above): the context changes zone by zone */
+    const int64_t per_chunk = OLMOE_TOKENS_PER_CHUNK;
+    norm_ctx nc;
+    nc.eps = m->rms_eps;
+
     uint64_t t = tr_prof_begin(prof);
-    for (int64_t i = 0; i < n_tok; i++) tr_get_row(&m->token_embd, tokens[i], s->x + i * n_embd);
+    embed_ctx ec;
+    ec.w = &m->token_embd;
+    ec.tokens = tokens;
+    ec.x = s->x;
+    ec.n_embd = n_embd;
+    tr_parallel_for(pool, n_tok, per_chunk, embed_body, &ec);
     tr_prof_end(prof, TR_PROF_EMBED, t);
     tr_prof_count(prof, TR_PROF_EMBED,
                   (uint64_t)n_tok * (uint64_t)tr_row_bytes(m->token_embd.type, m->token_embd.cols), 0);
@@ -728,8 +889,11 @@ static void forward_pass(olmoe_model *m, olmoe_session *s, const int32_t *tokens
 
         /* ---- attention ---- */
         t = tr_prof_begin(prof);
-        memcpy(s->normed, s->x, (size_t)(n_tok * n_embd) * sizeof(float));
-        for (int64_t i = 0; i < n_tok; i++) tr_rmsnorm(s->normed + i * n_embd, layer->attn_norm, n_embd, m->rms_eps);
+        nc.src = s->x;
+        nc.dst = s->normed;
+        nc.weight = layer->attn_norm;
+        nc.n = n_embd;
+        tr_parallel_for(pool, n_tok, per_chunk, norm_body, &nc);
         tr_prof_end(prof, TR_PROF_ATTN_NORM, t);
 
         t = tr_prof_begin(prof);
@@ -741,10 +905,14 @@ static void forward_pass(olmoe_model *m, olmoe_session *s, const int32_t *tokens
                       0);
 
         t = tr_prof_begin(prof);
-        for (int64_t i = 0; i < n_tok; i++) {
-            tr_rmsnorm(s->q + i * n_qkv, layer->q_norm, n_qkv, m->rms_eps);
-            tr_rmsnorm(s->k + i * n_kv, layer->k_norm, n_kv, m->rms_eps);
-        }
+        nc.src = nc.dst = s->q;
+        nc.weight = layer->q_norm;
+        nc.n = n_qkv;
+        tr_parallel_for(pool, n_tok, per_chunk, norm_body, &nc);
+        nc.src = nc.dst = s->k;
+        nc.weight = layer->k_norm;
+        nc.n = n_kv;
+        tr_parallel_for(pool, n_tok, per_chunk, norm_body, &nc);
         tr_prof_end(prof, TR_PROF_QK_NORM, t);
 
         if (m->have_clamp) {
@@ -754,15 +922,29 @@ static void forward_pass(olmoe_model *m, olmoe_session *s, const int32_t *tokens
         }
 
         t = tr_prof_begin(prof);
-        for (int64_t i = 0; i < n_tok; i++) {
-            const float *cos_p = s->rope_cos + (pos0 + i) * half, *sin_p = s->rope_sin + (pos0 + i) * half;
-            tr_rope_neox(s->q + i * n_qkv, n_head, head_dim, cos_p, sin_p);
-            tr_rope_neox(s->k + i * n_kv, n_head_kv, head_dim, cos_p, sin_p);
-        }
+        rope_ctx rc;
+        rc.q = s->q;
+        rc.k = s->k;
+        rc.rope_cos = s->rope_cos;
+        rc.rope_sin = s->rope_sin;
+        rc.n_qkv = n_qkv;
+        rc.n_kv = n_kv;
+        rc.n_head = n_head;
+        rc.n_head_kv = n_head_kv;
+        rc.head_dim = head_dim;
+        rc.pos0 = pos0;
+        tr_parallel_for(pool, n_tok, per_chunk, rope_body, &rc);
         tr_prof_end(prof, TR_PROF_ROPE, t);
 
         t = tr_prof_begin(prof);
-        tr_kv_write(&s->kv, L, pos0, n_tok, s->k, s->v);
+        kv_write_ctx wc;
+        wc.kv = &s->kv;
+        wc.k = s->k;
+        wc.v = s->v;
+        wc.layer = L;
+        wc.pos0 = pos0;
+        wc.n_kv = n_kv;
+        tr_parallel_for(pool, n_tok, per_chunk, kv_write_body, &wc);
         tr_prof_end(prof, TR_PROF_KV_WRITE, t);
 
         t = tr_prof_begin(prof);
@@ -778,24 +960,29 @@ static void forward_pass(olmoe_model *m, olmoe_session *s, const int32_t *tokens
         ac.group = n_head / n_head_kv;
         ac.n_tok = n_tok;
         ac.pos0 = pos0;
+        ac.score_stride = s->score_stride;
         /* an item costs ~30 ns per cached position: short contexts keep several per chunk */
         tr_parallel_for(pool, n_head * n_tok, 1 + 256 / (pos0 + n_tok), attn_body, &ac);
         tr_prof_end(prof, TR_PROF_ATTENTION, t);
-        /* token i reads positions 0..pos0+i of K and of V, once per query head */
-        tr_prof_count_kv(prof, TR_PROF_ATTENTION,
-                         (uint64_t)(n_tok * pos0 + n_tok * (n_tok + 1) / 2) * (uint64_t)(n_head * head_dim) * 2 *
-                             sizeof(float));
+        if (prof->enabled) tr_prof_count_kv(prof, TR_PROF_ATTENTION, attn_kv_bytes(n_tok, pos0, n_head, head_dim));
 
         t = tr_prof_begin(prof);
         tr_matmul(pool, &layer->wo, s->attn_concat, n_tok, s->attn_out);
-        for (int64_t j = 0; j < n_tok * n_embd; j++) s->x[j] += s->attn_out[j];
+        add_ctx dc;
+        dc.y = s->x;
+        dc.x = s->attn_out;
+        dc.n = n_embd;
+        tr_parallel_for(pool, n_tok, per_chunk, add_body, &dc);
         tr_prof_end(prof, TR_PROF_ATTN_OUT_PROJ, t);
         tr_prof_count(prof, TR_PROF_ATTN_OUT_PROJ, mat_bytes(&layer->wo), 0);
 
         /* ---- MoE FFN ---- */
         t = tr_prof_begin(prof);
-        memcpy(s->normed, s->x, (size_t)(n_tok * n_embd) * sizeof(float));
-        for (int64_t i = 0; i < n_tok; i++) tr_rmsnorm(s->normed + i * n_embd, layer->ffn_norm, n_embd, m->rms_eps);
+        nc.src = s->x;
+        nc.dst = s->normed;
+        nc.weight = layer->ffn_norm;
+        nc.n = n_embd;
+        tr_parallel_for(pool, n_tok, per_chunk, norm_body, &nc);
         tr_prof_end(prof, TR_PROF_FFN_NORM, t);
 
         /* route every token, then a counting sort of the (token, slot) pairs by expert:
@@ -803,11 +990,15 @@ static void forward_pass(olmoe_model *m, olmoe_session *s, const int32_t *tokens
          * at the end turns the advanced starts back into starts */
         t = tr_prof_begin(prof);
         tr_matmul(pool, &layer->gate_inp, s->normed, n_tok, s->router);
+        route_ctx oc;
+        oc.m = m;
+        oc.router = s->router;
+        oc.sel_w = s->sel_w;
+        oc.taken = s->taken;
+        oc.sel_id = s->sel_id;
+        tr_parallel_for(pool, n_tok, per_chunk, route_body, &oc);
         for (int64_t e = 0; e <= n_expert; e++) s->offsets[e] = 0;
-        for (int64_t i = 0; i < n_tok; i++) {
-            route_token(m, s->router + i * n_expert, s->taken, s->sel_id + i * n_used, s->sel_w + i * n_used);
-            for (int64_t slot = 0; slot < n_used; slot++) s->offsets[s->sel_id[i * n_used + slot] + 1]++;
-        }
+        for (int64_t j = 0; j < n_rows; j++) s->offsets[s->sel_id[j] + 1]++;
         for (int64_t e = 0; e < n_expert; e++) s->offsets[e + 1] += s->offsets[e];
         for (int64_t j = 0; j < n_rows; j++) s->place[j] = s->offsets[s->sel_id[j]]++;
         for (int64_t e = n_expert; e > 0; e--) s->offsets[e] = s->offsets[e - 1];
@@ -817,8 +1008,13 @@ static void forward_pass(olmoe_model *m, olmoe_session *s, const int32_t *tokens
 
         /* experts in stages, each one job over every (token, slot) row grouped by expert */
         t = tr_prof_begin(prof);
-        for (int64_t j = 0; j < n_rows; j++)
-            memcpy(s->xg + s->place[j] * n_embd, s->normed + (j / n_used) * n_embd, (size_t)n_embd * sizeof(float));
+        gather_ctx gc;
+        gc.normed = s->normed;
+        gc.place = s->place;
+        gc.xg = s->xg;
+        gc.n_embd = n_embd;
+        gc.n_used = n_used;
+        tr_parallel_for(pool, n_rows, per_chunk * n_used, gather_body, &gc);
         tr_prof_end(prof, TR_PROF_EXPERT_GATHER, t);
 
         t = tr_prof_begin(prof);
@@ -852,8 +1048,7 @@ static void forward_pass(olmoe_model *m, olmoe_session *s, const int32_t *tokens
         mc.x = s->x;
         mc.n_embd = n_embd;
         mc.n_used = n_used;
-        /* a token is n_used axpys of n_embd: a few thousand elements per chunk at least */
-        tr_parallel_for(pool, n_tok, 1 + 65536 / (n_used * n_embd), mix_body, &mc);
+        tr_parallel_for(pool, n_tok, per_chunk, mix_body, &mc);
         tr_prof_end(prof, TR_PROF_EXPERT_MIX, t);
     }
 

@@ -40,7 +40,8 @@ def read_runs(path):
 
 
 def context_of(label):
-    m = re.search(r"-(\d+)(-again)?$", label)
+    # "after8-2048-again", and the "p2048-again" of tools/prefill_context.sh measure
+    m = re.search(r"(?:-|^p)(\d+)(-again)?$", label)
     return int(m.group(1)) if m else -1
 
 

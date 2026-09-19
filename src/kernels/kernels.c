@@ -33,6 +33,16 @@ static void k_axpy_f32(float *y, const float *x, float a, int64_t n) {
     for (int64_t k = 0; k < n; k++) y[k] = y[k] + a * x[k];
 }
 
+/* ---- 4 cache positions per call: the definition is 4 calls ------------------ */
+
+static void k_dot_f32_x4(const float *a, const float *b, int64_t stride, int64_t n, float *out) {
+    for (int j = 0; j < TR_ATTN_X; j++) out[j] = k_dot_f32(a, b + j * stride, n);
+}
+
+static void k_axpy_f32_x4(float *y, const float *x, int64_t stride, const float *a, int64_t n) {
+    for (int j = 0; j < TR_ATTN_X; j++) k_axpy_f32(y, x + j * stride, a[j], n);
+}
+
 /* ---- F32 ------------------------------------------------------------------ */
 
 static void k_dequant_f32(const void *row, float *out, int64_t n) {
@@ -153,6 +163,8 @@ static void build_scalar_table(tr_kernels *k) {
     k->tier = "scalar";
     k->dot_f32 = k_dot_f32;
     k->axpy_f32 = k_axpy_f32;
+    k->dot_f32_x4 = k_dot_f32_x4;
+    k->axpy_f32_x4 = k_axpy_f32_x4;
     k->dot_row[TR_TYPE_F32] = k_dot_row_f32;
     k->dot_row[TR_TYPE_F16] = k_dot_row_f16;
     k->dot_row[TR_TYPE_Q8_0] = k_dot_row_q8_0;
@@ -183,6 +195,11 @@ void tr_kernels_init(void) {
 
 const tr_kernels *tr_kernels_get(void) {
     return g_active;
+}
+
+void tr_kernels_set_active(const tr_kernels *k) {
+    g_active = k;
+    if (k == NULL) tr_kernels_init();
 }
 
 const tr_kernels *tr_kernels_tier(const char *tier) {
@@ -391,5 +408,47 @@ void tr_attention_head(const float *q, const float *keys, const float *values, i
     tr_softmax(scores, n_pos);
     for (int64_t d = 0; d < head_dim; d++) out[d] = 0.0f;
     for (int64_t t = 0; t < n_pos; t++) k->axpy_f32(out, values + t * stride + offset, scores[t], head_dim);
+}
+
+/* Block by block: a block of keys meets every query of the group that sees it, and fills its
+ * piece of their score rows; then the softmax of every row; then the values block by block. A
+ * query sees a block up to its own position, so the last blocks of a group are cut query by
+ * query. Inside a block the positions go 4 at a time, in increasing order. */
+void tr_attention_group(const float *q, int64_t q_stride, const float *keys, const float *values, int64_t n_q,
+                        int64_t first_n_pos, int64_t head_dim, float scale, float *scores, int64_t score_stride,
+                        float *out, int64_t out_stride) {
+    const tr_kernels *k = g_active != NULL ? g_active : tr_kernels_scalar();
+    int64_t last_n_pos = first_n_pos + n_q - 1;
+    for (int64_t t0 = 0; t0 < last_n_pos; t0 += TR_ATTN_BLOCK) {
+        int64_t t1 = t0 + TR_ATTN_BLOCK < last_n_pos ? t0 + TR_ATTN_BLOCK : last_n_pos;
+        int64_t j0 = t0 + 1 > first_n_pos ? t0 + 1 - first_n_pos : 0; /* the first query that sees t0 */
+        for (int64_t j = j0; j < n_q; j++) {
+            const float *qj = q + j * q_stride;
+            float *row = scores + j * score_stride;
+            int64_t n_pos = first_n_pos + j, end = t1 < n_pos ? t1 : n_pos, t = t0;
+            for (; t + TR_ATTN_X <= end; t += TR_ATTN_X) {
+                k->dot_f32_x4(qj, keys + t * head_dim, head_dim, head_dim, row + t);
+                for (int x = 0; x < TR_ATTN_X; x++) row[t + x] = row[t + x] * scale;
+            }
+            for (; t < end; t++) row[t] = k->dot_f32(qj, keys + t * head_dim, head_dim) * scale;
+        }
+    }
+    for (int64_t j = 0; j < n_q; j++) {
+        float *oj = out + j * out_stride;
+        tr_softmax(scores + j * score_stride, first_n_pos + j);
+        for (int64_t d = 0; d < head_dim; d++) oj[d] = 0.0f;
+    }
+    for (int64_t t0 = 0; t0 < last_n_pos; t0 += TR_ATTN_BLOCK) {
+        int64_t t1 = t0 + TR_ATTN_BLOCK < last_n_pos ? t0 + TR_ATTN_BLOCK : last_n_pos;
+        int64_t j0 = t0 + 1 > first_n_pos ? t0 + 1 - first_n_pos : 0;
+        for (int64_t j = j0; j < n_q; j++) {
+            float *oj = out + j * out_stride;
+            const float *row = scores + j * score_stride;
+            int64_t n_pos = first_n_pos + j, end = t1 < n_pos ? t1 : n_pos, t = t0;
+            for (; t + TR_ATTN_X <= end; t += TR_ATTN_X)
+                k->axpy_f32_x4(oj, values + t * head_dim, head_dim, row + t, head_dim);
+            for (; t < end; t++) k->axpy_f32(oj, values + t * head_dim, row[t], head_dim);
+        }
+    }
 }
 /* hot: end */

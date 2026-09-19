@@ -1,0 +1,39 @@
+# measure_guard.lib -- functions sourced by the scripts that measure on a still machine
+# (prefill_context.sh, decode_context.sh, threads_phase.sh, remeasure.sh). Two things a long
+# measurement needs and nobody gave it (docs/LEZIONI.md #82):
+#
+#   measure_begin <name>   one measurement at a time: a second script finds the lock of the first
+#                          and refuses to start (exit 5), instead of stopping containers and
+#                          running its models beside it. The lock of a script that died is
+#                          taken over. Then the machine is kept awake for as long as the
+#                          measurement lasts (tools/stay_awake.ps1, Windows only).
+#   measure_end            releases both; the caller puts it in its EXIT trap.
+#
+# Stopping a background task kills the shell that launched the script, not the script: a
+# measurement is stopped by killing the pid in build/.measuring.lock/pid.
+MEASURE_LOCK=build/.measuring.lock
+
+measure_begin() {
+  mkdir -p build
+  if ! mkdir $MEASURE_LOCK 2> /dev/null; then
+    MEASURE_OWNER=$(cat $MEASURE_LOCK/pid 2> /dev/null || true)
+    if [ -n "$MEASURE_OWNER" ] && kill -0 "$MEASURE_OWNER" 2> /dev/null; then
+      echo "$1: another measurement is running (pid $MEASURE_OWNER, $(cat $MEASURE_LOCK/name 2> /dev/null)): not starting"
+      exit 5
+    fi
+    rm -rf $MEASURE_LOCK
+    mkdir $MEASURE_LOCK
+  fi
+  echo $$ > $MEASURE_LOCK/pid
+  echo "$1" > $MEASURE_LOCK/name
+  MEASURE_MINE=1
+  if command -v powershell.exe > /dev/null 2>&1; then
+    MEASURE_FLAG=$(cygpath -w "$(pwd)/$MEASURE_LOCK/pid" 2> /dev/null || echo "$MEASURE_LOCK/pid")
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/stay_awake.ps1 "$MEASURE_FLAG" > /dev/null 2>&1 &
+  fi
+}
+
+measure_end() {
+  # only the script that took the lock gives it back: one that was refused must not free it
+  [ -z "$MEASURE_MINE" ] || rm -rf $MEASURE_LOCK
+}

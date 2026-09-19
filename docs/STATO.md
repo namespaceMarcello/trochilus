@@ -167,6 +167,28 @@ Sostituisci, non appendere. Tetto 40 KB. Lo storico sta in `archivio/FATTO.md`.
   esatto resta il 6-11%, sparso (domande 34-35); **da qui il decode a contesto lungo va più forte
   solo leggendo meno byte**, cioè con leve non esatte (KV a 16 o 8 bit, domanda 36), che decide
   Marcello.
+- 2026-09-19 — **Prefill su prompt lunghi: tre leve esatte, e il pezzo grosso che resta è `expf`**
+  (`docs/MISURE.md` §Prefill su prompt lunghi). L'ipotesi «l'attenzione del prompt è lettura ripetuta
+  di chiavi e valori» era vera a metà: smontata nel banco (`make bench-attn`), la zona è per il
+  51-72% **softmax**, cioè `expf` della libreria C (30 ns a chiamata con MinGW, 2.3 con glibc), per
+  il 27-37% prodotti e somma pesata, e la lettura ripetuta pesa solo a 4000 token, dallo 0 al 39%
+  secondo la run (64 MB di chiavi e valori contro 64 MB di L3: sul bordo). Scritte le leve esatte:
+  l'attenzione a **gruppi di 16 token** per testa su blocchi di 64 posizioni (`tr_attention_group`,
+  `dot_f32_x4`, `axpy_f32_x4`; il decode è un gruppo da uno), il **lavoro di un token solo diviso sul
+  pool** (norme, RoPE, KV, router, righe per gli esperti: era l'8% del prefill su un thread), e le
+  **righe F32 e F16 col kernel del tier** (il router girava sullo scalare in ogni tier e nessun test
+  lo vedeva: ora `tests/test_tier_used.c` pretende che ogni tipo di peso passi per il tier attivo, e
+  lo conta nel motore; LEZIONI #78). Prefill **1.05-1.08×
+  a 512, 1.07-1.08× a 2048, 1.11-1.14× a 4000** (A/A 2.1%), decode non distinguibile, logit identici
+  al byte sul modello vero anche su un prompt da 4000. Non scritto, perché lo decide Marcello: un
+  **`expf` nostro**. `make bench-expf` dice che quello di MinGW coincide con l'arrotondamento corretto
+  su tutti i 4.28 miliardi di float e quello di glibc no in 170 648: un nostro `expf` arrotondato
+  correttamente darebbe su Windows **gli stessi bit di oggi** e renderebbe Linux uguale a Windows
+  (oggi non lo sono). Stima: prefill 1.12× a 512, 1.23× a 2048, 1.27× a 4000, decode +5-10%.
+  **Preparato, non scritto** (MISURE §Prefill su prompt lunghi, punto 7): uno schizzo scalare nel
+  banco dà 0 differenze da MinGW su tutti i 4.28 miliardi di float a 3.7 ns (la libreria 30); su
+  Linux la KL contro il binario di prima è 3.9e-13 di media, 0 token diversi su 1000; costo circa
+  450 righe di C, una sessione.
 - 2026-09-19 — **Un tetto si misura con uno strumento suo** (`make bench-mem`), e il profiler dice
   per ogni zona quanti byte legge e a quanti GB/s: una zona al tetto è limitata dalla memoria, una
   sotto da altro (LEZIONI #75-#76). Le misure a più contesti stanno in **una** sessione di
@@ -174,8 +196,16 @@ Sostituisci, non appendere. Tetto 40 KB. Lo storico sta in `archivio/FATTO.md`.
 
 ## Problemi noti
 
-- Smart App Control di Windows blocca un .exe appena compilato anche per 20 minuti: correttezza in
-  Docker, misure native quando il binario passa (LEZIONI #12).
+- Smart App Control di Windows blocca un .exe appena compilato anche per 20 minuti, e il 2026-09-19
+  per **quattro ore**: il verdetto sull'hash resta in cache e il cloud viene richiamato ogni due ore
+  (registro eventi `CodeIntegrity`, evento 3118). Correttezza in Docker, misure native quando il
+  binario passa; dopo mezz'ora di attesa si compila una **seconda copia in un'altra cartella**, senza
+  toccare la prima, e si misura con quella che parte (`TROCHILUS=<binario>`; LEZIONI #12, #81).
+- **Le misure lunghe si proteggono da sole** (LEZIONI #82): dopo tre ore senza input Windows va in
+  standby e sospende tutto, e fermare un task in background non ferma lo script figlio. Gli script
+  di misura prendono un lock (`build/.measuring.lock`, una misura alla volta) e tengono sveglia la
+  macchina finché girano (`tools/measure_guard.lib`, `tools/stay_awake.ps1`); una misura si ferma
+  uccidendo il pid scritto nel lock.
 - Gli hook di progetto (`.claude/settings.json`) valgono solo se Claude Code parte dalla cartella
   `trochilus`: una sessione aperta dal Desktop non li carica, nemmeno dopo `/hooks` (LEZIONI #18).
 - RAM disponibile sul PC spesso ~10-14 GB su 31: i container Docker degli altri progetti (OpenEMR,
@@ -264,6 +294,18 @@ l'ipotesi del punto 6; trovata e scritta la leva esatta, la KV con le posizioni 
 `tools/decode_context.sh` (che prima di misurare prova che i due binari diano gli stessi logit al
 byte), `tools/decode_context_report.py`, e la guardia dei container in `ab_modes.sh`.
 
+Fatto il 2026-09-19, prefill su prompt lunghi (`docs/MISURE.md` §Prefill su prompt lunghi, LEZIONI
+#77-#82; ogni run in `build/prefill_context/`): l'attenzione del prompt smontata nel banco (softmax
+51-72%, lettura ripetuta solo a 4000 token), poi le tre leve esatte della decisione sopra: prefill
+1.05-1.08× a 512, 1.07-1.08× a 2048, 1.11-1.14× a 4000, decode non distinguibile, logit identici al
+byte. Chiuse le domande 7 e 30, aperte la 37 (`expf` nostro) e la 38 (gruppi con GQA e oltre 4096
+token), chiusa la 29 (kernel F16 dei tier: 49× sullo scalare). Nuovo nel cancello:
+`tests/test_tier_used.c` (ogni tipo di peso passa per il tier attivo, contato nel motore, sotto ogni
+tier), e la regola in `CLAUDE.md`: un test si vede rosso almeno una volta e dice quale ramo esercita.
+Nuovo per le misure: `make bench-attn`, `make bench-expf`, `tools/expf_quality.sh`, `tools/prefill_context.sh`
+(`bench`, `measure`, `change`), `tools/prefill_context_report.py`, `bench/scenarios-prefill-context.json`,
+`tools/mutate_prefill.sh`, il lock e la macchina sveglia negli script di misura.
+
 1. **Accendere `--spec` di default?** La condizione «caso peggiore come senza» **non è
    soddisfatta**: 0.953× dove il modello inventa, 1.175× dove ricopia (A/A, 8 giri). Cambiare le
    costanti della pausa non basta (replay coi costi misurati: al massimo 0.97-0.98×); la leva è il
@@ -284,13 +326,28 @@ byte), `tools/decode_context_report.py`, e la guardia dei container in `ab_modes
    spento di default, con l'oracolo che misura di quanto si spostano i logit. La strada esatta «8
    token nei registri» è misurata e scartata. Lo decide Marcello, che il 2026-09-19 ha chiesto se
    esiste altro fra float e int8: si misura nel banco la via di mezzo a 16 bit (domanda 33) prima
-   di decidere; le strade esatte che restano sono la parte seriale del prefill (domanda 30) e, per
-   il decode, i modelli a 4 bit. Ogni modo non esatto (int8, e la KV a 16 bit che il punto 6
+   di decidere; la parte seriale del prefill è fatta (punto 4), e dal lato esatto restano `expf`
+   (domanda 37: le moltiplicazioni sono il 77% del prefill a 512 e il 56% a 4000, il resto è
+   soprattutto `expf`) e, per il decode, i modelli a 4 bit. Ogni modo non esatto (int8, e la KV a 16 bit che il punto 6
    ora chiama in causa) si decide coi numeri di qualità davanti: token uguali e KL sul modello vero
    contro il modo esatto (`tools/compare_llamacpp.py` la calcola già: llama.cpp sta a 9e-3).
-4. Prefill su prompt lunghi (2048-4096), dove l'attenzione per token cresce col quadrato. Con la KV
-   per testa il prefill fa 235 tok/s a 512, 205 a 2048 e 166 a 4000 (erano 186 e 119), e la zona
-   dell'attenzione vale il 5%, il 18% e il 34% (domanda 7): è il prossimo pezzo da attaccare lì.
+4. Prefill su prompt lunghi: **la parte esatta è fatta** (decisione del 2026-09-19 sopra: 241-246
+   tok/s a 512, 211-213 a 2048, 180-182 a 4000). Restano, in ordine:
+   - **`expf` nostro, sì o no** (domanda 37, decide Marcello): è la leva più grande rimasta e la sola
+     quasi esatta. Softmax e attivazione degli esperti chiamano `expf` della libreria C, 30 ns con
+     MinGW; uno nostro arrotondato correttamente (C scalare come definizione, AVX identico al bit)
+     darebbe su Windows gli stessi bit di oggi, per prova esaustiva sui 2^32 float (`make
+     bench-expf`), e cambierebbe Linux dello 0.004% delle chiamate, di un'unità sull'ultima cifra.
+     Stima: prefill **1.12× a 512, 1.23× a 2048, 1.27× a 4000**, decode +5-10%. **È tutto pronto
+     per decidere** (MISURE §Prefill su prompt lunghi, punto 7): il test sui 2^32 float (`make
+     bench-expf`, col candidato dato alla compilazione) ha già girato su uno schizzo scalare nel
+     banco: 0 differenze da MinGW, 3.7 ns contro 30, strada lenta per 8 argomenti su 4 miliardi; la KL
+     su Linux contro il binario di prima (`tools/expf_quality.sh`) è 3.9e-13 di media, 0 token
+     diversi su 1000; il costo è circa 450 righe di C, una sessione, e il pezzo delicato è il SIMD.
+   - i gruppi dell'attenzione con **GQA** e oltre 4096 token (domanda 38), quando arriva
+     Qwen3-Coder: 8 teste di query per testa di chiavi possono stare nello stesso gruppo;
+   - la KV a 16 bit **non** serve più al prefill (chiavi e valori si leggono una volta per gruppo):
+     resta una leva del decode (punto 6).
 5. Confronto per componente (decisione sopra), poi le correzioni che ne escono. **Sì di Marcello il
    2026-09-19, su tre fonti**: colibri, ds4 e llama.cpp. È una revisione di ciò che è già costruito
    (kernel, grafo OLMoE, GGUF, pool), una cartella per volta. Nel grafo guardare anche come le tre

@@ -19,8 +19,11 @@ OUT=build/remeasure
 mkdir -p $OUT
 [ -f $B ] && [ -f $M ] || { echo "remeasure: $B or $M is missing"; exit 1; }
 
+# one measurement at a time, and the machine stays awake while it lasts (docs/LEZIONI.md #82)
+. tools/measure_guard.lib
+measure_begin remeasure
 RUNNING=$(docker ps -q 2>/dev/null || true)
-restart() { if [ -n "$RUNNING" ]; then docker start $RUNNING > /dev/null 2>&1 || true; echo "containers started again"; fi; }
+restart() { measure_end; if [ -n "$RUNNING" ]; then docker start $RUNNING > /dev/null 2>&1 || true; echo "containers started again"; fi; }
 trap restart EXIT INT TERM
 if [ -n "$RUNNING" ]; then
   # the VM's file cache goes back to Windows first (docs/LEZIONI.md #38), then everything stops

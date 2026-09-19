@@ -35,6 +35,10 @@ Obiettivo: a ogni richiesta il tasso di successo sale. Si misura in `docs/LEZION
 3. **Ogni errore diventa un controllo**: un test che lo riproduce (rosso prima del fix, verde
    dopo), o un controllo in `make check`, un pin, un hook. Una frase in un documento è
    prevenzione debole: si scrive *regola* e la lezione resta aperta.
+   **Un test si vede rosso almeno una volta, e dice quale ramo esercita**: rosso prima del fix,
+   o con una mutazione (`tools/mutate_*.sh`) quando il codice nasce insieme al test; in testa al
+   file sta scritto quale ramo prova, e un contatore (`TR_CHECK(n > 0)`) lo fa fallire se quel ramo
+   non è stato preso. Risultati uguali non dicono quale codice ha girato (LEZIONI #43, #50, #54, #78).
 4. **Ogni scenario nuovo entra nei test**: modello, famiglia, forma di tensore, piattaforma, uso
    (prompt lungo, contesto pieno, file malformato) diventa un caso nella suite giusta: test C
    in `tests/`, oracolo in `make oracle`, scenario di prestazioni in `bench/scenarios.json`.
@@ -102,9 +106,14 @@ sh tools/decode_context.sh measure | change <binario prima>   # decode a contest
 tools/.venv/Scripts/python.exe tools/decode_context_report.py speed|model|zones <file>   # le tabelle di MISURE dai file delle run
 make bench               # microbenchmark dei kernel (mediana + rumore)
 make bench-mem           # banda della RAM (in fila, sparsa), matmul del motore, attenzione sui due layout della KV
+make bench-attn          # l'attenzione di un prompt (512/2048/4000) su un layer, smontata per fasi, con controllo dei bit
+make bench-expf          # expf della libreria C: costo a chiamata, e su quanti dei 2^32 float non è arrotondato correttamente
+sh tools/prefill_context.sh measure | change <binario prima>   # prefill a 512/2048/4000 in una sessione, A/A, logit al byte, zone
+tools/.venv/Scripts/python.exe tools/prefill_context_report.py attn|zones <file>   # le tabelle di MISURE §Prefill su prompt lunghi
 make profile             # scenari col profiler, mediana di N, token identici, confronto col precedente
 make profile SCENARIOS=bench/scenarios-olmoe-1b-7b.json   # modello vero, 16/8/4/1 thread
 make profile SCENARIOS=bench/scenarios-decode-context.json   # modello vero, contesto 32/512/2048/4000: ms e byte per zona
+make profile SCENARIOS=bench/scenarios-prefill-context.json  # modello vero, prompt 512/2048/4000 a 16 thread e 512 a 1 thread
 tools/.venv/Scripts/python.exe tools/<script>.py    # su Linux/macOS: tools/.venv/bin/python
 ```
 

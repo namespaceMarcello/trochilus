@@ -2,7 +2,8 @@
 # tier_check.sh <build dir> <tiny fixture dir> — every kernel tier end to end, not only the best
 # one this CPU has. tests/test_kernels.c compares the kernels of each tier with scalar; this
 # runs the ENGINE under each tier (TR_CPU_MAX) and compares what comes out:
-#   1. the model tests (prefill, speculation, session) pass under scalar and avx2 too;
+#   1. the model tests (prefill, speculation, session, phase) pass under scalar and avx2 too, and
+#      under each of them the engine really goes through the active tier (test_tier_used);
 #   2. the logits of the tiny fixtures (f32, f16, q8_0) are the same bytes for every tier,
 #      thread count and -b.
 # A cap that did not take effect (a typo in TR_CPU_MAX is ignored by design) would turn all of
@@ -25,7 +26,7 @@ for tier in scalar avx2; do
         echo "$kernels" | grep -q "tier avx2 *not available" ||
             { echo "tier-check: TR_CPU_MAX=scalar did not cap the tier"; exit 1; }
     fi
-    for t in test_prefill test_spec test_session test_phase; do
+    for t in test_prefill test_spec test_session test_phase test_tier_used; do
         TR_CPU_MAX=$tier "$B/tests/$t" > "$OUT/$t-$tier.log" 2>&1 ||
             { echo "tier-check: $t fails under TR_CPU_MAX=$tier"; tail -5 "$OUT/$t-$tier.log"; exit 1; }
     done

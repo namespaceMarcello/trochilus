@@ -16,8 +16,8 @@
 /* ------------------------------------------------------------------ test */
 
 int main(int argc, char **argv) {
-    /* 1 layer, n_embd 8, 2 heads (1 kv), n_ff 4, 2 experts (1 used), vocab 4, context 8 */
-    static const synth_params P = {1, 8, 2, 1, 4, 2, 1, 4, 8, TR_TYPE_F32};
+    /* 1 layer, n_embd 8, 2 heads (1 kv), n_ff 4, 2 experts (1 used), vocab 4, context 32 */
+    static const synth_params P = {1, 8, 2, 1, 4, 2, 1, 4, 32, TR_TYPE_F32};
     char path[512];
     TR_CHECK(synth_write(&P, argc > 0 ? argv[0] : "", "test_model_prof_tmp.gguf", path, sizeof path) == 0);
 
@@ -83,11 +83,12 @@ int main(int argc, char **argv) {
         TR_CHECK_EQ_INT(prof2->acc[TR_PHASE_DECODE][TR_PROF_TOKEN].calls, 0);
         TR_CHECK(prof2->weight_bytes_touched[TR_PHASE_PREFILL] > 0);
 
-        /* bytes per zone: token i of the pass reads i + 1 cached positions of K and of V, once
-         * per query head (2 heads of 4 floats: 8 floats a position), so 1 + 2 + 3 positions;
-         * and what the zones read adds up to the totals of the phase */
+        /* bytes per zone: the 3 tokens of the pass are one group of attention, which reads the
+         * cached positions of K and of V its last token sees, once per query head (2 heads of 4
+         * floats: 8 floats a position), so 3 positions and not 1 + 2 + 3; and what the zones
+         * read adds up to the totals of the phase */
         const tr_prof_acc *acc = prof2->acc[TR_PHASE_PREFILL];
-        uint64_t kv_pass = (uint64_t)(1 + 2 + 3) * 8 * 2 * sizeof(float);
+        uint64_t kv_pass = (uint64_t)3 * 8 * 2 * sizeof(float);
         TR_CHECK_EQ_INT(prof2->kv_bytes_read[TR_PHASE_PREFILL], kv_pass);
         TR_CHECK_EQ_INT(acc[TR_PROF_ATTENTION].bytes, kv_pass);
         /* F32 weights: wq 8x8, wk and wv 4x8 (1 kv head), one expert of 3 matrices 4x8 */
@@ -104,6 +105,24 @@ int main(int argc, char **argv) {
         TR_CHECK_EQ_INT(prof2->kv_bytes_read[TR_PHASE_PREFILL], kv_pass);
 
         tr_session_free(sess2);
+    }
+
+    /* A pass longer than a group of attention (16 tokens): 20 tokens are a group of 16, whose
+     * last token sees 16 positions, and a group of 4, whose last sees 20; 5 more tokens at
+     * position 20 are one group that sees 25. */
+    tr_session *sess3 = tr_session_create(model, 0, 0, err, sizeof err);
+    TR_CHECK(sess3 != NULL);
+    if (sess3 != NULL) {
+        tr_prof *prof3 = tr_session_prof(sess3);
+        prof3->enabled = 1;
+        prof3->phase = TR_PHASE_PREFILL;
+        int32_t longer[25];
+        for (int i = 0; i < 25; i++) longer[i] = i % 4;
+        TR_CHECK(tr_session_eval(sess3, longer, 20) == 0);
+        TR_CHECK_EQ_INT(prof3->kv_bytes_read[TR_PHASE_PREFILL], (uint64_t)(16 + 20) * 8 * 2 * sizeof(float));
+        TR_CHECK(tr_session_eval(sess3, longer + 20, 5) == 0);
+        TR_CHECK_EQ_INT(prof3->kv_bytes_read[TR_PHASE_PREFILL], (uint64_t)(16 + 20 + 25) * 8 * 2 * sizeof(float));
+        tr_session_free(sess3);
     }
 
     free(logits_off);

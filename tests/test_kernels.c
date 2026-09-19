@@ -205,24 +205,44 @@ static void fill_q8_0(unsigned char *row, int64_t nb, unsigned *seed, int specia
 
 enum { CMP_MAX_N = 4096 + 17 };
 
+/* n halves: ordinary ones (any sign, exponent bits 1..30), or with `special` any 16 bits at
+ * all, so subnormals, zeros, infinities and NaNs too */
+static void fill_f16(unsigned char *row, int64_t n, unsigned *seed, int special) {
+    for (int64_t i = 0; i < n; i++) {
+        unsigned r = next_rand(seed);
+        uint16_t h = (uint16_t)((r >> 8) & 0xFFFFu);
+        if (!special || (r & 63u) != 0) h = (uint16_t)((h & 0x83FFu) | ((1u + (r >> 3) % 30u) << 10));
+        memcpy(row + 2 * i, &h, sizeof h);
+    }
+}
+
 /* Runs K and S on the same inputs; counts the calls whose results differ. */
 static void count_diffs(const tr_kernels *K, const tr_kernels *S, unsigned seed, int *bad_dot, int *bad_row,
-                        int *bad_axpy) {
-    static float a[CMP_MAX_N], b[CMP_MAX_N], yk[CMP_MAX_N], ys[CMP_MAX_N];
-    static unsigned char row[(4096 / 32) * 34];
+                        int *bad_axpy, int *bad_x4) {
+    static float a[CMP_MAX_N], b[CMP_MAX_N], yk[CMP_MAX_N], ys[CMP_MAX_N], y4[CMP_MAX_N];
+    static unsigned char row[(4096 / 32) * 34], hrow[2 * CMP_MAX_N];
     static const int64_t big[] = {255, 256, 257, 1000, 2048, 4096};
 
-    *bad_dot = *bad_row = *bad_axpy = 0;
+    *bad_dot = *bad_row = *bad_axpy = *bad_x4 = 0;
     for (int round = 0; round < 40; round++) {
         for (int i = 0; i < CMP_MAX_N; i++) {
             a[i] = rand_special(&seed, round % 2);
             b[i] = rand_special(&seed, round % 2);
         }
+        fill_f16(hrow, CMP_MAX_N, &seed, round % 2);
         /* every length up to 200 (all tails), then large rows, from two offsets */
         for (int64_t n = 0; n <= 200 + (int64_t)(sizeof big / sizeof big[0]); n++) {
             int64_t len = n <= 200 ? n : big[n - 201];
             for (int off = 0; off < 2; off++) {
                 if (!same_float(K->dot_f32(a + off, b + off, len), S->dot_f32(a + off, b + off, len))) (*bad_dot)++;
+                /* an F32 weight row (the router's): the tier's kernel against scalar's */
+                if (!same_float(K->dot_row[TR_TYPE_F32](a + off, b + off, len),
+                                S->dot_row[TR_TYPE_F32](a + off, b + off, len)))
+                    (*bad_row)++;
+                /* an F16 weight row: the tier's conversion and lanes against scalar's */
+                if (!same_float(K->dot_row[TR_TYPE_F16](hrow + 2 * off, b + off, len),
+                                S->dot_row[TR_TYPE_F16](hrow + 2 * off, b + off, len)))
+                    (*bad_row)++;
                 /* axpy: y from a, x from b; the elements past len must stay untouched */
                 float alpha = rand_special(&seed, round % 2);
                 memcpy(yk, a, sizeof yk);
@@ -232,6 +252,40 @@ static void count_diffs(const tr_kernels *K, const tr_kernels *S, unsigned seed,
                 for (int i = 0; i < CMP_MAX_N; i++) {
                     if (!same_float(yk[i], ys[i])) {
                         (*bad_axpy)++;
+                        break;
+                    }
+                }
+                /* 4 cache positions per call, rows of b a stride apart that is not the length:
+                 * the same as scalar's, and as the tier's own dot_f32 and axpy_f32 called 4
+                 * times in a row (the 4 rows must fit in b) */
+                int64_t stride = len + 3;
+                if (off + TR_ATTN_X * stride > CMP_MAX_N) continue;
+                float dk[TR_ATTN_X], ds[TR_ATTN_X], alpha4[TR_ATTN_X];
+                K->dot_f32_x4(a + off, b + off, stride, len, dk);
+                S->dot_f32_x4(a + off, b + off, stride, len, ds);
+                for (int j = 0; j < TR_ATTN_X; j++) {
+                    if (!same_float(dk[j], ds[j])) (*bad_x4)++;
+                    if (!same_float(dk[j], K->dot_f32(a + off, b + off + j * stride, len))) (*bad_x4)++;
+                    alpha4[j] = rand_special(&seed, round % 2);
+                }
+                /* the same F32 row, and the same F16 row, against 4 input rows */
+                K->dot_row_x4[TR_TYPE_F32](a + off, b + off, stride, len, dk);
+                S->dot_row_x4[TR_TYPE_F32](a + off, b + off, stride, len, ds);
+                for (int j = 0; j < TR_DOT_TOKENS; j++)
+                    if (!same_float(dk[j], ds[j])) (*bad_row)++;
+                K->dot_row_x4[TR_TYPE_F16](hrow + 2 * off, b + off, stride, len, dk);
+                S->dot_row_x4[TR_TYPE_F16](hrow + 2 * off, b + off, stride, len, ds);
+                for (int j = 0; j < TR_DOT_TOKENS; j++)
+                    if (!same_float(dk[j], ds[j])) (*bad_row)++;
+                memcpy(yk, a, sizeof yk);
+                memcpy(ys, a, sizeof ys);
+                memcpy(y4, a, sizeof y4);
+                K->axpy_f32_x4(yk + off, b + off, stride, alpha4, len);
+                S->axpy_f32_x4(ys + off, b + off, stride, alpha4, len);
+                for (int j = 0; j < TR_ATTN_X; j++) K->axpy_f32(y4 + off, b + off + j * stride, alpha4[j], len);
+                for (int i = 0; i < CMP_MAX_N; i++) {
+                    if (!same_float(yk[i], ys[i]) || !same_float(yk[i], y4[i])) {
+                        (*bad_x4)++;
                         break;
                     }
                 }
@@ -278,9 +332,22 @@ static float wrong_dot_row_q8_0(const void *row, const float *x, int64_t n) {
     return wrong_dot_f32(w, x, n);
 }
 
+static float wrong_dot_row_f16(const void *row, const float *x, int64_t n) {
+    static float w[CMP_MAX_N];
+    tr_kernels_tier("scalar")->dequant_row[TR_TYPE_F16](row, w, n);
+    return wrong_dot_f32(w, x, n);
+}
+
 /* Wrong only in rounding: a fused multiply-add, what FMA contraction would silently do. */
 static void wrong_axpy_f32(float *y, const float *x, float a, int64_t n) {
     for (int64_t k = 0; k < n; k++) y[k] = fmaf(a, x[k], y[k]);
+}
+
+/* Wrong only in rounding: the 4 products added to each other first and to y last, what a
+ * kernel that keeps y out of the chain of additions would do. */
+static void wrong_axpy_f32_x4(float *y, const float *x, int64_t stride, const float *a, int64_t n) {
+    for (int64_t k = 0; k < n; k++)
+        y[k] = y[k] + ((a[0] * x[k] + a[1] * x[stride + k]) + (a[2] * x[2 * stride + k] + a[3] * x[3 * stride + k]));
 }
 
 static void test_tiers_match_scalar(void) {
@@ -288,16 +355,29 @@ static void test_tiers_match_scalar(void) {
     const tr_kernels *S = tr_kernels_tier("scalar");
     TR_CHECK(S != NULL);
     if (S == NULL) return;
-    int bad_dot, bad_row, bad_axpy;
+    int bad_dot, bad_row, bad_axpy, bad_x4;
 
     tr_kernels wrong = *S;
     wrong.dot_f32 = wrong_dot_f32;
     wrong.axpy_f32 = wrong_axpy_f32;
     wrong.dot_row[TR_TYPE_Q8_0] = wrong_dot_row_q8_0;
-    count_diffs(&wrong, S, 7u, &bad_dot, &bad_row, &bad_axpy);
+    count_diffs(&wrong, S, 7u, &bad_dot, &bad_row, &bad_axpy, &bad_x4);
     TR_CHECK(bad_dot > 0);
     TR_CHECK(bad_row > 0);
     TR_CHECK(bad_axpy > 0);
+    /* the x4 kernels of `wrong` are still scalar's: they differ from its own wrong dot and axpy */
+    TR_CHECK(bad_x4 > 0);
+    wrong = *S;
+    wrong.axpy_f32_x4 = wrong_axpy_f32_x4;
+    count_diffs(&wrong, S, 7u, &bad_dot, &bad_row, &bad_axpy, &bad_x4);
+    TR_CHECK_EQ_INT(bad_dot + bad_row + bad_axpy, 0);
+    TR_CHECK(bad_x4 > 0);
+    /* and a wrong F16 row alone: the Q8_0 rows above must not be what made bad_row move */
+    wrong = *S;
+    wrong.dot_row[TR_TYPE_F16] = wrong_dot_row_f16;
+    count_diffs(&wrong, S, 7u, &bad_dot, &bad_row, &bad_axpy, &bad_x4);
+    TR_CHECK_EQ_INT(bad_dot + bad_axpy + bad_x4, 0);
+    TR_CHECK(bad_row > 0);
 
     for (size_t t = 0; t < sizeof tiers / sizeof tiers[0]; t++) {
         const tr_kernels *K = tr_kernels_tier(tiers[t]);
@@ -305,12 +385,16 @@ static void test_tiers_match_scalar(void) {
             printf("  tier %-8s not available on this CPU: skipped\n", tiers[t]);
             continue;
         }
-        count_diffs(K, S, 2026u + (unsigned)t, &bad_dot, &bad_row, &bad_axpy);
+        /* same numbers says nothing on WHICH function ran: that the tier's entries are its own,
+         * and that the engine goes through them, is tests/test_tier_used.c */
+        count_diffs(K, S, 2026u + (unsigned)t, &bad_dot, &bad_row, &bad_axpy, &bad_x4);
         TR_CHECK_EQ_INT(bad_dot, 0);
         TR_CHECK_EQ_INT(bad_row, 0);
         TR_CHECK_EQ_INT(bad_axpy, 0);
-        printf("  tier %-8s dot_f32, axpy_f32 and dot_row q8_0 %s\n", K->tier,
-               bad_dot == 0 && bad_row == 0 && bad_axpy == 0 ? "identical to scalar" : "DIFFER from scalar");
+        TR_CHECK_EQ_INT(bad_x4, 0);
+        printf("  tier %-8s dot_f32, axpy_f32, their x4, dot_row and dot_row_x4 of f32, f16 and q8_0 %s\n", K->tier,
+               bad_dot == 0 && bad_row == 0 && bad_axpy == 0 && bad_x4 == 0 ? "identical to scalar"
+                                                                            : "DIFFER from scalar");
     }
 }
 
@@ -431,6 +515,57 @@ static void test_attention_head(void) {
         }
     }
     TR_CHECK_EQ_INT(bad, 0);
+}
+
+/* tr_attention_group: every query of a group gets the bits tr_attention_head gives it alone,
+ * scores included, and nothing is written outside its own slice of the output or past the end
+ * of its own row of scores. Groups start and
+ * end all around the borders of a block of positions (TR_ATTN_BLOCK) and of the 4 positions of
+ * an x4 kernel; strides are wider than what is used. */
+static void test_attention_group(void) {
+    enum { MAX_POS = 300, MAX_DIM = 130, MAX_Q = 19, SCORE_STRIDE = MAX_POS + 7 };
+    static const int64_t dims[] = {1, 5, 16, 100, 128};
+    static const int64_t firsts[] = {1, 2, 3, 4, 5, 61, 63, 64, 65, 66, 127, 128, 129, 190, 250};
+    static const int64_t groups[] = {1, 2, 3, 4, 5, 16, 19};
+    static float q[MAX_Q * 2 * MAX_DIM], got[MAX_Q * 3 * MAX_DIM], want[MAX_DIM];
+    static float keys[MAX_POS * MAX_DIM], values[MAX_POS * MAX_DIM];
+    static float s_got[MAX_Q * SCORE_STRIDE], s_want[MAX_POS];
+    unsigned seed = 17u;
+    int bad = 0, cases = 0;
+    TR_CHECK(TR_ATTN_BLOCK == 64); /* the borders above are chosen around 64 and 128 */
+    for (size_t di = 0; di < sizeof dims / sizeof dims[0]; di++) {
+        int64_t dim = dims[di], q_stride = 2 * dim, out_stride = 3 * dim;
+        float scale = 1.0f / sqrtf((float)dim);
+        for (size_t fi = 0; fi < sizeof firsts / sizeof firsts[0]; fi++) {
+            for (size_t gi = 0; gi < sizeof groups / sizeof groups[0]; gi++) {
+                int64_t first = firsts[fi], n_q = groups[gi], last = first + n_q - 1;
+                if (last > MAX_POS) continue;
+                /* small q: scores spread over many positions instead of one-hot softmax */
+                for (int64_t i = 0; i < n_q * q_stride; i++) q[i] = rand_float(&seed) * 0.01f;
+                for (int64_t i = 0; i < last * dim; i++) {
+                    keys[i] = rand_float(&seed);
+                    values[i] = rand_float(&seed);
+                }
+                for (int64_t i = 0; i < n_q * out_stride; i++) got[i] = 7.0f;
+                for (int64_t i = 0; i < n_q * SCORE_STRIDE; i++) s_got[i] = 7.0f;
+                tr_attention_group(q, q_stride, keys, values, n_q, first, dim, scale, s_got, SCORE_STRIDE, got,
+                                   out_stride);
+                for (int64_t j = 0; j < n_q; j++) {
+                    tr_attention_head(q + j * q_stride, keys, values, dim, 0, first + j, dim, scale, s_want, want);
+                    if (memcmp(got + j * out_stride, want, (size_t)dim * sizeof(float)) != 0) bad++;
+                    if (memcmp(s_got + j * SCORE_STRIDE, s_want, (size_t)(first + j) * sizeof(float)) != 0) bad++;
+                    for (int64_t d = dim; d < out_stride; d++) bad += got[j * out_stride + d] != 7.0f;
+                    /* a query's row of scores is as long as its context: not a float further */
+                    for (int64_t t = first + j; t < SCORE_STRIDE; t++) bad += s_got[j * SCORE_STRIDE + t] != 7.0f;
+                }
+                cases++;
+            }
+        }
+    }
+    TR_CHECK_EQ_INT(bad, 0);
+    printf("  tr_attention_group: %d groups (1..19 queries, first context 1..250, head_dim 1..128) identical to "
+           "tr_attention_head query by query\n",
+           cases);
 }
 
 /* ---- tr_matmul: identical output regardless of thread count --------------- */
@@ -572,6 +707,7 @@ int main(void) {
     test_rope_table();
     test_swiglu_threads();
     test_attention_head();
+    test_attention_group();
     test_matmul_thread_determinism();
     test_matmul_grouped();
 

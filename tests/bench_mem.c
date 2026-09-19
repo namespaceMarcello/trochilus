@@ -18,7 +18,9 @@
  *                          cache shaped like OLMoE-1B-7B's (16 layers, 16 heads of 128, f32, K
  *                          and V, context 4096), with 64 MiB of other memory read between two
  *                          layers as the engine reads its weights (not timed). The real kernel
- *                          (tr_attention_head) and plain reads of the same bytes, in two layouts:
+ *                          (tr_attention_group as the engine calls it, a group of one query, on
+ *                          the heads layout; tr_attention_head on the rows layout the engine had
+ *                          before) and plain reads of the same bytes, in two layouts:
  *                            rows     [position][head]: a head reads 512 B every 8 KiB
  *                            heads    [head][position]: a head reads its positions in a row
  *
@@ -326,6 +328,10 @@ static void kv_body(void *ctx_, int64_t begin, int64_t end, int worker) {
             for (int64_t t = 0; t < c->n_pos; t++)
                 s += read_bytes((const unsigned char *)(v + t * stride + offset), HEAD_DIM * sizeof(float));
             sinks[worker].sum += s;
+        } else if (c->by_head) {
+            /* the engine's call: a decode token is a group of one query */
+            tr_attention_group(c->q + h * HEAD_DIM, HEAD_DIM, k, v, 1, c->n_pos, HEAD_DIM, scale,
+                               c->scores + (int64_t)worker * KV_CTX, KV_CTX, c->out + h * HEAD_DIM, HEAD_DIM);
         } else {
             tr_attention_head(c->q + h * HEAD_DIM, k, v, stride, offset, c->n_pos, HEAD_DIM, scale,
                               c->scores + (int64_t)worker * KV_CTX, c->out + h * HEAD_DIM);

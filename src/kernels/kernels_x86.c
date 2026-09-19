@@ -48,6 +48,163 @@ static void avx2_axpy_f32(float *y, const float *x, float a, int64_t n) {
     for (; k < n; k++) y[k] = y[k] + a * x[k];
 }
 
+/* One a against 4 b: a is loaded once per 16 elements, each b keeps its own lo and hi, named
+ * registers as in dot_row_x4 below. out[j] is bit for bit avx2_dot_f32(a, b + j*stride, n). */
+TR_TARGET_AVX2
+static void avx2_dot_f32_x4(const float *a, const float *b, int64_t stride, int64_t n, float *out) {
+    const float *b0 = b, *b1 = b0 + stride, *b2 = b1 + stride, *b3 = b2 + stride;
+    __m256 lo0 = _mm256_setzero_ps(), lo1 = _mm256_setzero_ps(), lo2 = _mm256_setzero_ps(),
+           lo3 = _mm256_setzero_ps();
+    __m256 hi0 = _mm256_setzero_ps(), hi1 = _mm256_setzero_ps(), hi2 = _mm256_setzero_ps(),
+           hi3 = _mm256_setzero_ps();
+    int64_t k = 0;
+    for (; k + TR_LANES <= n; k += TR_LANES) {
+        __m256 alo = _mm256_loadu_ps(a + k), ahi = _mm256_loadu_ps(a + k + 8);
+        lo0 = _mm256_add_ps(lo0, _mm256_mul_ps(alo, _mm256_loadu_ps(b0 + k)));
+        hi0 = _mm256_add_ps(hi0, _mm256_mul_ps(ahi, _mm256_loadu_ps(b0 + k + 8)));
+        lo1 = _mm256_add_ps(lo1, _mm256_mul_ps(alo, _mm256_loadu_ps(b1 + k)));
+        hi1 = _mm256_add_ps(hi1, _mm256_mul_ps(ahi, _mm256_loadu_ps(b1 + k + 8)));
+        lo2 = _mm256_add_ps(lo2, _mm256_mul_ps(alo, _mm256_loadu_ps(b2 + k)));
+        hi2 = _mm256_add_ps(hi2, _mm256_mul_ps(ahi, _mm256_loadu_ps(b2 + k + 8)));
+        lo3 = _mm256_add_ps(lo3, _mm256_mul_ps(alo, _mm256_loadu_ps(b3 + k)));
+        hi3 = _mm256_add_ps(hi3, _mm256_mul_ps(ahi, _mm256_loadu_ps(b3 + k + 8)));
+    }
+    float l0[TR_LANES], l1[TR_LANES], l2[TR_LANES], l3[TR_LANES];
+    _mm256_storeu_ps(l0, lo0);
+    _mm256_storeu_ps(l0 + 8, hi0);
+    _mm256_storeu_ps(l1, lo1);
+    _mm256_storeu_ps(l1 + 8, hi1);
+    _mm256_storeu_ps(l2, lo2);
+    _mm256_storeu_ps(l2 + 8, hi2);
+    _mm256_storeu_ps(l3, lo3);
+    _mm256_storeu_ps(l3 + 8, hi3);
+    for (; k < n; k++) {
+        l0[k % TR_LANES] += a[k] * b0[k];
+        l1[k % TR_LANES] += a[k] * b1[k];
+        l2[k % TR_LANES] += a[k] * b2[k];
+        l3[k % TR_LANES] += a[k] * b3[k];
+    }
+    out[0] = tr_lane_combine(l0);
+    out[1] = tr_lane_combine(l1);
+    out[2] = tr_lane_combine(l2);
+    out[3] = tr_lane_combine(l3);
+}
+
+/* 4 axpys on one y, in order: y is loaded and stored once per 8 elements instead of 4 times.
+ * Bit for bit 4 calls of avx2_axpy_f32. */
+TR_TARGET_AVX2
+static void avx2_axpy_f32_x4(float *y, const float *x, int64_t stride, const float *a, int64_t n) {
+    const float *x0 = x, *x1 = x0 + stride, *x2 = x1 + stride, *x3 = x2 + stride;
+    __m256 a0 = _mm256_set1_ps(a[0]), a1 = _mm256_set1_ps(a[1]), a2 = _mm256_set1_ps(a[2]),
+           a3 = _mm256_set1_ps(a[3]);
+    int64_t k = 0;
+    for (; k + 8 <= n; k += 8) {
+        __m256 v = _mm256_loadu_ps(y + k);
+        v = _mm256_add_ps(v, _mm256_mul_ps(a0, _mm256_loadu_ps(x0 + k)));
+        v = _mm256_add_ps(v, _mm256_mul_ps(a1, _mm256_loadu_ps(x1 + k)));
+        v = _mm256_add_ps(v, _mm256_mul_ps(a2, _mm256_loadu_ps(x2 + k)));
+        v = _mm256_add_ps(v, _mm256_mul_ps(a3, _mm256_loadu_ps(x3 + k)));
+        _mm256_storeu_ps(y + k, v);
+    }
+    for (; k < n; k++) {
+        float v = y[k];
+        v = v + a[0] * x0[k];
+        v = v + a[1] * x1[k];
+        v = v + a[2] * x2[k];
+        v = v + a[3] * x3[k];
+        y[k] = v;
+    }
+}
+
+/* An F32 weight row is a plain dot_f32 of the row with x, and against 4 input rows it is
+ * dot_f32_x4 with the row as `a`: the tier's own kernels instead of the scalar loop (the
+ * router's matrix is F32 in every GGUF). */
+_Static_assert(TR_DOT_TOKENS == TR_ATTN_X, "x4"); /* hot-ok: stringa -- a compile-time message, no code */
+
+TR_TARGET_AVX2
+static float avx2_dot_row_f32(const void *row, const float *x, int64_t n) {
+    return avx2_dot_f32((const float *)row, x, n);
+}
+
+TR_TARGET_AVX2
+static void avx2_dot_row_x4_f32(const void *row, const float *x, int64_t stride, int64_t n, float *out) {
+    avx2_dot_f32_x4((const float *)row, x, stride, n, out);
+}
+
+/* F16 rows: 8 halves become 8 floats with one F16C instruction, an exact conversion (what
+ * tr_half_to_float computes, subnormals included), then the products go into the lanes as in
+ * dot_f32. The tail converts half by half, as scalar does. */
+#define TR_TARGET_AVX2_F16C __attribute__((target("avx2,f16c")))
+
+TR_TARGET_AVX2_F16C
+static inline __m256 avx2_f16_to_ps(const unsigned char *p) {
+    return _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(const void *)p));
+}
+
+static inline float tail_half(const unsigned char *row, int64_t k) {
+    uint16_t h;
+    memcpy(&h, row + 2 * (size_t)k, sizeof h);
+    return tr_half_to_float(h);
+}
+
+TR_TARGET_AVX2_F16C
+static float avx2_dot_row_f16(const void *row, const float *x, int64_t n) {
+    const unsigned char *p = (const unsigned char *)row;
+    __m256 lo = _mm256_setzero_ps(), hi = _mm256_setzero_ps();
+    int64_t k = 0;
+    for (; k + TR_LANES <= n; k += TR_LANES) {
+        lo = _mm256_add_ps(lo, _mm256_mul_ps(avx2_f16_to_ps(p + 2 * k), _mm256_loadu_ps(x + k)));
+        hi = _mm256_add_ps(hi, _mm256_mul_ps(avx2_f16_to_ps(p + 2 * k + 16), _mm256_loadu_ps(x + k + 8)));
+    }
+    float lane[TR_LANES];
+    _mm256_storeu_ps(lane, lo);
+    _mm256_storeu_ps(lane + 8, hi);
+    for (; k < n; k++) lane[k % TR_LANES] += tail_half(p, k) * x[k];
+    return tr_lane_combine(lane);
+}
+
+TR_TARGET_AVX2_F16C
+static void avx2_dot_row_x4_f16(const void *row, const float *x, int64_t stride, int64_t n, float *out) {
+    const unsigned char *p = (const unsigned char *)row;
+    const float *x0 = x, *x1 = x0 + stride, *x2 = x1 + stride, *x3 = x2 + stride;
+    __m256 lo0 = _mm256_setzero_ps(), lo1 = _mm256_setzero_ps(), lo2 = _mm256_setzero_ps(),
+           lo3 = _mm256_setzero_ps();
+    __m256 hi0 = _mm256_setzero_ps(), hi1 = _mm256_setzero_ps(), hi2 = _mm256_setzero_ps(),
+           hi3 = _mm256_setzero_ps();
+    int64_t k = 0;
+    for (; k + TR_LANES <= n; k += TR_LANES) {
+        __m256 w0 = avx2_f16_to_ps(p + 2 * k), w1 = avx2_f16_to_ps(p + 2 * k + 16);
+        lo0 = _mm256_add_ps(lo0, _mm256_mul_ps(w0, _mm256_loadu_ps(x0 + k)));
+        hi0 = _mm256_add_ps(hi0, _mm256_mul_ps(w1, _mm256_loadu_ps(x0 + k + 8)));
+        lo1 = _mm256_add_ps(lo1, _mm256_mul_ps(w0, _mm256_loadu_ps(x1 + k)));
+        hi1 = _mm256_add_ps(hi1, _mm256_mul_ps(w1, _mm256_loadu_ps(x1 + k + 8)));
+        lo2 = _mm256_add_ps(lo2, _mm256_mul_ps(w0, _mm256_loadu_ps(x2 + k)));
+        hi2 = _mm256_add_ps(hi2, _mm256_mul_ps(w1, _mm256_loadu_ps(x2 + k + 8)));
+        lo3 = _mm256_add_ps(lo3, _mm256_mul_ps(w0, _mm256_loadu_ps(x3 + k)));
+        hi3 = _mm256_add_ps(hi3, _mm256_mul_ps(w1, _mm256_loadu_ps(x3 + k + 8)));
+    }
+    float l0[TR_LANES], l1[TR_LANES], l2[TR_LANES], l3[TR_LANES];
+    _mm256_storeu_ps(l0, lo0);
+    _mm256_storeu_ps(l0 + 8, hi0);
+    _mm256_storeu_ps(l1, lo1);
+    _mm256_storeu_ps(l1 + 8, hi1);
+    _mm256_storeu_ps(l2, lo2);
+    _mm256_storeu_ps(l2 + 8, hi2);
+    _mm256_storeu_ps(l3, lo3);
+    _mm256_storeu_ps(l3 + 8, hi3);
+    for (; k < n; k++) {
+        float w = tail_half(p, k);
+        l0[k % TR_LANES] += w * x0[k];
+        l1[k % TR_LANES] += w * x1[k];
+        l2[k % TR_LANES] += w * x2[k];
+        l3[k % TR_LANES] += w * x3[k];
+    }
+    out[0] = tr_lane_combine(l0);
+    out[1] = tr_lane_combine(l1);
+    out[2] = tr_lane_combine(l2);
+    out[3] = tr_lane_combine(l3);
+}
+
 /* 8 int8 at p -> 8 exact floats */
 TR_TARGET_AVX2
 static inline __m256 avx2_i8_to_ps(const unsigned char *p) {
@@ -107,6 +264,128 @@ static void avx512_axpy_f32(float *y, const float *x, float a, int64_t n) {
         __m512 prod = _mm512_mul_ps(va, _mm512_maskz_loadu_ps(m, x + k));
         _mm512_mask_storeu_ps(y + k, m, _mm512_add_ps(_mm512_maskz_loadu_ps(m, y + k), prod));
     }
+}
+
+/* One a against 4 b, an accumulator per b in a named register. out[j] is bit for bit
+ * avx512_dot_f32(a, b + j*stride, n), tail included. */
+TR_TARGET_AVX512
+static void avx512_dot_f32_x4(const float *a, const float *b, int64_t stride, int64_t n, float *out) {
+    const float *b0 = b, *b1 = b0 + stride, *b2 = b1 + stride, *b3 = b2 + stride;
+    __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps(), acc2 = _mm512_setzero_ps(),
+           acc3 = _mm512_setzero_ps();
+    int64_t k = 0;
+    for (; k + TR_LANES <= n; k += TR_LANES) {
+        __m512 av = _mm512_loadu_ps(a + k);
+        acc0 = _mm512_add_ps(acc0, _mm512_mul_ps(av, _mm512_loadu_ps(b0 + k)));
+        acc1 = _mm512_add_ps(acc1, _mm512_mul_ps(av, _mm512_loadu_ps(b1 + k)));
+        acc2 = _mm512_add_ps(acc2, _mm512_mul_ps(av, _mm512_loadu_ps(b2 + k)));
+        acc3 = _mm512_add_ps(acc3, _mm512_mul_ps(av, _mm512_loadu_ps(b3 + k)));
+    }
+    if (k < n) {
+        __mmask16 m = (__mmask16)((1u << (unsigned)(n - k)) - 1u);
+        __m512 av = _mm512_maskz_loadu_ps(m, a + k);
+        acc0 = _mm512_mask_add_ps(acc0, m, acc0, _mm512_mul_ps(av, _mm512_maskz_loadu_ps(m, b0 + k)));
+        acc1 = _mm512_mask_add_ps(acc1, m, acc1, _mm512_mul_ps(av, _mm512_maskz_loadu_ps(m, b1 + k)));
+        acc2 = _mm512_mask_add_ps(acc2, m, acc2, _mm512_mul_ps(av, _mm512_maskz_loadu_ps(m, b2 + k)));
+        acc3 = _mm512_mask_add_ps(acc3, m, acc3, _mm512_mul_ps(av, _mm512_maskz_loadu_ps(m, b3 + k)));
+    }
+    float lane[TR_LANES];
+    _mm512_storeu_ps(lane, acc0);
+    out[0] = tr_lane_combine(lane);
+    _mm512_storeu_ps(lane, acc1);
+    out[1] = tr_lane_combine(lane);
+    _mm512_storeu_ps(lane, acc2);
+    out[2] = tr_lane_combine(lane);
+    _mm512_storeu_ps(lane, acc3);
+    out[3] = tr_lane_combine(lane);
+}
+
+/* 4 axpys on one y, in order, y loaded and stored once per 16 elements. Bit for bit 4 calls of
+ * avx512_axpy_f32. */
+TR_TARGET_AVX512
+static void avx512_axpy_f32_x4(float *y, const float *x, int64_t stride, const float *a, int64_t n) {
+    const float *x0 = x, *x1 = x0 + stride, *x2 = x1 + stride, *x3 = x2 + stride;
+    __m512 a0 = _mm512_set1_ps(a[0]), a1 = _mm512_set1_ps(a[1]), a2 = _mm512_set1_ps(a[2]),
+           a3 = _mm512_set1_ps(a[3]);
+    int64_t k = 0;
+    for (; k + TR_LANES <= n; k += TR_LANES) {
+        __m512 v = _mm512_loadu_ps(y + k);
+        v = _mm512_add_ps(v, _mm512_mul_ps(a0, _mm512_loadu_ps(x0 + k)));
+        v = _mm512_add_ps(v, _mm512_mul_ps(a1, _mm512_loadu_ps(x1 + k)));
+        v = _mm512_add_ps(v, _mm512_mul_ps(a2, _mm512_loadu_ps(x2 + k)));
+        v = _mm512_add_ps(v, _mm512_mul_ps(a3, _mm512_loadu_ps(x3 + k)));
+        _mm512_storeu_ps(y + k, v);
+    }
+    if (k < n) {
+        __mmask16 m = (__mmask16)((1u << (unsigned)(n - k)) - 1u);
+        __m512 v = _mm512_maskz_loadu_ps(m, y + k);
+        v = _mm512_add_ps(v, _mm512_mul_ps(a0, _mm512_maskz_loadu_ps(m, x0 + k)));
+        v = _mm512_add_ps(v, _mm512_mul_ps(a1, _mm512_maskz_loadu_ps(m, x1 + k)));
+        v = _mm512_add_ps(v, _mm512_mul_ps(a2, _mm512_maskz_loadu_ps(m, x2 + k)));
+        v = _mm512_add_ps(v, _mm512_mul_ps(a3, _mm512_maskz_loadu_ps(m, x3 + k)));
+        _mm512_mask_storeu_ps(y + k, m, v);
+    }
+}
+
+TR_TARGET_AVX512
+static float avx512_dot_row_f32(const void *row, const float *x, int64_t n) {
+    return avx512_dot_f32((const float *)row, x, n);
+}
+
+TR_TARGET_AVX512
+static void avx512_dot_row_x4_f32(const void *row, const float *x, int64_t stride, int64_t n, float *out) {
+    avx512_dot_f32_x4((const float *)row, x, stride, n, out);
+}
+
+/* F16 rows: 16 halves become 16 floats with one instruction (exact), then as dot_f32. */
+TR_TARGET_AVX512
+static inline __m512 avx512_f16_to_ps(const unsigned char *p) {
+    return _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(const void *)p));
+}
+
+TR_TARGET_AVX512
+static float avx512_dot_row_f16(const void *row, const float *x, int64_t n) {
+    const unsigned char *p = (const unsigned char *)row;
+    __m512 acc = _mm512_setzero_ps();
+    int64_t k = 0;
+    for (; k + TR_LANES <= n; k += TR_LANES)
+        acc = _mm512_add_ps(acc, _mm512_mul_ps(avx512_f16_to_ps(p + 2 * k), _mm512_loadu_ps(x + k)));
+    float lane[TR_LANES];
+    _mm512_storeu_ps(lane, acc);
+    for (; k < n; k++) lane[k % TR_LANES] += tail_half(p, k) * x[k];
+    return tr_lane_combine(lane);
+}
+
+TR_TARGET_AVX512
+static void avx512_dot_row_x4_f16(const void *row, const float *x, int64_t stride, int64_t n, float *out) {
+    const unsigned char *p = (const unsigned char *)row;
+    const float *x0 = x, *x1 = x0 + stride, *x2 = x1 + stride, *x3 = x2 + stride;
+    __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps(), acc2 = _mm512_setzero_ps(),
+           acc3 = _mm512_setzero_ps();
+    int64_t k = 0;
+    for (; k + TR_LANES <= n; k += TR_LANES) {
+        __m512 w = avx512_f16_to_ps(p + 2 * k);
+        acc0 = _mm512_add_ps(acc0, _mm512_mul_ps(w, _mm512_loadu_ps(x0 + k)));
+        acc1 = _mm512_add_ps(acc1, _mm512_mul_ps(w, _mm512_loadu_ps(x1 + k)));
+        acc2 = _mm512_add_ps(acc2, _mm512_mul_ps(w, _mm512_loadu_ps(x2 + k)));
+        acc3 = _mm512_add_ps(acc3, _mm512_mul_ps(w, _mm512_loadu_ps(x3 + k)));
+    }
+    float l0[TR_LANES], l1[TR_LANES], l2[TR_LANES], l3[TR_LANES];
+    _mm512_storeu_ps(l0, acc0);
+    _mm512_storeu_ps(l1, acc1);
+    _mm512_storeu_ps(l2, acc2);
+    _mm512_storeu_ps(l3, acc3);
+    for (; k < n; k++) {
+        float w = tail_half(p, k);
+        l0[k % TR_LANES] += w * x0[k];
+        l1[k % TR_LANES] += w * x1[k];
+        l2[k % TR_LANES] += w * x2[k];
+        l3[k % TR_LANES] += w * x3[k];
+    }
+    out[0] = tr_lane_combine(l0);
+    out[1] = tr_lane_combine(l1);
+    out[2] = tr_lane_combine(l2);
+    out[3] = tr_lane_combine(l3);
 }
 
 TR_TARGET_AVX512
@@ -229,6 +508,14 @@ const tr_kernels *tr_kernels_x86_tier(const char *tier) {
             g_avx2.tier = "avx2";
             g_avx2.dot_f32 = avx2_dot_f32;
             g_avx2.axpy_f32 = avx2_axpy_f32;
+            g_avx2.dot_f32_x4 = avx2_dot_f32_x4;
+            g_avx2.axpy_f32_x4 = avx2_axpy_f32_x4;
+            g_avx2.dot_row[TR_TYPE_F32] = avx2_dot_row_f32;
+            g_avx2.dot_row_x4[TR_TYPE_F32] = avx2_dot_row_x4_f32;
+            if (c->f16c) {
+                g_avx2.dot_row[TR_TYPE_F16] = avx2_dot_row_f16;
+                g_avx2.dot_row_x4[TR_TYPE_F16] = avx2_dot_row_x4_f16;
+            }
             g_avx2.dot_row[TR_TYPE_Q8_0] = avx2_dot_row_q8_0;
             g_avx2.dot_row_x4[TR_TYPE_Q8_0] = avx2_dot_row_x4_q8_0;
             g_avx2_built = 1;
@@ -242,6 +529,12 @@ const tr_kernels *tr_kernels_x86_tier(const char *tier) {
             g_avx512.tier = "avx512";
             g_avx512.dot_f32 = avx512_dot_f32;
             g_avx512.axpy_f32 = avx512_axpy_f32;
+            g_avx512.dot_f32_x4 = avx512_dot_f32_x4;
+            g_avx512.axpy_f32_x4 = avx512_axpy_f32_x4;
+            g_avx512.dot_row[TR_TYPE_F32] = avx512_dot_row_f32;
+            g_avx512.dot_row_x4[TR_TYPE_F32] = avx512_dot_row_x4_f32;
+            g_avx512.dot_row[TR_TYPE_F16] = avx512_dot_row_f16;
+            g_avx512.dot_row_x4[TR_TYPE_F16] = avx512_dot_row_x4_f16;
             g_avx512.dot_row[TR_TYPE_Q8_0] = avx512_dot_row_q8_0;
             g_avx512.dot_row_x4[TR_TYPE_Q8_0] = avx512_dot_row_x4_q8_0;
             g_avx512_built = 1;
