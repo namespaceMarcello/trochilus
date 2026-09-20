@@ -1,0 +1,55 @@
+Explain what this file does, then list its weak points.
+# seven minutes into a measurement). Example: AB_GUARD='[ -z "$(docker ps -q)" ]'.
+set -e
+# The body is one function, called on the last line: the shell parses all of it before it runs
+# any, so editing this file while it runs cannot change a run under way (docs/LEZIONI.md #69).
+main() {
+ROUNDS=$1
+if [ -z "$ROUNDS" ] || [ $# -lt 3 ]; then
+  echo "usage: ab_modes.sh <rounds> \"label=command\" \"label=command\" [...]" >&2
+  exit 2
+fi
+shift
+M=$#
+OUT=$(mktemp)
+R=0
+while [ "$R" -le "$ROUNDS" ]; do
+  I=0
+  while [ "$I" -lt "$M" ]; do
+    K=$(( (R + I) % M + 1 ))
+    eval "MODE=\${$K}"
+    LABEL=${MODE%%=*}
+    CMD=${MODE#*=}
+    if [ -n "$AB_GUARD" ] && ! sh -c "$AB_GUARD" > /dev/null 2>&1; then
+      echo "ab_modes: the guard '$AB_GUARD' failed before '$LABEL' round $R: the machine changed, stopping." >&2
+      rm -f "$OUT"
+      exit 3
+    fi
+    ERR=$(sh -c "$CMD" 2>&1 >/dev/null) || true
+    # "width": the decode threads the run settled on, where the binary says it (measured per
+    # session, so min and max across the rounds say how stable that choice is)
+    LINES=$(printf '%s\n' "$ERR" |
+      sed -n "s/^prompt: [0-9]* tokens in .* (\([0-9.]*\) tok.s)/$LABEL prefill $R \1/p;
+              s/^generate: .* in .* (\([0-9.]*\) tok.s)/$LABEL decode $R \1/p;
+              s/^threads: [0-9]* prompt, \([0-9]*\) decode.*/$LABEL width $R \1/p")
+    # a run that measured nothing must stop the comparison, not leave a hole in the table (#56)
+    if [ -z "$LINES" ]; then
+      echo "ab_modes: '$LABEL' round $R produced no tok/s line, stopping. The run said:" >&2
+      printf '%s\n' "$ERR" | tail -3 >&2
+      rm -f "$OUT"
+      exit 1
+    fi
+    printf '%s\n' "$LINES" | tee -a "$OUT"
+    I=$((I + 1))
+  done
+  R=$((R + 1))
+done
+echo
+echo "medians (round 0 dropped as warm-up; ratio to the first mode, phase by phase)"
+FIRST=${1%%=*}
+awk -v first="$FIRST" '
+  $3 > 0 { key = $2 " " $1; v[key] = v[key] " " $4; if (!(key in seen)) { seen[key] = 1; order[++n_keys] = key } }
+  END {
+    for (q = 1; q <= n_keys; q++) {
+      k = order[q]; n = split(v[k], a, " ")
+      for (i = 1; i < n; i++) for (j = i + 1; j <= n; j++) if (a[j] + 0 < a[i] + 0) { t = a[i]; a[i] = a[j]; a[j] = t }

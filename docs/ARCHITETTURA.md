@@ -79,6 +79,18 @@ e usa il contatore della CPU (RDTSC con TSC invariante, altrimenti il clock del 
 risultati della suite vanno in `bench/results/<data>-<commit>-<macchina>.json`; il riassunto e
 le decisioni che ne escono in `docs/MISURE.md`.
 
+Una misura nativa vale quanto la macchina su cui gira, e la macchina si interroga, non si presume
+(`docs/LEZIONI.md` #84-#88: quattro processi dimenticati sotto due giorni di misure):
+
+| Regola | Controllo |
+|---|---|
+| ogni script finisce ciò che ha lanciato, e un segnale lo ferma subito | `tools/cleanup.lib` in ogni `tools/*.sh` (lo pretende `tools/lint.py`); `tools/test_cleanup.sh` in `make check`, rosso senza il trap a ogni esecuzione |
+| niente parte accanto a qualcosa che il progetto ha lasciato acceso | `tools/orphans.sh` in testa a `make check` e a ogni misura (`measure_begin`) |
+| la macchina si carica apposta in un modo solo | `tools/busy_machine.sh <n> <comando>`: i generatori di carico muoiono con lui |
+| la macchina è ferma prima della sessione e prima di ogni run | `measure_still` e `tools/machine_still.sh` in `AB_GUARD`: processori occupati e container; aspetta, poi si ferma e dice chi tiene la CPU |
+| ogni misura dichiara il carico di fondo; se non è basso le conclusioni non si tirano | `measure_declare` scrive nel log processori occupati e quota di `System` prima della prima run e dopo l'ultima |
+| un confronto ha il suo A/A, e una scelta si giudica dalla distribuzione, non dalla mediana | `tools/ab_modes.sh`; `tools/decode_context_report.py speed` stampa scelte e cambi di larghezza |
+
 ## Zona calda
 
 Il codice che gira a ogni token sta fra `/* hot: begin */` e `/* hot: end */` (modello, kernel,
@@ -92,6 +104,7 @@ Regole della zona calda, ognuna con il suo controllo:
 | nessuna allocazione né rilascio di memoria | `tools/lint.py` sul sorgente; `tests/test_hot.c` conta le chiamate all'allocatore mentre il modello genera (devono essere zero) |
 | niente stringhe, stampe, file, variabili d'ambiente | `tools/lint.py` |
 | niente `pow`, `sin`, `cos`, `log` per elemento: si calcolano una volta in tabella | `tools/lint.py` |
+| niente `expf`/`exp` della libreria C: l'esponenziale è `tr_expf` (`src/kernels/expf.c`), arrotondato correttamente su ogni float, gli stessi bit su ogni piattaforma, nessuna chiamata alla libreria dentro | `tools/lint.py`; `make bench-expf` lo prova su tutti i 2^32 float, in `make check` con gcc e clang; `tests/test_expf.c`; `tools/mutate_expf.sh` |
 | stessi logit con ogni numero di thread e con il profiler acceso | `tests/test_hot.c` (pool da 1, 2, 3, 8 thread) |
 | ogni ottimizzazione misurata prima e dopo, tenuta solo sopra il rumore | riga in `docs/MISURE.md` §Tentativi |
 
@@ -114,7 +127,7 @@ codice macchina con e senza, verificato): nella zona calda restano quelli che sp
 | `src/format/` | lettore GGUF v3, tabella dei tipi, metadati | ds4 `parse_metadata` / `parse_tensors`, senza gli agganci per architettura |
 | `src/kernels/` | kernel CPU per tipo quantizzato: scalare + AVX2 + AVX-512 (+VNNI) + NEON, tabella di dispatch | colibri `quant.h`, `expert_ffn.h`; ds4 riferimenti K-quant |
 | `src/backend/` | interfaccia backend (tensori residenti sul dispositivo, grafo per token) e backend CPU | ds4 `ds4_gpu.h` (modello di esecuzione), ridotto alle primitive generiche |
-| `src/memory/` | archivio esperti a livelli (VRAM / RAM / disco), lease, LRU O(1), pool I/O, pin appresi dall'uso | colibri `expert_store.h`, `st.h`, `route_trace.h`; ds4 streaming su VRAM |
+| `src/memory/` | archivio degli esperti (M1: RAM / disco; VRAM alla M3): unità (layer, esperto), slot allocati una volta, indice diretto e LRU O(1), letture a richiesta dal GGUF | idee: colibri `olmoe.c` (indice esperto → slot, esperto in un solo slot), ds4 streaming; scelte dalle nostre misure (`docs/MISURE.md` §M1): LRU e non pin dall'uso, niente pool di I/O, niente precaricamento su dischi lenti; codice nuovo |
 | `src/kv/` | cache KV `[layer][testa][posizione]`: le posizioni di una testa in fila, perché l'attenzione le legga alla banda della RAM (`docs/MISURE.md` §Decode a contesto lungo); poi riuso del prefisso, checkpoint su disco con punteggio a decadimento | layout: codice nuovo, dalle misure; idee per il resto: colibri `kv_prefix.h`, `kv_fp8.h`; ds4 `ds4_kvstore.c` |
 | `src/tokenizer/` | BPE byte-level dai metadati GGUF (famiglie di pretokenizer ammesse solo con oracolo), NFC e classi Unicode sondate da HF `tokenizers`, template di chat per architettura | idee: colibri `tok.h` (regex rigiocata in C), ds4 `vocab_load` (dal GGUF); codice nuovo |
 | `src/models/` | un grafo per famiglia, costruito dalle primitive | colibri `olmoe.c`, ds4 / colibri DeepSeek V4 |
@@ -128,9 +141,32 @@ codice macchina con e senza, verificato): nella zona calda restano quelli che sp
 
 - **Pesi**: letti con `pread` in buffer propri, non `mmap`: la memoria residente resta sotto
   controllo (colibri `st.h`, bug RSS di mmap). Denso: caricato all'avvio. Esperti: su richiesta.
-- **Esperti**: `lease(layer, expert)` restituisce un puntatore valido finché non si rilascia.
-  Mancante → lettura dal disco. La lettura degli esperti mancanti avviene **mentre** si calcola
-  quello che è già in memoria (disciplina di ds4, `PIPE` di colibri).
+- **Esperti (M1)**: il denso (attenzione, norme, router, embedding) sta sempre in RAM; gli esperti
+  passano per l'archivio di `src/memory/`. Un'unità è un (layer, esperto) con le sue tre matrici in
+  uno slot solo; gli slot si allocano tutti al caricamento, quanti ne entrano nel **budget**. Dopo
+  il router il grafo chiede le unità del layer (`acquire`): quelle presenti si toccano (LRU), le
+  mancanti si leggono **subito e in fila, sul thread che chiama**, dal GGUF alle posizioni dei
+  tensori, sfrattando le meno usate di recente; le unità chieste dalla passata in corso non si
+  sfrattano. Si legge **senza la cache del sistema** (`tr_file_open_direct`), altrimenti il modello
+  finirebbe in RAM una seconda volta, proprio la memoria che il budget doveva risparmiare, e ogni
+  misura direbbe la banda della RAM invece di quella del disco. Il prezzo è l'allineamento a 4096:
+  l'inizio di una parte nel file non è allineato e il suo resto dipende da quale esperto è, quindi
+  lo slot tiene un margine di un settore per parte e la lettura allineata atterra lì dentro, senza
+  copie; dove la parte comincia dentro lo slot lo si registra a ogni riempimento. Se il file system
+  rifiuta (prova di apertura e una lettura allineata di saggio), si torna alla lettura normale e la
+  riga `experts:` lo dice. Un solo percorso: col budget che copre tutto, l'archivio si riempie al caricamento e
+  non manca mai niente, che è il motore di prima. Gli stessi byte negli stessi kernel: i logit
+  sono identici al byte con qualunque budget, e il test lo pretende. Perché così (`docs/MISURE.md`
+  §M1): l'LRU batte il pin dall'uso a ogni capacità; il disco dà la stessa banda a uno e a otto
+  lettori, quindi niente thread di I/O finché non c'è qualcosa da sovrapporre; senza una previsione
+  non c'è niente da sovrapporre, e la previsione (il router del layer dopo, 92-95%) su un disco da
+  1.5 GB/s costa più di quel che rende. Thread di I/O e precaricamento arrivano insieme, come
+  opzione che il piano accende sui dischi veloci (domanda 43). Budget minimo: le unità di un
+  layer intero più quelle di un token, o il motore rifiuta. Un errore di lettura fa fallire la
+  valutazione e lascia la sessione com'era, mai il processo.
+- **Piano automatico (M1)**: al caricamento si misura la RAM disponibile e si toglie la riserva
+  (§Sicurezza), il denso e una sessione al contesto di default; quel che resta, fino a coprire
+  tutti gli esperti, è il budget. `--expert-budget <MiB>` lo forza, per test e misure.
 - **Passate**: una chiamata di valutazione corre in passate da al più `n_batch` token (512, `-b`); il
   decode è una passata da un token, lo stesso codice. In una passata ogni numero è la stessa chiamata di
   kernel che con un token solo (un elemento di matmul = un `dot_row`; norme, RoPE, router e somma degli
@@ -157,8 +193,9 @@ codice macchina con e senza, verificato): nella zona calda restano quelli che sp
   §Dove vanno i thread). **Thread per fase**: una passata lunga (il prompt) è limitata dal calcolo e
   usa tutto il pool; una passata corta (decode, bozza corta: fino a 4 righe) è limitata dalla lettura
   dei pesi e usa i primi n slot del pool. n non è una costante: ogni sessione lo **misura** sulle sue
-  prime passate da un token (tutto il pool, metà, un quarto), tiene la larghezza più ampia entro
-  l'1% dalla più veloce e rimisura ogni 1024 token; `--decode-threads` lo forza. La larghezza cambia
+  prime passate da un token (tutto il pool, metà, un quarto, mai sotto 4 thread), tiene la più
+  stretta entro il rumore misurato in quelle stesse passate, rimisura a ogni raddoppio del contesto
+  e cambia solo dopo due misure concordi; `--decode-threads` lo forza. La larghezza cambia
   la velocità, mai un logit (`docs/MISURE.md` §Thread per fase).
 - **GPU**: tutto il token in un solo lotto di comandi, tensori che restano sul dispositivo (ds4).
 - **KV**: in memoria per sessione; riuso del prefisso per id di token; checkpoint su disco con
@@ -213,7 +250,7 @@ la regola «non fa danni + guadagna davvero»:
 | Tappa | Contenuto | Fatta quando |
 |---|---|---|
 | **M0** | base, GGUF, convertitore (F32/F16/Q8_0), backend CPU scalare + AVX2 + AVX-512 con dispatch, grafo OLMoE, greedy, CLI | oracolo minuscolo esatto su Windows e Linux; OLMoE-1B-7B vero risponde |
-| M1 | esperti dal disco con budget di RAM, pool I/O, LRU O(1), pin dall'uso; **piano automatico** (misura RAM e disco, sceglie budget e thread) | budget piccolo forzato → stessi token; nessuna opzione necessaria |
+| M1 | esperti dal disco con budget di RAM: archivio a slot, LRU O(1), letture a richiesta; **piano automatico** (misura la RAM, sceglie il budget); poi, su dischi veloci, thread di I/O e precaricamento | budget piccolo forzato → logit identici al byte; nessuna opzione necessaria |
 | M2 | K-quant (Q4_K, Q6_K, Q2_K, IQ2_XXS) su CPU, laboratorio assembly | kernel bit-identici, microbenchmark |
 | M3 | modulo CUDA (mmq di ggml via ds4), esperti caldi in VRAM, piano VRAM + RAM + disco | stessi token della CPU; un modello più grande della RAM gira sul PC di riferimento |
 | M4 | DeepSeek V4 Flash | oracolo minuscolo esatto; gira sul PC di riferimento |

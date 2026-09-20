@@ -15,6 +15,9 @@ set -e
 # The body is one function, called on the last line: the shell parses all of it before it runs
 # any, so editing this file while it runs cannot change a run under way (docs/LEZIONI.md #69).
 main() {
+. tools/cleanup.lib
+trap cleanup_children EXIT
+trap 'exit 130' INT TERM
 MODEL=$1
 A=$2
 B=$3

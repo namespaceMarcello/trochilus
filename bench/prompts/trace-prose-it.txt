@@ -1,0 +1,42 @@
+Summarize this text, then list its weak points.
+## Principi
+
+0. **Si adatta da solo.** All'avvio misura la macchina (core fisici, istruzioni della CPU, RAM
+   libera, VRAM, velocità del disco) e decide dove mettere cosa: pesi densi, esperti caldi, KV,
+   thread. Nessuna opzione obbligatoria; le opzioni servono solo a forzare una scelta.
+1. **La CPU è un motore, non un riferimento.** Ogni modello gira prima su CPU; la GPU accelera.
+2. **Un binario per tutte le CPU.** Kernel scelti a runtime (cpuid / hwcap), non con `-march`:
+   lo stesso eseguibile usa AVX-512 VNNI dove c'è e AVX2 o scalare dove no. Né colibri né ds4 lo fanno.
+3. **Lo scalare definisce i numeri.** Ogni variante SIMD o assembly somma nello stesso ordine
+   ed è **bit-identica** allo scalare, verificata da test. Una variante non identica non entra.
+4. **Zero dipendenze nel nucleo**: libc, thread del sistema operativo. Niente OpenMP (su macOS e
+   MinGW è una libreria in più), niente librerie di terzi. I backend GPU sono moduli caricati a
+   runtime: il nucleo parte anche dove CUDA o Metal non ci sono.
+5. **Il formato è GGUF v3** con i numeri di tipo standard di ggml e i nomi dei tensori di
+   llama.cpp: un file scaricato da Hugging Face si apre senza conversione.
+6. **Operazioni generiche, grafi per modello.** Il backend espone primitive senza nome di modello
+   (matmul quantizzata, rmsnorm, rope, attenzione, top-k, swiglu). Un'operazione fusa per un
+   modello è ammessa solo come accelerazione, con la composizione generica come fallback.
+
+## C e assembly
+
+Il motore si scrive in C, e i punti dove il tempo si consuma davvero si portano in assembly.
+In un motore di inferenza quasi tutto il tempo sta in pochi kernel (prodotti scalari delle
+matrici quantizzate, attenzione, dequantizzazione); caricamento, tokenizer e orchestrazione non
+guadagnano niente dall'assembly e perderebbero la portabilità.
+
+Il giro per ogni kernel:
+1. versione C scalare: definisce il risultato bit per bit;
+2. versione con intrinseci (AVX2, AVX-512, NEON): stessa aritmetica, test di identità;
+3. **versione assembly** per la CPU di riferimento (Zen 4, AVX-512 VNNI), scritta in GAS `.S` con
+   macro per le due convenzioni di chiamata (System V e Windows x64);
+4. microbenchmark delle tre: la più veloce entra nella tabella di dispatch per quella CPU.
+
+Il profiler decide l'ordine: si porta in assembly prima il kernel che pesa di più nella misura.
+
+**Ogni ottimizzazione si prende, anche piccola**, a qualsiasi livello (algoritmo, memoria,
+istruzioni, assembly), a due condizioni verificate da strumenti, non a occhio:
+- **non fa danni**: i test la trovano bit-identica alla versione di prima;
+- **guadagna davvero**: il benchmark (mediana di almeno 5 run, macchina a regime) la trova più
+  veloce di più del rumore misurato su quel benchmark. Sotto il rumore non è un guadagno.
+

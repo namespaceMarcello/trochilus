@@ -28,6 +28,9 @@ set -e
 # The body is one function, called on the last line: the shell parses all of it before it runs
 # any, so editing this file while it runs cannot change a run under way (docs/LEZIONI.md #69).
 main() {
+. tools/cleanup.lib
+trap cleanup_children EXIT
+trap 'exit 130' INT TERM
 ROUNDS=$1
 if [ -z "$ROUNDS" ] || [ $# -lt 3 ]; then
   echo "usage: ab_modes.sh <rounds> \"label=command\" \"label=command\" [...]" >&2
@@ -51,11 +54,23 @@ while [ "$R" -le "$ROUNDS" ]; do
     fi
     ERR=$(sh -c "$CMD" 2>&1 >/dev/null) || true
     # "width": the decode threads the run settled on, where the binary says it (measured per
-    # session, so min and max across the rounds say how stable that choice is)
+    # session, so min and max across the rounds say how stable that choice is). "hits", "misses"
+    # and "mib": the expert store's own counters, from the `experts:` line of a streaming run
+    # (nothing matches when the store is resident, and those rows are simply absent).
     LINES=$(printf '%s\n' "$ERR" |
       sed -n "s/^prompt: [0-9]* tokens in .* (\([0-9.]*\) tok.s)/$LABEL prefill $R \1/p;
               s/^generate: .* in .* (\([0-9.]*\) tok.s)/$LABEL decode $R \1/p;
               s/^threads: [0-9]* prompt, \([0-9]*\) decode.*/$LABEL width $R \1/p")
+    # the store's three counters come from one line, so awk (a second s/// would work on what the
+    # first one already rewrote); "MiB)," of the resident form is not the field "MiB"
+    EXPERTS=$(printf '%s\n' "$ERR" | awk -v l="$LABEL" -v r="$R" '
+      /^experts: / { for (i = 2; i <= NF; i++) {
+          if ($i == "hits,")   print l, "hits", r, $(i - 1)
+          if ($i == "misses,") print l, "misses", r, $(i - 1)
+          if ($i == "MiB")     print l, "mib", r, $(i - 1)
+      } }')
+    [ -z "$EXPERTS" ] || LINES="$LINES
+$EXPERTS"
     # a run that measured nothing must stop the comparison, not leave a hole in the table (#56)
     if [ -z "$LINES" ]; then
       echo "ab_modes: '$LABEL' round $R produced no tok/s line, stopping. The run said:" >&2

@@ -371,7 +371,7 @@ void tr_softmax(float *x, int64_t n) {
     float m = x[0];
     for (int64_t i = 1; i < n; i++)
         if (x[i] > m) m = x[i];
-    for (int64_t i = 0; i < n; i++) x[i] = expf(x[i] - m);
+    for (int64_t i = 0; i < n; i++) x[i] = tr_expf(x[i] - m);
     float sum = lane_sum(x, n);
     for (int64_t i = 0; i < n; i++) x[i] /= sum;
 }
@@ -388,7 +388,7 @@ static void swiglu_body(void *ctx_, int64_t begin, int64_t end, int worker) {
     const float *y = ctx->y;
     for (int64_t i = begin; i < end; i++) {
         float v = x[i];
-        float silu = v / (1.0f + expf(-v));
+        float silu = v / (1.0f + tr_expf(-v));
         x[i] = silu * y[i];
     }
 }
@@ -397,7 +397,7 @@ void tr_swiglu(tr_pool *pool, float *x, const float *y, int64_t n) {
     swiglu_ctx ctx;
     ctx.x = x;
     ctx.y = y;
-    /* expf is ~20 ns per element: a few hundred per chunk outweigh waking a thread */
+    /* one tr_expf per element, a few ns: a few hundred per chunk are what waking a thread costs */
     tr_parallel_for(pool, n, 256, swiglu_body, &ctx);
 }
 

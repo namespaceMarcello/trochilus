@@ -98,6 +98,86 @@ static void test_file(void) {
     if (bad != NULL) tr_file_close(bad);
 }
 
+/* ---- tr_file_open_direct: unbuffered reads, and the short-read-at-EOF rule (platform.h Step A,
+ * docs/ARCHITETTURA.md Esperti M1). Skips with a message, rather than failing, when this
+ * filesystem cannot actually serve an aligned read on it (docker bind mounts, in particular) --
+ * proven with a trial read, not merely a successful open, since some filesystems accept
+ * FILE_FLAG_NO_BUFFERING/O_DIRECT at open and then cannot service a read on it. */
+static void test_file_direct(void) {
+    ensure_dir("build");
+    ensure_dir("build/tests");
+    const char *path = "build/tests/test_base_direct.bin";
+
+    /* not a multiple of TR_FILE_DIRECT_ALIGN: the file's real end falls inside its last aligned
+     * sector, exactly the case Step A must tolerate. */
+    enum { SIZE = 3 * TR_FILE_DIRECT_ALIGN + 777 };
+    unsigned char *data = (unsigned char *)malloc(SIZE);
+    TR_CHECK(data != NULL);
+    if (data == NULL) return;
+    for (int i = 0; i < SIZE; i++) data[i] = (unsigned char)(i * 53u + 7u);
+
+    FILE *wf = fopen(path, "wb");
+    TR_CHECK(wf != NULL);
+    if (wf != NULL) {
+        TR_CHECK(fwrite(data, 1, SIZE, wf) == (size_t)SIZE);
+        fclose(wf);
+    }
+
+    char err[256];
+    tr_file *buffered = tr_file_open(path, err, sizeof err);
+    TR_CHECK(buffered != NULL);
+    if (buffered != NULL) {
+        TR_CHECK_EQ_INT(tr_file_alignment(buffered), 1);
+        tr_file_close(buffered);
+    }
+
+    err[0] = '\0';
+    tr_file *f = tr_file_open_direct(path, err, sizeof err);
+    unsigned char *probe = f != NULL ? (unsigned char *)tr_alloc_aligned(TR_FILE_DIRECT_ALIGN, TR_FILE_DIRECT_ALIGN)
+                                     : NULL;
+    int works = f != NULL && probe != NULL && tr_file_pread(f, probe, TR_FILE_DIRECT_ALIGN, 0) == 0 &&
+                memcmp(probe, data, TR_FILE_DIRECT_ALIGN) == 0;
+    tr_free_aligned(probe);
+    if (!works) {
+        printf("  test_file_direct: SKIPPED, '%s' cannot serve an aligned read on this filesystem%s%s\n", path,
+               err[0] != '\0' ? ": " : "", err);
+        if (f != NULL) tr_file_close(f);
+        free(data);
+        remove(path);
+        return;
+    }
+    TR_CHECK_EQ_INT(tr_file_alignment(f), TR_FILE_DIRECT_ALIGN);
+
+    /* the last sector: its aligned range runs past the real end of the file -- must still
+     * succeed, and return exactly the real bytes that exist (the rest of buf is unspecified) */
+    {
+        int64_t lo = (SIZE / TR_FILE_DIRECT_ALIGN) * TR_FILE_DIRECT_ALIGN; /* 3 * ALIGN, < SIZE */
+        size_t want = 2 * TR_FILE_DIRECT_ALIGN; /* [lo, lo + want) ends well past SIZE */
+        unsigned char *buf = (unsigned char *)tr_alloc_aligned(want, TR_FILE_DIRECT_ALIGN);
+        TR_CHECK(buf != NULL);
+        if (buf != NULL) {
+            TR_CHECK_EQ_INT(tr_file_pread(f, buf, want, (uint64_t)lo), 0);
+            TR_CHECK(memcmp(buf, data + lo, (size_t)(SIZE - lo)) == 0);
+            tr_free_aligned(buf);
+        }
+    }
+
+    /* entirely past the real end of the file: still not an error on a direct handle */
+    {
+        uint64_t lo = 4 * (uint64_t)TR_FILE_DIRECT_ALIGN; /* >= SIZE */
+        unsigned char *buf = (unsigned char *)tr_alloc_aligned(TR_FILE_DIRECT_ALIGN, TR_FILE_DIRECT_ALIGN);
+        TR_CHECK(buf != NULL);
+        if (buf != NULL) {
+            TR_CHECK_EQ_INT(tr_file_pread(f, buf, TR_FILE_DIRECT_ALIGN, lo), 0);
+            tr_free_aligned(buf);
+        }
+    }
+
+    tr_file_close(f);
+    free(data);
+    remove(path);
+}
+
 /* Positional reads on the same tr_file from several threads at once must not
  * corrupt each other (this is the whole point of the OVERLAPPED-offset /
  * pread design). Each chunk owns a distinct slice of the output, so this is
@@ -657,6 +737,7 @@ int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "--oversubscribed") == 0) return oversubscribed_child();
 #endif
     test_file();
+    test_file_direct();
     test_alloc();
     test_time();
     test_mem();

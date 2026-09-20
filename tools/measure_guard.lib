@@ -1,20 +1,29 @@
 # measure_guard.lib -- functions sourced by the scripts that measure on a still machine
-# (prefill_context.sh, decode_context.sh, threads_phase.sh, remeasure.sh). Two things a long
-# measurement needs and nobody gave it (docs/LEZIONI.md #82):
+# (prefill_context.sh, decode_context.sh, threads_phase.sh, remeasure.sh). What a long
+# measurement needs and nobody gave it (docs/LEZIONI.md #82, #84):
 #
-#   measure_begin <name>   one measurement at a time: a second script finds the lock of the first
-#                          and refuses to start (exit 5), instead of stopping containers and
-#                          running its models beside it. The lock of a script that died is
-#                          taken over. Then the machine is kept awake for as long as the
-#                          measurement lasts (tools/stay_awake.ps1, Windows only).
-#   measure_end            releases both; the caller puts it in its EXIT trap.
+#   measure_begin <name>   nothing this project started is still running (tools/orphans.sh: a
+#                          forgotten load generator, an engine, another script), or it refuses
+#                          to start (exit 6). One measurement at a time: a second script finds
+#                          the lock of the first and refuses to start (exit 5), instead of
+#                          stopping containers and running its models beside it. The lock of a
+#                          script that died is taken over. Then the machine is kept awake for as
+#                          long as the measurement lasts (tools/stay_awake.ps1, Windows only).
+#   measure_still <name>   before the first run, once the containers are stopped: the CPU is not
+#                          busy with somebody else's work, or it waits, then refuses (exit 3).
+#   measure_end            ends what the script started (tools/cleanup.lib) and releases the
+#                          lock; the caller puts it in its EXIT trap, and `exit 130` in its
+#                          INT and TERM traps.
 #
-# Stopping a background task kills the shell that launched the script, not the script: a
-# measurement is stopped by killing the pid in build/.measuring.lock/pid.
+# A measurement is stopped by killing the pid in build/.measuring.lock/pid: the script runs its
+# long steps through cleanup_run, so the signal is served at once, and its EXIT trap takes the
+# ab_modes session and the engine run under it along.
+. tools/cleanup.lib
 MEASURE_LOCK=build/.measuring.lock
 
 measure_begin() {
   mkdir -p build
+  sh tools/orphans.sh || { echo "$1: not measuring beside what is listed above"; exit 6; }
   if ! mkdir $MEASURE_LOCK 2> /dev/null; then
     MEASURE_OWNER=$(cat $MEASURE_LOCK/pid 2> /dev/null || true)
     if [ -n "$MEASURE_OWNER" ] && kill -0 "$MEASURE_OWNER" 2> /dev/null; then
@@ -34,6 +43,27 @@ measure_begin() {
 }
 
 measure_end() {
+  cleanup_children
   # only the script that took the lock gives it back: one that was refused must not free it
   [ -z "$MEASURE_MINE" ] || rm -rf $MEASURE_LOCK
+}
+
+# What "the machine is still" means before every run (AB_GUARD of tools/ab_modes.sh): no
+# container running (docs/LEZIONI.md #73) and the CPU not busy with somebody else's work (#84).
+MEASURE_AB_GUARD='[ -z "$(docker ps -q 2>/dev/null)" ] && sh tools/machine_still.sh 3.5 600 2'
+
+# measure_still <name>: a longer look (10 s), and a wait of up to 15 minutes for whoever is using
+# the machine to finish; then exit 3 with the names of the processes that hold the CPU.
+measure_still() {
+  sh tools/machine_still.sh 3.0 900 10 || { echo "$1: the machine is not still, not measuring"; exit 3; }
+}
+
+# measure_declare <when>: a native measurement says what else the machine was doing, before its
+# first run and after its last: total busy logical processors and who holds them, over 20 s
+# (tools/background_load.ps1; docs/LEZIONI.md #85: on this machine the kernel's System process
+# alone holds 0.8 of a core with everything stopped, and every number here has it underneath).
+measure_declare() {
+  if command -v powershell.exe > /dev/null 2>&1; then
+    echo "$1: $(powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/background_load.ps1 20 | tr -d '\r')"
+  fi
 }

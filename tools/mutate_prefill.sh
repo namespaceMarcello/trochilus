@@ -13,6 +13,9 @@
 set -e
 # The body is one function, called on the last line (docs/LEZIONI.md #69).
 main() {
+. tools/cleanup.lib
+trap cleanup_children EXIT
+trap 'exit 130' INT TERM
 PYBIN=${PY:-tools/.venv/bin/python}
 cat > /tmp/mut.py <<'EOF'
 import sys
@@ -29,7 +32,10 @@ wanted() { [ -z "$ONLY" ] || [ "$1" = "no mutation" ] || case "$1" in *"$ONLY"*)
 # $1: name, $2: file, $3: text, $4: replacement
 run() {
   wanted "$1" || return 0
-  rm -rf /tmp/mut && mkdir -p /tmp/mut && cp -r Makefile src tests tools bench /tmp/mut/
+  # tools without .venv: the repo's own Python environment is 706 MiB over a Windows bind mount,
+  # and the container has its own, so copying it made one mutation take minutes
+  rm -rf /tmp/mut && mkdir -p /tmp/mut/tools && cp -r Makefile src tests bench /tmp/mut/ &&
+    find tools -maxdepth 1 -mindepth 1 ! -name .venv ! -name __pycache__ -exec cp -r {} /tmp/mut/tools/ ';'
   cd /tmp/mut
   $PYBIN /tmp/mut.py "$2" "$3" "$4"
   BINS=""
@@ -48,7 +54,10 @@ run() {
 # sees it every time (test_hot under TSan, as in make check). Same arguments as run.
 run_tsan() {
   wanted "$1" || return 0
-  rm -rf /tmp/mut && mkdir -p /tmp/mut && cp -r Makefile src tests tools bench /tmp/mut/
+  # tools without .venv: the repo's own Python environment is 706 MiB over a Windows bind mount,
+  # and the container has its own, so copying it made one mutation take minutes
+  rm -rf /tmp/mut && mkdir -p /tmp/mut/tools && cp -r Makefile src tests bench /tmp/mut/ &&
+    find tools -maxdepth 1 -mindepth 1 ! -name .venv ! -name __pycache__ -exec cp -r {} /tmp/mut/tools/ ';'
   cd /tmp/mut
   $PYBIN /tmp/mut.py "$2" "$3" "$4"
   make BUILD=bt CC=gcc EXTRA_CFLAGS="-O1 -g -fsanitize=thread" EXTRA_LDFLAGS="-fsanitize=thread" bt/tests/test_hot \

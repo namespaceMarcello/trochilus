@@ -1,0 +1,61 @@
+# cleanup.lib -- every script kills what it started (docs/LEZIONI.md #84).
+#
+# On 2026-09-17 a busy-machine test left four `yes` processes behind; they ran at 100% for 37
+# hours under every native measurement of two days. The cause was not a missing guard on the
+# measurements: it was a test that did not clean up after itself. Every script in tools/ sources
+# this file (tools/lint.py asks for it) and ends its life through it:
+#
+#   . tools/cleanup.lib
+#   trap cleanup_children EXIT        # whatever this script started dies with it
+#   trap 'exit 130' INT TERM          # a signal ends the script (and so runs the line above)
+#
+#   cleanup_run <command...>          runs a long command in the background and waits for it.
+#                                     A shell that waits for a foreground child does not run its
+#                                     traps until the child ends: a measuring script told to stop
+#                                     went on for the twenty minutes of its ab_modes session
+#                                     (docs/LEZIONI.md #82). `wait` is interrupted at once.
+#   cleanup_children                  kills every descendant of this script, deepest included:
+#                                     the engine under `sh -c` under ab_modes.sh, the keep-awake
+#                                     helper, a load generator.
+#
+# Killing the shell that launched a script does not kill the script's children (#82): they are
+# found from the process table, by parent, not remembered one by one. On Windows a native
+# program started by another native program (the engine under Python) is not in the MSYS
+# process table: taskkill takes the whole tree below each descendant.
+# tools/test_cleanup.sh proves it, and proves that without the trap the child stays.
+
+# every descendant of pid $1, from `ps -ef` (PID in column 2, PPID in column 3, on MSYS and Linux)
+cleanup_descendants() {
+  ps -ef 2> /dev/null | awk -v root="$1" '
+    { pid[NR] = $2; ppid[NR] = $3 }
+    END {
+      want[root] = 1
+      for (changed = 1; changed; ) {
+        changed = 0
+        for (i = 1; i <= NR; i++) if ((ppid[i] in want) && !(pid[i] in want)) { want[pid[i]] = 1; changed = 1 }
+      }
+      for (i = 1; i <= NR; i++) if ((pid[i] in want) && pid[i] != root) print pid[i]
+    }'
+}
+
+cleanup_children() {
+  CLEANUP_LIST=$(cleanup_descendants $$)
+  if command -v taskkill > /dev/null 2>&1; then
+    # MSYS: the Windows pid of each descendant (ps -l: PID PPID PGID WINPID ...), and its tree
+    for CLEANUP_PID in $CLEANUP_LIST; do
+      CLEANUP_WIN=$(ps -l 2> /dev/null | awk -v p="$CLEANUP_PID" '{ for (i = 1; i <= 2; i++) if ($i == p) { print $(i + 3); exit } }')
+      [ -z "$CLEANUP_WIN" ] || taskkill //F //T //PID "$CLEANUP_WIN" > /dev/null 2>&1 || true
+    done
+  fi
+  for CLEANUP_PID in $CLEANUP_LIST; do kill "$CLEANUP_PID" 2> /dev/null || true; done
+  for CLEANUP_PID in $CLEANUP_LIST; do
+    kill -0 "$CLEANUP_PID" 2> /dev/null || continue
+    kill -9 "$CLEANUP_PID" 2> /dev/null || true
+  done
+}
+
+cleanup_run() {
+  "$@" &
+  CLEANUP_RUN=$!
+  wait $CLEANUP_RUN
+}

@@ -9,7 +9,7 @@
 #   make bench      kernel microbenchmark (median and noise), native
 #   make bench-mem  what the RAM gives: plain reads, the engine's matmul, attention on two KV layouts
 #   make bench-attn the attention of a whole prompt on one layer, taken apart, with the bits checked
-#   make bench-expf the C library's expf: cost per call, and how many floats it rounds wrong
+#   make bench-expf tr_expf on all the 2^32 floats against the correctly rounded exp and the C library's
 #   make lint       docs and tables against the lessons in docs/LEZIONI.md
 #   make WERROR=1   warnings are errors
 # Extra flags without losing the defaults: EXTRA_CFLAGS, EXTRA_LDFLAGS.
@@ -52,8 +52,9 @@ BENCH_BIN := $(BUILD)/tests/bench_kernels$(EXE)
 MEM_BIN := $(BUILD)/tests/bench_mem$(EXE)
 ATTN_BIN := $(BUILD)/tests/bench_attn$(EXE)
 EXPF_BIN := $(BUILD)/tests/bench_expf$(EXE)
+DISK_BIN := $(BUILD)/tests/bench_disk$(EXE)
 
-.PHONY: all test oracle tier-check oracle-tokenizer chat-check oracle-real spec-check bench bench-mem bench-attn bench-expf lint profile check check-linux clean platform-guard
+.PHONY: all test oracle tier-check oracle-tokenizer chat-check oracle-real spec-check bench bench-mem bench-attn bench-expf bench-disk lint profile check check-linux clean-machine clean platform-guard
 all: $(BUILD)/trochilus$(EXE)
 
 # Objects of two platforms must never share a BUILD directory: a build in the container with
@@ -112,15 +113,28 @@ bench-mem: $(MEM_BIN)
 	./$(MEM_BIN) kv 2048
 	./$(MEM_BIN) kv 4000
 
+# What the disk gives to a reader of experts (docs/MISURE.md question 16): blocks as big as an
+# expert matrix at random positions of DISK_FILE, without the system's cache. Under 60 s, reads only.
+DISK_FILE ?= models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf
+bench-disk: $(DISK_BIN)
+	./$(DISK_BIN) $(DISK_FILE)
+
 # The attention of a whole prompt on one layer, taken apart: one query at a time against several
 # queries per block of keys, with and without the softmax. One run per length and thread count.
 bench-attn: $(ATTN_BIN)
 	for n in 512 2048 4000; do ./$(ATTN_BIN) $$n || exit 1; ./$(ATTN_BIN) $$n --threads 1 --heads 1 || exit 1; done
 
-# The C library's expf: what a call costs, and on how many of the 2^32 floats it is not the
-# correctly rounded value. Native and in the container: the two libraries are not the same code.
+# tr_expf on every one of the 2^32 floats, against the correctly rounded value and against the C
+# library's expf (what each costs, too): it fails unless tr_expf is correctly rounded everywhere.
+# Native and in the container: the two libraries are not the same code, and MinGW-w64's is itself
+# correctly rounded everywhere, so on Windows zero differences from the library are asked as well.
+ifeq ($(OS),Windows_NT)
+EXPF_CHECK := --check --like-library
+else
+EXPF_CHECK := --check
+endif
 bench-expf: $(EXPF_BIN)
-	./$(EXPF_BIN)
+	./$(EXPF_BIN) $(EXPF_CHECK)
 
 # Scenarios with the engine profiler (bench/scenarios.json), compared with the
 # previous run on this machine. See docs/ARCHITETTURA.md §Profilazione.
@@ -131,6 +145,7 @@ profile: $(BUILD)/trochilus$(EXE)
 
 lint:
 	$(PY) tools/lint.py
+	$(PY) tools/route_trace_report.py --check
 
 # Tiny OLMoE: transformers reference -> GGUF -> engine, greedy tokens must match exactly.
 FIX := fixtures/tiny-olmoe
@@ -212,9 +227,16 @@ spec-check: $(BUILD)/trochilus$(EXE)
 # Windows Smart App Control, which blocks freshly built executables for minutes (docs/LEZIONI.md #12),
 # cannot make it flaky; on Windows the native build is still compiled with 0 warnings.
 DOCKER_IMG := trochilus-dev:local
+# Before anything else: nothing this project started is still running, or the gate does not
+# start (four forgotten load generators ran at 100% under two days of measurements, and a build
+# beside a measurement spoils it: docs/LEZIONI.md #84, #57); and a script that is told to stop
+# takes its children with it (tools/cleanup.lib), seen failing without the trap at every run.
+clean-machine:
+	sh tools/orphans.sh
+	sh tools/test_cleanup.sh
 ifeq ($(OS),Windows_NT)
-check: lint
-	$(MAKE) WERROR=1 all $(TEST_BIN) $(BENCH_BIN) $(MEM_BIN) $(ATTN_BIN) $(EXPF_BIN)
+check: clean-machine lint
+	$(MAKE) WERROR=1 all $(TEST_BIN) $(BENCH_BIN) $(MEM_BIN) $(ATTN_BIN) $(EXPF_BIN) $(DISK_BIN) $(BUILD)/tests/dump_rope$(EXE)
 	@# the models volume, when it exists, replaces models/ read over the Windows bind mount:
 	@# the real-model checks load the same file from ext4 instead of 9p (docs/LEZIONI.md #41)
 	MSYS_NO_PATHCONV=1 docker run --rm --security-opt seccomp=unconfined -v "$(CURDIR):/src" \
@@ -225,7 +247,7 @@ check: lint
 	sh tools/check_argv_utf8.sh $(BUILD)/trochilus$(EXE) $(TOKFIX)/vocab.gguf
 	@echo "== check passed (native Windows build: 0 warnings; tests, ASan and oracles: Linux)"
 else
-check: lint check-linux
+check: clean-machine lint check-linux
 	@echo "== check passed"
 endif
 
@@ -243,12 +265,24 @@ check-linux:
 	@# a race shows up once in many runs: the threaded model test runs 20 times
 	@for i in $$(seq 20); do build/linux-gcc/tests/test_hot > /dev/null || exit 1; done; echo "== test_hot 20/20"
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 build/linux-gcc/tests/bench_kernels build/linux-gcc/tests/bench_mem \
-		build/linux-gcc/tests/bench_attn build/linux-gcc/tests/bench_expf
+		build/linux-gcc/tests/bench_attn build/linux-gcc/tests/bench_disk build/linux-gcc/tests/dump_rope
+	@# tr_expf is the correctly rounded exp on every float, as gcc and as clang compile it (7 s each)
+	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 bench-expf
+	$(MAKE) BUILD=build/linux-clang CC=clang WERROR=1 bench-expf
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle
+	@# the same tiny models again, with a store too small to hold every expert (Esperti M1):
+	@# TR_EXPERT_BUDGET_MIB=min forces the smallest store that can run, so this exercises eviction
+	TR_EXPERT_BUDGET_MIB=min $(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle
+	@# proof it really ran non-resident, not just green by luck: the "hits, ... misses" form of the
+	@# experts: line only prints when n_slots < n_units (src/app/main.c print_experts)
+	TR_EXPERT_BUDGET_MIB=min build/linux-gcc/trochilus generate -m $(FIX)/model-f32.gguf -p 6 -n 4 2>&1 >/dev/null | \
+		grep -q "^experts:.*hits,.*misses"
+	@echo "== expert budget min evicts on the tiny model"
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} tier-check
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle-tokenizer
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} chat-check
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle-real
+	TR_EXPERT_BUDGET_MIB=min $(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle-real
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} spec-check
 	$(PY) tools/profile_suite.py --binary build/linux-gcc/trochilus$(EXE) --smoke
 	@# -c is honoured: 6 + 4 tokens fit a context of 16, and do not fit one of 8

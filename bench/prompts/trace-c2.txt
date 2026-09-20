@@ -1,0 +1,70 @@
+Explain what this file does, then list its weak points.
+    [TR_TYPE_IQ4_XS]  = {"iq4_xs", 256, 136},
+    [TR_TYPE_I8]      = {"i8",       1,   1},
+    [TR_TYPE_I16]     = {"i16",      1,   2},
+    [TR_TYPE_I32]     = {"i32",      1,   4},
+    [TR_TYPE_I64]     = {"i64",      1,   8},
+    [TR_TYPE_F64]     = {"f64",      1,   8},
+    [TR_TYPE_IQ1_M]   = {"iq1_m",  256,  56},
+    [TR_TYPE_BF16]    = {"bf16",     1,   2},
+    [TR_TYPE_TQ1_0]   = {"tq1_0",  256,  54},
+    [TR_TYPE_TQ2_0]   = {"tq2_0",  256,  66},
+    [TR_TYPE_MXFP4]   = {"mxfp4",   32,  17},
+};
+
+const tr_type_info *tr_type_get(uint32_t type) {
+    if (type >= TR_TYPE_COUNT || type_table[type].name == NULL) return NULL;
+    return &type_table[type];
+}
+
+/* ------------------------------------------------------------------ arena */
+
+typedef struct arena_block {
+    struct arena_block *next;
+    size_t used, cap;
+    /* data follows */
+} arena_block;
+
+typedef struct { arena_block *head; } arena;
+
+static void *arena_alloc(arena *a, size_t n) {
+    size_t align = 16;
+    n = (n + align - 1) & ~(align - 1);
+    if (a->head == NULL || a->head->cap - a->head->used < n) {
+        size_t cap = n > READ_CHUNK ? n : READ_CHUNK;
+        arena_block *b = malloc(sizeof(arena_block) + cap);
+        if (b == NULL) return NULL;
+        b->next = a->head; b->used = 0; b->cap = cap;
+        a->head = b;
+    }
+    void *p = (char *)(a->head + 1) + a->head->used;
+    a->head->used += n;
+    return p;
+}
+
+static void arena_free(arena *a) {
+    arena_block *b = a->head;
+    while (b) { arena_block *n = b->next; free(b); b = n; }
+    a->head = NULL;
+}
+
+/* ------------------------------------------------------------------ reader */
+
+struct tr_gguf {
+    tr_file *file;
+    uint64_t file_size;
+    uint32_t version;
+    uint64_t n_kv, n_tensors;
+    tr_gguf_kv *kv;
+    tr_gguf_tensor *tensors;
+    uint64_t alignment, data_offset;
+    uint64_t *kv_index, *tensor_index;  /* open addressing: slot = i + 1, 0 = empty */
+    uint64_t kv_cap, tensor_cap;
+    arena mem;
+};
+
+typedef struct {
+    const tr_file *f;
+    uint64_t file_size;
+    uint64_t pos;               /* absolute position of the next byte */
+    uint8_t buf[READ_CHUNK];

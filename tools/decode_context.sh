@@ -11,6 +11,19 @@
 #                    A/A copy. About 35 minutes.
 #       profile      ms and bytes read per zone at every context (tools/profile_suite.py on
 #                    bench/scenarios-decode-context.json). About 15 minutes.
+#   sh tools/decode_context.sh widths [rounds]
+#       speed-d16: the decode forced on 16 threads against forced on 8, at the four contexts,
+#       each with its A/A copy: does the decode want half the pool at every context, or was that
+#       a fact of a machine with four cores taken (docs/LEZIONI.md #84)? About 40 minutes.
+#       speed-d4: the decode forced on 4 threads against forced on 8, at the four contexts, each
+#       with its A/A copy: the truth the estimator is checked against from 2048 up, where 4 and 8
+#       sit within the noise of three passes (docs/MISURE.md domanda 31). About 40 minutes more.
+#   sh tools/decode_context.sh long [runs]
+#       the estimator on a run that crosses two context classes (docs/MISURE.md domanda 31): 1500
+#       tokens after a prompt of 1000 go through 1024 and 2048, so the session measures again
+#       twice and the debounce has something to hold. One line per run in long.txt: tok/s and the
+#       history of the choices the `threads:` line prints; then the switches of every run. About
+#       a minute a run, 5 runs.
 #   sh tools/decode_context.sh change <binary-before> [rounds]
 #       exact: the two binaries give the same logits (600 positions, byte for byte) and the same
 #       tokens after a prompt of 4000 on the real model, or the measurement does not start.
@@ -41,9 +54,10 @@ PY=tools/.venv/Scripts/python.exe
 SCEN=bench/scenarios-decode-context.json
 OUT=build/decode_context
 case "$WHAT" in
-  measure) R=${2:-8} ;;
+  measure|widths) R=${2:-8} ;;
+  long) R=${2:-5} ;;
   change) BEFORE=$2; R=${3:-8}; [ -f "$BEFORE" ] || { echo "decode_context: no binary '$BEFORE'"; exit 2; } ;;
-  *) echo "usage: decode_context.sh measure [rounds] | change <binary-before> [rounds]"; exit 2 ;;
+  *) echo "usage: decode_context.sh measure [rounds] | widths [rounds] | long [runs] | change <binary-before> [rounds]"; exit 2 ;;
 esac
 mkdir -p $OUT
 [ -f $B ] && [ -f $MEMB ] && [ -f $M ] || { echo "decode_context: $B, $MEMB or $M is missing"; exit 1; }
@@ -66,7 +80,8 @@ wait_runs() {
 # one measurement at a time, and the machine stays awake while it lasts (docs/LEZIONI.md #82)
 . tools/measure_guard.lib
 measure_begin decode_context
-trap measure_end EXIT INT TERM
+trap measure_end EXIT
+trap 'exit 130' INT TERM
 wait_runs $B cpu
 wait_runs $MEMB
 [ -z "$BEFORE" ] || wait_runs $BEFORE cpu
@@ -74,17 +89,18 @@ wait_runs $MEMB
 
 RUNNING=$(docker ps -q 2>/dev/null || true)
 restart() { measure_end; if [ -n "$RUNNING" ]; then docker start $RUNNING > /dev/null 2>&1 || true; echo "containers started again"; fi; }
-trap restart EXIT INT TERM
+trap restart EXIT
 if [ -n "$RUNNING" ]; then
   # the VM's file cache goes back to Windows first (docs/LEZIONI.md #38), then everything stops
   MSYS_NO_PATHCONV=1 docker run --rm --privileged trochilus-dev:local sh -c "sync; echo 3 > /proc/sys/vm/drop_caches" || true
   docker stop $RUNNING > /dev/null
   echo "containers stopped: $(echo $RUNNING | wc -w)"
 fi
-# from here on a running container means somebody else is using the machine
-AB_GUARD='[ -z "$(docker ps -q 2>/dev/null)" ]'
+# from here on a running container, or a CPU busy with other work, means somebody else is using
+# the machine (tools/measure_guard.lib, tools/machine_still.sh)
+AB_GUARD=$MEASURE_AB_GUARD
 export AB_GUARD
-still() { sh -c "$AB_GUARD" || { echo "decode_context: a container is running $1: the machine is not still, stopping"; exit 3; }; }
+still() { sh -c "$AB_GUARD" || { echo "decode_context: the machine is not still $1 (a container, or a busy CPU), stopping"; exit 3; }; }
 
 # The model takes 7 GiB and the memory guard wants 3 more left free; Windows needs minutes to
 # take back what the VM has released (docs/LEZIONI.md #72). Up to 15 minutes, a look every 30 s.
@@ -97,6 +113,8 @@ while :; do
   echo "decode_context: ${AVAIL:-?} GiB available, 12 wanted: waiting 30 s"
   sleep 30
 done
+measure_still decode_context
+measure_declare "before the first run"
 
 # $1: binary, $2: prompt length, $3: context, $4: further arguments
 gen() { echo "$1 generate -m $M -p $2 -n 48 -c $3 -t 16 $4"; }
@@ -116,7 +134,7 @@ bench_mem() {
 profile() {
   echo "##### profile by zone, $2"
   still "before the profile"
-  $PY tools/profile_suite.py --binary $2 --scenarios $SCEN > $OUT/profile-$1.txt
+  cleanup_run $PY tools/profile_suite.py --binary $2 --scenarios $SCEN > $OUT/profile-$1.txt
   still "after the profile"
   grep -c "^==" $OUT/profile-$1.txt
 }
@@ -130,7 +148,7 @@ session() {
   a() { echo "$LA-$1$3=$(gen $BA $1 $2 "$AA")"; }
   b() { echo "$LB-$1$3=$(gen $BB $1 $2 "$AB")"; }
   echo "##### $NAME"
-  sh tools/ab_modes.sh $R \
+  cleanup_run sh tools/ab_modes.sh $R \
      "$(a 32 128)" "$(b 32 128)" "$(a 512 600)" "$(a 32 128 -again)" \
      "$(a 2048 2200)" "$(b 32 128 -again)" "$(a 4000 4096)" "$(b 512 600)" \
      "$(a 512 600 -again)" "$(b 2048 2200)" "$(b 512 600 -again)" "$(b 4000 4096)" \
@@ -168,7 +186,35 @@ exact() {
   echo "tokens identical after a prompt of 4000: $(cut -c1-60 $OUT/tokens-after.txt)..."
 }
 
-if [ "$WHAT" = measure ]; then
+# $R runs of 1500 tokens after a prompt of 1000. `choices` on the `threads:` line is the history
+# of the session's measurements, position:width in effect, with the pick the debounce held back
+# in brackets (src/app/main.c); a switch is a width in effect that differs from the one before.
+long_runs() {
+  echo "##### long: $R runs of 1500 tokens after a prompt of 1000 (through 1024 and 2048)"
+  : > $OUT/long.txt
+  I=1
+  while [ "$I" -le "$R" ]; do
+    still "before long run $I"
+    cleanup_run $B generate -m $M -p 1000 -n 1500 -c 2600 -t 16 > /dev/null 2> $OUT/long-run.txt
+    SPEED=$(sed -n 's/^generate: .* in .* (\([0-9.]*\) tok.s)/\1/p' $OUT/long-run.txt)
+    CHOICES=$(sed -n 's/^threads: .* choices \(.*\)$/\1/p' $OUT/long-run.txt)
+    # a run that says nothing must stop the session, not leave a hole (docs/LEZIONI.md #56)
+    [ -n "$SPEED" ] && [ -n "$CHOICES" ] || { echo "decode_context: long run $I gave no speed or no choices:"; tail -3 $OUT/long-run.txt; exit 1; }
+    echo "run $I decode $SPEED tok/s choices $CHOICES" >> $OUT/long.txt
+    I=$((I + 1))
+  done
+  still "after the long runs"
+  rm -f $OUT/long-run.txt
+  cat $OUT/long.txt
+  awk -f tools/long_switches.awk $OUT/long.txt
+}
+
+if [ "$WHAT" = long ]; then
+  long_runs
+elif [ "$WHAT" = widths ]; then
+  session speed-d16 d16 $B "--decode-threads 16" d8 $B "--decode-threads 8"
+  session speed-d4 d4 $B "--decode-threads 4" d8 $B "--decode-threads 8"
+elif [ "$WHAT" = measure ]; then
   bench_mem measure
   session speed auto $B "" d8 $B "--decode-threads 8"
   profile measure $B
@@ -182,6 +228,7 @@ else
   [ -z "$PROF_BEFORE" ] || profile before $PROF_BEFORE
   profile change $B
 fi
+measure_declare "after the last run"
 echo "done: $OUT"
 }
 main "$@"; exit

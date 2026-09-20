@@ -39,12 +39,13 @@ static const synth_params P = {2, 256, 4, 2, 512, 8, 2, 64, 32, TR_TYPE_F32};
  * ThreadSanitizer runs this test (make check) */
 enum { N_TOKENS = 32, SHORT_PASS = 4, LAST_PASS = 20 };
 
-/* Generates N_TOKENS with a pool of `threads`; logits of the last token go to out.
- * Returns the allocations counted while generating (after the first token). */
-static unsigned long run(const char *path, int threads, int profile, float *out) {
+/* Generates N_TOKENS with a pool of `threads`; logits of the last token go to out. expert_budget:
+ * see tr_model_load_budget (0: automatic, same as tr_model_load). Returns the allocations
+ * counted while generating (after the first token). */
+static unsigned long run(const char *path, int threads, int profile, uint64_t expert_budget, float *out) {
     tr_pool *pool = tr_pool_create(threads);
     char err[256];
-    tr_model *model = pool ? tr_model_load(path, pool, err, sizeof err) : NULL;
+    tr_model *model = pool ? tr_model_load_budget(path, pool, expert_budget, err, sizeof err) : NULL;
     tr_session *s = model ? tr_session_create(model, 0, 0, err, sizeof err) : NULL;
     TR_CHECK(s != NULL);
     unsigned long allocs = 0;
@@ -85,10 +86,10 @@ int main(int argc, char **argv) {
 
     static const int threads[] = {1, 2, 3, 8};
     float ref[64], got[64];
-    run(path, 1, 0, ref);
+    run(path, 1, 0, 0, ref);
     for (size_t t = 0; t < sizeof threads / sizeof threads[0]; t++) {
         for (int profile = 0; profile < 2; profile++) {
-            unsigned long allocs = run(path, threads[t], profile, got);
+            unsigned long allocs = run(path, threads[t], profile, 0, got);
 #ifndef TR_NO_WRAP
             TR_CHECK_EQ_INT((int)allocs, 0);
 #endif
@@ -101,6 +102,17 @@ int main(int argc, char **argv) {
     printf("  %d tokens (one a pass, then passes of %d and %d), pools of 1/2/3/8 threads, profiler off/on: no "
            "allocations, identical logits\n",
            N_TOKENS, SHORT_PASS, LAST_PASS);
+
+    /* the shared expert store's disk reads (Esperti M1) must also allocate nothing: the smallest
+     * store that can run ("min"), so most tokens miss and evict, not just the resident path above */
+    float got_min[64];
+    unsigned long allocs_min = run(path, 8, 0, UINT64_MAX, got_min);
+#ifndef TR_NO_WRAP
+    TR_CHECK_EQ_INT((int)allocs_min, 0);
+#endif
+    TR_CHECK(memcmp(ref, got_min, sizeof ref) == 0);
+    printf("  same, under the smallest expert store (--expert-budget min): no allocations, identical logits\n");
+
     remove(path);
     TR_TEST_EXIT();
 }

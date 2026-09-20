@@ -68,6 +68,11 @@ def speed(paths):
                     if phase == "decode" and x in runs.get("width", {}):
                         w = runs["width"][x]
                         line += "   width " + " ".join("%dx%d" % (w.count(k), int(k)) for k in sorted(set(w)))
+                        # a choice that flips from one round to the next is not a choice: the count
+                        # says how stable the measured default is, which a median hides
+                        changes = sum(1 for p, q in zip(w, w[1:]) if p != q)
+                        if len(set(w)) > 1:
+                            line += " (%d changes in %d rounds)" % (changes, len(w))
                     print(line)
                 # every real mode against every copy of the other
                 real = [x for x in here if not x.endswith("-again")]

@@ -20,8 +20,8 @@ si sposta nella sezione giusta con il numero quando è misurato.
 | 1 | ~~Quanto costa svegliare i thread su Windows nativo?~~ Misurato: §Pool di thread | — | — |
 | 2 | ~~8 thread vincono perché stanno in un solo gruppo di core (CCD, L3 da 32 MB)?~~ No: 4+4 sui due CCD vanno **meglio** di 8 su uno solo. Misurato: §Dove vanno i thread | — | — |
 | 3 | ~~Le copie SMT aiutano o peggiorano?~~ **Peggiorano**: 32 thread pinnati (i due fratelli di ogni core) contro 16 (uno per core) danno prefill 110 contro 164 e decode 2.2 contro 22.9. Misurato: §SMT | — | — |
-| 4 | ~~Qual è la banda reale della RAM di questa macchina?~~ **~54 GB/s** in lettura da 4 thread in su (52-58; un thread 22-25, due 43-49), uguale in fila e a blocchi sparsi da 2 MiB o 256 KiB; a pagine sparse da 4 KiB 7 GB/s a un thread e 34-41 a 6-16. Il matmul del motore ne tira 46-58. I «41 GB/s» erano la velocità del motore del 17/09, non il tetto. Il `memcpy` non è stato misurato: il decode legge, non scrive. Misurato: §Decode a contesto lungo | — | — |
-| 5 | Quanti TLB miss per token, e quanto valgono le pagine da 2 MB? | Linux: pesi con `madvise(MADV_HUGEPAGE)` contro senza, stessi token/s mediani | 300 000 pagine da 4 KB toccate per token |
+| 4 | ~~Qual è la banda reale della RAM di questa macchina?~~ **~57 GB/s** in lettura con 4-6 thread, poi cala (8: 55.7, 12: 54.4, 16: 49.5; un thread 26, due 52): rimisurato a macchina pulita il 2026-09-19 (§Rimisura a macchina pulita; i «~54, un thread 22-25, due 43-49» di prima avevano sotto quattro core presi, LEZIONI #84), uguale in fila e a blocchi sparsi da 2 MiB o 256 KiB; a pagine sparse da 4 KiB 7 GB/s a un thread e 34-41 a 6-16. Il matmul del motore ne tira 46-58. I «41 GB/s» erano la velocità del motore del 17/09, non il tetto. Il `memcpy` non è stato misurato: il decode legge, non scrive. Misurato: §Decode a contesto lungo | — | — |
+| 5 | ~~Quanti TLB miss per token, e quanto valgono le pagine da 2 MB?~~ **Chiusa come «no» su Windows il 2026-09-19 (Marcello)**: le pagine grandi chiedono un privilegio (`SeLockMemoryPrivilege`) che un utente normale non ha, e il bersaglio è il PC senza opzioni. Su Linux resta una misura facoltativa, non un passo | Linux: pesi con `madvise(MADV_HUGEPAGE)` contro senza, stessi token/s mediani | 300 000 pagine da 4 KB toccate per token |
 | 6 | Il portatile rallenta quando si scalda? | 60 s di decode continuo, token/s ogni 5 s | una misura breve può non valere per un uso reale |
 | 7 | ~~Quanto costa l'attenzione quando il contesto cresce (128, 1024, 4096 token)?~~ **Nel decode** (§Decode a contesto lungo): 0.5 ms a contesto 32, 2.9 a 512, 11.5 a 2048, 22.6 a 4000 su 25-48 ms di token, cioè byte di KV letti a 47 GB/s. **Nel prefill** (§Prefill su prompt lunghi): la zona valeva il 5%, il 18% e il 31-35% a 512, 2048 e 4000, e dentro c'è soprattutto il softmax (51-72%: `expf` della libreria C a 30 ns), poi prodotti e somma pesata (27-37%), e la lettura ripetuta di chiavi e valori solo a 4000 (dallo 0 al 39% secondo la run). Con l'attenzione a gruppi la zona fa 1.09×, 1.12× e 1.13×; quello che resta è la domanda 37 | — | — |
 | 8 | Quanto costa il profiler acceso sul modello vero? | stessi scenari con e senza `--profile` | per fidarsi delle percentuali delle zone |
@@ -29,17 +29,17 @@ si sposta nella sezione giusta con il numero quando è misurato.
 | 10 | Più corsie (32 o 64) sbloccano la catena delle somme su un thread? | kernel sperimentale, `make bench` | AVX-512 va come AVX2 per quel limite; cambierebbe i numeri (dichiarato) |
 | 11 | Quanto pesa la divisione per riga e la chiamata indiretta in `matmul_body`? | kernel che riceve tutta la matrice contro uno per riga | 1024 chiamate e 2 divisioni a 64 bit per matrice |
 | 12 | ~~Gli esperti scelti in token consecutivi si ripetono?~~ **In parte sì** (§Revisione): una riga in più nella stessa passata fa leggere 2.3-4.7 esperti nuovi per layer su 8, cioè il 40-70% dei suoi esperti è già letto dalle altre righe. A tempo (zone native, macchina ferma): una riga in più costa **17.6 ms** se è la sola e **13.7 ms** l'una se sono otto, contro 31.3 di una passata; negli esperti sta il **91%** e il **61%**, e lì il tempo segue i MiB di esperti nuovi (30 MiB/ms ai due punti); le moltiplicazioni dense sono gratis per la prima riga e valgono 4.1 ms per riga a nove. Il costo di una bozza si attacca dal lato dei pesi | — | — |
-| 13 | Il router del layer successivo, applicato allo stato del layer corrente, indovina gli esperti che verranno scelti? | traccia del routing sul modello vero (prompt di codice, ~1000 token): esperti previsti (primi 8, 12, 16) contro scelti | se prevedendone al massimo 12 se ne indovina almeno l'80%, gli esperti si precaricano dal disco prima che servano (M1) |
-| 14 | Quanti byte per token restano da leggere dal disco con una cache degli esperti grande il 25, 50, 75% del modello? | simulazione LRU sulla stessa traccia | decide il budget di RAM di default della M1 |
-| 15 | Streaming dal disco per layer interi (DeepSpeed) o per esperti: quanti byte per token? | stessa traccia: layer interi contro soli esperti scelti e non in cache | con un solo utente leggere tutto il modello a ogni token dà al massimo ~0.3 tok/s su 10 GB |
-| 16 | Quanto legge davvero l'NVMe in blocchi grandi quanto un esperto, a posizioni casuali, senza cache? | microbenchmark `pread` senza cache del sistema (`FILE_FLAG_NO_BUFFERING`, `O_DIRECT`), al massimo 60 s | con 14 e 15 dà i token/s attesi (M1 per esperti se ≥ 5 tok/s al 50%); decide anche la KV vecchia su SSD, attesa no con attenzione piena |
+| 13 | ~~Il router del layer successivo, applicato allo stato del layer corrente, indovina gli esperti che verranno scelti?~~ **Sì** (2026-09-20, §M1 prima di scrivere codice): prevedendone 12 si trova il 92.4% degli scelti già con lo stato che entra nel FFN (prima che girino gli esperti del layer), il 94.9% con l'uscita del layer; il primo layer è l'eccezione (75-80%) | — | la previsione c'è, ma **su un disco da 1.5 GB/s precaricare non rende** (§M1 punto 6: ogni candidato sbagliato è una lettura, e la lettura è il collo): il primo M1 legge a richiesta; precaricamento solo su dischi veloci (domanda 43) |
+| 14 | ~~Quanti byte per token restano da leggere dal disco con una cache degli esperti grande il 25, 50, 75% del modello?~~ **348 / 143 / 32 MiB per token generato** con una LRU (54.6 / 22.4 / 5.0 esperti mancati su 128); il pin statico dall'uso nel prompt perde a ogni capacità (372 / 223 / 94 MiB). Una traccia sola, di codice (§M1 prima di scrivere codice) | altre tracce (prosa, conversazione lunga) e un modello con più esperti, quando c'è | default di M1: LRU; budget dal piano automatico |
+| 15 | ~~Streaming dal disco per layer interi (DeepSpeed) o per esperti: quanti byte per token?~~ **Per esperti**: per layer interi 5106 / 3404 / 1702 MiB per token, 15-53 volte di più (§M1 prima di scrivere codice) | — | — |
+| 16 | ~~Quanto legge davvero l'NVMe in blocchi grandi quanto un esperto, a posizioni casuali, senza cache?~~ **~1.5 GB/s** (1.4-1.5 a blocchi da 2.125 MiB, 1.6-1.75 da 6.375 MiB), uguale con 1, 4 o 8 lettori; con la domanda 14: 7-10 tok/s con la cache al 50%, 17 e oltre al 75%, ~4 al 25% (§M1 prima di scrivere codice). Criterio «≥ 5 tok/s al 50%»: passato. KV vecchia su SSD: non misurata, attesa no | `make bench-disk` su altre macchine | M1 per esperti; 1-2 thread di I/O bastano |
 | 17 | Ricaricare dal disco la KV di un file già letto costa meno del prefill? La KV in q8 cambia i token? | checkpoint: logit identici al bit dopo il ricaricamento, tempo almeno 10 volte sotto il prefill; q8: token greedy uguali ≥ 99% su 1000 token di codice | leve del coding (file già letti, contesti lunghi), M5 |
 | 18 | ~~Perché il decode perde l'11-13% da 32 a 512 token di contesto, e llama.cpp solo il 5-7%?~~ Perché la KV si leggeva **più piano dei pesi**: 32-36 GB/s contro 47-54, con una testa che leggeva 512 byte ogni 8 KiB. Con le posizioni di una testa in fila la KV si legge a 47 GB/s e da 32 a 512 il decode perde l'8.8% (38.9 → 35.5), che è il costo dei byte in più. Misurato: §Decode a contesto lungo. Il confronto con llama.cpp a run alternate resta la domanda 19 | — | — |
 | 19 | Decode a 4-16 thread: llama.cpp è davvero avanti dell'8-12%? | `tools/speed_compare.py` con i due motori alternati run per run nella stessa sessione (fra due sessioni la mediana di llama.cpp si è spostata del 3-7%) | dice se c'è una leva nel decode a più thread o solo rumore |
 | 20 | ~~Il prefill rende 1.16× da 8 a 16 thread: è il limite di potenza del portatile?~~ No, e nemmeno il CCD: è lo scheduler che mette due thread sullo stesso core fisico. Misurato: §Dove vanno i thread | — | — |
 | 22 | Fissare i thread ai core fisici vale anche **sul decode** e **con la macchina occupata**? Misurato (§Il pin dei thread): sul decode a 16 thread **non distinguibile** da nessun pin (rimisura con A/A: −1.8%, soglia 2.2%; il vecchio 0.82× del pin al processore non si riproduce) e **sì a 4-8** (1.14-1.32×, pin al processore, 3 giri); con la macchina occupata il prefill tiene (1.19×) e il decode perde (0.67×, 3 giri, non rimisurato). Resta la sola parte **Linux**: su questa macchina non è misurabile (niente Linux nativo, e in WSL2 la topologia è sintetica, LEZIONI #47); il codice Linux gira ed è provato in `make check`, i numeri no | una macchina Linux vera, stessi scenari | il pin è una decisione di prodotto: sulle altre righe è già presa (acceso) |
-| 26 | ~~Quanti thread vuole **ogni fase**?~~ Il prefill tutti (16 contro 8: 1.37×), il decode **8 su 16**: è il solo numero sopra la soglia a contesto 512 (1.10×) e a 2048 (1.03×); 4 vince di poco a 512 (+1.8% su 8) e perde il 3.6% a 2048, 12 non rende; fra 4 e 8 la curva è piatta. Il motore non porta il numero scritto: ogni sessione misura la sua larghezza e `--decode-threads` la forza. Misurato: §Thread per fase | — | — |
-| 31 | La larghezza **misurata dalla sessione** regge sulle altre macchine (4-8 core, più canali di memoria, Apple Silicon senza pin, core P/E)? E uno stimatore più robusto del «migliore di tre passate» (eliminare subito le larghezze lontane e dare più giri alle vicine) toglie le scelte sbagliate dove due larghezze distano il 2-4%? | `sh tools/threads_phase.sh after <binario>` su un'altra macchina: colonna `width` e larghezze forzate; qui, contare le scelte a contesto 2048 con lo stimatore nuovo | la regola è fatta per valere ovunque, ma l'ha provata una macchina sola; su questa a 2048 sceglie ancora 16 in qualche run e lì perde il 4% |
+| 26 | ~~Quanti thread vuole **ogni fase**?~~ **Rimisurato a macchina pulita il 2026-09-19** (§Rimisura a macchina pulita; i numeri del 18/09 avevano sotto quattro core presi, LEZIONI #84). Il prefill tutti (16 contro 8: 1.49× a 512, 1.57× a 2048). Il decode **pochi**: 4 a contesto corto (a 512 l'automatico, che sceglie 4, batte 8 del 4-6%, sopra la soglia), 8 a contesto lungo, e 16 non vince a nessun contesto ma **non è distinguibile da 8** (1.00-1.02× a 512, 0.99-1.09× a 2048, soglia 4.6%): il «1.10× a 8 thread» del 18/09 era l'effetto dei core presi. Il perché è la banda della RAM, che tocca il tetto con 4-6 lettori e oltre cala (domanda 4). Il motore non porta il numero scritto: ogni sessione misura la sua larghezza e `--decode-threads` la forza; ma lo stimatore che la misura va riscritto (domanda 31) | — | — |
+| 31 | **Lo stimatore della larghezza del decode, riscritto il 2026-09-19, sceglie sul modello vero ciò che la verità forzata indica?** (LEZIONI #88, §Rimisura a macchina pulita punto 3). Quello di prima tirava a sorte: la più ampia entro un 1% fisso dalla più veloce su tre passate da un token, che hanno il 2-5% di rumore (una scelta diversa su otto a macchina quieta, 4×4 1×8 3×16 appena c'è rumore, 3-5 cambi su 8 a 2048 coi `yes`; la mediana non lo mostrava). Quello nuovo (`src/models/model.h`): centro = la passata più veloce, rumore = distacco della seconda; la più **stretta** entro il rumore della coppia (lei e la più veloce, mai quello di una terza larghezza); se decide il margine altre passate sulle due, fino a 6; rimisura a ogni raddoppio del contesto da 32; si cambia solo con due misure concordi (la seconda al più dopo 128 passate); niente sondaggi sotto 4 thread. **Nessun numero ancora sul modello vero.** Poi: regge sulle altre macchine (4-8 core, più canali di memoria, Apple Silicon senza pin, core P/E)? | fatto: tre funzioni pure e la sessione con un orologio finto in `tests/test_phase.c`, dieci mutazioni viste rosse (`tools/mutate_tune.sh`), la storia delle scelte nella riga `threads:`. Da fare **a macchina quieta, di notte**: `decode_context.sh widths` (la verità forzata: 16 contro 8, 4 contro 8), `decode_context.sh measure 16`, `decode_context.sh long` (1500 token dopo un prompt di 1000: due rimisure, i cambi contati dalla storia), `threads_phase.sh widths`. Criterio: l'automatico entro l'A/A dalla migliore forzata a ogni contesto, cambi a zero fra run, al più un cambio 4 → 8 nella run lunga | primo dei prossimi passi: la regola sceglie il default di ogni sessione di ogni utente |
 | 32 | `--spec`: si può decidere **prima di provare** se la bozza conviene, invece di scoprirlo sbagliando (idea di Marcello, 2026-09-19)? Oggi basta che le ultime 2 parole compaiano già nel testo (`TR_LOOKUP_NGRAM_MIN` 2) per tentare, e su codice nuovo una coppia torna per caso | contare, senza cronometro, bozze accettate e proposte **per lunghezza del match** (2, 3, 4) su `code.txt` e `code-edit.txt`; poi il replay esatto coi costi misurati (17.6 e 13.7 ms per riga) di una regola che chiede match più lunghi quando le bozze stanno fallendo | il caso peggiore sta a 0.95× e le costanti della pausa non bastano (al massimo 0.97-0.98×): se i match corti sono quelli che falliscono, il −5% scende senza toccare il +17% |
 | 33 | Fra float (esatto) e int8 (1.8-2.3× sul kernel, non esatto) c'è una via di mezzo per il prefill (domanda di Marcello, 2026-09-19)? Candidato: attivazioni a **16 bit** con `vpdpwssd` (VNNI), errore di arrotondamento 256 volte più piccolo dell'int8 | nel banco, come per l'int8 (`tests/bench_kernels.c`, stessa struttura del kernel a 4 token, run alternate), più di quanto si spostano i logit sul modello a 2 layer | attese basse sulla velocità (metà delle corsie dell'int8, più l'allargamento dei pesi a 16 bit), ma costa poco saperlo; le altre strade: parte seriale del prefill (domanda 30, esatta) e i modelli a 4 bit, che accelerano il decode e restano esatti rispetto ai propri pesi |
 | 27 | ~~Perché il decode a 16 thread pinnati va il 17% più piano che senza pin?~~ **La premessa non regge**: con 8 giri e controllo A/A il pin a un processore sta a −3.4% da nessun pin e a −1.6% dal pin al core (non distinguibile), non a −17%. Il pin al **core** resta il default per il prefill (1.27× su nessun pin, +9% sul pin al processore). Misurato: §Il pin dei thread, §Revisione | — | — |
@@ -51,11 +51,18 @@ si sposta nella sezione giusta con il numero quando è misurato.
 
 | 29 | ~~Quanto vale una variante SIMD per **F16**?~~ **49×** sul kernel (`make bench`, n=2048: 466 M el/s lo scalare, 22.8 G el/s AVX2 con F16C, 22.7 AVX-512; prima ogni tier faceva i 466-824 dello scalare). La conversione half→float è esatta, quindi resta bit-identico (`tests/test_kernels.c`, anche con subnormali, infiniti e NaN). Scritta il 2026-09-19 perché il controllo nuovo, `tests/test_tier_used.c`, pretende che **ogni tipo** di peso passi per i kernel del tier (LEZIONI #78) | — | — |
 | 30 | ~~La parte seriale del prefill (copia per esperto, scrittura della KV, norme, RoPE) si può dividere per token?~~ **Sì** (§Prefill su prompt lunghi): valeva l'8% del prefill a 512 e il 5-6% a 4000, contando la scelta del router (57 ms su 512 token) che stava dentro la zona `router`. Divisa sul pool per token (almeno 8 a pezzo) passa da 121 a 48 ms a 512 e da 880 a 353 a 4000: norme e RoPE si dividono per 6, le copie in memoria (righe per gli esperti, scrittura della KV: 27 → 19 ms) solo per 2 e per 1.1-1.4, perché lì il limite è scrivere in RAM. Con l'int8 (domanda 21) il peso di ciò che resta raddoppia | — | — |
-| 34 | **Larghezza per zona**: l'attenzione del decode su tutto il pool e il resto sulla larghezza del decode (esatto: il contratto del pool). Potenziale misurato per zona (§Decode a contesto lungo): a contesto 4000 l'attenzione fa 21.6 ms su 16 thread e 22.6 su 8, mentre esperti e proiezioni su 16 perdono 1.3 ms; tenendo il meglio dei due si toglie **1.0 ms su 48.1 (2.1%)**, a 2048 0.24 ms su 36.4 (0.7%) | `tr_pool_set_active` attorno alla zona `attention` nelle passate corte; serve una soglia più bassa del 3.8% di questa notte (più giri, o 200 token generati invece di 48) | cresce col contesto: oltre 4000 l'attenzione supera metà del token. Sotto la soglia oggi, quindi non scritta |
+| 34 | **Chiusa come «no» il 2026-09-19 (Marcello)**: 2.1% stimato a contesto 4000, sotto la soglia delle misure; si riapre se un modello con contesti oltre 4000 la porta sopra. ~~Larghezza per zona~~: l'attenzione del decode su tutto il pool e il resto sulla larghezza del decode (esatto: il contratto del pool). Potenziale misurato per zona (§Decode a contesto lungo): a contesto 4000 l'attenzione fa 21.6 ms su 16 thread e 22.6 su 8, mentre esperti e proiezioni su 16 perdono 1.3 ms; tenendo il meglio dei due si toglie **1.0 ms su 48.1 (2.1%)**, a 2048 0.24 ms su 36.4 (0.7%) | `tr_pool_set_active` attorno alla zona `attention` nelle passate corte; serve una soglia più bassa del 3.8% di questa notte (più giri, o 200 token generati invece di 48) | cresce col contesto: oltre 4000 l'attenzione supera metà del token. Sotto la soglia oggi, quindi non scritta |
 | 35 | Cosa resta sotto il tetto nel decode, dal lato esatto? `attn_out_proj` legge a 43-52 GB/s dove le altre moltiplicazioni stanno a 52-55 (0.2-0.3 ms per token); le zone senza byte (norme, RoPE, copia per esperto, attivazione, somma, scelta del token) valgono **1.1 ms per token**, il 4.4% a contesto corto; l'attenzione legge a 47 GB/s dove la sola lettura degli stessi byte fa 52-56 (il calcolo di prodotto, softmax e somma pesata vale il 12% della zona) | profilo per zona con le zone piccole divise; `bench_mem kv` con il kernel a pezzi | in tutto il 6-11% che separa i 48-51 GB/s del decode dai 54 della RAM |
 | 36 | **KV a 16 bit** (non esatta, decide Marcello): di quanto si spostano i logit? Guadagno stimato dai byte (§Decode a contesto lungo): +5% a contesto 512, +16-19% a 2048, +26-31% a 4000, e metà memoria della KV | modo dichiarato e spento di default; contro il modo esatto sul modello vero: KL media e primo token uguale su ≥ 1000 posizioni di codice fino a contesto 4000 (`trochilus logits` nei due modi, `tools/compare_llamacpp.py` calcola già la KL: llama.cpp sta a 9e-3), token greedy uguali su 1000 generati (soglia della domanda 17: ≥ 99%), e nessun valore di K o V oltre il massimo dei 16 bit (65504) | è la sola leva grande che resta al decode a contesto lungo: dopo la KV per testa l'attenzione legge già alla banda della RAM |
-| 37 | **`expf` nostro** (decide Marcello; **preparato, non scritto**: §Prefill su prompt lunghi, punto 7): il softmax (attenzione, router) e l'attivazione degli esperti chiamano `expf` della libreria C, la sola funzione della zona calda che non è nostra: **30 ns** a chiamata con MinGW, 2.5 con glibc. Il softmax è il 51-72% della zona `attention` del prefill, `expert_act` il 5-7% del prefill. Guadagno stimato: prefill **1.12× a 512, 1.23× a 2048, 1.27× a 4000**, decode +5-10% | i tre numeri sono pronti. (1) `make bench-expf`, tutti i 2^32 float: l'`expf` di MinGW è arrotondato correttamente ovunque (0 differenze dal riferimento, e il riferimento è provato a 200 bit sui 369 casi al confine), quello di glibc no in 170 648; uno schizzo scalare nel banco dà **0 differenze da MinGW su 4.28 miliardi di float**, a 3.7 ns. (2) `tools/expf_quality.sh`: su Linux la KL contro il binario di prima è **3.9e-13** di media e 1.5e-11 al massimo, 0 token diversi su 1000. (3) Costo: circa 450 righe di C, una sessione; il pezzo delicato è il SIMD | è la leva più grande rimasta al prefill lungo; su Windows è **esatta** per prova esaustiva, e toglie la sola differenza di bit fra Windows e Linux |
+| 37 | ~~**`expf` nostro**: il softmax (attenzione, router) e l'attivazione degli esperti chiamavano `expf` della libreria C, 30 ns a chiamata con MinGW e altri bit con glibc~~ **Scritto lo scalare il 2026-09-19** (`tr_expf`, §`tr_expf`): arrotondato correttamente su tutti i 4 278 190 082 float per prova esaustiva in `make check` (gcc e clang), 3.5 ns a chiamata, nessuna chiamata alla libreria dentro; su Windows gli stessi bit di prima (logit identici al byte), su Linux KL 3.9e-13 e 1000 token su 1000 uguali, e gli stessi byte del build di emulazione; **Windows e Linux ora danno gli stessi logit al byte**. Prefill **1.03-1.08× a 512, 1.20-1.23× a 2048, 1.29-1.31× a 4000**, decode 1.02-1.10× (stimati 1.12 / 1.23 / 1.27× e +5-10%). Resta il SIMD: domanda 39 | — | — |
 | 38 | L'attenzione a gruppi con **GQA** e oltre 4096 token (Qwen3-Coder: 32 teste di query su 4 di chiavi): un gruppo oggi sono 16 token di **una** testa di query; le 8 teste che condividono chiavi e valori potrebbero stare nello stesso gruppo e leggerli una volta sola. E a 16-32 mila token chiavi e valori di una testa (16-32 MB) non stanno in nessuna cache: lì la lettura ripetuta, che a 4000 va dall'1% al 21-39% della zona secondo la run, diventa il grosso | `make bench-attn` con le forme del modello nuovo e `--heads`/`--group`; prefill a 8, 16, 32 mila token quando il modello c'è | il coding usa contesti lunghi; a 4000 il gruppo da 4, 16 o 64 va uguale, più su non è detto |
+| 39 | **Chiusa come «no» il 2026-09-19 (Marcello)**: 1.01-1.04× stimato sta alla soglia del rumore, per circa 200 righe col pezzo più delicato del progetto; lo scalare ha già preso quasi tutto. ~~`tr_expf` in SIMD, sì o no~~ (numeri in §`tr_expf` punto 7). Dopo lo scalare restano, nel prefill a 512 / 2048 / 4000, softmax dell'attenzione per circa 9 / 130 / 610 ms e `expert_act` per 25 / 108 / 218 ms. Stima con un esponenziale AVX-512 a 1.0-1.3 ns per elemento: prefill **1.01× / 1.03× / 1.04×**, decode +1-2%; costo circa 200 righe, il pezzo delicato (gather dalla tabella, maschera per le corsie che non passano il test, identità al bit con lo scalare provata su tutti i float per ogni tier) | uno schizzo nel banco (`tests/bench_expf.c`) darebbe il costo vero per elemento prima di decidere; poi voce `exp` nella tabella dei kernel, `make bench-expf` per tier, `prefill_context.sh change` | lo scalare ha preso quasi tutto: a 4000 token il guadagno stimato è vicino alla soglia di una buona sessione (3%) |
+| 40 | ~~Le **tabelle RoPE** di Windows e di Linux sono le stesse voce per voce?~~ **Sì**, misurato il 2026-09-19 (`sh tools/platform_bits.sh`, §`tr_expf` punto 5): su 4096 posizioni × 64 coppie i `cos` e i `sin` **in double** delle due librerie differiscono nello 0.83-0.85% delle voci (2175 e 2216 su 262 144: glibc e MinGW arrotondano diversamente l'ultima cifra del double), `pow` mai (64 su 64 arrotondati correttamente su tutte e due), e **nessuna** delle 524 288 voci in float differisce: l'arrotondamento a float assorbe la differenza. Con `tr_expf` il motore dà quindi **gli stessi byte sulle due piattaforme** fino al contesto di addestramento di OLMoE | — | — |
+| 41 | **Perché il disco dà 1.5 GB/s, un terzo della sua scheda (Micron 2400, 4.5 GB/s)?** Tre ipotesi: la cifratura del volume di Windows (si legge con `manage-bde -status C:` da amministratore), il QLC senza DRAM su letture sparse, la richiesta sincrona da 2 MiB (provare richieste più grandi e sovrapposte). Vale il triplo dei token al secondo di M1 con la cache al 50%. **2026-09-20: il volume è cifrato** (`manage-bde`: BitLocker ON, XTS-AES 128, quindi in software). Non è provato che sia la causa, né la sola: durante le letture il processo System passa da 0.79 a 0.94 processori (`tools/background_load.ps1`, `build/disk/run3.txt`), nessun core è saturo, quindi se il limite è lì è di latenza e non di calcolo. La prova vera chiede un volume non cifrato sullo stesso disco, e **la cifratura non si toglie per una misura**: i PC con Windows 11 escono cifrati di fabbrica, quindi ~1.5 GB/s **è** il bersaglio, e il piano automatico di M1 misura il disco che trova | `bench_disk --block` a 16 e 64 MiB; più richieste in volo per lettore; lo stesso banco su un disco esterno o una partizione non cifrata, se capita | dopo il primo M1 che gira: prima il percorso esatto, poi la banda |
+| 43 | **Da che velocità di disco in su il precaricamento rende, e con quanti candidati?** Il modello a tempo dice: a 1.5 GB/s no (k=8 neutro, k=12 −40%), a 4.3 GB/s k=8 dà l'11-15% (§M1 punto 6). È un modello: un disco, una lettura per volta | con M1 che gira: `--expert-budget` al 50%, precaricamento spento e con k=8, su questo disco e su uno veloce (o sul file nella cache del sistema, che rende 12-26 GB/s); soglia nel piano automatico | dopo il primo M1 |
+| 42 | **Come si prevede il primo layer?** La previsione col router del layer dopo prende il 92-95% ovunque tranne che al layer 0 (75-80%, domanda 13) | dalla traccia: gli esperti del layer 0 scelti per token uguale (dipendono quasi solo dall'embedding?); in alternativa il layer 0 sta sempre in RAM (64 esperti = 408 MiB, il 6% del modello) | progetto di M1 |
+| 44 | **Il comportamento del modello sul codice è un grafo piccolo e deterministico?** (Marcello, 2026-09-20). Dalla traccia che c'è (OLMoE-1B-7B, `code-1000`, 1204 token; calcolo una tantum sulla traccia, non ancora nel report): **piccolo no**: usate 1012 unità su 1024, l'89% già dopo 100 token; il 25% più usato copre il 68% delle attivazioni, il 50% l'88%, il 75% il 97%; entropia d'uso 5.1 bit su 6 per layer. **Statico no**: un grafo di co-occorrenze fra layer imparato sui primi 900 token indovina il 53.7% degli esperti del layer dopo sui 300 seguenti (frequenza sola: 40.3%; il router sullo stato vivo: 82-86%); nessun percorso intero si ripete (0 su 1204), il singolo insieme di 8 sì (32%); 3.6 esperti su 8 in comune col token prima (caso: 1.0), che è ciò che l'LRU sfrutta. Coerente col pin dall'uso che perde contro l'LRU (domanda 14) e con la loss di bilanciamento con cui i MoE si addestrano. Limiti: un modello generalista, un prompt, un linguaggio | mancano, con le soglie scritte **prima**: (1) id dei token nella traccia → stesso token, stessi esperti? (la versione «tabella» dell'ipotesi, plausibile al layer 0); (2) 4-6 tracce (file e linguaggi diversi, e prosa di controllo) → la sovrapposizione delle unità calde codice-codice supera quella codice-prosa?; (3) margine fra l'8° e il 9° esperto (probabilità nella traccia); (4) la prova che decide, funzionale e non di routing: **mascherare** gli esperti fuori dal X% più usato e misurare token uguali e KL contro il modello intero su codice mai visto (modo di sola misura) **Soglie scritte prima di misurare (2026-09-20, sì di Marcello)**: *piccolo* = il 25% delle unità copre ≥ 99% delle attivazioni su codice; *grafo del codice* = la sovrapposizione (Jaccard) del 25% più caldo fra due tracce di codice supera di ≥ 0.20 quella fra codice e prosa; *tabella* = stesso id di token → stesso insieme di esperti al layer 0 in ≥ 95% delle ripetizioni (gli altri layer si riportano); *funzionale* = con il 50% delle unità mascherate (le meno usate su un **altro** file di codice) il token greedy coincide in ≥ 99% delle posizioni e la KL media è ≤ 1e-2 su codice mai visto (il metro del progetto per un modo non esatto: llama.cpp sta a 9e-3). Una soglia mancata falsifica quella parte dell'ipotesi per OLMoE-1B-7B; per dirlo «dei modelli» serve almeno un secondo modello | **Risposta (§Il comportamento sul codice…)**: piccolo no, tabella no, statico no, funzionale no (già sul testo della maschera: 93.9% dei token col 50% spento); una **regione del codice** sì (Jaccard 0.68-0.77 fra C, Python e shell, 0.07-0.09 con la prosa inglese), e l'uso ordina gli esperti 40-50 volte meglio del caso. Restano da misurare i quattro testi mai visti della prova funzionale (run fermata per memoria) e un secondo modello |
+| 45 | **Una cache degli esperti già calda all'avvio, per chi fa codice?** L'insieme caldo di un file di codice copre il 68-71% delle attivazioni di un altro, in un altro linguaggio (domanda 44): salvare a fine sessione quali unità erano in RAM e ricaricarle all'avvio toglierebbe la partenza a freddo di M1 | con M1 che gira: mancati nei primi 100 token, cache fredda contro cache ricaricata dall'elenco di un'altra sessione di codice | dopo le misure di M1 a budget 25/50/75% |
 
 Macchina di riferimento: Ryzen 9 7940HX (Zen 4, 16 core / 32 thread, AVX-512 VNNI/BF16), 31 GB
 RAM (2×16 GB DDR5-5200), NVMe Micron 1 TB, GPU RTX 4070 Laptop 8 GB e Radeon 610M (non usate fino
@@ -1342,7 +1349,8 @@ su 6.6): dal lato esatto nell'attenzione resta poco. Il prossimo pezzo è `expf`
   a 512 e il 56% a 4000; col kernel a 1.8-2.3× (§Attivazioni int8) il prefill andrebbe **1.5-1.8×** a
   512 e **1.3-1.5×** a 4000. Non è esatto: la decisione resta quella del punto 3 di STATO.
 
-**7. `expf` nostro: preparato, non scritto** (domanda 37; decide Marcello). I tre numeri chiesti:
+**7. `expf` nostro: preparato, non scritto** (domanda 37; decide Marcello). **Poi scritto, lo stesso
+giorno: lo scalare, coi numeri misurati, sta in §`tr_expf`.** I tre numeri chiesti allora:
 
 - **Il test sui 2^32 float è pronto**, e ha già girato su un prototipo. `make bench-expf` confronta
   un candidato con l'`expf` della libreria e col riferimento su tutti i float; il candidato si dà
@@ -1399,6 +1407,434 @@ su 6.6): dal lato esatto nell'attenzione resta poco. Il prossimo pezzo è `expf`
 | i test vedono gli errori? | `tools/mutate_prefill.sh` nel container | 45 minuti |
 
 
+## Rimisura a macchina pulita (2026-09-19)
+
+Quattro processi `yes`, residui di una prova del 17/09, sono rimasti al 100% di un core l'uno sotto
+**ogni misura nativa del 18 e del 19/09** (LEZIONI #84). Rimisurato il 19/09 dalle 16:09 alle 17:52,
+senza di loro, ciò da cui era stato scelto il default del motore: thread per fase e decode a
+contesto lungo. Binario con `tr_expf` (hash in `build/prefill_context/binaries.sha256`), 8 giri,
+A/A, ogni run in `build/threads_phase/` e `build/decode_context/`; le sessioni coi `yes` restano in
+`build/threads_phase-with-yes/` e `build/decode_context-with-yes/`. Ogni sessione dichiara nel log
+il **carico di fondo** (LEZIONI #85): il processo `System` del kernel tiene da solo 0.7-0.9 core,
+sempre; è un fatto di questa macchina e sta sotto ogni numero di questo documento.
+
+| sessione | ora | carico di fondo prima → dopo (processori logici occupati, di cui `System`) | peggiore A/A |
+|---|---|---|---|
+| larghezze forzate a 512 (`threads_phase.sh widths`) | 16:09 | 3.82 (0.84; `svchost` 1.23, indicizzatore di Windows) → 2.14 (0.72) | decode 2.6% |
+| decode a 16 contro 8 thread, quattro contesti (`decode_context.sh widths`) | 16:19 | 2.01 (0.78) → 1.17 (0.71) | decode 4.6% |
+| automatico contro 8, banda della RAM, zone (`decode_context.sh measure`) | 16:51 | 1.25 (0.75) → 0.98 (0.73) | decode 2.5% |
+| sweep dei thread (`threads_phase.sh sweep`) | 17:30 | 0.99 (0.71) → 1.02 (0.74) | decode 2.7%, prefill 4.1% |
+
+**Il rumore del giorno è un fatto, non un difetto da nascondere**: con Marcello alla macchina, un'altra
+finestra al lavoro e l'indicizzatore di Windows, le prime sessioni hanno spread del 15-30% fra minimo
+e massimo e non distinguono differenze sotto il 5%; la sera, a macchina lasciata sola, l'A/A torna
+all'1-3%. Le sessioni strette del 18/09 erano strette perché notturne, non grazie ai `yes`. Le
+misure che decidono si fanno di notte, e ora si possono lasciare sole (orfani rifiutati, guardia
+sulla CPU prima di ogni run, carico dichiarato).
+
+**1. La banda della RAM** (`bench_mem ram`, lettura in fila; domanda 4):
+
+| thread | 1 | 2 | 4 | 6 | 8 | 12 | 16 |
+|---|---|---|---|---|---|---|---|
+| coi `yes` (19/09 mattina), GB/s | 22.4 | 42.7 | 54.0 | 54.0 | 52.3 | 51.0 | 51.5 |
+| macchina pulita, GB/s | 26.2 | 52.2 | **57.3** | **57.6** | 55.7 | 54.4 | 49.5 |
+
+Il tetto è **~57 GB/s, non 54**, si tocca con 4-6 thread e oltre **cala**: il decode, che è lettura
+di memoria, con più lettori non ha niente da guadagnare. È il perché di tutto quello che segue.
+
+**2. Il decode a larghezza forzata, 16 contro 8 thread** (tok/s, mediana di 8; ogni modo con la sua
+copia; rapporto di 8 su 16 contro tutte e due le copie):
+
+| contesto | 16 thread | 8 thread | 8 / 16 | A/A | coi `yes` |
+|---|---|---|---|---|---|
+| 32 | 38.5 / 37.7 | 40.2 / 39.3 | 1.02-1.07× | 1.9% / 2.4% | — |
+| 512 | 34.6 / 34.3 | 34.7 / 35.0 | **1.00-1.02×** | 0.9% / 1.0% | **1.10×** |
+| 2048 | 27.1 / 25.9 | 28.1 / 26.9 | 0.99-1.09× | 4.6% / 4.3% | 1.03-1.05× |
+| 4000 | 21.1 / 21.5 | 21.6 / 22.2 | 1.01-1.06× | 1.9% / 2.9% | — |
+
+Con la soglia della sessione (4.6%) 8 e 16 **non sono distinguibili a nessun contesto**; 8 è avanti
+dello 0-7% nominale e non è mai dietro. Il «+10% a 8 thread» del 18/09 era l'effetto dei quattro
+core presi: 16 thread fissati ai core pagavano il thread più lento, 8 no.
+
+**3. L'automatico contro 8 thread, e cosa sceglie** (la sessione più quieta; soglia 2.5%). «Scelte»:
+quante volte su 8 run la sessione ha scelto ogni larghezza, e fra parentesi quanti cambi da una run
+alla successiva (`tools/decode_context_report.py speed`), per il modo e per la sua copia:
+
+| contesto | automatico | 8 forzati | 8 / automatico | scelte, macchina pulita | scelte, coi `yes` (19/09 mattina) |
+|---|---|---|---|---|---|
+| 32 | 40.7 / 41.1 | 40.6 / 40.6 | 0.99-1.00× | 7×4 1×8 (1) · 7×4 1×8 (1) | 7×4 1×8 (1) · 6×4 2×8 (3) |
+| 512 | **36.9** / 36.1 | 34.8 / 34.6 | **0.94-0.96×** | 7×4 1×8 (1) · 6×4 1×8 1×16 (3) | 6×4 2×8 (4) · 2×4 2×8 4×16 (4) |
+| 2048 | 28.5 / 27.7 | 28.1 / 28.6 | 0.99-1.03× | 8×8 (0) · 7×8 1×16 (2) | 6×8 2×16 (3) · 4×8 4×16 (5) |
+| 4000 | 22.7 / 22.1 | 22.4 / 22.6 | 0.99-1.02× | 7×8 1×16 (2) · 5×8 3×16 (3) | 1×8 7×16 (2) · 2×8 6×16 (2) |
+
+A 512 l'automatico, che sceglie quasi sempre **4 thread**, batte 8 del 4-6%, sopra la soglia contro
+tutte e due le copie: a contesto corto il decode vuole 4 thread, a contesto lungo 8, e 16 non vince
+mai. Il verso della conclusione del 18/09 («pochi thread») era giusto; la misura era gonfiata.
+Le larghezze forzate a 512 della prima sessione (rumorosa) dicono lo stesso: 16 thread 33.1 (copia
+32.3), 12 31.1, 8 31.1, 6 33.1, 4 33.1, automatico 33.6 (scelte 4×4 1×8 3×16, 3 cambi); coi `yes`
+erano 30.9, 31.6, 34.1, 34.6, 33.8 e 33.8.
+
+**Lo stimatore tira a sorte** (LEZIONI #88, domanda 31). Le scelte cambiano da una run all'altra: poco a
+macchina quieta (una run su otto), molto appena c'è rumore (4×4 1×8 3×16), e succedeva già coi `yes`,
+dove a 2048 cambiava 3-5 volte su 8: la velocità mediana non lo mostrava, perché dove le larghezze si
+equivalgono una scelta instabile non costa. Il margine (la più ampia entro l'**1%** dalla più veloce,
+su tre passate da un token) è sotto il rumore di quelle passate (2-5%), ed era stato stretto dal 3%
+all'1% **sulla macchina coi core presi**, dove 16 thread perdevano davvero. Va riscritto lo stimatore,
+non il default: margine dal rumore misurato, più giri se non decide, isteresi nelle rimisure, e a
+parità la larghezza **stretta**, che su macchina pulita non perde mai e sotto il carico di altri vale
+il 10%.
+
+**4. Lo sweep dei thread** (`-t n` per tutte e due le fasi; il decode sceglie da sé la larghezza
+dentro il pool, scritta fra parentesi; tok/s):
+
+| `-t` | 512: prefill | decode | 2048: prefill | decode |
+|---|---|---|---|---|
+| 16 | 316.8 (copia 303.7) | 37.4 (4) | 308.5 (copia 305.8) | 29.5 (8) |
+| 12 | 287.0 | 37.3 (6) | 265.7 | 29.3 (6) |
+| 8 | 213.1 | 36.7 (4) | 196.7 | 28.0 (8) |
+| 4 | 112.5 | 32.3 | 104.5 | 24.6 |
+
+Il prefill vuole tutto il pool (da 8 a 16 thread 1.49× a 512 e 1.57× a 2048); il decode va uguale
+con ogni pool purché la larghezza scelta sia 4-8. Con `-t 4` lo stimatore prova anche 2 e 1 thread:
+in una run da 48 token quelle sei passate lente pesano il 14-17%, quindi quel numero è il costo del
+sondaggio, non il regime (un altro argomento per la domanda 31: non sondare larghezze sotto 4).
+
+**5. Il modello del decode** (`decode_context_report.py model`, automatico): **24.5 ms a contesto zero
+più 5.0 ms ogni 1000 token di contesto** (la KV letta a 52 GB/s); 41.0 / 36.6 / 28.4 / 22.5 tok/s a
+contesto 32 / 512 / 2048 / 4000, cioè il 3-8% in più della mattina coi `yes` (38.9 / 35.5 / 27.5 /
+20.9 a 8 thread). Il decode muove 50-51 GB/s su 57: dal lato esatto resta il 10-12%.
+
+**6. Come si rifà**, a macchina lasciata sola: `sh tools/threads_phase.sh widths`, `sh
+tools/decode_context.sh widths` (16 contro 8 ai quattro contesti, 40 minuti), `sh
+tools/decode_context.sh measure`, `sh tools/threads_phase.sh sweep`; le tabelle con
+`tools/decode_context_report.py speed <file>` (scelte e cambi compresi) e `model`.
+
+
+## `tr_expf`: l'esponenziale nostro, scalare (2026-09-19)
+
+Domanda 37, primo tempo: **solo lo scalare**, che è la definizione. Il SIMD è una decisione a parte
+(punto 7). Velocità misurate sulla macchina pulita della sezione sopra, dalle 17:58 alle 18:39:
+carico di fondo 1.10 → 0.98 processori occupati (0.68-0.71 del `System`), A/A peggiore 3.0% sul
+prefill e 1.9% sul decode; ogni run in `build/prefill_context/`, hash in `binaries.sha256` («prima» è
+il binario del commit ef3cb99). Le due sessioni del giorno fatte prima, una coi `yes` accesi
+(spread 24-57%) e una interrotta, restano in `build/prefill_context-expf-noisy/` e `-interrupted/`.
+
+**1. La funzione** (`src/kernels/expf.c`). exp(x) = 2^(k/64) · exp(r), k = round(x · 64/ln2), r = x −
+k · ln2/64 con ln2/64 in due pezzi (il primo esatto per ogni k), tutto in double: 64 valori di
+2^(j/64), un polinomio di Taylor di grado 5, e un **test di arrotondamento**: se y·(1 − 2^-50) e
+y·(1 + 2^-50) arrotondano allo stesso float, exp(x) arrotonda lì. Gli argomenti che lo falliscono sono
+**8 su 4 278 190 082** e stanno in una tabella di eccezioni con l'esponenziale calcolato a 200 bit (e
+a 400: uguale). Un argomento che fallisse il test senza essere in tabella darebbe un NaN: un
+arrotondamento che nessuno ha provato non esce dalla funzione come numero. Dentro non c'è nessuna
+chiamata alla libreria C, e nessuna costante viene da una libreria: le scrive `tools/gen_expf_table.py`
+con mpmath (`src/kernels/expf_table.h`, confrontato col suo generatore da `tools/lint.py`, LEZIONI
+#83). Le 8 eccezioni le trovano uguali tre strade: il C su Windows (MinGW gcc 15.2), il C su Linux
+(gcc 13.3), e un mirror numpy bit a bit della strada veloce su tutti i float in campo
+(`gen_expf_table.py --scan`, 4 minuti). Softmax (attenzione e router) e SwiGLU la usano;
+`tools/lint.py` rifiuta `expf(` e `exp(` nella zona calda.
+
+**2. La prova è esaustiva** (`make bench-expf`: tutti i 2^32 float contro il riferimento, che è
+provato a 200 bit sui 369 casi al confine; in `make check` con gcc e con clang):
+
+| | costo a chiamata, libreria / `tr_expf` | diversi dalla libreria | diversi dal riferimento | non provati | tempo |
+|---|---|---|---|---|---|
+| Windows (MinGW-w64) | 29.9 ns / **3.5 ns** | **0 su 4 278 190 082** | **0** | 0 | 18 s |
+| Linux (glibc), gcc | 2.4 ns / 3.8 ns | 170 648 (dove glibc sbaglia) | **0** | 0 | 7 s |
+| Linux (glibc), clang | 4.0 ns / 4.1 ns | 170 648 | **0** | 0 | 6 s |
+
+Rosso prima: con la tabella delle eccezioni vuota, 8 NaN e `check: FAILED`. `tools/mutate_expf.sh`:
+**17 mutazioni su 17 viste** da almeno un controllo (test rapido `tests/test_expf.c`, prova esaustiva,
+confronto col generatore, lint della zona calda). Tre cose che le mutazioni insegnano. (a) Tre costanti
+spostate di un'unità sull'ultima cifra (2^(1/64), 1/6, il pezzo basso di ln2/64) **non cambiano nessun
+risultato** su 4 miliardi di float: le vede solo il confronto dell'header col generatore. (b) Col
+margine del test a 2^-60 (che in double vuol dire nessun margine) i risultati restano **tutti giusti**:
+il double della strada veloce arrotonda già al float giusto ovunque. Test e tabella non correggono
+numeri: rendono la prova strutturale, perché un cambio che sposta un risultato lascia argomenti non
+provati o voci di tabella morte (8, in quella mutazione), che il controllo conta, invece di un
+arrotondamento sbagliato in silenzio. (c) Softmax o SiLU rimessi sull'`expf` della libreria: su Linux
+li vede `test_expf` (il softmax e il SiLU sono la loro definizione con `tr_expf`, bit a bit), ovunque
+il lint; su Windows i bit sono gli stessi e resta il lint.
+
+**3. Su Windows gli stessi bit di prima.** Stadio `exact` di `tools/prefill_context.sh`, contro il
+binario del commit precedente, passato tre volte nel giorno: logit **identici al byte** su 600
+posizioni un token per passata (120 MB, 16 thread), a passate da 64 su 8 thread, su un prompt da 4000
+a passate da 512 e da 100, e gli stessi token dopo un prompt da 4000.
+
+**4. Su Linux cambia quanto previsto, e solo l'esponenziale** (`tools/expf_quality.sh` nel container,
+modello vero, prompt `code-edit.txt` più 1000 token generati, 1411 posizioni). Contro il binario di
+prima (`build/linux-before`, sull'`expf` di glibc): nessuna riga identica al byte, differenza massima
+fra due logit **2.3e-5** su un campo di 65.8, **KL media 3.9e-13, massima 1.5e-11, 0 posizioni** che
+scelgono un altro token, **1000 token su 1000** uguali. Contro il build di emulazione (il commit di
+prima con ogni `expf` sostituito da `(float)exp((double)x)`, `tools/cr_expf_emul.h`): **1411 righe su
+1411 identiche al byte** e gli stessi token, ed è un controllo (lo script esce 1 se no): nel motore è
+cambiato l'esponenziale e nient'altro.
+
+**5. Windows e Linux danno gli stessi byte** (`sh tools/platform_bits.sh`): logit identici al byte
+fra il binario nativo e quello del container sulle fixture minuscole F32, F16 e Q8_0 (120 posizioni) e
+sul **modello vero a 2 layer su 1000 posizioni (201 MB)**. Il sospetto sulla tabella RoPE (`pow`, `cos`
+e `sin` della libreria C, in double, arrotondati a float: il solo posto rimasto dove i numeri vengono
+da una libreria) è misurato voce per voce (`tests/dump_rope.c`, `tools/rope_table_compare.py`; la
+seconda copia dello strumento, LEZIONI #81, perché Smart App Control bloccava la prima): su 4096
+posizioni × 64 coppie i **double** di `cos` e `sin` differiscono fra le due librerie nello 0.8% delle
+voci (2175 coseni, 2216 seni su 262 144), `pow` mai, e i **float** della tabella del motore **mai**:
+l'arrotondamento a float assorbe l'ultima cifra del double. Domanda 40 chiusa: fino al contesto di
+addestramento di OLMoE le due piattaforme calcolano sugli stessi numeri.
+
+**6. Prima e dopo** (tok/s, mediana (min-max) di 8; decode forzato a 8 thread nei due binari, perché
+la larghezza scelta dalla sessione oscilla, domanda 31; soglia: prefill 3.0%, decode 1.9%):
+
+| | prima | prima, copia | dopo | dopo, copia | dopo / prima | stima (§Prefill su prompt lunghi, punto 6) |
+|---|---|---|---|---|---|---|
+| prefill, prompt 512 | 296.3 (271.6-313.7) | 290.8 | 305.5 (298.7-349.7) | 314.6 | 1.03-1.08× | 1.12× |
+| 2048 | 249.4 (239.4-261.5) | 252.7 | 303.2 (297.8-321.9) | 307.8 | **1.20-1.23×** | 1.23× |
+| 4000 | 210.9 (204.2-218.5) | 214.0 | 276.1 (267.8-281.3) | 276.5 | **1.29-1.31×** | 1.27× |
+| decode dopo 512 | 35.1 (34.8-36.1) | 35.1 | 36.0 (35.2-36.5) | 35.9 | **1.02-1.03×** | +5% |
+| dopo 2048 | 28.0 (27.6-28.2) | 27.5 | 29.3 (28.6-30.0) | 29.4 | **1.05-1.07×** | +8% |
+| dopo 4000 | 21.4 (21.1-21.8) | 21.2 | 23.2 (22.9-23.4) | 23.3 | **1.08-1.10×** | +10% |
+
+A 512 il prefill è sopra la soglia contro tre copie su quattro (1.031× contro la quarta): «fra 1.03 e
+1.08×». Per zona (profilo dei due binari nella stessa sessione, ms del prompt):
+
+| | 512: prima | dopo | 2048: prima | dopo | 4000: prima | dopo |
+|---|---|---|---|---|---|---|
+| `attention` | 92.3 | 40.5 | 1537 | 591 | 5960 | 2331 (**2.56×**) |
+| `expert_act` | 138.2 | 24.6 | 594.9 | 108.0 | 1201 | 218.4 (**5.5×**) |
+| `router` | 5.0 | 4.0 | 19.6 | 16.4 | 41.8 | 34.8 |
+| tutto il prompt | 1802 | 1644 (1.10×) | 8236 | 6825 (1.21×) | 19087 | 14693 (1.30×) |
+
+Il softmax passa da 32-35 a **4.4-6.6 ns per elemento** (`make bench-attn`) e da 61-73% a 22-31%
+dell'attenzione. A un thread il prefill a 512 va 1.15× (25.2 → 28.9 tok/s).
+
+**7. Il SIMD: i numeri per decidere** (non scritto). Dopo lo scalare, nel prefill a 512 / 2048 / 4000
+restano: softmax dell'attenzione circa 9 / 130 / 610 ms (il 22-27% di una zona che vale il 2.5 / 8.7 /
+15.9% del prompt) e `expert_act` 24.6 / 108 / 218 ms (l'1.5%). Con un esponenziale AVX-512 stimato a
+1.0-1.3 ns per elemento (8 double per registro; su Zen 4 i 512 bit sono due passate da 256 e il gather
+costa) e il resto del softmax vettoriale, softmax e attivazione scenderebbero del 65-70%: prefill
+stimato **1.01× / 1.03× / 1.04×**, decode +1-2%. Costo: circa 200 righe (varianti AVX2 e AVX-512
+identiche al bit allo scalare, gather dalla tabella, maschera per le corsie che non passano il test e
+code; voce `exp` nella tabella dei kernel con uno scratch per l'attivazione; la prova esaustiva per ogni
+tier, 7 s l'una nel cancello). Lo scalare ha preso quasi tutto: a 4000 token il guadagno che resta è
+sotto la soglia di una buona sessione. Decide Marcello (domanda 39).
+
+**8. Come si rifà.**
+
+| misura | comando | dura |
+|---|---|---|
+| la prova su tutti i float, e il costo a chiamata | `make bench-expf`, nativo e nel container | 7-18 s |
+| le costanti dal generatore; le eccezioni ritrovate da zero | `tools/gen_expf_table.py [--check]`; `--scan` | 1 s; 4 minuti |
+| i controlli vedono gli errori? | `sh tools/mutate_expf.sh` nel container | 8 minuti |
+| Linux: KL e token contro il binario di prima, byte contro l'emulazione | `sh tools/expf_quality.sh` nel container, col volume dei modelli | 8 minuti |
+| Windows e Linux, gli stessi byte? | `sh tools/platform_bits.sh` | 3 minuti |
+| logit al byte, prima e dopo con A/A, banco, zone | `GEN_EXTRA="--decode-threads 8" PROF_BEFORE=<prima> sh tools/prefill_context.sh change <prima>` | 45 minuti |
+
+
+## M1, prima di scrivere codice: routing e disco (2026-09-19/20)
+
+Domande 13-16. Una traccia del routing sul modello vero e un banco del disco; nessun cronometro sul
+motore, quindi nessuna dipendenza dallo stimatore della larghezza non ancora validato.
+
+**La traccia.** `trochilus run --route-trace <file>` registra, per ogni token e ogni layer, gli 8
+esperti scelti e due previsioni dei 16 più probabili del layer dopo, col router del layer dopo:
+`pred_in` sullo stato che entra nel FFN del layer corrente (noto **prima** che girino i suoi
+esperti), `pred_out` sull'uscita del layer passata per la `ffn_norm` del layer dopo (noto solo a
+layer finito). Spenta non costa niente e non cambia un byte. `tests/test_route.c` la prova esatta su
+modelli sintetici (con l'uscita dell'attenzione a zero `pred_out` **è** la scelta del layer dopo; con
+il router del layer 0 generato come quello del layer 1 `pred_in` **è** la scelta del layer 0), cinque
+mutazioni viste rosse (`tools/mutate_route.sh`). Run: OLMoE-1B-7B Q8_0, `bench/prompts/code-1000.txt`
+(904 token di codice nostro), 300 token generati, nel container (si contano esperti, non secondi).
+Tabelle da `tools/route_trace_report.py build/route/code-1000.bin`.
+
+Domanda 13, quota degli esperti scelti dal layer L+1 che stavano fra i primi K previsti:
+
+| | `pred_in` 8 | 12 | 16 | `pred_out` 8 | 12 | 16 |
+|---|---|---|---|---|---|---|
+| tutti i token | 82.4% | 92.4% | 95.8% | 86.1% | 94.9% | 97.2% |
+| solo prompt | 81.4% | 91.7% | 95.3% | 85.5% | 94.5% | 97.0% |
+| solo generati | 85.2% | 94.5% | 97.1% | 88.0% | 96.0% | 97.8% |
+| layer peggiore (L=0) | 63.2% | 74.6% | 82.0% | 67.7% | 79.7% | 85.7% |
+
+La soglia era «almeno l'80% prevedendone al massimo 12»: **passata** (92-96%), e già con la
+previsione presa **prima** degli esperti, che lascia al disco il tempo di un layer intero; aspettare
+l'uscita del layer dà 2-3 punti in più e metà del tempo. Il primo layer è l'eccezione (75-80%): chi
+lo prevede è l'embedding, non un layer.
+
+Domanda 14, cache di unità (layer, esperto) simulata su tutta la traccia, contata sui soli token
+generati; un esperto di un layer sono 6.375 MiB (tre matrici Q8_0), il modello ne ha 1024:
+
+| cache | LRU: mancati per token | LRU: MiB per token | pin dall'uso nel prompt: mancati | MiB |
+|---|---|---|---|---|
+| 25% (256) | 54.6 | 347.9 | 58.3 | 371.7 |
+| 50% (512) | 22.4 | 143.0 | 35.0 | 222.9 |
+| 75% (768) | 5.0 | 32.2 | 14.7 | 93.8 |
+
+Un token usa 128 unità (8 × 16): con metà modello in RAM ne mancano 22. **Il pin statico dall'uso
+perde contro l'LRU a ogni capacità** (a 75% legge il triplo): il piano di M1 diceva «pin dall'uso»,
+e su questa traccia è la scelta peggiore delle due.
+
+Domanda 15, streaming per layer interi (ogni token tocca ogni layer): 5106 / 3404 / 1702 MiB per
+token con il 25 / 50 / 75% dei layer in RAM, **15-53 volte** lo streaming per esperti. Chiusa: per
+esperti.
+
+**La lettura diretta, sul modello vero in nativo** (2026-09-20, una run per modo, non una misura:
+serve solo a dire che la catena regge fuori dal container e fuori dai modelli minuscoli). Budget
+3264 MiB, prompt 8, 2 token: `experts: 511 of 1024 units in RAM (3264 MiB, direct), 109 hits, 584
+misses, 3723 MiB read in 2.96 s`, e con `TR_EXPERT_DIRECT=0` gli stessi colpiti, mancati e MiB in
+3.41 s. Due cose: **3723 MiB in 2.96 s sono 1258 MiB/s**, cioè la banda del disco misurata da
+`make bench-disk` (~1.4 GB/s a blocchi da 2 MiB) e non quella della RAM, quindi si sta leggendo
+davvero dal disco anche su un volume cifrato; e gli slot sono **511 contro 512**, perché in diretta
+ognuno porta un settore di margine per parte (3 × 4 KiB su 6.4 MiB: lo 0.2%).
+
+**Il costo di una chiamata di lettura** (LEZIONI #94, misurato il 2026-09-20 in nativo,
+`bench_event_overhead` in `tests/bench_disk.c`): su Windows `tr_file_pread` crea e chiude un evento
+a ogni chiamata. Su un blocco da 4 KiB già in cache, 20 000 giri: **2.54-2.61 µs** contro
+**2.11-2.20 µs** con un evento tenuto vivo, cioè 0.41-0.44 µs a chiamata su tre run. Una lettura da
+2 MiB su questo disco è 1.4 ms: lo 0.03%. Non si cambia.
+
+**Il disco** (domanda 16). `make bench-disk` (`tests/bench_disk.c`): blocchi grandi quanto una
+matrice di un esperto (2.125 MiB) e quanto tre (6.375 MiB), a posizioni casuali allineate del file
+del modello (6.85 GiB), aperto senza la cache del sistema (`FILE_FLAG_NO_BUFFERING`; `O_DIRECT` su
+Linux), con 1-16 lettori; prima di ogni numero il lettore diretto e `tr_file_pread` devono dare gli
+stessi byte. Nativo, macchina ferma (`tools/machine_still.sh`), due sessioni, mediana di 5 run
+ciascuna (`build/disk/run1.txt`, `run2.txt`); NVMe Micron 2400 da 1 TB (QLC, senza DRAM).
+
+| blocco | 1 lettore | 4 | 8 | 16 | spread |
+|---|---|---|---|---|---|
+| 2.125 MiB | 1396 / 1454 MB/s | 1489 / 1471 | 1504 / 1514 | 1373 | 8-16% |
+| 6.375 MiB | 1641 / 1718 | 1749 / 1696 | 1666 / 1723 | 1614 | 7-20% |
+
+Attraverso la cache del sistema (`tr_file_pread`, 8 lettori): la prima lettura 1.66-1.93 GB/s, la
+seconda degli stessi blocchi **12-26 GB/s** (è una copia dalla RAM).
+
+1. **Il disco dà ~1.5 GB/s e i lettori non contano**: uno solo prende quanto otto, sedici perdono.
+   Il «pool di I/O» di M1 non serve per la banda: bastano 1-2 thread, e servono solo a non fermare
+   il calcolo. Tre matrici in fila rendono il 15% in più di tre letture separate.
+2. **1.5 GB/s è un terzo della scheda del disco** (4.5 GB/s in lettura sequenziale). Non si sa
+   perché: cifratura del volume, QLC senza DRAM su letture sparse, o la richiesta sincrona da 2 MiB.
+   Domanda 41.
+3. **Token al secondo attesi** (decode a 8 thread ~28-36 ms di calcolo per token; 1 MB = 10^6 byte,
+   1.5 GB/s = 1430 MiB/s): con la cache al 50% si leggono 143 MiB = 100 ms per token, cioè **7-8
+   tok/s** se lettura e calcolo si sommano e **10 tok/s** se si sovrappongono del tutto (la
+   previsione della domanda 13 serve a questo); al 75% 22 ms, **17-20 tok/s** sommati e il solo calcolo
+   (28-36) se sovrapposti; al 25% 243 ms, **3.6-4.1 tok/s**. Il criterio era «per esperti se almeno 5 tok/s al 50%»: **passato**.
+4. La cache del sistema rende 12-26 GB/s su ciò che ha già letto, ma non si governa (né quanto
+   tiene né cosa butta): il budget di RAM di M1 resta nostro, e la lettura va fatta senza passare
+   due volte dalla RAM (o diretta, o nostra: da decidere nel progetto).
+5. Limiti della misura: una sola traccia (codice, 904 + 300 token) e un solo modello, con esperti
+   piccoli (8 attivi su 64); il prompt è contato token per token, mentre un prefill a blocchi tocca
+   quasi tutti gli esperti di ogni layer in una passata (per il prompt lo streaming per esperti vale
+   quanto leggere tutto il modello una volta).
+6. **Con questo disco il precaricamento non rende, e con 12 candidati fa danno.** Il report simula
+   la stessa LRU col precaricamento dei primi k di `pred_in` (per token generato, cache al 50%):
+   gli stalli scendono da 22.4 a 7.2 (k=8) e 5.5 (k=12), ma le letture salgono da 22.4 a 29.9 e
+   49.8, perché 5 e 21 sono di esperti che poi non servono. Il disco è il collo, quindi conta il
+   totale letto, non gli stalli. **Modello a tempo** (non è una misura: un disco, una lettura per
+   volta a 4.46 ms per unità, 33 ms di calcolo per token; `route_trace_report.py`, provato a mano
+   in `--check` e con quattro mutazioni rosse):
+
+   | cache | senza | k=8 | k=12 | k=16 | | disco 3× (4.3 GB/s): senza | k=8 | k=12 |
+   |---|---|---|---|---|---|---|---|---|
+   | 25% | 3.6 tok/s | 3.5 | 2.2 | 1.6 | | 8.8 | 10.0 | 6.4 |
+   | 50% | 7.5 | 7.0 | 4.5 | 3.0 | | 15.1 | 17.4 | 12.7 |
+   | 75% | 18.0 | 18.1 | 13.0 | 9.0 | | 24.7 | 26.9 | 24.6 |
+
+   La soglia della domanda 13 («80% con 12 candidati») misurava la cosa sbagliata: la previsione è
+   buona, ma ogni candidato in più è una lettura, e la lettura è ciò che manca. Il primo M1 è
+   **LRU e letture a richiesta, senza precaricamento**; il precaricamento (k = gli 8 più probabili,
+   mai di più) resta un'opzione che il piano automatico accende solo su un disco veloce, dove vale
+   l'11-15%. Domanda 43.
+
+## Il comportamento sul codice è un grafo piccolo e deterministico? (2026-09-20)
+
+Domanda 44 (Marcello), con le soglie scritte prima di misurare (riga 44 di §Da misurare). Sei
+tracce del routing su OLMoE-1B-7B Q8_0, 300 token generati ciascuna, nel container (si contano
+esperti, non secondi): quattro di codice nostro (`code-1000` C, `trace-c2` C, `trace-py` Python,
+`trace-sh` shell; 842-904 token di prompt) e due di prosa di controllo (`trace-prose-it`, un pezzo
+di questo progetto in italiano, 941 token; `trace-prose-en`, un testo inglese sui colibrì, 583
+token e 265 generati). Traccia versione 2: anche l'id di ogni token e il margine del router
+(probabilità dell'ultimo esperto scelto e del migliore escluso), esatti per prova
+(`tests/test_route.c`: al layer 0 l'escluso di un modello con 2 esperti per token **è** l'ultimo
+scelto dello stesso modello con 3). Tabelle da `tools/route_graph_report.py` (`--check` calcolato
+a mano, mutazioni in `tools/mutate_reports.py`); file in `build/route/`.
+
+| | code-1000 | c2 | py | sh | prosa it | prosa en |
+|---|---|---|---|---|---|---|
+| unità usate, di 1024 | 1012 | 998 | 1006 | 1011 | 1013 | 1018 |
+| il 25% più usato copre | 68.1% | 73.2% | 72.5% | 70.0% | 60.9% | 51.7% |
+| il 50% più usato copre | 87.7% | 92.5% | 91.2% | 87.7% | 83.6% | 79.2% |
+| unità per il 99% delle attivazioni | 84.9% | 75.6% | 81.8% | 84.0% | 85.6% | 89.5% |
+| grafo statico di co-occorrenze, primi 8 (il router vivo: 82-86%) | 53.7% | 64.2% | 64.8% | 54.3% | 59.3% | 51.3% |
+| sola frequenza, primi 8 (caso: 12.5%) | 40.2% | 51.9% | 54.2% | 40.0% | 37.7% | 20.7% |
+| stesso id di token → stesso insieme, layer 0 / media / ultimo | 14% / 11% / 12% | 16 / 14 / 16 | 13 / 11 / 14 | 9 / 10 / 14 | 6 / 9 / 27 | 3 / 6 / 8 |
+| idem, Jaccard medio, layer 0 / media | 0.51 / 0.60 | 0.51 / 0.64 | 0.46 / 0.62 | 0.42 / 0.62 | 0.40 / 0.56 | 0.33 / 0.51 |
+| esperti in comune col token prima, di 8 (caso 1.0) | 3.6 | 3.9 | 3.9 | 4.0 | 3.3 | 3.0 |
+| percorsi interi ripetuti | 0 | 0 | 0 | 0 | 0 | 0 |
+| margine del router, mediana (quota della probabilità dell'ultimo scelto) | 5.1% | | | | | 6.3% |
+
+Sovrapposizione del 25% più caldo fra due tracce (Jaccard; fra parentesi la quota delle
+attivazioni della seconda che cade nell'insieme caldo della prima):
+
+| | c2 | py | sh | prosa it | prosa en |
+|---|---|---|---|---|---|
+| code-1000 | 0.75 (71%) | 0.73 (70%) | 0.68 (68%) | 0.34 (45%) | 0.09 (19%) |
+| c2 | | 0.77 (71%) | 0.72 (68%) | 0.33 (45%) | 0.07 (17%) |
+| py | | | 0.74 (68%) | 0.37 (48%) | 0.08 (17%) |
+| prosa it | | | | | 0.16 (24%) |
+
+Col 50% più caldo: codice-codice 0.72-0.77 (85-90% delle attivazioni dentro), codice-prosa inglese
+0.28 (46%).
+
+1. **Piccolo: no.** Soglia «il 25% delle unità copre il 99%»: copre il 68-73% sul codice, e per il
+   99% serve il 76-85% del modello. Ogni traccia tocca il 97-99% delle unità in mille token.
+2. **Tabella: no, nemmeno al layer 0.** Soglia «stesso id → stesso insieme nel 95% dei casi»: 9-16%
+   sul codice (Jaccard 0.42-0.51). Lo stesso token prende esperti diversi secondo il contesto già
+   al primo layer, dove fra l'embedding e il router c'è solo un'attenzione.
+3. **Statico: no.** Un grafo di co-occorrenze senza stato indovina il 54-65% del layer dopo, il
+   router sullo stato vivo l'82-86%; nessun percorso intero si ripete, in nessuna traccia. E le
+   scelte sono strette: metà sono decise da meno del 5% della probabilità dell'ultimo esperto
+   scelto (mediana 5.1%), quindi il grafo discreto è anche fragile a piccole perturbazioni.
+4. **Una regione del codice: sì, netta.** Soglia «codice-codice supera codice-prosa di almeno 0.20»:
+   0.68-0.77 contro 0.07-0.09 con la prosa inglese, e 0.31-0.37 con la prosa tecnica italiana
+   (che di codice parla). C, Python e shell scaldano le stesse unità; il testo sui colibrì quasi
+   nessuna di quelle. Il codice è anche più concentrato della prosa (25% → 68-73% contro 52-61%) e
+   più prevedibile dalla sola frequenza (40-54% contro 21%). È specializzazione per dominio, non
+   un grafo piccolo: l'insieme caldo di un file copre solo il 68-71% delle attivazioni di un altro.
+5. Per il motore: l'LRU resta la scelta giusta dentro una sessione (3.6-4.0 esperti su 8 in
+   comune col token prima); la regione del codice dice che una cache **calda fra sessioni di
+   codice** parte già col 68-71% di ciò che serve (domanda 45), e non dice niente su quanto del
+   modello si possa togliere: quello lo dice solo la prova funzionale qui sotto.
+6. Limiti: un modello generalista da 64 esperti, sei testi, 300 token generati a traccia, prompt
+   fatti di codice nostro; «deterministico» qui vuol dire prevedibile senza lo stato, non
+   ripetibile (ripetibile lo è per costruzione).
+
+**La prova funzionale** (`sh tools/mask_quality.sh`: esperti spenti con `--expert-mask`, modo di sola
+misura; maschera = le unità fuori dal 75 / 50 / 25% più usato in `code-1000`, e per controllo lo
+stesso numero estratto a caso; logit di ogni posizione contro il modello intero). **Fatti due testi
+su cinque**: la macchina è rimasta senza memoria due volte (3-5 GiB liberi su 31, con le altre
+finestre al lavoro) e la run è stata fermata. I due testi sono `code-1000`, cioè il caso **più
+favorevole** (è quello da cui la maschera è ricavata, 904 posizioni), e `trace-c2`, un file C che la
+maschera **non ha mai visto** (860 posizioni):
+
+| unità tenute | | per uso: KL media | token diverso | a caso: KL media | token diverso |
+|---|---|---|---|---|---|
+| 75% (256 spente) | code-1000 | 0.0154 | 29 (3.2%) | 0.598 | 178 (19.7%) |
+| | trace-c2 | 0.0198 | 30 (3.5%) | 0.702 | 209 (24.3%) |
+| 50% (512 spente) | code-1000 | 0.0902 | 55 (6.1%) | 4.58 | 663 (73.3%) |
+| | trace-c2 | 0.103 | 62 (7.2%) | 4.70 | 644 (74.9%) |
+| 25% (755 spente) | code-1000 | 0.309 | 121 (13.4%) | 8.27 | 880 (97.3%) |
+| | trace-c2 | 0.334 | 117 (13.6%) | 8.39 | 848 (98.6%) |
+
+7. **Funzionale: no.** Soglia «col 50% spento, stesso token nel 99% delle posizioni e KL ≤ 1e-2»:
+   93.9% e KL 0.090 sul testo stesso della maschera, 92.8% e 0.103 su un file C mai visto; nemmeno
+   tenendo il 75% si passa (96.8% e 96.5%, KL 0.015 e 0.020). Il grafo piccolo non c'è nemmeno nel
+   senso debole: per tenere il comportamento servono quasi tutti gli esperti.
+8. **La maschera non si sgretola sul testo nuovo.** Le due colonne per uso sono a un punto
+   percentuale l'una dall'altra a ogni capacità: quel che l'uso impara su un file vale su un altro
+   file di codice (la regione del punto 4), e il poco che si perde non è memoria del testo.
+8. **Ma l'uso dice moltissimo su quali esperti servono**: a parità di unità spente, la maschera per
+   uso sposta l'uscita 40-50 volte meno di quella a caso (KL 0.09 contro 4.6 col 50% spento). Non è
+   un grafo piccolo, è una graduatoria ripida: il modello regge male la perdita degli esperti
+   giusti e quasi per niente quella degli esperti sbagliati.
+
 ## Tentativi
 
 | Data | Cosa | Prima | Dopo | Spread | Esito |
@@ -1424,4 +1860,7 @@ su 6.6): dal lato esatto nell'attenzione resta poco. Il prossimo pezzo è `expf`
 | 2026-09-19 | lavoro di un token solo sul pool (norme, RoPE, KV, router, righe per gli esperti) e righe F32 col kernel del tier | zone per token 121 / 455 / 880 ms, `router` 80 / 324 / 627 | 48 / 174 / 353 e 6 / 22 / 45 | A/A 2.1% | **tenuto**; con la riga sopra il prefill fa **1.05-1.08× / 1.07-1.08× / 1.11-1.14×** a 512 / 2048 / 4000, decode non distinguibile (A/A 2.4%) |
 | 2026-09-19 | righe di pesi **F16** con i kernel del tier (`vcvtph2ps`, conversione esatta), bit-identiche allo scalare; nate dal controllo `test_tier_used` (LEZIONI #78) | `dot_row f16` 466 M el/s in ogni tier (n=2048) | 22.8 G el/s AVX2, 22.7 AVX-512 (**49×**) | 3-7% | **tenuto**; nessun modello F16 negli scenari: il numero è del kernel, non di un prefill |
 | 2026-09-19 | gruppo da 4 o 64 query, blocco da 16 o 256 posizioni invece di 16 × 64 (solo nel banco) | 355 ms per layer a 4000 | 352-387 | 2-15% | scartato: tutto dentro lo spread, resta 16 × 64 |
-| 2026-09-19 | `expf` nostro, arrotondato correttamente (non scritto: i numeri per decidere) | `expf` di MinGW 30.2 ns, di glibc 2.3 | stima: prefill 1.11× / 1.21× / 1.25×, decode +5-10% | — | **decide Marcello** (domanda 37): su Windows darebbe gli stessi bit di oggi, su Linux cambierebbe lo 0.004% delle chiamate |
+| 2026-09-19 | **`tr_expf` scalare**, arrotondato correttamente su tutti i 2^32 float (prova esaustiva in `make check`), al posto dell'`expf` della libreria in softmax e SwiGLU; Windows: logit identici al byte; Linux: KL 3.9e-13, stessi byte dell'emulazione | prefill 296 / 249 / 211 tok/s a 512 / 2048 / 4000; decode a 8 thread 35.1 / 28.0 / 21.4; `attention` 92 / 1537 / 5960 ms, `expert_act` 138 / 595 / 1201 | 306-315 / 303-308 / 276; 36.0 / 29.3 / 23.2; 41 / 591 / 2331 e 25 / 108 / 218 | A/A 3.0% prefill, 1.9% decode | **tenuto**: prefill 1.03-1.08× / 1.20-1.23× / 1.29-1.31×, decode 1.02-1.10×; Windows e Linux ora danno gli stessi byte (§`tr_expf`) |
+| 2026-09-19 | `tr_expf` in SIMD (non scritto: i numeri per decidere) | dopo lo scalare, softmax 9 / 130 / 610 ms e `expert_act` 25 / 108 / 218 ms del prefill | stima: prefill 1.01× / 1.03× / 1.04×, decode +1-2%, circa 200 righe | — | **decide Marcello** (domanda 39): lo scalare ha preso quasi tutto |
+| 2026-09-19 | rimisura a macchina pulita di thread per fase e decode a contesto lungo (quattro `yes` dimenticati sotto le misure del 18-19/09, LEZIONI #84) | decode a 512, 8 contro 16 thread: 1.10×; RAM ~54 GB/s | 1.00-1.02× (non distinguibile a nessun contesto); RAM ~57 GB/s con 4-6 thread; a 512 il decode vuole 4 thread | A/A 2.5-4.6% | conclusione corretta: pochi thread sì, il «+10%» no; lo stimatore della larghezza va riscritto (domanda 31, §Rimisura a macchina pulita) |
+| 2026-09-19 | stimatore della larghezza del decode riscritto (domanda 31, LEZIONI #88): margine dal rumore misurato nelle passate stesse (non più un tetto fisso), scelta a coppie (mai il rumore di una terza larghezza), estensione fino a `TR_DECODE_TUNE_ROUNDS_MAX` sui due contendenti, nuova misura ad ogni classe di contesto e dopo `TR_DECODE_TUNE_REMEASURE_KEPT` passate mantenute con un cambio in sospeso, isteresi a due voti prima di cambiare scelta | — | — | — | test C verdi (`tests/test_phase.c`, `tools/mutate_tune.sh`); **da validare sul modello vero**, di notte a macchina tranquilla: nessun numero ancora |

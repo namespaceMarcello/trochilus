@@ -6,6 +6,9 @@
 #   sh tools/threads_phase.sh sweep [rounds]
 #       one -t for both phases: 16, 8, 12, 4 and 16 again (the A/A), context 512 then 2048.
 #       About 30 minutes. This is the measurement the width was chosen from.
+#   sh tools/threads_phase.sh widths [rounds]
+#       decode-512 alone (below): the decode forced on 16, 8, 4, 12, 6 threads and the measured
+#       default, prompt on 16. About 10 minutes.
 #   sh tools/threads_phase.sh change <binary-before> [rounds]
 #       change-512, change-2048: before and after at -t 16, each with its A/A copy, and the new
 #       binary with the decode forced on 8; "width" is the decode width each run of the new
@@ -30,9 +33,9 @@ B=build/trochilus.exe
 M=models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf
 OUT=build/threads_phase
 case "$WHAT" in
-  sweep) R=${2:-8} ;;
+  sweep|widths) R=${2:-8} ;;
   change|after) BEFORE=$2; R=${3:-8}; [ -f "$BEFORE" ] || { echo "threads_phase: no binary '$BEFORE'"; exit 2; } ;;
-  *) echo "usage: threads_phase.sh sweep [rounds] | change <binary-before> [rounds] | after <binary-before> [rounds]"; exit 2 ;;
+  *) echo "usage: threads_phase.sh sweep [rounds] | widths [rounds] | change <binary-before> [rounds] | after <binary-before> [rounds]"; exit 2 ;;
 esac
 mkdir -p $OUT
 [ -f $B ] && [ -f $M ] || { echo "threads_phase: $B or $M is missing"; exit 1; }
@@ -50,22 +53,23 @@ wait_runs() {
 # one measurement at a time, and the machine stays awake while it lasts (docs/LEZIONI.md #82)
 . tools/measure_guard.lib
 measure_begin threads_phase
-trap measure_end EXIT INT TERM
+trap measure_end EXIT
+trap 'exit 130' INT TERM
 wait_runs $B
 [ -z "$BEFORE" ] || wait_runs $BEFORE
 
 RUNNING=$(docker ps -q 2>/dev/null || true)
 restart() { measure_end; if [ -n "$RUNNING" ]; then docker start $RUNNING > /dev/null 2>&1 || true; echo "containers started again"; fi; }
-trap restart EXIT INT TERM
+trap restart EXIT
 if [ -n "$RUNNING" ]; then
   # the VM's file cache goes back to Windows first (docs/LEZIONI.md #38), then everything stops
   MSYS_NO_PATHCONV=1 docker run --rm --privileged trochilus-dev:local sh -c "sync; echo 3 > /proc/sys/vm/drop_caches" || true
   docker stop $RUNNING > /dev/null
   echo "containers stopped: $(echo $RUNNING | wc -w)"
 fi
-# from here on a running container means somebody else is using the machine: ab_modes.sh stops
-# at the next run instead of going on (docs/LEZIONI.md #73)
-AB_GUARD='[ -z "$(docker ps -q 2>/dev/null)" ]'
+# from here on a running container, or a CPU busy with other work, means somebody else is using
+# the machine: ab_modes.sh stops at the next run instead of going on (docs/LEZIONI.md #73, #84)
+AB_GUARD=$MEASURE_AB_GUARD
 export AB_GUARD
 
 # The model takes 7 GiB and the memory guard wants 3 more left free. After a `make check` Windows
@@ -80,18 +84,31 @@ while :; do
   echo "threads_phase: ${AVAIL:-?} GiB available, 12 wanted: waiting 30 s"
   sleep 30
 done
+measure_still threads_phase
+measure_declare "before the first run"
 
 # $1: prompt length, $2: context
 gen() { echo "generate -m $M -p $1 -n 48 -c $2 -t 16"; }
 # $1: prompt file
 spec() { echo "run -m $M -f bench/prompts/$1 -n 200 -t 16 --spec 8"; }
 
-if [ "$WHAT" = sweep ]; then
+widths() {
+  G=$(gen 512 600)
+  echo "##### decode width forced, prompt 512"
+  cleanup_run sh tools/ab_modes.sh $R "d16=$B $G --decode-threads 16" "d8=$B $G --decode-threads 8" \
+     "d4=$B $G --decode-threads 4" "auto=$B $G" "d12=$B $G --decode-threads 12" \
+     "d6=$B $G --decode-threads 6" "d16again=$B $G --decode-threads 16" > $OUT/decode-512.txt
+  tail -22 $OUT/decode-512.txt
+}
+
+if [ "$WHAT" = widths ]; then
+  widths
+elif [ "$WHAT" = sweep ]; then
   for P in "512 600" "2048 2200"; do
     set -- $P
     G="generate -m $M -p $1 -n 48 -c $2"
     echo "##### sweep, prompt $1"
-    sh tools/ab_modes.sh $R "t16=$B $G -t 16" "t8=$B $G -t 8" "t12=$B $G -t 12" "t4=$B $G -t 4" \
+    cleanup_run sh tools/ab_modes.sh $R "t16=$B $G -t 16" "t8=$B $G -t 8" "t12=$B $G -t 12" "t4=$B $G -t 4" \
        "t16again=$B $G -t 16" > $OUT/sweep-$1.txt
     tail -11 $OUT/sweep-$1.txt
   done
@@ -100,25 +117,21 @@ else
     set -- $P
     G=$(gen $1 $2)
     echo "##### change, prompt $1"
-    sh tools/ab_modes.sh $R "before=$BEFORE $G" "after=$B $G" "forced8=$B $G --decode-threads 8" \
+    cleanup_run sh tools/ab_modes.sh $R "before=$BEFORE $G" "after=$B $G" "forced8=$B $G --decode-threads 8" \
        "beforeagain=$BEFORE $G" "afteragain=$B $G" > $OUT/change-$1.txt
     tail -14 $OUT/change-$1.txt
   done
-  [ "$WHAT" = after ] || { echo "done: $OUT"; exit 0; }
-  G=$(gen 512 600)
-  echo "##### decode width forced, prompt 512"
-  sh tools/ab_modes.sh $R "d16=$B $G --decode-threads 16" "d8=$B $G --decode-threads 8" \
-     "d4=$B $G --decode-threads 4" "auto=$B $G" "d12=$B $G --decode-threads 12" \
-     "d6=$B $G --decode-threads 6" "d16again=$B $G --decode-threads 16" > $OUT/decode-512.txt
-  tail -22 $OUT/decode-512.txt
+  [ "$WHAT" = after ] || { measure_declare "after the last run"; echo "done: $OUT"; exit 0; }
+  widths
   for F in code-edit code; do
     S=$(spec $F.txt)
     echo "##### --spec 8, $F"
-    sh tools/ab_modes.sh $R "before=$BEFORE $S" "after=$B $S" "rows16=TR_DECODE_ROWS=16 $B $S" \
+    cleanup_run sh tools/ab_modes.sh $R "before=$BEFORE $S" "after=$B $S" "rows16=TR_DECODE_ROWS=16 $B $S" \
        "beforeagain=$BEFORE $S" > $OUT/spec-$F.txt
     tail -11 $OUT/spec-$F.txt
   done
 fi
+measure_declare "after the last run"
 echo "done: $OUT"
 }
 main "$@"; exit

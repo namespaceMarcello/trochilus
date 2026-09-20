@@ -103,3 +103,21 @@ istantanea non serve: la nostra cache è indicizzata per posizione, si torna ind
 In più, qui i token sono **identici al bit**, perché ogni riga del lotto è lo stesso calcolo della
 passata da un token (`tests/test_prefill.c`, `tests/test_spec.c`): nessuna delle tre fonti lo prova.
 
+
+### L'archivio degli esperti: cosa si è preso da colibri e cosa no (2026-09-20)
+
+`src/memory/experts.{h,c}` è codice nuovo (nessuna riga portata), scritto dopo aver letto
+`ref/colibri/c/olmoe.c` (`LCache`, `Slot`, `expert_get`, `pilot_worker`) e con le misure delle
+domande 13-16 davanti (`docs/MISURE.md` §M1). Tre difetti trovati in quella lettura stanno in
+`docs/UPSTREAM.md` #7-#9.
+
+| Scelta | colibri | Trochilus | Perché |
+|---|---|---|---|
+| trovare un esperto in cache | array `slot_by_expert[eid]`, O(1) (`olmoe.c:158`) | `slot_of[unit]`, O(1), unità = (layer, esperto) | preso: è la cosa giusta |
+| un esperto in memoria | un solo blocco per le tre matrici (`load_expert_merged`, `olmoe.c:636`) | uno slot per unità, le tre parti allineate a 64 dentro lo slot | preso a metà: nel nostro GGUF i tre tensori sono separati, quindi le tre parti si leggono comunque con tre `pread` (lettura unica impossibile senza un formato nostro, escluso il 2026-09-17) |
+| scegliere chi sfrattare | scansione lineare di tutti gli slot a ogni mancato, O(capacità) (`olmoe.c:696`) | lista doppiamente concatenata, O(1) | rifiutato: peggiora al crescere del budget, ed è proprio il caso che ci interessa |
+| tenere in RAM gli esperti più usati (pin) | `pin_hot_experts` dopo 5 token, con una via di fuga se tutti gli slot sono bloccati (`olmoe.c:745`) | niente pin: solo LRU | rifiutato **coi numeri**: sulla traccia del routing il pin dall'uso legge di più dell'LRU a ogni capacità (al 75%: 94 contro 32 MiB per token, domanda 14) |
+| precaricare gli esperti del layer dopo | un thread dedicato, previsione con un mini-matmul del router più una media mobile (`PILOT`, `olmoe.c:1110`) | niente, per ora | rifiutato **coi numeri**: la previsione è buona (92-95%, domanda 13) ma su un disco da 1.5 GB/s ogni candidato sbagliato è una lettura e il totale letto peggiora (domanda 43) |
+| thread di I/O | uno, solo per il precaricamento | nessuno: la lettura è sul thread che chiama | il disco dà la stessa banda a 1 e a 8 lettori (domanda 16): un thread servirebbe solo a sovrapporre, e senza precaricamento non c'è niente da sovrapporre |
+| un errore di lettura | `exit(1)` dentro `st_pread_full` (`st.h:268`), anche per un precaricamento facoltativo | la valutazione torna -1 e la sessione resta com'era | un motore in una libreria non può chiudere il processo |
+| da dove si legge | formato proprio convertito (`model-*.safetensors`, `st.h`) | il GGUF standard, alle posizioni dei tensori | decisione del 2026-09-17: i file di Hugging Face si aprono senza conversione |

@@ -90,24 +90,39 @@ make oracle              # modelli minuscoli: genera, converte, confronta con tr
 make tier-check          # il motore sotto ogni tier (TR_CPU_MAX): test del modello e logit identici al byte
 make oracle-tokenizer    # tokenizer di OLMoE contro transformers: id, pezzi, NFC, decodifica
 make oracle-real         # OLMoE vero tagliato a 2 layer contro transformers (saltato senza modello)
-build/trochilus run -m <file.gguf> -f prompt.txt -n 200    # testo in entrata, generazione greedy
+build/trochilus run -m <f.gguf> -f prompt.txt -n 200    # testo in entrata, generazione greedy
 build/trochilus chat -m <file.gguf>                       # conversazione con il template del modello
 make chat-check          # chat sul modello vero: seconda risposta = run da zero (saltato senza modello)
 make spec-check          # `--spec 0/1/4/8/15` danno lo stesso testo sul modello vero a 2 layer
-build/trochilus run -m <f.gguf> -f prompt.txt -n 200 --spec 8   # speculazione dal prompt (stessi token)
+build/trochilus run ... --spec 8   # speculazione dal prompt (stessi token)
 sh tools/ab_spec.sh <gguf> <binario> bench/prompts/code.txt 8   # quanto rende --spec, run alternate
-sh tools/build_llamacpp.sh; tools/compare_llamacpp.py ...   # nel container: llama.cpp e confronto dei logit
-tools/speed_compare.py ...   # nel container: velocità contro llama.cpp e colibri (modelli nel volume trochilus-models)
+sh tools/build_llamacpp.sh; tools/compare_llamacpp.py ...   # nel container: llama.cpp, logit a confronto
+tools/speed_compare.py ...   # nel container: velocità contro llama.cpp e colibri (volume trochilus-models)
 sh tools/ab_speed.sh <gguf> <binario A> <binario B>   # due binari alternati run per run (LEZIONI #46)
 sh tools/ab_modes.sh <giri> "a=<comando>" "b=<comando>"   # modi di un binario (env, flag), ordine a rotazione, A/A (LEZIONI #66)
-build/trochilus run -m <f.gguf> -f prompt.txt --decode-threads 8   # forza i thread del decode (default: li misura la sessione)
-sh tools/threads_phase.sh sweep | after <binario prima>   # thread per fase: -t 4/8/12/16, prima e dopo, larghezze forzate, --spec
-sh tools/decode_context.sh measure | change <binario prima>   # decode a contesto 32/512/2048/4000 in una sessione, A/A, logit al byte, byte per zona
-tools/.venv/Scripts/python.exe tools/decode_context_report.py speed|model|zones <file>   # le tabelle di MISURE dai file delle run
+build/trochilus run ... --decode-threads 8   # forza i thread del decode (default: li misura la sessione)
+sh tools/threads_phase.sh sweep | widths | after <binario prima>   # thread per fase: -t 4/8/12/16, larghezze forzate
+sh tools/decode_context.sh measure | widths | long | change <prima>   # decode a contesto 32/512/2048/4000: A/A, larghezze forzate, byte per zona
+tools/.venv/Scripts/python.exe tools/decode_context_report.py speed|model|zones <file>   # le tabelle di MISURE dalle run; speed conta scelte e cambi
+sh tools/orphans.sh      # è rimasto acceso qualcosa di nostro? make check e le misure non partono
+sh tools/busy_machine.sh <n> <comando>   # il SOLO modo di caricare la macchina: i generatori muoiono con lo script
+sh tools/machine_still.sh [limite] [attesa] [finestra]   # processori occupati (chi: tools/background_load.ps1): la guardia di ogni misura
+sh tools/test_cleanup.sh   # uno script fermato porta via i figli; senza il trap di cleanup.lib il figlio resta
 make bench               # microbenchmark dei kernel (mediana + rumore)
-make bench-mem           # banda della RAM (in fila, sparsa), matmul del motore, attenzione sui due layout della KV
+make bench-mem           # banda della RAM (in fila, sparsa), matmul del motore, attenzione sui due layout
+make bench-disk          # il disco per chi legge esperti, senza cache del sistema (DISK_FILE=<file>)
+build/trochilus run ... --route-trace <file>   # traccia del routing: esperti scelti e previsti
+tools/.venv/Scripts/python.exe tools/route_trace_report.py <traccia> | --check   # previsione, cache LRU, streaming
+tools/.venv/Scripts/python.exe tools/route_graph_report.py <traccia> | --compare | --mask-from   # domanda 44
+sh tools/mask_quality.sh   # esperti spenti: KL e token contro il modello intero (sola misura)
+sh tools/experts_budget.sh measure | misses | direct   # M1: tok/s ai 4 budget, costo di un token, cache sì/no
+build/trochilus run ... --expert-budget <MiB|min>   # RAM degli esperti (default: il piano); TR_EXPERT_BUDGET_MIB nei test
+sh tools/mutate_{route,tune,experts,stream}.sh | tools/mutate_reports.py   # nel container: le mutazioni, tutte rosse
 make bench-attn          # l'attenzione di un prompt (512/2048/4000) su un layer, smontata per fasi, con controllo dei bit
-make bench-expf          # expf della libreria C: costo a chiamata, e su quanti dei 2^32 float non è arrotondato correttamente
+make bench-expf          # tr_expf su tutti i 2^32 float contro il valore arrotondato e la libreria C
+tools/.venv/Scripts/python.exe tools/gen_expf_table.py [--check | --scan]   # le costanti di tr_expf da mpmath (src/kernels/expf_table.h)
+sh tools/expf_quality.sh | sh tools/mutate_expf.sh   # nel container: tr_expf contro il binario di prima (KL) e l'emulazione (byte)
+sh tools/platform_bits.sh   # Windows e Linux danno gli stessi byte? logit e tabelle RoPE delle due piattaforme
 sh tools/prefill_context.sh measure | change <binario prima>   # prefill a 512/2048/4000 in una sessione, A/A, logit al byte, zone
 tools/.venv/Scripts/python.exe tools/prefill_context_report.py attn|zones <file>   # le tabelle di MISURE §Prefill su prompt lunghi
 make profile             # scenari col profiler, mediana di N, token identici, confronto col precedente
@@ -136,6 +151,10 @@ Smart App Control blocca i binari appena compilati (LEZIONI #12).
 - Ogni variante di kernel (SIMD, assembly) è bit-identica allo scalare; il test lo verifica.
 - Zona calda (codice che gira a ogni token): niente allocazioni, stringhe, I/O; `tools/lint.py` e
   `tests/test_hot.c` lo verificano. Ogni misura è una mediana di N run, mai una run sola.
+- **Misure native**: ogni script finisce ciò che ha lanciato (`tools/cleanup.lib`), niente parte con
+  orfani accesi (`tools/orphans.sh`), la macchina si carica solo con `tools/busy_machine.sh`, ogni
+  sessione dichiara il carico di fondo nel log e con un carico non basso le conclusioni non si tirano
+  (`docs/ARCHITETTURA.md` §Profilazione, LEZIONI #84-#88).
 - Un file derivato da colibri o ds4 dice nell'intestazione progetto, commit, percorso, modifica.
 - Commenti e nomi nel codice in inglese; documenti in `docs/` in italiano.
 - Prefisso `tr_` per i simboli pubblici; niente stato globale per modello (più modelli in un processo).

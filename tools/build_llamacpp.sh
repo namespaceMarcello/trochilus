@@ -7,6 +7,9 @@ set -e
 # The body is one function, called on the last line: the shell parses all of it before it runs
 # any, so editing this file while it runs cannot change a run under way (docs/LEZIONI.md #69).
 main() {
+. tools/cleanup.lib
+trap cleanup_children EXIT
+trap 'exit 130' INT TERM
 command -v cmake >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq cmake >/dev/null; }
 B=ref/llama.cpp/build-trochilus
 cmake -S ref/llama.cpp -B "$B" -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DLLAMA_CURL=OFF \

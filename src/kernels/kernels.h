@@ -118,9 +118,23 @@ void tr_rope_table(float *cos_t, float *sin_t, int64_t n_pos, int64_t head_dim, 
  * elements, one position: x' = x*cos_p + rotate_half(x)*sin_p, where cos_p and sin_p are the
  * head_dim/2 entries of that position in the tr_rope_table tables. */
 void tr_rope_neox(float *x, int64_t n_heads, int64_t head_dim, const float *cos_p, const float *sin_p);
-/* In place softmax over n logits (max-subtracted, sum via the lane contract). */
+/* exp(x) correctly rounded to float (to nearest, ties to even) for every float: the same bits
+ * on every platform, and no C library call inside (expf.c). The exponential of the softmax and
+ * of the SiLU. */
+float tr_expf(float x);
+/* Which way tr_expf settles x, for the tests: a border case (NaN, overflow, underflow), the
+ * fast path, the table of exceptions, or none of them (a NaN; bench_expf --check proves that
+ * no float gets there). */
+enum { TR_EXPF_SPECIAL, TR_EXPF_FAST, TR_EXPF_TABLE, TR_EXPF_UNPROVEN };
+int tr_expf_path(float x);
+/* The table of exceptions, for the tests: entry i (0 <= i < n) is the bits of an argument and
+ * the bits of its exp, computed at 200 bits (tools/gen_expf_table.py). */
+int tr_expf_n_exceptions(void);
+void tr_expf_exception(int i, uint32_t *x_bits, uint32_t *y_bits);
+/* In place softmax over n logits (max-subtracted, tr_expf, sum via the lane contract). */
 void tr_softmax(float *x, int64_t n);
-/* x[i] = silu(x[i]) * y[i]; element-wise, split over the pool (p == NULL: serial). */
+/* x[i] = silu(x[i]) * y[i], silu(v) = v / (1 + tr_expf(-v)); element-wise, split over the pool
+ * (p == NULL: serial). */
 void tr_swiglu(tr_pool *pool, float *x, const float *y, int64_t n);
 /* Causal attention of one query head over n_pos cached positions. `keys` and `values`
  * hold n_pos slots of `stride` floats; this head reads head_dim floats at `offset` in

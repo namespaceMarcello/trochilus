@@ -14,12 +14,25 @@ typedef struct tr_file tr_file;
 /* Opens `path` (UTF-8, also on Windows) read-only. Returns NULL on failure and,
  * if err is not NULL, writes a message into err[0..err_len). */
 tr_file *tr_file_open(const char *path, char *err, size_t err_len);
+/* Like tr_file_open, but the operating system keeps no copy of what is read (FILE_FLAG_NO_BUFFERING,
+ * O_DIRECT, F_NOCACHE). Every tr_file_pread on such a file must have offset, length AND buffer
+ * address multiples of tr_file_alignment(). NULL when the file cannot be opened that way (some
+ * filesystems refuse O_DIRECT), with a message in err if it is not NULL: the caller falls back to
+ * tr_file_open. */
+tr_file *tr_file_open_direct(const char *path, char *err, size_t err_len);
 void tr_file_close(tr_file *f);
 /* Size in bytes, or -1 on error. */
 int64_t tr_file_size(const tr_file *f);
+/* The alignment tr_file_pread needs on this handle: TR_FILE_DIRECT_ALIGN for one opened with
+ * tr_file_open_direct, 1 for one opened with tr_file_open. */
+int64_t tr_file_alignment(const tr_file *f);
+#define TR_FILE_DIRECT_ALIGN 4096
 /* Reads exactly n bytes starting at offset into buf, looping over short reads.
- * Returns 0 on success, -1 on error or end of file before n bytes.
- * Positional: concurrent calls on the same tr_file are allowed. */
+ * Returns 0 on success, -1 on error or end of file before n bytes -- except on a handle from
+ * tr_file_open_direct, where a read whose aligned range runs past the real end of the file still
+ * succeeds (the last, partial sector of the file is not an error): bytes past the real end of the
+ * file are then left as whatever buf already held. Positional: concurrent calls on the same
+ * tr_file are allowed. */
 int tr_file_pread(const tr_file *f, void *buf, size_t n, uint64_t offset);
 
 /* Aligned allocation; align is a power of two >= sizeof(void *). Contents are

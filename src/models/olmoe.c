@@ -20,6 +20,7 @@
 #include "../base/platform.h"
 #include "../kernels/kernels.h"
 #include "../kv/kv.h"
+#include "../memory/experts.h"
 
 /* ---- weights ---------------------------------------------------------- */
 
@@ -39,6 +40,10 @@ typedef struct {
     const tr_mat *down_exps;   /* rows=n_embd, cols=n_ff */
 } olmoe_layer;
 
+/* Owns the buffers behind a session's tr_route_trace, defined near tr_session_route_trace_begin
+ * below (docs/MISURE.md domande 13-15). Opaque here: forward_pass only ever sees s->trace != NULL. */
+typedef struct olmoe_route_trace olmoe_route_trace;
+
 typedef struct {
     tr_pool *pool; /* not owned */
     tr_model_info info;
@@ -52,6 +57,15 @@ typedef struct {
     tr_mat token_embd;    /* rows=vocab, cols=n_embd */
     tr_mat output;          /* rows=vocab, cols=n_embd */
     olmoe_layer *layers;      /* [n_layers] */
+
+    tr_gguf *gguf;       /* kept open for the model's life: tr_experts reads straight from it
+                          * (buffered), unless experts_file is not NULL */
+    tr_file *experts_file; /* NULL: experts read through gguf's own buffered handle; else a second,
+                            * unbuffered handle on the same path this model owns and closes (Step C,
+                            * docs/ARCHITETTURA.md): tr_experts then reads with tr_file_alignment */
+    tr_experts *experts; /* shared store for every layer's gate/up/down experts (Esperti M1) */
+    unsigned char *expert_off; /* [n_layers][n_expert], 1: never chosen (tr_model_set_expert_mask,
+                                * measurement only); NULL: every expert can be chosen */
 
     /* every tr_alloc_aligned buffer owned by this model, freed on destroy */
     void **owned;
@@ -90,6 +104,8 @@ typedef struct {
     float *sel_w;     /* [B][U] their weights */
     int64_t *place;   /* [B][U] row of each (token, slot) in the grouped buffers below */
     int64_t *offsets; /* [n_expert + 1] grouped rows of each expert */
+    int64_t *acquire_ids; /* [n_expert] scratch: this pass's non-empty experts of the current layer,
+                           * for tr_experts_acquire (olmoe_refresh_experts, outside the hot zone) */
     unsigned char *taken; /* [n_workers][n_expert] scratch of the router's choice, a row per pool worker */
     float *xg;        /* [B*U][n_embd] expert inputs, grouped by expert */
     float *h1, *h2;   /* [B*U][n_ff] gate and up outputs */
@@ -100,6 +116,8 @@ typedef struct {
     float *scores;    /* attention scores, a group of rows per pool worker: [n_workers][OLMOE_ATTN_QUERIES][score_stride] */
     int64_t score_stride; /* floats from a row of scores to the next: n_ctx and some (score_row_stride) */
     int64_t n_workers;
+
+    olmoe_route_trace *trace; /* NULL: tracing off (docs/MISURE.md domande 13-15) */
 } olmoe_session;
 
 /* ---- loading helpers ---------------------------------------------------- */
@@ -217,9 +235,11 @@ static int read_mat(tr_gguf *g, olmoe_model *m, const char *name, int64_t cols, 
     return 0;
 }
 
-/* Loads a 3-D stacked expert weight [ne0=in, ne1=out, ne2=n_expert], kept raw. */
-static const void *read_experts(tr_gguf *g, olmoe_model *m, const char *name, int64_t ne0, int64_t ne1,
-                                 int64_t ne2, tr_type *type_out, char *err, size_t err_len) {
+/* Validates a stacked expert weight's shape and type [ne0=in, ne1=out, ne2=n_expert] like
+ * read_mat/read_vec, but never reads it: the shared store (src/memory/experts.h) reads it later,
+ * part by part, straight off disk (Esperti M1). The caller records t->offset and t->type. */
+static const tr_gguf_tensor *find_experts(tr_gguf *g, const char *name, int64_t ne0, int64_t ne1, int64_t ne2,
+                                          char *err, size_t err_len) {
     const tr_gguf_tensor *t = tr_gguf_find_tensor(g, name);
     if (t == NULL) {
         snprintf(err, err_len, "missing tensor '%s'", name);
@@ -230,35 +250,24 @@ static const void *read_experts(tr_gguf *g, olmoe_model *m, const char *name, in
         return NULL;
     }
     if (check_shape(t, 3, (uint64_t)ne0, (uint64_t)ne1, (uint64_t)ne2, err, err_len) != 0) return NULL;
-
-    void *raw = tr_alloc_aligned((size_t)t->n_bytes, 64);
-    if (raw == NULL) {
-        snprintf(err, err_len, "out of memory loading '%s'", name);
-        return NULL;
-    }
-    if (tr_gguf_read(g, t, raw) != 0) {
-        snprintf(err, err_len, "failed reading tensor '%s'", name);
-        tr_free_aligned(raw);
-        return NULL;
-    }
-    if (track(m, raw) != 0) {
-        snprintf(err, err_len, "out of memory");
-        return NULL;
-    }
-    *type_out = t->type;
-    return raw;
+    return t;
 }
 
-/* One tr_mat per expert over a stacked tensor: exps[e] = rows [e*out_dim, (e+1)*out_dim). */
-static void expert_views(tr_mat *exps, const void *base, tr_type type, int64_t in_dim, int64_t out_dim,
-                         int64_t n_expert) {
-    size_t rb = tr_row_bytes(type, in_dim);
+/* One tr_mat view per expert of a stacked tensor: shape only, data = NULL until the shared store
+ * fills it in for the layer's turn (olmoe_refresh_experts, below the hot zone). */
+static void expert_shapes(tr_mat *exps, tr_type type, int64_t in_dim, int64_t out_dim, int64_t n_expert) {
     for (int64_t e = 0; e < n_expert; e++) {
         exps[e].type = type;
         exps[e].rows = out_dim;
         exps[e].cols = in_dim;
-        exps[e].data = (const unsigned char *)base + (size_t)e * (size_t)out_dim * rb;
+        exps[e].data = NULL;
     }
+}
+
+/* The expert store's only door to disk (src/memory/experts.h): positional reads straight on the
+ * model's own GGUF file, kept open for the model's life. */
+static int model_experts_read(void *ctx, void *buf, size_t n, uint64_t offset) {
+    return tr_file_pread((const tr_file *)ctx, buf, n, offset);
 }
 
 /* ---- vtable: free ------------------------------------------------------- */
@@ -266,17 +275,22 @@ static void expert_views(tr_mat *exps, const void *base, tr_type type, int64_t i
 static void olmoe_free(void *model) {
     olmoe_model *m = (olmoe_model *)model;
     if (m == NULL) return;
+    tr_experts_free(m->experts);
+    tr_file_close(m->experts_file);
+    free(m->expert_off);
     for (size_t i = 0; i < m->n_owned; i++) tr_free_aligned(m->owned[i]);
     free(m->owned);
     if (m->layers != NULL)
         for (int64_t L = 0; L < m->n_layers; L++) free(m->layers[L].exps);
     free(m->layers);
+    tr_gguf_close(m->gguf);
     free(m);
 }
 
 /* ---- vtable: load -------------------------------------------------------- */
 
-static void *olmoe_load(tr_gguf *g, tr_pool *pool, char *err, size_t err_len) {
+static void *olmoe_load(const char *path, tr_gguf *g, tr_pool *pool, uint64_t expert_budget, char *err,
+                        size_t err_len) {
     tr_kernels_init();
 
     olmoe_model *m = (olmoe_model *)calloc(1, sizeof *m);
@@ -286,6 +300,7 @@ static void *olmoe_load(tr_gguf *g, tr_pool *pool, char *err, size_t err_len) {
         return NULL;
     }
     m->pool = pool;
+    m->gguf = g; /* kept open for the model's life; olmoe_free closes it, not this function */
 
     uint32_t block_count = 0, n_embd32 = 0, n_ff32 = 0, n_head32 = 0, n_head_kv32 = 0;
     uint32_t n_expert32 = 0, n_expert_used32 = 0, key_length = 0, ctx_length = 0;
@@ -349,15 +364,167 @@ static void *olmoe_load(tr_gguf *g, tr_pool *pool, char *err, size_t err_len) {
     m->have_clamp = have_clamp;
     m->norm_topk = norm_topk;
 
-    /* Safety of the machine: estimate before loading any weight. Every tensor
-     * in an OLMoE GGUF file is a model weight, so the sum over the whole
-     * directory is the (exact, not just estimated) total to be loaded. */
+    /* Shapes and file offsets of every expert tensor, no reads yet (Esperti M1): the shared
+     * store (src/memory/experts.h) reads these straight off disk later, part by part, under
+     * whatever budget this load settles on. Part 0 = gate, 1 = up, 2 = down, per layer, since a
+     * GGUF file may quantize layers differently (part sizes are not assumed uniform). */
+    int64_t n_units = m->n_layers * m->n_expert;
+    size_t *part_bytes_tbl =
+        (size_t *)tr_alloc_aligned(sizeof(size_t) * (size_t)(m->n_layers * TR_EXPERT_PARTS), 64);
+    uint64_t *part_offset_tbl =
+        (uint64_t *)tr_alloc_aligned(sizeof(uint64_t) * (size_t)(m->n_layers * TR_EXPERT_PARTS), 64);
+    tr_type *part_type_tbl =
+        (tr_type *)tr_alloc_aligned(sizeof(tr_type) * (size_t)(m->n_layers * TR_EXPERT_PARTS), 64);
+    if (part_bytes_tbl == NULL || part_offset_tbl == NULL || part_type_tbl == NULL ||
+        track(m, part_bytes_tbl) != 0 || track(m, part_offset_tbl) != 0 || track(m, part_type_tbl) != 0) {
+        snprintf(err, err_len, "out of memory");
+        goto fail;
+    }
+    uint64_t all_experts_bytes = 0; /* this file's real expert bytes, unpadded */
+    for (int64_t L = 0; L < m->n_layers; L++) {
+        char name[64];
+        const tr_gguf_tensor *t;
+
+        snprintf(name, sizeof name, "blk.%" PRId64 ".ffn_gate_exps.weight", L);
+        t = find_experts(g, name, m->n_embd, m->n_ff, m->n_expert, err, err_len);
+        if (t == NULL) goto fail;
+        part_type_tbl[L * TR_EXPERT_PARTS + 0] = t->type;
+        part_bytes_tbl[L * TR_EXPERT_PARTS + 0] = (size_t)m->n_ff * tr_row_bytes(t->type, m->n_embd);
+        part_offset_tbl[L * TR_EXPERT_PARTS + 0] = t->offset;
+        all_experts_bytes += t->n_bytes;
+
+        snprintf(name, sizeof name, "blk.%" PRId64 ".ffn_up_exps.weight", L);
+        t = find_experts(g, name, m->n_embd, m->n_ff, m->n_expert, err, err_len);
+        if (t == NULL) goto fail;
+        part_type_tbl[L * TR_EXPERT_PARTS + 1] = t->type;
+        part_bytes_tbl[L * TR_EXPERT_PARTS + 1] = (size_t)m->n_ff * tr_row_bytes(t->type, m->n_embd);
+        part_offset_tbl[L * TR_EXPERT_PARTS + 1] = t->offset;
+        all_experts_bytes += t->n_bytes;
+
+        snprintf(name, sizeof name, "blk.%" PRId64 ".ffn_down_exps.weight", L);
+        t = find_experts(g, name, m->n_ff, m->n_embd, m->n_expert, err, err_len);
+        if (t == NULL) goto fail;
+        part_type_tbl[L * TR_EXPERT_PARTS + 2] = t->type;
+        part_bytes_tbl[L * TR_EXPERT_PARTS + 2] = (size_t)m->n_embd * tr_row_bytes(t->type, m->n_ff);
+        part_offset_tbl[L * TR_EXPERT_PARTS + 2] = t->offset;
+        all_experts_bytes += t->n_bytes;
+    }
+
+    /* Step C (docs/ARCHITETTURA.md): read the experts without the operating system's page cache
+     * when the platform and filesystem allow it, so the budget planned below is not spent twice
+     * (docs/MISURE.md M1 point 4: a resident store's own copy plus the OS's page cache copy of the
+     * same bytes). TR_EXPERT_DIRECT=0 forces the buffered path outright, for the measurement that
+     * compares the two. A resident store does not need this, but takes the same path anyway --
+     * one path either way (docs/ARCHITETTURA.md). */
+    uint64_t read_align = 1;
+    void *experts_read_ctx = (void *)tr_gguf_file(g);
+    {
+        const char *want_direct = getenv("TR_EXPERT_DIRECT");
+        if (want_direct == NULL || strcmp(want_direct, "0") != 0) {
+            tr_file *df = tr_file_open_direct(path, NULL, 0);
+            if (df != NULL) {
+                /* some filesystems accept the unbuffered open but cannot actually service an
+                 * aligned read on it (docker bind mounts, in particular): a trial read at the
+                 * file's own start catches that before the store is built to depend on it. */
+                unsigned char *probe = (unsigned char *)tr_alloc_aligned(TR_FILE_DIRECT_ALIGN, TR_FILE_DIRECT_ALIGN);
+                int probe_ok = probe != NULL && tr_file_pread(df, probe, TR_FILE_DIRECT_ALIGN, 0) == 0;
+                tr_free_aligned(probe);
+                if (probe_ok) {
+                    m->experts_file = df; /* owned from here on: olmoe_free closes it */
+                    read_align = (uint64_t)tr_file_alignment(df);
+                    experts_read_ctx = (void *)df;
+                } else {
+                    tr_file_close(df);
+                }
+            }
+        }
+    }
+
+    /* Safety of the machine, and the expert budget (docs/ARCHITETTURA.md Esperti M1). Every
+     * tensor in an OLMoE GGUF file is a model weight, so the sum over the whole directory minus
+     * the expert tensors just sized above is the (exact) dense total. slot_bytes pads every
+     * layer's parts to the biggest layer's needs, so resident_bytes (every unit, padded) is what
+     * the store would actually allocate, not the raw all_experts_bytes above. */
+    uint64_t slot_bytes = tr_experts_slot_bytes(part_bytes_tbl, m->n_layers, read_align);
+    int64_t min_slots = tr_experts_min_slots(m->n_expert, m->n_expert_used);
+    uint64_t min_bytes = (uint64_t)min_slots * slot_bytes;
+    uint64_t resident_bytes = (uint64_t)n_units * slot_bytes;
+    uint64_t dense_bytes;
     {
         uint64_t total_bytes = 0;
         uint64_t tcount = tr_gguf_tensor_count(g);
         for (uint64_t i = 0; i < tcount; i++) total_bytes += tr_gguf_tensor_at(g, i)->n_bytes;
-        if (tr_mem_guard(total_bytes, err, err_len) != 0) goto fail;
-        m->info.weight_bytes = total_bytes;
+        dense_bytes = total_bytes - all_experts_bytes;
+    }
+
+    uint64_t budget;
+    if (expert_budget == UINT64_MAX) {
+        budget = min_bytes; /* "min": exactly tr_experts_min_slots slots */
+    } else if (expert_budget != 0) {
+        budget = expert_budget; /* forced; above resident_bytes clamps to resident in tr_experts_create */
+    } else {
+        uint64_t session_allowance = tr_kv_bytes(m->n_layers, m->n_head_kv, m->head_dim,
+                                                 m->n_ctx_train < 4096 ? m->n_ctx_train : 4096) +
+                                     (uint64_t)512 * 1024 * 1024;
+        tr_meminfo mi;
+        if (tr_mem_info(&mi) != 0) {
+            tr_log(TR_LOG_WARN, "could not query system memory; the expert store will be resident");
+            budget = resident_bytes;
+        } else {
+            /* TR_MEM_AVAILABLE_MIB in the environment, read once here like TR_EXPERT_BUDGET_MIB
+             * (model.c): substitutes the RAM the plan below sees as available, MEASUREMENT ONLY
+             * (model.h tr_model_load_budget), so the partial branch can be exercised without a
+             * machine actually short on RAM. tr_mem_guard just below still queries the real
+             * machine, so safety never depends on this. */
+            uint64_t available = mi.available_bytes;
+            const char *avail_mib = getenv("TR_MEM_AVAILABLE_MIB");
+            if (avail_mib != NULL) {
+                long long v = atoll(avail_mib);
+                if (v > 0) available = (uint64_t)v * 1024 * 1024;
+            }
+            if (tr_expert_budget_plan(available, mi.total_bytes, dense_bytes, resident_bytes, session_allowance,
+                                      min_bytes, &budget) != 0) {
+                uint64_t two_gib = (uint64_t)2 * 1024 * 1024 * 1024;
+                uint64_t reserve = mi.total_bytes / 10;
+                if (reserve < two_gib) reserve = two_gib;
+                uint64_t used = reserve + dense_bytes + session_allowance;
+                uint64_t have = used < available ? available - used : 0;
+                double mib = 1024.0 * 1024.0;
+                snprintf(err, err_len,
+                         "not enough memory for the expert store: %.2f MiB short of the %.2f MiB minimum",
+                         (double)(min_bytes - have) / mib, (double)min_bytes / mib);
+                goto fail;
+            }
+        }
+    }
+
+    {
+        uint64_t budget_slots = budget / slot_bytes;
+        uint64_t slab_bytes = (budget_slots < (uint64_t)n_units ? budget_slots : (uint64_t)n_units) * slot_bytes;
+        if (tr_mem_guard(dense_bytes + slab_bytes, err, err_len) != 0) goto fail;
+        m->info.weight_bytes = dense_bytes + slab_bytes;
+    }
+
+    {
+        tr_experts_config ecfg;
+        memset(&ecfg, 0, sizeof ecfg);
+        ecfg.n_layers = m->n_layers;
+        ecfg.n_expert = m->n_expert;
+        ecfg.n_used = m->n_expert_used;
+        ecfg.part_bytes = part_bytes_tbl;
+        ecfg.part_offset = part_offset_tbl;
+        ecfg.budget_bytes = budget;
+        ecfg.read = model_experts_read;
+        ecfg.read_ctx = experts_read_ctx;
+        ecfg.read_align = read_align;
+        m->experts = tr_experts_create(&ecfg, err, err_len);
+        if (m->experts == NULL) goto fail;
+        /* resident: fill every slot now, so forward_pass's acquire calls are hits from the very
+         * first token and the reader is never called again (one path afterwards either way). */
+        if (tr_experts_resident(m->experts) && tr_experts_load_all(m->experts) != 0) {
+            snprintf(err, err_len, "failed reading the experts at load");
+            goto fail;
+        }
     }
 
     /* token_embd.weight: vocab size comes from its shape, not metadata. */
@@ -452,25 +619,18 @@ static void *olmoe_load(tr_gguf *g, tr_pool *pool, char *err, size_t err_len) {
             snprintf(err, err_len, "out of memory");
             goto fail;
         }
-        tr_type type;
-        const void *raw;
 
-        snprintf(name, sizeof name, "blk.%" PRId64 ".ffn_gate_exps.weight", L);
-        raw = read_experts(g, m, name, m->n_embd, m->n_ff, m->n_expert, &type, err, err_len);
-        if (raw == NULL) goto fail;
-        expert_views(layer->exps, raw, type, m->n_embd, m->n_ff, m->n_expert);
+        /* shapes and type only, already validated above: data comes from the shared store,
+         * refreshed layer by layer as the forward pass runs (olmoe_refresh_experts) */
+        expert_shapes(layer->exps, part_type_tbl[L * TR_EXPERT_PARTS + 0], m->n_embd, m->n_ff, m->n_expert);
         layer->gate_exps = layer->exps;
 
-        snprintf(name, sizeof name, "blk.%" PRId64 ".ffn_up_exps.weight", L);
-        raw = read_experts(g, m, name, m->n_embd, m->n_ff, m->n_expert, &type, err, err_len);
-        if (raw == NULL) goto fail;
-        expert_views(layer->exps + m->n_expert, raw, type, m->n_embd, m->n_ff, m->n_expert);
+        expert_shapes(layer->exps + m->n_expert, part_type_tbl[L * TR_EXPERT_PARTS + 1], m->n_embd, m->n_ff,
+                      m->n_expert);
         layer->up_exps = layer->exps + m->n_expert;
 
-        snprintf(name, sizeof name, "blk.%" PRId64 ".ffn_down_exps.weight", L);
-        raw = read_experts(g, m, name, m->n_ff, m->n_embd, m->n_expert, &type, err, err_len);
-        if (raw == NULL) goto fail;
-        expert_views(layer->exps + 2 * m->n_expert, raw, type, m->n_ff, m->n_embd, m->n_expert);
+        expert_shapes(layer->exps + 2 * m->n_expert, part_type_tbl[L * TR_EXPERT_PARTS + 2], m->n_ff, m->n_embd,
+                      m->n_expert);
         layer->down_exps = layer->exps + 2 * m->n_expert;
     }
 
@@ -480,12 +640,10 @@ static void *olmoe_load(tr_gguf *g, tr_pool *pool, char *err, size_t err_len) {
     m->info.n_layers = m->n_layers;
     m->info.n_embd = m->n_embd;
 
-    tr_gguf_close(g);
-    return m;
+    return m; /* g stays open: m->gguf, closed by olmoe_free */
 
 fail:
-    olmoe_free(m);
-    tr_gguf_close(g);
+    olmoe_free(m); /* closes m->gguf */
     return NULL;
 }
 
@@ -494,11 +652,48 @@ static const tr_model_info *olmoe_info(const void *model) {
     return &m->info;
 }
 
+static int olmoe_expert_stats(const void *model, tr_experts_stats *out) {
+    const olmoe_model *m = (const olmoe_model *)model;
+    tr_experts_get_stats(m->experts, out);
+    return 0;
+}
+
+/* Measurement only (model.h: tr_model_set_expert_mask). */
+static int olmoe_set_expert_mask(void *model, const unsigned char *off) {
+    olmoe_model *m = (olmoe_model *)model;
+    if (off == NULL) {
+        free(m->expert_off);
+        m->expert_off = NULL;
+        return 0;
+    }
+    for (int64_t L = 0; L < m->n_layers; L++) {
+        int64_t left = 0;
+        for (int64_t e = 0; e < m->n_expert; e++) left += off[L * m->n_expert + e] == 0;
+        if (left < m->n_expert_used) return -1;
+    }
+    size_t n = (size_t)(m->n_layers * m->n_expert);
+    unsigned char *copy = (unsigned char *)malloc(n);
+    if (copy == NULL) return -1;
+    for (size_t i = 0; i < n; i++) copy[i] = off[i] != 0;
+    free(m->expert_off);
+    m->expert_off = copy;
+    return 0;
+}
+
+/* tests only (model_internal.h: tr_model_experts) */
+static void *olmoe_experts(const void *model) {
+    const olmoe_model *m = (const olmoe_model *)model;
+    return m->experts;
+}
+
 /* ---- vtable: session ------------------------------------------------------ */
+
+static void olmoe_route_trace_free(olmoe_route_trace *tr); /* below, after the hot zone */
 
 static void olmoe_session_free(void *session) {
     olmoe_session *s = (olmoe_session *)session;
     if (s == NULL) return;
+    olmoe_route_trace_free(s->trace);
     tr_kv_free(&s->kv);
     tr_free_aligned(s->rope_cos);
     tr_free_aligned(s->rope_sin);
@@ -515,6 +710,7 @@ static void olmoe_session_free(void *session) {
     tr_free_aligned(s->sel_w);
     tr_free_aligned(s->place);
     tr_free_aligned(s->offsets);
+    tr_free_aligned(s->acquire_ids);
     tr_free_aligned(s->taken);
     tr_free_aligned(s->xg);
     tr_free_aligned(s->h1);
@@ -553,7 +749,7 @@ static void *olmoe_session_create(void *model, int64_t n_ctx, int64_t n_batch, c
                            (uint64_t)B * (uint64_t)U * (uint64_t)(m->n_embd * 2 + m->n_ff * 2) +
                            (uint64_t)(n_workers * OLMOE_ATTN_QUERIES * score_row_stride(actual_ctx) + m->vocab) +
                            rope_elems * 2;
-    uint64_t scratch_i64 = (uint64_t)B * (uint64_t)U * 2 + (uint64_t)m->n_expert + 1;
+    uint64_t scratch_i64 = (uint64_t)B * (uint64_t)U * 2 + (uint64_t)m->n_expert + 1 + (uint64_t)m->n_expert;
     uint64_t scratch_bytes = scratch_f32 * sizeof(float) + scratch_i64 * sizeof(int64_t) +
                              (uint64_t)(n_workers * m->n_expert);
     if (tr_mem_guard(kv_bytes + scratch_bytes, err, err_len) != 0) return NULL;
@@ -585,6 +781,7 @@ static void *olmoe_session_create(void *model, int64_t n_ctx, int64_t n_batch, c
     s->sel_w = alloc_f32(B * U);
     s->place = (int64_t *)tr_alloc_aligned((size_t)(B * U) * sizeof(int64_t), 64);
     s->offsets = (int64_t *)tr_alloc_aligned((size_t)(m->n_expert + 1) * sizeof(int64_t), 64);
+    s->acquire_ids = (int64_t *)tr_alloc_aligned((size_t)m->n_expert * sizeof(int64_t), 64);
     s->taken = (unsigned char *)tr_alloc_aligned((size_t)(n_workers * m->n_expert), 64);
     s->xg = alloc_f32(B * U * m->n_embd);
     s->h1 = alloc_f32(B * U * m->n_ff);
@@ -599,8 +796,8 @@ static void *olmoe_session_create(void *model, int64_t n_ctx, int64_t n_batch, c
     if (kv_rc != 0 || s->rope_cos == NULL || s->rope_sin == NULL || s->x == NULL ||
         s->normed == NULL || s->attn_out == NULL || s->ffn_out == NULL || s->q == NULL || s->attn_concat == NULL ||
         s->k == NULL || s->v == NULL || s->router == NULL || s->sel_id == NULL || s->sel_w == NULL ||
-        s->place == NULL || s->offsets == NULL || s->taken == NULL || s->xg == NULL || s->h1 == NULL ||
-        s->h2 == NULL || s->h3 == NULL || s->logits == NULL || s->scores == NULL) {
+        s->place == NULL || s->offsets == NULL || s->acquire_ids == NULL || s->taken == NULL || s->xg == NULL ||
+        s->h1 == NULL || s->h2 == NULL || s->h3 == NULL || s->logits == NULL || s->scores == NULL) {
         if (err != NULL) snprintf(err, err_len, "out of memory allocating session");
         olmoe_session_free(s);
         return NULL;
@@ -776,14 +973,17 @@ static void mix_body(void *ctx_, int64_t begin, int64_t end, int worker) {
     }
 }
 
-/* Router of token i: softmax over all experts, top-k (ties to the lower id), optional
- * renormalization, then the selection sorted by increasing expert id (the order in which
- * contributions are added). Writes n_used entries of sel_id and sel_w. */
-static void route_token(const olmoe_model *m, float *router, unsigned char *taken, int64_t *sel_id, float *sel_w) {
-    int64_t n_expert = m->n_expert, n_used = m->n_expert_used;
-    tr_softmax(router, n_expert);
-    for (int64_t e = 0; e < n_expert; e++) taken[e] = 0;
-    for (int64_t slot = 0; slot < n_used; slot++) {
+/* Repeated argmax over router[0..n_expert) (already a softmax), ties to the lower id: the k
+ * best experts, best first, into ids (and, if not NULL, their scores into vals). taken is
+ * scratch of n_expert bytes, set here: cleared, or a copy of `off` (NULL: none), the experts
+ * switched off for a measurement (tr_model_set_expert_mask), which are then never chosen.
+ * Shared by route_token (which sorts its own selection
+ * by id afterward) and the route trace's predictions (kept best-first, docs/MISURE.md domande
+ * 13-15: tr_session_route_trace_begin below, after the hot zone). */
+static void top_experts(const float *router, int64_t n_expert, const unsigned char *off, unsigned char *taken,
+                        int64_t k, int64_t *ids, float *vals) {
+    for (int64_t e = 0; e < n_expert; e++) taken[e] = off != NULL ? off[e] : 0;
+    for (int64_t slot = 0; slot < k; slot++) {
         int64_t best = -1;
         float best_val = 0.0f;
         for (int64_t e = 0; e < n_expert; e++) {
@@ -794,9 +994,19 @@ static void route_token(const olmoe_model *m, float *router, unsigned char *take
             }
         }
         taken[best] = 1;
-        sel_id[slot] = best;
-        sel_w[slot] = best_val;
+        ids[slot] = best;
+        if (vals != NULL) vals[slot] = best_val;
     }
+}
+
+/* Router of token i: softmax over all experts, top-k (ties to the lower id), optional
+ * renormalization, then the selection sorted by increasing expert id (the order in which
+ * contributions are added). Writes n_used entries of sel_id and sel_w. */
+static void route_token(const olmoe_model *m, float *router, const unsigned char *off, unsigned char *taken,
+                        int64_t *sel_id, float *sel_w) {
+    int64_t n_expert = m->n_expert, n_used = m->n_expert_used;
+    tr_softmax(router, n_expert);
+    top_experts(router, n_expert, off, taken, n_used, sel_id, sel_w);
     if (m->norm_topk) {
         float sum = 0.0f;
         for (int64_t i = 0; i < n_used; i++) sum += sel_w[i];
@@ -820,6 +1030,7 @@ static void route_token(const olmoe_model *m, float *router, unsigned char *take
 typedef struct {
     const olmoe_model *m;
     float *router, *sel_w;
+    const unsigned char *off; /* this layer's row of the expert mask, or NULL */
     unsigned char *taken;
     int64_t *sel_id;
 } route_ctx;
@@ -828,8 +1039,8 @@ static void route_body(void *ctx_, int64_t begin, int64_t end, int worker) {
     const route_ctx *c = (const route_ctx *)ctx_;
     int64_t n_expert = c->m->n_expert, n_used = c->m->n_expert_used;
     for (int64_t i = begin; i < end; i++)
-        route_token(c->m, c->router + i * n_expert, c->taken + (int64_t)worker * n_expert, c->sel_id + i * n_used,
-                    c->sel_w + i * n_used);
+        route_token(c->m, c->router + i * n_expert, c->off, c->taken + (int64_t)worker * n_expert,
+                    c->sel_id + i * n_used, c->sel_w + i * n_used);
 }
 
 /* Rows [begin, end) of the (token, slot) pairs copied to their place in the grouped buffer:
@@ -849,13 +1060,26 @@ static void gather_body(void *ctx_, int64_t begin, int64_t end, int worker) {
                (size_t)c->n_embd * sizeof(float));
 }
 
+/* Defined below, after the hot zone (docs/MISURE.md domande 13-15): records layer L's routing
+ * of this pass's tokens into s->trace, called once per layer under one `if` in forward_pass. */
+static void route_trace_record(olmoe_session *s, int64_t L, const int32_t *tokens, int64_t n_tok);
+
+/* Defined below, after the hot zone (docs/ARCHITETTURA.md Esperti M1): acquires layer L's
+ * non-empty experts from the shared store (reading the missing ones from disk) and refreshes
+ * every expert's tr_mat.data for this layer, called once per layer from forward_pass. Allocates
+ * nothing: it only touches s->acquire_ids, sized at session create. -1 on a failed read. */
+static int olmoe_refresh_experts(olmoe_model *m, olmoe_session *s, int64_t L);
+
 /* One forward pass over n_tok tokens (1 <= n_tok <= n_batch) at positions pos..pos+n_tok-1.
  * Every value is computed with the same kernel call as when the tokens run one per pass:
  * a matmul element is one dot_row, norms/RoPE/routing/mixing are per token, and a token's
  * attention reads only cache positions up to its own. So the logits and the cache are
  * bit-identical for every split of the input into passes (tests/test_prefill.c).
- * Logits of the last n_logits tokens (0: none), one row each, oldest first. */
-static void forward_pass(olmoe_model *m, olmoe_session *s, const int32_t *tokens, int64_t n_tok, int64_t n_logits) {
+ * Logits of the last n_logits tokens (0: none), one row each, oldest first. -1 if the shared
+ * expert store fails to read a layer's missing units from disk: s's cache and s->pos are
+ * untouched by this call (olmoe_eval restores s->pos across the whole eval on failure), so a
+ * later eval of the same tokens can retry. */
+static int forward_pass(olmoe_model *m, olmoe_session *s, const int32_t *tokens, int64_t n_tok, int64_t n_logits) {
     tr_prof *prof = &s->prof;
     uint64_t t_pass = tr_prof_begin(prof);
 
@@ -993,6 +1217,7 @@ static void forward_pass(olmoe_model *m, olmoe_session *s, const int32_t *tokens
         route_ctx oc;
         oc.m = m;
         oc.router = s->router;
+        oc.off = m->expert_off != NULL ? m->expert_off + L * n_expert : NULL;
         oc.sel_w = s->sel_w;
         oc.taken = s->taken;
         oc.sel_id = s->sel_id;
@@ -1005,6 +1230,11 @@ static void forward_pass(olmoe_model *m, olmoe_session *s, const int32_t *tokens
         s->offsets[0] = 0;
         tr_prof_end(prof, TR_PROF_ROUTER, t);
         tr_prof_count(prof, TR_PROF_ROUTER, mat_bytes(&layer->gate_inp), 0);
+
+        /* the shared store's turn (Esperti M1): acquire this layer's non-empty experts (missing
+         * ones read from disk here) and refresh every expert's data pointer, NULL for the ones
+         * not in RAM -- a wrong read then crashes instead of reading stale bytes. */
+        if (olmoe_refresh_experts(m, s, L) != 0) return -1;
 
         /* experts in stages, each one job over every (token, slot) row grouped by expert */
         t = tr_prof_begin(prof);
@@ -1050,6 +1280,8 @@ static void forward_pass(olmoe_model *m, olmoe_session *s, const int32_t *tokens
         mc.n_used = n_used;
         tr_parallel_for(pool, n_tok, per_chunk, mix_body, &mc);
         tr_prof_end(prof, TR_PROF_EXPERT_MIX, t);
+
+        if (s->trace != NULL) route_trace_record(s, L, tokens, n_tok);
     }
 
     if (n_logits > 0) {
@@ -1069,10 +1301,14 @@ static void forward_pass(olmoe_model *m, olmoe_session *s, const int32_t *tokens
 
     tr_prof_end(prof, TR_PROF_TOKEN, t_pass);
     if (prof->enabled) prof->tokens[prof->phase] += (uint64_t)n_tok;
+    return 0;
 }
 
 /* Passes of at most n_batch tokens; only the last one computes logits. More than one row of
- * logits needs them all in that pass, so the whole call must fit one pass. */
+ * logits needs them all in that pass, so the whole call must fit one pass. A failed pass (the
+ * shared expert store could not read a missing unit) restores s->pos to what it was when this
+ * function was called: the cache past that position is never read, so the session is exactly as
+ * it was before this call, and the same tokens can be evaluated again. */
 static int olmoe_eval(void *session, const int32_t *tokens, int64_t n, int64_t n_logits) {
     olmoe_session *s = (olmoe_session *)session;
     olmoe_model *m = s->m;
@@ -1085,14 +1321,47 @@ static int olmoe_eval(void *session, const int32_t *tokens, int64_t n, int64_t n
         if (tokens[i] < 0 || tokens[i] >= m->vocab) return -1;
     }
 
+    int64_t pos0 = s->pos;
     for (int64_t off = 0; off < n; off += s->n_batch) {
         int64_t len = n - off < s->n_batch ? n - off : s->n_batch;
-        forward_pass(m, s, tokens + off, len, off + len == n ? n_logits : 0);
+        if (forward_pass(m, s, tokens + off, len, off + len == n ? n_logits : 0) != 0) {
+            s->pos = pos0;
+            return -1;
+        }
         s->pos += len;
     }
     return 0;
 }
 /* hot: end */
+
+/* Outside the hot zone (docs/ARCHITETTURA.md Esperti M1): allocates nothing, using only
+ * s->acquire_ids (sized at session create). Called once per layer from forward_pass. */
+static int olmoe_refresh_experts(olmoe_model *m, olmoe_session *s, int64_t L) {
+    olmoe_layer *layer = &m->layers[L];
+    int64_t n_expert = m->n_expert;
+
+    int64_t n_ids = 0;
+    for (int64_t e = 0; e < n_expert; e++)
+        if (s->offsets[e + 1] > s->offsets[e]) s->acquire_ids[n_ids++] = e;
+
+    tr_experts_stats before, after;
+    tr_experts_get_stats(m->experts, &before);
+    uint64_t t = tr_prof_begin(&s->prof);
+    int rc = tr_experts_acquire(m->experts, L, s->acquire_ids, n_ids);
+    tr_prof_end(&s->prof, TR_PROF_WEIGHT_READ, t);
+    tr_experts_get_stats(m->experts, &after);
+    uint64_t read_bytes = after.bytes_read - before.bytes_read;
+    tr_prof_count(&s->prof, TR_PROF_WEIGHT_READ, read_bytes, read_bytes);
+
+    /* every expert of the layer, present or not: a stale pointer from a past layer's turn must
+     * never survive, so a wrong read crashes instead of reading someone else's bytes. */
+    for (int64_t e = 0; e < n_expert; e++) {
+        layer->exps[e].data = tr_experts_part(m->experts, L, e, 0);
+        layer->exps[n_expert + e].data = tr_experts_part(m->experts, L, e, 1);
+        layer->exps[2 * n_expert + e].data = tr_experts_part(m->experts, L, e, 2);
+    }
+    return rc;
+}
 
 static const float *olmoe_logits(const void *session, int64_t back) {
     const olmoe_session *s = (const olmoe_session *)session;
@@ -1130,11 +1399,185 @@ static tr_prof *olmoe_prof(void *session) {
     return &s->prof;
 }
 
+/* ---- routing trace (docs/MISURE.md domande 13-15) -------------------------------------------
+ * Outside the hot zone: route_trace_record (called from inside it, under one `if`) allocates
+ * nothing and only touches the scratch begun here. */
+
+struct olmoe_route_trace {
+    tr_route_trace pub;                    /* returned as-is by olmoe_route_trace */
+    uint16_t *chosen, *pred_in, *pred_out; /* owned; pub.chosen/pred_in/pred_out alias these */
+    int32_t *tokens;                       /* owned; pub.tokens */
+    float *margins;                        /* owned; pub.margins */
+    float *router;                         /* [B][n_expert] scratch: a prediction's raw scores */
+    float *normed;                         /* [B][n_embd] scratch: next layer's ffn_norm over this layer's x */
+    unsigned char *taken;                  /* [n_expert] scratch for top_experts, one row (serial) */
+};
+
+static void olmoe_route_trace_free(olmoe_route_trace *tr) {
+    if (tr == NULL) return;
+    tr_free_aligned(tr->chosen);
+    tr_free_aligned(tr->pred_in);
+    tr_free_aligned(tr->pred_out);
+    tr_free_aligned(tr->tokens);
+    tr_free_aligned(tr->margins);
+    tr_free_aligned(tr->router);
+    tr_free_aligned(tr->normed);
+    tr_free_aligned(tr->taken);
+    free(tr);
+}
+
+/* One expert's gate + up + down rows, and every tensor of one layer, bytes as stored
+ * (mat_bytes above): every layer has the same shapes, so layer 0 stands for all. */
+static void route_trace_sizes(const olmoe_model *m, int64_t *expert_bytes, int64_t *layer_bytes) {
+    const olmoe_layer *l0 = &m->layers[0];
+    int64_t eb = (int64_t)mat_bytes(&l0->gate_exps[0]) + (int64_t)mat_bytes(&l0->up_exps[0]) +
+                 (int64_t)mat_bytes(&l0->down_exps[0]);
+    int64_t lb = (int64_t)mat_bytes(&l0->wq) + (int64_t)mat_bytes(&l0->wk) + (int64_t)mat_bytes(&l0->wv) +
+                 (int64_t)mat_bytes(&l0->wo) + (int64_t)mat_bytes(&l0->gate_inp) + m->n_expert * eb +
+                 (m->n_embd + m->n_embd + m->n_qkv + m->n_kv) * (int64_t)sizeof(float);
+    *expert_bytes = eb;
+    *layer_bytes = lb;
+}
+
+static int olmoe_route_trace_begin(void *session, int64_t max_tokens) {
+    olmoe_session *s = (olmoe_session *)session;
+    olmoe_model *m = s->m;
+    if (m->n_expert > 65535) return -1;
+    if (max_tokens < 0) max_tokens = 0;
+
+    olmoe_route_trace *tr = (olmoe_route_trace *)calloc(1, sizeof *tr);
+    if (tr == NULL) return -1;
+
+    int64_t n_expert = m->n_expert, n_used = m->n_expert_used, n_layers = m->n_layers;
+    int64_t n_pred = n_expert < TR_ROUTE_TRACE_PRED ? n_expert : TR_ROUTE_TRACE_PRED;
+    int64_t B = s->n_batch;
+
+    if (max_tokens > 0) {
+        tr->chosen = (uint16_t *)tr_alloc_aligned((size_t)(max_tokens * n_layers * n_used) * sizeof(uint16_t), 64);
+        tr->pred_in = (uint16_t *)tr_alloc_aligned((size_t)(max_tokens * n_layers * n_pred) * sizeof(uint16_t), 64);
+        tr->pred_out = (uint16_t *)tr_alloc_aligned((size_t)(max_tokens * n_layers * n_pred) * sizeof(uint16_t), 64);
+        tr->tokens = (int32_t *)tr_alloc_aligned((size_t)max_tokens * sizeof(int32_t), 64);
+        tr->margins = alloc_f32(max_tokens * n_layers * 2);
+    }
+    tr->router = alloc_f32(B * n_expert);
+    tr->normed = alloc_f32(B * m->n_embd);
+    tr->taken = (unsigned char *)tr_alloc_aligned((size_t)n_expert, 64);
+
+    if ((max_tokens > 0 && (tr->chosen == NULL || tr->pred_in == NULL || tr->pred_out == NULL ||
+                            tr->tokens == NULL || tr->margins == NULL)) ||
+        tr->router == NULL || tr->normed == NULL || tr->taken == NULL) {
+        olmoe_route_trace_free(tr);
+        return -1;
+    }
+
+    tr->pub.n_tokens = 0;
+    tr->pub.max_tokens = max_tokens;
+    tr->pub.n_layers = n_layers;
+    tr->pub.n_expert = n_expert;
+    tr->pub.n_used = n_used;
+    tr->pub.n_pred = n_pred;
+    route_trace_sizes(m, &tr->pub.expert_bytes, &tr->pub.layer_bytes);
+    tr->pub.chosen = tr->chosen;
+    tr->pub.pred_in = tr->pred_in;
+    tr->pub.pred_out = tr->pred_out;
+    tr->pub.tokens = tr->tokens;
+    tr->pub.margins = tr->margins;
+
+    olmoe_route_trace_free(s->trace);
+    s->trace = tr;
+    return 0;
+}
+
+static const tr_route_trace *olmoe_route_trace_get(const void *session) {
+    const olmoe_session *s = (const olmoe_session *)session;
+    return s->trace != NULL ? &s->trace->pub : NULL;
+}
+
+/* Records layer L's routing into the trace for the tokens of this pass that still fit under
+ * max_tokens (evaluation order; recording then stops, but the pass still runs to completion).
+ * Called once per layer from forward_pass, right after that layer's own residual add, while
+ * s->normed still holds this layer's own FFN input (ffn_norm_L(x), untouched since this layer's
+ * own router read it: the gather that follows only copies from it) and s->x holds this layer's
+ * own output (x after the residual). Uses only the scratch tr_session_route_trace_begin
+ * allocated: nothing here allocates. */
+static void route_trace_record(olmoe_session *s, int64_t L, const int32_t *tokens, int64_t n_tok) {
+    olmoe_route_trace *tr = s->trace;
+    const olmoe_model *m = s->m;
+    int64_t n_expert = m->n_expert, n_used = m->n_expert_used, n_pred = tr->pub.n_pred;
+    int64_t n_layers = m->n_layers, n_embd = m->n_embd;
+
+    int64_t rec = tr->pub.max_tokens - tr->pub.n_tokens;
+    if (rec > n_tok) rec = n_tok;
+    if (rec < 0) rec = 0;
+    int64_t base = tr->pub.n_tokens;
+
+    /* s->router still holds this layer's softmax (route_token ran it in place and nothing has
+     * written there since): the margin is the probability of the last expert chosen and of the
+     * best one left out, among the experts the mask, if any, leaves on. */
+    const unsigned char *off = m->expert_off != NULL ? m->expert_off + L * n_expert : NULL;
+    for (int64_t i = 0; i < rec; i++) {
+        uint16_t *row = tr->chosen + (base + i) * n_layers * n_used + L * n_used;
+        const float *prob = s->router + i * n_expert;
+        float p_last = 1.0f, p_next = 0.0f;
+        for (int64_t e = 0; e < n_expert; e++) tr->taken[e] = off != NULL ? off[e] : 0;
+        for (int64_t slot = 0; slot < n_used; slot++) {
+            int64_t id = s->sel_id[i * n_used + slot];
+            row[slot] = (uint16_t)id;
+            tr->taken[id] = 1;
+            if (prob[id] < p_last) p_last = prob[id];
+        }
+        for (int64_t e = 0; e < n_expert; e++)
+            if (!tr->taken[e] && prob[e] > p_next) p_next = prob[e];
+        tr->margins[((base + i) * n_layers + L) * 2] = p_last;
+        tr->margins[((base + i) * n_layers + L) * 2 + 1] = p_next;
+        if (L == 0) tr->tokens[base + i] = tokens[i];
+    }
+
+    if (rec > 0 && L + 1 < n_layers) {
+        const olmoe_layer *next = &m->layers[L + 1];
+        int64_t ids[TR_ROUTE_TRACE_PRED];
+
+        /* pred_in: the next layer's router applied to this layer's own FFN input -- known
+         * before this layer's experts run. */
+        tr_matmul(m->pool, &next->gate_inp, s->normed, rec, tr->router);
+        for (int64_t i = 0; i < rec; i++) {
+            float *scores = tr->router + i * n_expert;
+            tr_softmax(scores, n_expert);
+            top_experts(scores, n_expert, NULL, tr->taken, n_pred, ids, NULL);
+            uint16_t *out = tr->pred_in + (base + i) * n_layers * n_pred + L * n_pred;
+            for (int64_t k = 0; k < n_pred; k++) out[k] = (uint16_t)ids[k];
+        }
+
+        /* pred_out: the next layer's own ffn_norm and router applied to this layer's own
+         * output -- known only after this layer's experts ran and added their residual. */
+        memcpy(tr->normed, s->x, (size_t)rec * n_embd * sizeof(float));
+        for (int64_t i = 0; i < rec; i++) tr_rmsnorm(tr->normed + i * n_embd, next->ffn_norm, n_embd, m->rms_eps);
+        tr_matmul(m->pool, &next->gate_inp, tr->normed, rec, tr->router);
+        for (int64_t i = 0; i < rec; i++) {
+            float *scores = tr->router + i * n_expert;
+            tr_softmax(scores, n_expert);
+            top_experts(scores, n_expert, NULL, tr->taken, n_pred, ids, NULL);
+            uint16_t *out = tr->pred_out + (base + i) * n_layers * n_pred + L * n_pred;
+            for (int64_t k = 0; k < n_pred; k++) out[k] = (uint16_t)ids[k];
+        }
+    } else if (rec > 0) {
+        for (int64_t i = 0; i < rec; i++) {
+            uint16_t *pin = tr->pred_in + (base + i) * n_layers * n_pred + L * n_pred;
+            uint16_t *pout = tr->pred_out + (base + i) * n_layers * n_pred + L * n_pred;
+            for (int64_t k = 0; k < n_pred; k++) { pin[k] = 0xFFFF; pout[k] = 0xFFFF; }
+        }
+    }
+
+    if (L == n_layers - 1) tr->pub.n_tokens += rec;
+}
+
 const tr_arch_vtable tr_olmoe_vtable = {
     "olmoe",
     olmoe_load,
     olmoe_free,
     olmoe_info,
+    olmoe_expert_stats,
+    olmoe_experts,
     olmoe_session_create,
     olmoe_session_free,
     olmoe_eval,
@@ -1144,4 +1587,7 @@ const tr_arch_vtable tr_olmoe_vtable = {
     olmoe_max_logit_rows,
     olmoe_rewind,
     olmoe_prof,
+    olmoe_route_trace_begin,
+    olmoe_route_trace_get,
+    olmoe_set_expert_mask,
 };

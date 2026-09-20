@@ -456,7 +456,7 @@ static void test_swiglu_threads(void) {
         int64_t n = sizes[si];
         for (int64_t i = 0; i < n; i++) {
             float v = x0[i];
-            want[i] = v / (1.0f + expf(-v)) * y[i];
+            want[i] = v / (1.0f + tr_expf(-v)) * y[i];
         }
         memcpy(got, x0, sizeof got);
         tr_swiglu(NULL, got, y, n);

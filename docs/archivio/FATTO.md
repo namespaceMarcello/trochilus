@@ -453,3 +453,131 @@ da 100). `expf` nostro, la leva grande che resta, non è scritto: lo decide Marc
   e la macchina tenuta sveglia finché il lock esiste (una richiesta di alimentazione, nessuna
   impostazione cambiata). Prova: due `sh tools/prefill_context.sh bench` insieme, il secondo si
   rifiuta.
+
+### 2026-09-19 — `tr_expf` scalare, la pulizia negli script, la rimisura a macchina pulita
+
+- **`tr_expf`** (`src/kernels/expf.c`, `src/kernels/expf_table.h` generato da
+  `tools/gen_expf_table.py` con mpmath): exp(x) arrotondato correttamente a float su ogni float,
+  scalare, nessuna chiamata alla libreria C dentro. Tabella di 64 valori di 2^(j/64), ln2/64 in due
+  pezzi, polinomio di grado 5, test di arrotondamento a 2^-50, 8 eccezioni calcolate a 200 e a 400
+  bit (le ritrova `gen_expf_table.py --scan`, mirror numpy della strada veloce), NaN per un
+  arrotondamento non provato. `tr_softmax` e `tr_swiglu` la usano; `tr_expf_path` e
+  `tr_expf_exception` dicono ai test quale strada prende un argomento. Prova: `make bench-expf`
+  (tutti i 2^32 float contro il riferimento; su Windows anche contro l'`expf` di MinGW: 0 e 0),
+  `make test` (`tests/test_expf.c`: bordi, strada veloce a campione, ogni eccezione, softmax e SiLU
+  contro la definizione), `sh tools/mutate_expf.sh` nel container (17 mutazioni su 17 viste).
+- **Nel cancello**: `make check` gira `make bench-expf` con gcc e con clang; `tools/lint.py` rifiuta
+  `expf(` e `exp(` nella zona calda, confronta `expf_table.h` col suo generatore, pretende il trap di
+  pulizia in ogni `tools/*.sh` e rifiuta le pipe verso `tee` di ciò che può fallire; `clean-machine`
+  (`tools/orphans.sh`, `tools/test_cleanup.sh`) prima di tutto.
+- **Qualità e piattaforme**: `sh tools/expf_quality.sh` nel container (binario di prima, build di
+  emulazione dai sorgenti del commit di prima tirati fuori da git, binario nuovo: KL e token, e gli
+  stessi byte dell'emulazione o esce 1); `sh tools/platform_bits.sh` (logit di Windows e Linux al byte
+  su fixture e modello vero a 2 layer; le tabelle RoPE con `tests/dump_rope.c` e
+  `tools/rope_table_compare.py`, saltate se Smart App Control blocca lo strumento).
+- **La pulizia** (LEZIONI #84): `tools/cleanup.lib` in ogni script (discendenti uccisi dal trap EXIT,
+  anche l'albero nativo su Windows; INT e TERM diventano `exit 130`; `cleanup_run` per i passi lunghi,
+  perché una shell che aspetta un figlio in primo piano non serve i segnali); `tools/orphans.sh` e
+  `tools/orphans.ps1`; `tools/busy_machine.sh`; `tools/test_cleanup.sh`. Prova: `sh
+  tools/test_cleanup.sh`; un `yes` lasciato acceso e poi `sh tools/orphans.sh` o `make check`.
+- **La macchina interrogata** (LEZIONI #85): `tools/machine_still.sh` e `tools/cpu_busy.ps1` (processori
+  occupati, prima della sessione e prima di ogni run, in `MEASURE_AB_GUARD`), `tools/background_load.ps1`
+  e `measure_declare` (il carico di fondo e la quota di `System` nel log di ogni misura);
+  `prefill_context.sh` scrive da sé `binaries.sha256` e accetta `GEN_EXTRA` (decode a larghezza
+  forzata nei confronti prima/dopo). Prova: `sh tools/machine_still.sh 3.0 0 5` a macchina quieta e con
+  tre `yes` accesi da `sh tools/busy_machine.sh 3 sh tools/machine_still.sh 3.0 0 5`.
+- **La rimisura**: `threads_phase.sh widths` e `decode_context.sh widths` (decode forzato a 16 contro 8
+  thread ai quattro contesti), e `decode_context_report.py speed` che conta scelte e cambi di
+  larghezza. Prova: i comandi di MISURE §Rimisura a macchina pulita, a macchina lasciata sola.
+
+### 2026-09-19 — Lo stimatore della larghezza del decode, riscritto
+
+- **Cosa**: la larghezza delle passate corte non la sceglie più «la più ampia entro l'1%» (tirava a
+  sorte: LEZIONI #88, domanda 31). `src/models/model.c`: `tr_decode_tune_widths` dà le larghezze
+  dalla più stretta e non scende sotto 4 thread; `tr_decode_tune_stats` dà di ogni larghezza il
+  centro (la passata più veloce) e il rumore (il distacco della seconda); `tr_decode_tune_pick`
+  tiene la più stretta entro il rumore della coppia (lei e la più veloce) e chiede altre passate
+  sulle due, fino a 6, quando decide il margine; `tr_decode_tune_debounce` cambia solo con due
+  misure concordi. La sessione rimisura a ogni raddoppio del contesto (da 32, ricalcolato dalla
+  posizione: un `rewind` lo abbassa) e dopo 128 passate se un cambio aspetta il secondo voto.
+  `tr_session_decode_history` tiene ciò che ogni misura ha deciso, e la riga `threads:` lo stampa:
+  `threads: 8 prompt, 4 decode (measured), choices 26:4 38:4(8) 76:8` (posizione:larghezza in uso,
+  fra parentesi la scelta che il debounce ha trattenuto). `tools/decode_context.sh long`: 1500 token
+  dopo un prompt di 1000, i cambi di ogni run contati da quella storia (`tools/long_switches.awk`).
+- **Come si prova**: `tests/test_phase.c` (in `make check`): le funzioni pure su tempi scritti a
+  mano, la sessione con un orologio finto (`tr_session_set_tune_clock`), ogni ramo col suo
+  contatore. Visto rosso: prima della riscrittura il caso piatto con l'attesa «la stretta»
+  (`0 != 2`); dopo, dieci mutazioni, nel container: `MSYS_NO_PATHCONV=1 docker run --rm -v
+  "$(pwd -W):/src" -w /src trochilus-dev:local sh tools/mutate_tune.sh` (mezz'ora; `-e ONLY=history`
+  per le due della storia). La riga: `build/trochilus generate -m fixtures/tiny-olmoe/model-f32.gguf
+  -p 20 -n 100 -t 8`. **Sul modello vero non è ancora misurato**: la validazione è il punto 0 di
+  `docs/STATO.md`, di notte a macchina quieta.
+
+### 2026-09-20 — M1, prima di scrivere codice: la traccia del routing e il banco del disco
+
+- **Cosa**: `trochilus run --route-trace <file>` (`src/models/olmoe.c`, `model.h`: `tr_session_route_trace_begin`,
+  `tr_session_route_trace`) registra per token e layer gli esperti scelti e due previsioni del
+  layer dopo (`pred_in` prima degli esperti del layer, `pred_out` a layer finito); spenta non cambia
+  un byte e non tocca la zona calda. `tools/route_trace_report.py` ne ricava le domande 13-15
+  (previsione, cache LRU e pin, streaming per layer). `tests/bench_disk.c` / `make bench-disk`:
+  letture senza la cache del sistema, a blocchi grandi quanto una matrice di un esperto, 1-16
+  lettori (domanda 16). Prompt nuovo `bench/prompts/code-1000.txt` (904 token). Chiuse come «no» le
+  domande 5, 34, 39; aperte la 41 (il disco a un terzo della scheda) e la 42 (il primo layer).
+- **Come si prova**: `tests/test_route.c` in `make check` (previsioni esatte su due modelli
+  sintetici fatti apposta, traccia uguale per ogni forma delle passate, logit uguali con la traccia
+  accesa); cinque mutazioni rosse: `MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src
+  trochilus-dev:local sh tools/mutate_route.sh`; `tools/.venv/Scripts/python.exe
+  tools/route_trace_report.py --check` (in `make lint`). I numeri: nel container `build/linux-gcc/trochilus
+  run -m models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf -f bench/prompts/code-1000.txt -n 300 -t 8
+  --decode-threads 8 --route-trace build/route/code-1000.bin`, poi il report su quel file; `make
+  bench-disk` in nativo a macchina ferma. Risultati in `docs/MISURE.md` §M1, prima di scrivere codice.
+
+### 2026-09-20 — M1, lotti 1 e 2: gli esperti passano per un archivio con un budget di RAM
+
+- **Cosa**: `src/memory/experts.{h,c}`: unità (layer, esperto) in slot allocati al caricamento,
+  indice diretto e lista LRU O(1), letture a richiesta sul thread che chiama, dimensioni delle parti
+  per layer. `src/models/olmoe.c`: il denso resta in RAM, gli esperti si chiedono all'archivio dopo
+  il router (`olmoe_refresh_experts`, fuori dalla zona calda), il GGUF resta aperto per la vita del
+  modello, un errore di lettura fa fallire la valutazione e rimette `pos` dov'era. Piano automatico
+  (`tr_expert_budget_plan`), `tr_model_load_budget`, `--expert-budget <MiB|min>` e
+  `TR_EXPERT_BUDGET_MIB`, riga `experts:` dopo `threads:`. Un solo percorso: col budget pieno
+  l'archivio si riempie al caricamento. `tools/lint.py` ora rifiuta i fine riga CRLF (LEZIONI #95).
+- **Come si prova**: `tests/test_experts.c` (contenuti al byte, LRU calcolata a mano, un layer
+  intero col minimo, residente, errori iniettati, 800 chiamate contro un modello di riferimento) e
+  `tests/test_stream.c` (logit identici al byte fra residente, minimo e intermedio, con e senza
+  pool; byte dell'archivio contro `tr_gguf_read_range`; errore di lettura a metà prompt; piano su
+  numeri finti), in `make check`, dove gli oracoli girano anche sotto `TR_EXPERT_BUDGET_MIB=min`;
+  mutazioni `tools/mutate_experts.sh` (10) e `tools/mutate_stream.sh` (5), tutte rosse. Modello vero
+  nel container: `trochilus logits` su 32 posizioni, residente contro `--expert-budget min` (72
+  unità su 1024): `cmp` identico. Nessuna misura di velocità ancora (lotto 3: letture dirette).
+
+### 2026-09-20 — Domanda 44: il codice è un grafo piccolo e deterministico? Traccia versione 2 e maschera degli esperti
+
+- **Cosa**: la traccia del routing porta anche l'id di ogni token e il margine del router;
+  `tr_model_set_expert_mask` / `--expert-mask <file>` spegne esperti (sola misura: l'uscita non è
+  più del modello, e la riga `expert mask:` lo dice); `tools/route_graph_report.py` (copertura,
+  grafo statico, ripetizioni, tabella per id, margini, `--compare`, `--mask-from` anche a caso);
+  `tools/mask_quality.sh` (KL e token contro il modello intero); `tools/mutate_reports.py`; prompt
+  `bench/prompts/trace-{c2,py,sh,prose-it,prose-en}.txt`. Risultati in `docs/MISURE.md`.
+- **Come si prova**: `tests/test_route.c` (id dei token, margini esatti contro lo stesso modello
+  con un esperto in più per token, maschera mai scelta e per layer, vuota e tolta = il modello);
+  `tools/.venv/Scripts/python.exe tools/route_graph_report.py --check` e `tools/mutate_reports.py`
+  (12 mutazioni rosse). Nel container: `trochilus run ... --route-trace`, poi il report sul file;
+  `sh tools/mask_quality.sh` da Git Bash. **Non ancora rifatti dopo queste modifiche**: `make check`
+  e `tools/mutate_route.sh` per intero (fermati per memoria il 20/09).
+
+### 2026-09-20 — M1 lotto 3: gli esperti si leggono senza la cache del sistema
+
+- **Cosa**: `tr_file_open_direct` e `tr_file_alignment` in `src/base/platform.{h,c}`; l'archivio
+  legge allineato a 4096 senza copie (margine di un settore per parte nello slot, spostamento
+  registrato a ogni riempimento) e `tr_experts_stats` dice se è diretta; `olmoe_load` apre il
+  secondo handle, prova una lettura allineata di saggio e ricade sulla lettura normale se il file
+  system rifiuta; `TR_EXPERT_DIRECT=0` e `TR_MEM_AVAILABLE_MIB` per le misure; la riga `experts:`
+  dice `direct` o `buffered`. Nuovo per le misure: `tools/experts_budget.sh`,
+  `tools/experts_steady.awk`, i contatori dell'archivio in `tools/ab_modes.sh`.
+- **Come si prova**: `tests/test_experts.c` gira ogni suo caso con entrambi gli allineamenti e ha
+  il caso dei due esperti con resti diversi nello stesso slot; `tests/test_stream.c` confronta
+  diretta e normale al byte (residente e al minimo) e forza il ramo stretto del piano;
+  `tests/test_base.c` prova la lettura corta nell'ultimo settore. Quindici mutazioni rosse e la riga di controllo verde:
+  `MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src trochilus-dev:local sh
+  tools/mutate_experts.sh`. Tutto in `make check`.

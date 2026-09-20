@@ -73,25 +73,30 @@ wait_runs() {
 # one measurement at a time, and the machine stays awake while it lasts (docs/LEZIONI.md #82)
 . tools/measure_guard.lib
 measure_begin prefill_context
-trap measure_end EXIT INT TERM
+trap measure_end EXIT
+trap 'exit 130' INT TERM
 [ "$WHAT" = bench ] || wait_runs $B cpu
 wait_runs $ATTNB
 [ -z "$BEFORE" ] || wait_runs $BEFORE cpu
 [ -z "$PROF_BEFORE" ] || wait_runs $PROF_BEFORE cpu
+# which binaries these numbers belong to: a name like trochilus-before.exe is reused from one
+# session to the next, a hash is not (docs/LEZIONI.md #81, #86)
+sha256sum $B $ATTNB $BEFORE $PROF_BEFORE > $OUT/binaries.sha256 2> /dev/null || true
 
 RUNNING=$(docker ps -q 2>/dev/null || true)
 restart() { measure_end; if [ -n "$RUNNING" ]; then docker start $RUNNING > /dev/null 2>&1 || true; echo "containers started again"; fi; }
-trap restart EXIT INT TERM
+trap restart EXIT
 if [ -n "$RUNNING" ]; then
   # the VM's file cache goes back to Windows first (docs/LEZIONI.md #38), then everything stops
   MSYS_NO_PATHCONV=1 docker run --rm --privileged trochilus-dev:local sh -c "sync; echo 3 > /proc/sys/vm/drop_caches" || true
   docker stop $RUNNING > /dev/null
   echo "containers stopped: $(echo $RUNNING | wc -w)"
 fi
-# from here on a running container means somebody else is using the machine
-AB_GUARD='[ -z "$(docker ps -q 2>/dev/null)" ]'
+# from here on a running container, or a CPU busy with other work, means somebody else is using
+# the machine (tools/measure_guard.lib, tools/machine_still.sh)
+AB_GUARD=$MEASURE_AB_GUARD
 export AB_GUARD
-still() { sh -c "$AB_GUARD" || { echo "prefill_context: a container is running $1: the machine is not still, stopping"; exit 3; }; }
+still() { sh -c "$AB_GUARD" || { echo "prefill_context: the machine is not still $1 (a container, or a busy CPU), stopping"; exit 3; }; }
 
 # The model takes 7 GiB and the memory guard wants 3 more left free; Windows needs minutes to
 # take back what the VM has released (docs/LEZIONI.md #72). Up to 15 minutes, a look every 30 s.
@@ -104,9 +109,14 @@ while [ "$WHAT" != bench ]; do
   echo "prefill_context: ${AVAIL:-?} GiB available, 12 wanted: waiting 30 s"
   sleep 30
 done
+measure_still prefill_context
+measure_declare "before the first run"
 
-# $1: binary, $2: prompt length, $3: context
-gen() { echo "$1 generate -m $M -p $2 -n 48 -c $3 -t 16"; }
+# $1: binary, $2: prompt length, $3: context. GEN_EXTRA: further arguments of every run, for
+# instance "--decode-threads 8": the width of the decode is measured by each session for itself
+# and changes from run to run (docs/MISURE.md question 31); forcing it on both binaries keeps
+# that choice out of a before/after comparison of the 48 tokens after the prompt.
+gen() { echo "$1 generate -m $M -p $2 -n 48 -c $3 -t 16 $GEN_EXTRA"; }
 
 # $1: name of the output. Every call is one run, well under 60 s.
 bench_attn() {
@@ -132,7 +142,7 @@ bench_attn() {
 profile() {
   echo "##### profile by zone, $2"
   still "before the profile"
-  $PY tools/profile_suite.py --binary $2 --scenarios $SCEN > $OUT/profile-$1.txt
+  cleanup_run $PY tools/profile_suite.py --binary $2 --scenarios $SCEN > $OUT/profile-$1.txt
   still "after the profile"
   grep -c "^==" $OUT/profile-$1.txt
 }
@@ -178,7 +188,7 @@ elif [ "$WHAT" = measure ]; then
   bench_attn measure
   echo "##### speed"
   # lengths 0 1 2 0 2 1: every length after each of the other two, the copies after different ones
-  sh tools/ab_modes.sh $R \
+  cleanup_run sh tools/ab_modes.sh $R \
      "p512=$(gen $B 512 600)" "p2048=$(gen $B 2048 2200)" "p4000=$(gen $B 4000 4096)" \
      "p512-again=$(gen $B 512 600)" "p4000-again=$(gen $B 4000 4096)" "p2048-again=$(gen $B 2048 2200)" \
      > $OUT/speed.txt
@@ -191,7 +201,7 @@ else
   echo "##### speed"
   # lengths 0 0 1 0 2 1 1 2 2 0 1 2: every length after every length; before and after of a length
   # follow the same length, a mode and its A/A copy follow different ones
-  sh tools/ab_modes.sh $R \
+  cleanup_run sh tools/ab_modes.sh $R \
      "before-512=$(gen $BEFORE 512 600)" "before-512-again=$(gen $BEFORE 512 600)" \
      "before-2048=$(gen $BEFORE 2048 2200)" "after-512-again=$(gen $B 512 600)" \
      "before-4000-again=$(gen $BEFORE 4000 4096)" "before-2048-again=$(gen $BEFORE 2048 2200)" \
@@ -204,6 +214,7 @@ else
   [ -z "$PROF_BEFORE" ] || profile before $PROF_BEFORE
   profile change $B
 fi
+measure_declare "after the last run"
 echo "done: $OUT, $(date '+%H:%M')"
 }
 main "$@"; exit

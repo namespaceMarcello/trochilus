@@ -24,16 +24,17 @@ mkdir -p $OUT
 measure_begin remeasure
 RUNNING=$(docker ps -q 2>/dev/null || true)
 restart() { measure_end; if [ -n "$RUNNING" ]; then docker start $RUNNING > /dev/null 2>&1 || true; echo "containers started again"; fi; }
-trap restart EXIT INT TERM
+trap restart EXIT
+trap 'exit 130' INT TERM
 if [ -n "$RUNNING" ]; then
   # the VM's file cache goes back to Windows first (docs/LEZIONI.md #38), then everything stops
   MSYS_NO_PATHCONV=1 docker run --rm --privileged trochilus-dev:local sh -c "sync; echo 3 > /proc/sys/vm/drop_caches" || true
   docker stop $RUNNING > /dev/null
   echo "containers stopped: $(echo $RUNNING | wc -w)"
 fi
-# from here on a running container means somebody else is using the machine: ab_modes.sh stops
-# at the next run instead of going on (docs/LEZIONI.md #73)
-AB_GUARD='[ -z "$(docker ps -q 2>/dev/null)" ]'
+# from here on a running container, or a CPU busy with other work, means somebody else is using
+# the machine: ab_modes.sh stops at the next run instead of going on (docs/LEZIONI.md #73, #84)
+AB_GUARD=$MEASURE_AB_GUARD
 export AB_GUARD
 
 # The model takes 7 GiB and the memory guard wants 3 more left free; after a `make check` Windows
@@ -47,22 +48,24 @@ while :; do
   echo "remeasure: ${AVAIL:-?} GiB available, 12 wanted: waiting 30 s"
   sleep 30
 done
+measure_still remeasure
+measure_declare "before the first run"
 
 echo "##### 1. speculation, worst case (code.txt), with an A/A control"
-sh tools/ab_modes.sh $R \
+cleanup_run sh tools/ab_modes.sh $R \
   "spec0=$B run -m $M -f bench/prompts/code.txt -n 200 -t 16 --spec 0" \
   "spec8=$B run -m $M -f bench/prompts/code.txt -n 200 -t 16 --spec 8" \
   "spec0again=$B run -m $M -f bench/prompts/code.txt -n 200 -t 16 --spec 0" > $OUT/1-spec-code.txt
 tail -4 $OUT/1-spec-code.txt
 
 echo "##### 2. speculation, good case (code-edit.txt)"
-sh tools/ab_modes.sh $R \
+cleanup_run sh tools/ab_modes.sh $R \
   "spec0=$B run -m $M -f bench/prompts/code-edit.txt -n 200 -t 16 --spec 0" \
   "spec8=$B run -m $M -f bench/prompts/code-edit.txt -n 200 -t 16 --spec 8" > $OUT/2-spec-code-edit.txt
 tail -3 $OUT/2-spec-code-edit.txt
 
 echo "##### 3. pin modes at 16 threads, with an A/A control"
-sh tools/ab_modes.sh $R \
+cleanup_run sh tools/ab_modes.sh $R \
   "pin2=TR_POOL_PIN=2 $B generate -m $M -p 512 -n 24 -c 600 -t 16" \
   "pin1=TR_POOL_PIN=1 $B generate -m $M -p 512 -n 24 -c 600 -t 16" \
   "pin0=TR_POOL_PIN=0 $B generate -m $M -p 512 -n 24 -c 600 -t 16" \
@@ -70,7 +73,7 @@ sh tools/ab_modes.sh $R \
 tail -9 $OUT/3-pin.txt
 
 echo "##### 4. threads per phase: 8 against 16 (default pin), with an A/A control"
-sh tools/ab_modes.sh $R \
+cleanup_run sh tools/ab_modes.sh $R \
   "t16=$B generate -m $M -p 512 -n 48 -c 600 -t 16" \
   "t8=$B generate -m $M -p 512 -n 48 -c 600 -t 8" \
   "t16again=$B generate -m $M -p 512 -n 48 -c 600 -t 16" > $OUT/4-threads.txt
@@ -84,7 +87,8 @@ for round in 1 2 3; do
     $B generate -m $M --tokens "$IDS" -n 200 -t 16 --spec $mode --profile-json $OUT/5-zones-$tag-$round.json > /dev/null 2>&1
   done
 done
-$PY - $OUT <<'EOF' | tee $OUT/5-zones.txt
+# to a file and then shown: through a pipe into tee a failed report would end with 0 (docs/LEZIONI.md #90)
+$PY - $OUT > $OUT/5-zones.txt <<'EOF'
 import json, statistics, sys
 out = sys.argv[1]
 def load(tag):
@@ -105,6 +109,8 @@ for tag in ("1specfixed", "8specfixed"):
     print(f"{tag}: {rows:.2f} rows/pass, {z['token']:.1f} ms/pass; one more row = {total:.1f} ms "
           f"(dense matmul {dense:.1f}, experts {experts:.1f}, rest {total - dense - experts:.1f})")
 EOF
+cat $OUT/5-zones.txt
+measure_declare "after the last run"
 echo "done: $OUT"
 }
 main "$@"; exit

@@ -10,6 +10,9 @@
 set -e
 # The body is one function, called on the last line (docs/LEZIONI.md #69).
 main() {
+. tools/cleanup.lib
+trap cleanup_children EXIT
+trap 'exit 130' INT TERM
 PYBIN=${PY:-tools/.venv/bin/python}
 cat > /tmp/mut.py <<'EOF'
 import sys
@@ -21,7 +24,11 @@ open(path, "w", encoding="utf-8").write(s.replace(old, new, 1))
 EOF
 # $1: name, $2: file, $3: text, $4: replacement
 run() {
-  rm -rf /tmp/mut && mkdir -p /tmp/mut && cp -r Makefile src tests tools bench /tmp/mut/ && ln -s /src/fixtures /tmp/mut/fixtures
+  # tools without .venv: the repo's own Python environment is 706 MiB over a Windows bind mount,
+  # and the container has its own ($PY below), so copying it made one mutation take minutes
+  rm -rf /tmp/mut && mkdir -p /tmp/mut/tools && cp -r Makefile src tests bench /tmp/mut/ &&
+    find tools -maxdepth 1 -mindepth 1 ! -name .venv ! -name __pycache__ -exec cp -r {} /tmp/mut/tools/ ';' &&
+    ln -s /src/fixtures /tmp/mut/fixtures
   cd /tmp/mut
   $PYBIN /tmp/mut.py "$2" "$3" "$4"
   make BUILD=b CC=gcc b/trochilus b/tests/test_kv b/tests/test_prefill b/tests/test_spec b/tests/test_session > /dev/null 2>&1

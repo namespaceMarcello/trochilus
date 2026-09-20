@@ -29,6 +29,21 @@ def check_docs_control_chars():
                 fail(14, f"{f.relative_to(ROOT)}:{line}: contains a {name}")
 
 
+def check_line_endings():
+    """#95: an agent rewrote four source files with Windows line endings; with core.autocrlf off
+    git then shows the whole file as changed and every later text replacement on LF misses."""
+    suffixes = {".c", ".h", ".py", ".sh", ".lib", ".awk", ".json", ".txt", ".ps1", ".md", ".cjs"}
+    files = [ROOT / "Makefile"]
+    for top in ("src", "tests", "tools", "bench", ".claude"):
+        files += [f for f in sorted((ROOT / top).rglob("*")) if f.is_file() and f.suffix in suffixes
+                  and ".venv" not in f.parts and "results" not in f.parts]  # bench/results: run output
+    for f in files:
+        data = f.read_bytes()
+        if b"\r" in data:
+            line = data[: data.index(b"\r")].count(b"\n") + 1
+            fail(95, f"{f.relative_to(ROOT)}:{line}: carriage return (the file must end its lines with LF)")
+
+
 def check_doc_limits():
     """struttura-repo: CLAUDE.md is a map (<= 200 lines), STATO.md does not grow (<= 40 KB)."""
     claude = ROOT / "CLAUDE.md"
@@ -95,8 +110,8 @@ def check_tests_no_tmpfile():
 # Hot zone (docs/ARCHITETTURA.md §Zona calda): code that runs for every token, between
 # /* hot: begin */ and /* hot: end */. A line may allow a name with /* hot-ok: name -- reason */.
 HOT_FILES = ["src/models/olmoe.c", "src/models/model.c", "src/kernels/kernels.c", "src/kernels/kernels_x86.c",
-             "src/kernels/kernels_internal.h", "src/base/threads.c", "src/base/prof.h", "src/kv/kv.c",
-             "src/kv/kv.h"]
+             "src/kernels/kernels_internal.h", "src/kernels/expf.c", "src/base/threads.c", "src/base/prof.h",
+             "src/kv/kv.c", "src/kv/kv.h"]
 HOT_RULES = [
     ("allocazione", re.compile(r"\b(malloc|calloc|realloc|free|tr_alloc_aligned|tr_free_aligned|"
                                r"_aligned_malloc|_aligned_free|posix_memalign|aligned_alloc)\s*\(")),
@@ -104,6 +119,8 @@ HOT_RULES = [
                                  r"fopen|fread|fwrite|getenv|tr_log|tr_file_\w+|tr_gguf_\w+)\s*\(")),
     ("letterale stringa", re.compile(r'(")(?:[^"\\]|\\.)*"')),
     ("matematica da tabellare", re.compile(r"\b(pow|powf|cos|cosf|sin|sinf|tan|tanf|log|logf|log2|log10)\s*\(")),
+    # the library's exponential: 30 ns a call with MinGW, and other bits with glibc (docs/MISURE.md question 37)
+    ("esponenziale della libreria C (si usa tr_expf)", re.compile(r"\b(expf|exp|exp2f|exp2|expm1f|expm1)\s*\(")),
 ]
 HOT_BEGIN, HOT_END = "/* hot: begin */", "/* hot: end */"
 
@@ -161,6 +178,9 @@ def check_hot_zones():
         (f"{b}\nvoid f(void) {{ y = pow(2, 3); /* hot-ok: pow -- sample */ }}\n{e}\n", 0),
         (f"{b}\nvoid f(void) {{ y = 0; /* hot-ok: cos -- sample */ }}\n{e}\n", 1),
         (f"{b}\n/* malloc( in a comment */\n{e}\nvoid g(void) {{ malloc(1); }}\n", 0),
+        (f"{b}\nvoid f(void) {{ y = expf(x); }}\n{e}\n", 1),
+        (f"{b}\nvoid f(void) {{ y = exp((double)x); }}\n{e}\n", 1),
+        (f"{b}\nvoid f(void) {{ y = tr_expf(x); }}\n{e}\n", 0),
         (f"{b}\nvoid f(void) {{ }}\n", 1),
         ("void f(void) { }\n", 1),
     ]
@@ -248,10 +268,97 @@ def check_shell_scripts_whole():
                      'main "$@"; exit (uno script modificato mentre gira si rompe)')
 
 
+def cleanup_problems(text):
+    """what a tools/*.sh lacks to end what it starts (tools/cleanup.lib)."""
+    problems = []
+    if not re.search(r"^\s*\. tools/(cleanup|measure_guard)\.lib\s*$", text, flags=re.M):
+        problems.append("non carica tools/cleanup.lib (o tools/measure_guard.lib, che la carica)")
+    if not re.search(r"^\s*trap \S+ EXIT\s*$", text, flags=re.M):
+        problems.append("manca `trap <pulizia> EXIT`")
+    if not re.search(r"^\s*trap 'exit 130' INT TERM\s*$", text, flags=re.M):
+        problems.append("manca `trap 'exit 130' INT TERM`: un segnale deve far finire lo script, e passare dal trap EXIT")
+    if re.search(r"^\s*trap [^\n]*\bEXIT\b[^\n]*\b(INT|TERM)\b", text, flags=re.M):
+        problems.append("un trap solo per EXIT e per i segnali: dopo il segnale lo script proseguirebbe")
+    return problems
+
+
+def check_scripts_clean_up():
+    """#84: a busy-machine test left four `yes` processes that ran for 37 hours under two days of
+    measurements. Every script ends what it started: it loads tools/cleanup.lib, kills its
+    descendants from the EXIT trap, and turns INT and TERM into an exit."""
+    good = ". tools/cleanup.lib\ntrap cleanup_children EXIT\ntrap 'exit 130' INT TERM\n"
+    samples = [
+        (good, 0),
+        (". tools/measure_guard.lib\ntrap restart EXIT\ntrap 'exit 130' INT TERM\n", 0),
+        ("trap cleanup_children EXIT\ntrap 'exit 130' INT TERM\n", 1),
+        (". tools/cleanup.lib\ntrap 'exit 130' INT TERM\n", 1),
+        (". tools/cleanup.lib\ntrap cleanup_children EXIT\n", 1),
+        (". tools/cleanup.lib\ntrap cleanup_children EXIT INT TERM\n", 3),
+    ]
+    for n, (text, want) in enumerate(samples, 1):
+        got = len(cleanup_problems(text))
+        if got != want:
+            fail(84, f"il controllo della pulizia degli script è rotto: campione {n} dà {got} problemi invece di {want}")
+            return
+    for f in sorted((ROOT / "tools").glob("*.sh")):
+        for msg in cleanup_problems(f.read_text(encoding="utf-8")):
+            fail(84, f"tools/{f.name}: {msg}")
+
+
+def tee_problems(text):
+    """lines of a shell script that pipe into tee something that can fail."""
+    problems = []
+    for i, line in enumerate(text.split("\n"), 1):
+        code = line.split("#", 1)[0] if line.lstrip().startswith("#") else line
+        if re.search(r"\|\s*tee\b", code) and not re.match(r"^\s*(\[.*\]\s*\|\|\s*\{\s*)?(printf|echo)\b", code):
+            problems.append(i)
+    return problems
+
+
+def check_no_failure_into_tee():
+    """#90: the exit status of `a | tee f` is tee's: tools/platform_bits.sh ended with 0 after a step
+    inside its block had failed. What can fail goes to a file and the file is shown (cat); only an
+    echo or a printf may be piped into tee."""
+    samples = [
+        ('echo "done" | tee -a $OUT/report.txt\n', 0),
+        ("    printf '%s\\n' \"$LINES\" | tee -a \"$OUT\"\n", 0),
+        ('[ $SAME = 0 ] || { echo "FAILED" | tee -a $OUT/report.txt; exit 1; }\n', 0),
+        ("} | tee $OUT/report.txt\n", 1),
+        ("$PY - $OUT <<'EOF' | tee $OUT/5-zones.txt\n", 1),
+        ("# a comment about a | tee b\n", 0),
+    ]
+    for n, (text, want) in enumerate(samples, 1):
+        got = len(tee_problems(text))
+        if got != want:
+            fail(90, f"il controllo delle pipe verso tee è rotto: campione {n} dà {got} problemi invece di {want}")
+            return
+    for f in sorted((ROOT / "tools").glob("*.sh")):
+        for line in tee_problems(f.read_text(encoding="utf-8")):
+            fail(90, f"tools/{f.name}:{line}: una pipe verso tee inghiotte il fallimento di ciò che sta a sinistra; "
+                     "scrivi su file e mostra il file con cat")
+
+
+def check_expf_table():
+    """#83: src/kernels/expf_table.h is generated (tools/gen_expf_table.py, mpmath at 200 bits). A
+    constant edited by hand, or a script changed without running it, would leave the header and
+    its generator telling two stories: the header on disk must be what the script writes."""
+    try:
+        import mpmath  # noqa: F401
+    except ImportError:
+        print("lint: mpmath is missing, src/kernels/expf_table.h not compared with its generator")
+        return
+    import subprocess
+    r = subprocess.run([sys.executable, str(ROOT / "tools" / "gen_expf_table.py"), "--check"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        fail(83, (r.stdout + r.stderr).strip() or "tools/gen_expf_table.py --check failed")
+
+
 def main():
-    for check in (check_docs_control_chars, check_doc_limits, check_lessons_table,
+    for check in (check_docs_control_chars, check_line_endings, check_doc_limits, check_lessons_table,
                   check_type_table, check_tests_no_tmpfile, check_hot_zones, check_global_state,
-                  check_makefile_recipes_ascii, check_shell_scripts_whole):
+                  check_makefile_recipes_ascii, check_shell_scripts_whole, check_scripts_clean_up,
+                  check_no_failure_into_tee, check_expf_table):
         check()
     for f in failures:
         print(f)

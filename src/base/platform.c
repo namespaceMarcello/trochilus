@@ -48,6 +48,7 @@ struct tr_file {
 #else
     int fd;
 #endif
+    int direct; /* opened with tr_file_open_direct: tr_file_pread applies its EOF rule */
 };
 
 static void set_err(char *err, size_t err_len, const char *fmt, ...) {
@@ -124,6 +125,33 @@ tr_file *tr_file_open(const char *path, char *err, size_t err_len) {
         return NULL;
     }
     f->handle = h;
+    f->direct = 0;
+    return f;
+}
+
+tr_file *tr_file_open_direct(const char *path, char *err, size_t err_len) {
+    wchar_t *wpath = utf8_to_utf16(path);
+    if (wpath == NULL) {
+        set_err(err, err_len, "invalid UTF-8 path");
+        return NULL;
+    }
+
+    HANDLE h = CreateFileW(wpath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                            FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, NULL);
+    free(wpath);
+    if (h == INVALID_HANDLE_VALUE) {
+        set_err(err, err_len, "CreateFileW (unbuffered) failed: error %lu", (unsigned long)GetLastError());
+        return NULL;
+    }
+
+    tr_file *f = malloc(sizeof *f);
+    if (f == NULL) {
+        set_err(err, err_len, "out of memory");
+        CloseHandle(h);
+        return NULL;
+    }
+    f->handle = h;
+    f->direct = 1;
     return f;
 }
 
@@ -139,6 +167,10 @@ int64_t tr_file_size(const tr_file *f) {
     return (int64_t)size.QuadPart;
 }
 
+int64_t tr_file_alignment(const tr_file *f) {
+    return f->direct ? TR_FILE_DIRECT_ALIGN : 1;
+}
+
 int tr_file_pread(const tr_file *f, void *buf, size_t n, uint64_t offset) {
     unsigned char *p = (unsigned char *)buf;
     while (n > 0) {
@@ -152,22 +184,31 @@ int tr_file_pread(const tr_file *f, void *buf, size_t n, uint64_t offset) {
         if (ov.hEvent == NULL) return -1;
 
         DWORD got = 0;
+        int eof = 0;
         BOOL ok = ReadFile(f->handle, p, want, &got, &ov);
         if (!ok) {
             DWORD gle = GetLastError();
             if (gle == ERROR_IO_PENDING) {
                 BOOL waited = GetOverlappedResult(f->handle, &ov, &got, TRUE);
+                DWORD wait_err = waited ? 0 : GetLastError();
                 CloseHandle(ov.hEvent);
-                if (!waited) return -1; /* includes ERROR_HANDLE_EOF */
+                if (!waited) {
+                    if (f->direct && wait_err == ERROR_HANDLE_EOF) eof = 1;
+                    else return -1;
+                }
             } else {
                 CloseHandle(ov.hEvent);
-                return -1; /* includes ERROR_HANDLE_EOF for a read that starts past EOF */
+                if (f->direct && gle == ERROR_HANDLE_EOF) eof = 1;
+                else return -1; /* includes ERROR_HANDLE_EOF for a buffered read starting past EOF */
             }
         } else {
             CloseHandle(ov.hEvent);
         }
 
-        if (got == 0) return -1; /* end of file before n bytes were read */
+        /* a direct handle's aligned range can run past the file's real end: the last, partial
+         * sector then comes back short (eof, or got == 0), which is not an error (platform.h) */
+        if (eof) return 0;
+        if (got == 0) return f->direct ? 0 : -1; /* end of file before n bytes were read */
         p += got;
         offset += got;
         n -= got;
@@ -259,6 +300,37 @@ tr_file *tr_file_open(const char *path, char *err, size_t err_len) {
         return NULL;
     }
     f->fd = fd;
+    f->direct = 0;
+    return f;
+}
+
+tr_file *tr_file_open_direct(const char *path, char *err, size_t err_len) {
+#if defined(__APPLE__)
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        set_err(err, err_len, "open failed: %s", strerror(errno));
+        return NULL;
+    }
+    if (fcntl(fd, F_NOCACHE, 1) == -1) {
+        set_err(err, err_len, "F_NOCACHE failed: %s", strerror(errno));
+        close(fd);
+        return NULL;
+    }
+#else
+    int fd = open(path, O_RDONLY | O_DIRECT);
+    if (fd < 0) {
+        set_err(err, err_len, "open (O_DIRECT) failed: %s", strerror(errno));
+        return NULL;
+    }
+#endif
+    tr_file *f = malloc(sizeof *f);
+    if (f == NULL) {
+        set_err(err, err_len, "out of memory");
+        close(fd);
+        return NULL;
+    }
+    f->fd = fd;
+    f->direct = 1;
     return f;
 }
 
@@ -274,6 +346,10 @@ int64_t tr_file_size(const tr_file *f) {
     return (int64_t)st.st_size;
 }
 
+int64_t tr_file_alignment(const tr_file *f) {
+    return f->direct ? TR_FILE_DIRECT_ALIGN : 1;
+}
+
 int tr_file_pread(const tr_file *f, void *buf, size_t n, uint64_t offset) {
     unsigned char *p = (unsigned char *)buf;
     while (n > 0) {
@@ -282,7 +358,9 @@ int tr_file_pread(const tr_file *f, void *buf, size_t n, uint64_t offset) {
             if (errno == EINTR) continue;
             return -1;
         }
-        if (got == 0) return -1; /* end of file before n bytes were read */
+        /* a direct handle's aligned range can run past the file's real end: the last, partial
+         * sector then comes back short, which is not an error (platform.h) */
+        if (got == 0) return f->direct ? 0 : -1; /* end of file before n bytes were read */
         p += got;
         offset += (uint64_t)got;
         n -= (size_t)got;
