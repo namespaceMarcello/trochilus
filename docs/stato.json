@@ -484,22 +484,26 @@
       "tappa": "M1",
       "titolo": "Il costo fisso della generazione",
       "stato": "aperto",
-      "cosa": "Generando 64 token il motore va a 20.6 tok/s, generandone 1000 a 30.8: c'è un costo di circa un secondo all'inizio che non sappiamo spiegare. Gli esperti mancati ne spiegano un quinto. Finché non lo sappiamo, non sappiamo quale numero promettere.",
+      "cosa": "Sotto budget i primi token dopo il prompt costano di più: circa un secondo una tantum al 25% del modello in RAM. Col modello tutto in RAM non succede, quindi non è il motore che si scalda: è la dispensa degli esperti che si riassesta dopo il prompt. Sappiamo dov'è, non ancora esattamente cosa sia.",
       "numeri": [
         {
-          "v": "al 25% del modello in RAM: 48.6 / 36.8 / 32.4 ms per token a 64 / 200 / 1000 token",
-          "d": "2026-09-20"
+          "v": "residente: 34.64 tok/s a 200 token, 33.48 a 1000 — nessun costo fisso",
+          "d": "2026-09-21"
         },
         {
-          "v": "spiegato dai mancati: ~2.7 ms su ~17",
-          "d": "2026-09-20"
+          "v": "50%: 29.21 → 30.79 (~0.35 s fissi); 25%: 26.53 → 29.84 (~0.84 s)",
+          "d": "2026-09-21"
+        },
+        {
+          "v": "i mancati in più dei primi token ne spiegano ~115 ms su 840",
+          "d": "2026-09-21"
         }
       ],
       "domande": [
         {
           "n": 46,
           "stato": "aperta",
-          "testo": "perché il decode sotto budget migliora con la lunghezza della generazione"
+          "testo": "dove va il resto del costo fisso: profilo per zone dei primi 64 token"
         }
       ],
       "file": [],

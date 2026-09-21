@@ -306,27 +306,27 @@ lo stato di fabbrica dei PC bersaglio, M1 si progetta su ~1.5 GB/s.
   fondo 1.0-1.4 processori su 16, larghezza del decode forzata a 8, A/A su ogni modo):
   `experts_budget.sh measure | misses | long | direct`, risultati in `build/experts_budget/`.
   **M1 funziona: il costo è il prompt.**
-  - decode 35.45 / 29.56 / 24.27 / 20.56 tok/s al 100 / 75 / 50 / 25% (64 token generati), ma
-    **a generazione lunga il budget conta poco**: a 1000 token 32.02 al 50% e 30.82 al 25%,
-    cioè 0.90× e 0.87× del modello residente;
+  - decode 35.45 / 29.56 / 24.27 / 20.56 tok/s al 100 / 75 / 50 / 25% a 64 token generati, ma
+    **a generazione lunga il budget conta poco**: 0.90× e 0.87× del residente a 1000 token;
   - prefill **306.9 tok/s se il modello è in RAM e 80-84 con qualunque budget parziale** (prompt
     di 512): il prompt legge tutto il modello (6031 MiB contro i 6528 di tabella), ~4.4 s di
     disco. Il dirupo è fra residente e non residente, non fra i budget — ma **una parte del
     dirupo ce la facciamo da soli**: a 2048 token il prompt legge 22 880 MiB, quattro volte la
     tabella, una per passata (domanda 47 qui sotto);
-  - un token generato costa **0.3 unità e 1.8 MiB al 50%** subito dopo il prompt, **0.03 e 0.2**
-    lontano dal prompt: la simulazione della domanda 14 (22.4 e 143) rispondeva a un'altra
-    domanda, il motore entra nel decode con la LRU riempita dal prompt (LEZIONI #98, controllo
-    nuovo `tools/check_misure.py` in `make check`);
+  - un token generato costa **0.3 unità al 50%** subito dopo il prompt e **0.03** lontano: la
+    simulazione della domanda 14 (22.4) rispondeva a un'altra domanda — il motore entra nel decode
+    con la LRU riempita dal prompt (LEZIONI #98, controllo `tools/check_misure.py` in `make check`);
   - la lettura diretta contro la cache del sistema, stesso budget e stessi byte: prefill 81.4
     contro 197.0 (**2.42×**), decode 24.2 contro 32.6. La guardia che rifiuta di misurare senza
     `direct` era giusta: senza, ogni numero di M1 sarebbe gonfiato di 2.4× sul prompt.
 - **Deciso da qui**: (a) **niente precaricamento nel decode** — lontano dal prompt mancano
   0.03-0.14 unità per token, non c'è niente da nascondere; se serve è nel prompt (domanda 43);
   (b) il budget non è la leva che sembrava: fra 25% e 75% ballano il 4% a generazione lunga.
-- **Aperta, nuova**: domanda 46 — il decode sotto budget migliora con la lunghezza della
-  generazione (20.6 → 30.8 tok/s al 25% da 64 a 1000 token): i mancati spiegano ~2.7 ms dei ~17.
-  La run a budget pieno che decide se è l'archivio o il metro è ancora da fare.
+- **Domanda 46, metà chiusa** (2026-09-21 notte, con il budget pieno nella stessa sessione): il
+  costo fisso all'inizio della generazione **non c'è col modello residente** (34.64 → 33.48 tok/s
+  da 200 a 1000 token, dentro lo spread) e c'è sotto budget (~0.35 s al 50%, ~0.84 s al 25%).
+  È l'archivio che si riassesta dopo il prompt, non i kernel che si scaldano: la fase di
+  preparazione (48) non lo può nascondere. I mancati ne spiegano ~115 ms su 840.
 - **Misurato il 2026-09-21, domanda 47** (`docs/MISURE.md` §Il prefill legge il modello una volta
   per passata; `sh tools/prefill_overlap.sh`): il prompt si elabora a blocchi di 512 token e ogni
   passata percorre tutti i layer, quindi sotto budget **rilegge la tabella intera a ogni passata**.

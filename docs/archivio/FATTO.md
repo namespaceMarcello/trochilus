@@ -661,3 +661,16 @@ cambia. Numeri in `docs/MISURE.md` §Il prefill legge il modello una volta per p
   lette per un prompt di 36 token in passate da 12 e vuole al massimo `n_units + n_slots`; rosso
   prima del fix con 33 su 16). Sul modello vero: `sh tools/prefill_overlap.sh 5`, risultati in
   `build/prefill_overlap/report.txt`.
+
+### 2026-09-21 — Il costo fisso della generazione è l'archivio, non un warm-up (domanda 46)
+
+`sh tools/experts_budget.sh long` con dentro anche il **budget pieno** (200 contro 1000 token
+generati, contesto 1600, due giri, macchina ferma dopo aver chiuso una chat rimasta aperta): col
+modello residente il tempo per token non migliora da 200 a 1000 (34.64 → 33.48 tok/s, spread
+4-7%), sotto budget sì (29.21 → 30.79 al 50%, 26.53 → 29.84 al 25%). Il costo fisso di ~0.35 s e
+~0.84 s esiste solo quando si legge dal disco: è la LRU che si riassesta dopo il prompt, non i
+kernel che si scaldano né il contatore del decode. Numeri in `docs/MISURE.md` §M1 misurato punto 3,
+domanda 46 ristretta a «dove va il resto» (i mancati spiegano ~115 ms su 840).
+
+- **Come si prova**: `sh tools/experts_budget.sh long` (~30 minuti, macchina ferma; prima
+  `sh tools/orphans.sh` deve essere pulito). Risultati in `build/experts_budget/steady-long.txt`.
