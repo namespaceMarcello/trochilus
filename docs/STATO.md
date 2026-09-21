@@ -282,15 +282,13 @@ I passi del 19/09 (decode a contesto lungo e la KV per testa, prefill su prompt 
 37, 40, aperte la 34, 35, 36, 38, 39.
 
 Fatto il 2026-09-19 sera e il 20 (`docs/MISURE.md` §M1, prima di scrivere codice; LEZIONI #91-#94):
-lo stimatore della larghezza riscritto e la storia delle scelte nella riga `threads:` (decisione
-sopra, validazione al punto 0), e il **primo pezzo di M1**, le misure 13-16: la traccia del routing
-(`--route-trace`, `tools/route_trace_report.py`, `tests/test_route.c`) e il banco del disco (`make
-bench-disk`). Il router del layer dopo prevede il 92-95% degli esperti con 12 candidati (il layer 0
-no: 75-80%); con una LRU restano da leggere 348 / 143 / 32 MiB per token con la cache al 25 / 50 /
-75% del modello; lo streaming per layer interi costa 15-53 volte di più; il disco dà ~1.5 GB/s con
-qualunque numero di lettori. Attesi (modello a tempo, non misura) 7.5 tok/s con metà modello in
-RAM, 18 col 75%, 3.6 col 25%. Chiuse le domande 13-16 e, come «no», la 5, la 34 e la 39; aperte la
-41, la 42 e la 43.
+lo stimatore della larghezza riscritto, e il **primo pezzo di M1**, le misure 13-16 — la traccia
+del routing (`--route-trace`, `tools/route_trace_report.py`, `tests/test_route.c`) e il banco del
+disco (`make bench-disk`): il router del layer dopo prevede il 92-95% degli esperti con 12
+candidati (il layer 0 no: 75-80%), lo streaming per layer interi costa 15-53 volte quello per
+esperti, il disco dà ~1.5 GB/s con qualunque numero di lettori. Le attese per token di quelle
+simulazioni le ha poi smentite la misura (domanda 14, LEZIONI #98). Chiuse le domande 13-16 e,
+come «no», la 5, la 34 e la 39; aperte la 41, la 42 e la 43.
 
 **M1 in corso** (progetto in `docs/ARCHITETTURA.md` §Esecuzione «Esperti (M1)», dai numeri sopra):
 archivio a slot allocati al caricamento, indice e LRU O(1), non il pin dall'uso (LEZIONI #93);
@@ -301,34 +299,64 @@ un layer più un token; un errore di lettura fa fallire la valutazione, non il p
 fa colibri (tre difetti in `docs/UPSTREAM.md` #7-#9; preso: indice esperto → slot, esperto in uno
 slot solo). Il volume è cifrato (BitLocker XTS-AES 128 in software, domanda 41) e non si tocca: è
 lo stato di fabbrica dei PC bersaglio, M1 si progetta su ~1.5 GB/s.
-- **Lotto 1, fatto** (2026-09-20): `src/memory/experts.{h,c}`, `tests/test_experts.c` (contenuti al
-  byte, LRU calcolata a mano, un layer intero col minimo, residente, errori iniettati, 800 chiamate
-  contro un modello di riferimento), otto mutazioni rosse (`tools/mutate_experts.sh`).
-- **Lotto 2, fatto** (2026-09-20, riletto; quattro file riportati da CRLF a LF, LEZIONI #95): dimensioni delle parti per layer nell'archivio; `olmoe.c`
-  prende gli esperti dall'archivio (denso residente, GGUF aperto per la vita del modello, piano
-  automatico, `--expert-budget <MiB|min>` e `TR_EXPERT_BUDGET_MIB`), riga `experts:`, zona
-  `weight_read`; `tests/test_stream.c` (logit al byte col budget minimo, errore di lettura a metà
-  prompt, piano su numeri finti), `tools/mutate_stream.sh`, oracoli anche sotto `min`, modello vero
-  `cmp` al byte. Se il lavoro è a metà si vede da `git status src/memory src/models tests/test_stream.c`.
-- **Lotto 3, fatto** (2026-09-20): letture **senza la cache del sistema**
-  (`tr_file_open_direct`: `FILE_FLAG_NO_BUFFERING`, `O_DIRECT`, `F_NOCACHE`), perché altrimenti il
-  modello sta in RAM due volte e ogni misura direbbe la banda della RAM invece del disco. Il
-  prezzo è l'allineamento a 4096: lo slot tiene un margine di un settore per parte e la lettura
-  allineata atterra lì dentro senza copie, con la posizione della parte registrata a ogni
-  riempimento (il resto dell'offset dipende da quale esperto è). Se il file system rifiuta si
-  torna alla lettura normale, e la riga `experts:` dice quale delle due. `TR_EXPERT_DIRECT=0` la
-  forza; `TR_MEM_AVAILABLE_MIB` fa credere al piano di avere meno RAM, così il suo ramo stretto si
-  percorre davvero e non solo su numeri finti. 15 mutazioni rosse (più la riga di controllo verde), logit identici al byte fra
-  diretta e normale, residente e al minimo.
-- **Pronto, mai girato**: `sh tools/experts_budget.sh measure | misses | direct` (tok/s ai quattro
-  budget con A/A, il costo di un token generato come differenza fra 72 e 8 token, la cache del
-  sistema sì contro no). Si rifiuta di partire se la riga `experts:` non dice `direct`, perché
-  misurerebbe la RAM. `tools/ab_modes.sh` raccoglie anche i contatori dell'archivio,
-  `tools/experts_steady.awk` fa la sottrazione. **Serve un'ora o due di macchina ferma**: è il
-  passo che manca a M1.
-- **Poi**: le domande 42 (il layer 0), 43 (da che disco in su il precaricamento rende), 45 (una
-  cache calda fra sessioni di codice). Tre matrici in una lettura sola: **no**, in GGUF i tre
-  tensori sono separati (docs/ORIGINI.md §L'archivio degli esperti).
+- **Lotti 1-3, fatti** (2026-09-20, dettaglio in FATTO): `src/memory/experts.{h,c}`
+  con l'indice e la LRU, `olmoe.c` che prende gli esperti dall'archivio (`--expert-budget`,
+  `TR_EXPERT_BUDGET_MIB`, riga `experts:`, zona `weight_read`), e le letture **senza la cache del
+  sistema** (`tr_file_open_direct`, allineamento a 4096, `TR_EXPERT_DIRECT=0` per forzarlo).
+  Test: `tests/test_experts.c`, `tests/test_stream.c`, oracoli sotto `min`, modello vero `cmp` al
+  byte; 23 mutazioni rosse.
+- **Misurato la notte del 2026-09-20** (`docs/MISURE.md` §M1 misurato; macchina ferma, carico di
+  fondo 1.0-1.4 processori su 16, larghezza del decode forzata a 8, A/A su ogni modo):
+  `experts_budget.sh measure | misses | long | direct`, risultati in `build/experts_budget/`.
+  **M1 funziona, e il costo è il prompt.**
+  - decode 35.45 / 29.56 / 24.27 / 20.56 tok/s al 100 / 75 / 50 / 25% (64 token generati), ma
+    **a generazione lunga il budget conta poco**: a 1000 token 32.02 al 50% e 30.82 al 25%,
+    cioè 0.90× e 0.87× del modello residente;
+  - prefill **306.9 tok/s se il modello è in RAM e 80-84 con qualunque budget parziale** (prompt
+    di 512): il prompt legge tutto il modello (6031 MiB contro i 6528 di tabella), ~4.4 s di
+    disco. Il dirupo è fra residente e non residente, non fra i budget — ma **una parte del
+    dirupo ce la facciamo da soli**: a 2048 token il prompt legge 22 880 MiB, quattro volte la
+    tabella, una per passata (domanda 47 qui sotto);
+  - un token generato costa **0.3 unità e 1.8 MiB al 50%** subito dopo il prompt, **0.03 e 0.2**
+    lontano dal prompt: la simulazione della domanda 14 (22.4 e 143) rispondeva a un'altra
+    domanda, il motore entra nel decode con la LRU riempita dal prompt (LEZIONI #98, controllo
+    nuovo `tools/check_misure.py` in `make check`);
+  - la lettura diretta contro la cache del sistema, stesso budget e stessi byte: prefill 81.4
+    contro 197.0 (**2.42×**), decode 24.2 contro 32.6. La guardia che rifiuta di misurare senza
+    `direct` era giusta: senza, ogni numero di M1 sarebbe gonfiato di 2.4× sul prompt.
+- **Deciso da qui**: (a) **niente precaricamento nel decode** — non c'è quasi niente da nascondere
+  (0.03-0.14 unità per token lontano dal prompt); se il precaricamento serve è nel **prompt**
+  (domanda 43); (b) il budget non è la leva che sembrava: fra 25% e 75% ballano il 4% a
+  generazione lunga, mentre fra residente e non ballano 3.8× sul prompt; (c) **la leva più grande
+  che resta su M1 è la domanda 45**, l'archivio che sopravvive alla sessione — ogni avvio rilegge
+  il modello intero, e con la lettura diretta la cache del sistema non aiuta per definizione.
+- **Aperta, nuova**: domanda 46 — il decode sotto budget migliora con la lunghezza della
+  generazione (20.6 → 30.8 tok/s al 25% da 64 a 1000 token) e i mancati spiegano ~2.7 ms dei ~17
+  di differenza. Finché non si sa, il numero da promettere con metà modello in RAM è fra 24 e 32.
+- **Misurato il 2026-09-21, domanda 47** (`docs/MISURE.md` §Il prefill legge il modello una volta
+  per passata; `sh tools/prefill_overlap.sh`): il prompt si elabora a blocchi di 512 token e ogni
+  passata percorre tutti i layer, quindi sotto budget **rilegge la tabella intera a ogni passata**.
+  A 2048 token: 22 880 MiB invece di 6 528 e 23.51 s; con una passata sola (`-b 2048`) 6 273 MiB e
+  **11.27 s, 2.09×**, con l'ultima riga di logit identica al byte. Il calcolo non peggiora (6.67 s
+  contro 7.24).
+- **La cura è l'ordine per layer, non `-b`**: per ogni layer tutte le passate del prompt, poi il
+  layer dopo. Stessa lettura unica, blocchi piccoli per i kernel, e scala a 4000 e oltre (serve lo
+  stato nascosto di tutti i token: 32 MiB a 4000). `-b` grande non si spedisce perché **le
+  attivazioni di una passata crescono col numero di token** — non per i kernel, che con la passata
+  grande vanno un filo meglio. È una **modalità che il piano accende quando il modello non entra**.
+- **Ordine di lavoro su M1, deciso il 2026-09-21** (dai numeri, non dal piano):
+  1. **ordine per layer nel prefill sotto budget** — 2.09× a 2048 e di più sui prompt lunghi,
+     esatto, e non c'è ancora niente di scritto. Con il fix entra il controllo che chiude
+     LEZIONI #99: un prompt da 2048 sotto budget deve leggere entro ~1.1× la tabella degli esperti;
+  2. **domanda 45**, l'archivio che sopravvive alla sessione: toglie il disco dalla seconda
+     sessione in poi;
+  3. **sovrapporre disco e calcolo**: tetto 1.38-1.69× (modello, non misura), si
+     moltiplica con il punto 1: 23.5 s → 11.3 → tetto 6.7, cioè 3.5×;
+  4. **riordino del file per co-attivazione** (mbolt, MIT): ≤ 1.15× su questo disco con questi
+     esperti, e costa un formato nostro. In fondo.
+- **Poi**: le domande 42 (il layer 0), 43 (da che disco in su il precaricamento rende), 46 (il
+  costo fisso del decode). Tre matrici in una lettura sola: **no**, in GGUF i tre tensori sono
+  separati (docs/ORIGINI.md §L'archivio degli esperti).
 
 - **Domanda 44, fatta quasi tutta** (2026-09-20, `docs/MISURE.md` §Il comportamento sul codice…): sul
   codice OLMoE-1B-7B **non** è un grafo piccolo (il 25% delle unità copre il 68-73%), **non** è una
@@ -339,11 +367,13 @@ lo stato di fabbrica dei PC bersaglio, M1 si progetta su ~1.5 GB/s.
   versione 2 (id dei token, margini), `--expert-mask` (sola misura), `tools/route_graph_report.py`,
   `tools/mutate_reports.py`, `tools/mask_quality.sh`, cinque prompt `bench/prompts/trace-*.txt`.
   `make check` verde il 2026-09-20 con tutto questo dentro, e le 12 mutazioni di
-  `tools/mutate_route.sh` tutte rosse (7 nuove: maschera e margini). **Resta `sh
-  tools/mask_quality.sh` sui tre testi mancanti** (`trace-py`, `trace-sh`, `trace-prose-en`): la
-  run è stata fermata due volte perché la macchina era senza memoria (3-5 GiB liberi su 31, le
-  altre finestre al lavoro; ~7 minuti a testo). I due fatti bastano per la risposta, il terzo
-  linguaggio e la prosa servono solo a irrobustirla.
+  `tools/mutate_route.sh` tutte rosse (7 nuove: maschera e margini). **Chiusa la notte del
+  2026-09-20** con `sh tools/mask_quality.sh` sui cinque testi (`build/mask/quality.txt`): col 50%
+  degli esperti spento per uso il token coincide nel 93.9% (testo della maschera), 92.8% (altro C),
+  **86.0% (Python), 81.4% (shell)** — la regione del codice ha un centro, e allontanandosi dal
+  linguaggio della maschera costa; sulla **prosa inglese la maschera per uso fa come quella a caso**
+  (36.4% contro 38.8% di token diversi col 75% tenuto, KL 6.37 contro 6.35 col 25%): gli esperti
+  caldi sul codice non sono «i migliori», sono quelli del codice. Resta solo un secondo modello.
 
 **Ordine deciso da Marcello il 2026-09-19 sera**: (a) **M1**, esperti dal disco, a partire dalle
 misure 13-16 e con dentro le cartelle GGUF e pool del confronto per componente (punto 5); (b) KV a

@@ -30,7 +30,7 @@ si sposta nella sezione giusta con il numero quando è misurato.
 | 11 | Quanto pesa la divisione per riga e la chiamata indiretta in `matmul_body`? | kernel che riceve tutta la matrice contro uno per riga | 1024 chiamate e 2 divisioni a 64 bit per matrice |
 | 12 | ~~Gli esperti scelti in token consecutivi si ripetono?~~ **In parte sì** (§Revisione): una riga in più nella stessa passata fa leggere 2.3-4.7 esperti nuovi per layer su 8, cioè il 40-70% dei suoi esperti è già letto dalle altre righe. A tempo (zone native, macchina ferma): una riga in più costa **17.6 ms** se è la sola e **13.7 ms** l'una se sono otto, contro 31.3 di una passata; negli esperti sta il **91%** e il **61%**, e lì il tempo segue i MiB di esperti nuovi (30 MiB/ms ai due punti); le moltiplicazioni dense sono gratis per la prima riga e valgono 4.1 ms per riga a nove. Il costo di una bozza si attacca dal lato dei pesi | — | — |
 | 13 | ~~Il router del layer successivo, applicato allo stato del layer corrente, indovina gli esperti che verranno scelti?~~ **Sì** (2026-09-20, §M1 prima di scrivere codice): prevedendone 12 si trova il 92.4% degli scelti già con lo stato che entra nel FFN (prima che girino gli esperti del layer), il 94.9% con l'uscita del layer; il primo layer è l'eccezione (75-80%) | — | la previsione c'è, ma **su un disco da 1.5 GB/s precaricare non rende** (§M1 punto 6: ogni candidato sbagliato è una lettura, e la lettura è il collo): il primo M1 legge a richiesta; precaricamento solo su dischi veloci (domanda 43) |
-| 14 | ~~Quanti byte per token restano da leggere dal disco con una cache degli esperti grande il 25, 50, 75% del modello?~~ **348 / 143 / 32 MiB per token generato** con una LRU (54.6 / 22.4 / 5.0 esperti mancati su 128); il pin statico dall'uso nel prompt perde a ogni capacità (372 / 223 / 94 MiB). Una traccia sola, di codice (§M1 prima di scrivere codice) | altre tracce (prosa, conversazione lunga) e un modello con più esperti, quando c'è | default di M1: LRU; budget dal piano automatico |
+| 14 | ~~Quanti byte per token restano da leggere dal disco con una cache degli esperti grande il 25, 50, 75% del modello?~~ **Misurato sul motore vero** (2026-09-20 notte, §M1 misurato): **3.7 / 1.8 / 0.5 MiB per token** subito dopo il prompt e **0.9 / 0.2 / — lontano dal prompt** (0.6 / 0.3 / 0.1 e 0.14 / 0.03 unità mancate). La simulazione su traccia diceva 348 / 143 / 32 MiB (54.6 / 22.4 / 5.0 unità; modello superato dalla misura): rispondeva a un'altra domanda, perché il motore entra nel decode con la LRU riempita dal prompt, che legge comunque tutto il modello. Regge invece il confronto fra strategie: il pin statico dall'uso perde contro la LRU a ogni capacità | un secondo modello, e la prosa (la maschera per uso non vale fuori dal dominio, domanda 44) | default di M1: LRU, letture a richiesta; il costo sta nel prompt, non nel token |
 | 15 | ~~Streaming dal disco per layer interi (DeepSpeed) o per esperti: quanti byte per token?~~ **Per esperti**: per layer interi 5106 / 3404 / 1702 MiB per token, 15-53 volte di più (§M1 prima di scrivere codice) | — | — |
 | 16 | ~~Quanto legge davvero l'NVMe in blocchi grandi quanto un esperto, a posizioni casuali, senza cache?~~ **~1.5 GB/s** (1.4-1.5 a blocchi da 2.125 MiB, 1.6-1.75 da 6.375 MiB), uguale con 1, 4 o 8 lettori; con la domanda 14: 7-10 tok/s con la cache al 50%, 17 e oltre al 75%, ~4 al 25% (§M1 prima di scrivere codice). Criterio «≥ 5 tok/s al 50%»: passato. KV vecchia su SSD: non misurata, attesa no | `make bench-disk` su altre macchine | M1 per esperti; 1-2 thread di I/O bastano |
 | 17 | Ricaricare dal disco la KV di un file già letto costa meno del prefill? La KV in q8 cambia i token? | checkpoint: logit identici al bit dopo il ricaricamento, tempo almeno 10 volte sotto il prefill; q8: token greedy uguali ≥ 99% su 1000 token di codice | leve del coding (file già letti, contesti lunghi), M5 |
@@ -59,10 +59,12 @@ si sposta nella sezione giusta con il numero quando è misurato.
 | 39 | **Chiusa come «no» il 2026-09-19 (Marcello)**: 1.01-1.04× stimato sta alla soglia del rumore, per circa 200 righe col pezzo più delicato del progetto; lo scalare ha già preso quasi tutto. ~~`tr_expf` in SIMD, sì o no~~ (numeri in §`tr_expf` punto 7). Dopo lo scalare restano, nel prefill a 512 / 2048 / 4000, softmax dell'attenzione per circa 9 / 130 / 610 ms e `expert_act` per 25 / 108 / 218 ms. Stima con un esponenziale AVX-512 a 1.0-1.3 ns per elemento: prefill **1.01× / 1.03× / 1.04×**, decode +1-2%; costo circa 200 righe, il pezzo delicato (gather dalla tabella, maschera per le corsie che non passano il test, identità al bit con lo scalare provata su tutti i float per ogni tier) | uno schizzo nel banco (`tests/bench_expf.c`) darebbe il costo vero per elemento prima di decidere; poi voce `exp` nella tabella dei kernel, `make bench-expf` per tier, `prefill_context.sh change` | lo scalare ha preso quasi tutto: a 4000 token il guadagno stimato è vicino alla soglia di una buona sessione (3%) |
 | 40 | ~~Le **tabelle RoPE** di Windows e di Linux sono le stesse voce per voce?~~ **Sì**, misurato il 2026-09-19 (`sh tools/platform_bits.sh`, §`tr_expf` punto 5): su 4096 posizioni × 64 coppie i `cos` e i `sin` **in double** delle due librerie differiscono nello 0.83-0.85% delle voci (2175 e 2216 su 262 144: glibc e MinGW arrotondano diversamente l'ultima cifra del double), `pow` mai (64 su 64 arrotondati correttamente su tutte e due), e **nessuna** delle 524 288 voci in float differisce: l'arrotondamento a float assorbe la differenza. Con `tr_expf` il motore dà quindi **gli stessi byte sulle due piattaforme** fino al contesto di addestramento di OLMoE | — | — |
 | 41 | **Perché il disco dà 1.5 GB/s, un terzo della sua scheda (Micron 2400, 4.5 GB/s)?** Tre ipotesi: la cifratura del volume di Windows (si legge con `manage-bde -status C:` da amministratore), il QLC senza DRAM su letture sparse, la richiesta sincrona da 2 MiB (provare richieste più grandi e sovrapposte). Vale il triplo dei token al secondo di M1 con la cache al 50%. **2026-09-20: il volume è cifrato** (`manage-bde`: BitLocker ON, XTS-AES 128, quindi in software). Non è provato che sia la causa, né la sola: durante le letture il processo System passa da 0.79 a 0.94 processori (`tools/background_load.ps1`, `build/disk/run3.txt`), nessun core è saturo, quindi se il limite è lì è di latenza e non di calcolo. La prova vera chiede un volume non cifrato sullo stesso disco, e **la cifratura non si toglie per una misura**: i PC con Windows 11 escono cifrati di fabbrica, quindi ~1.5 GB/s **è** il bersaglio, e il piano automatico di M1 misura il disco che trova | `bench_disk --block` a 16 e 64 MiB; più richieste in volo per lettore; lo stesso banco su un disco esterno o una partizione non cifrata, se capita | dopo il primo M1 che gira: prima il percorso esatto, poi la banda |
-| 43 | **Da che velocità di disco in su il precaricamento rende, e con quanti candidati?** Il modello a tempo dice: a 1.5 GB/s no (k=8 neutro, k=12 −40%), a 4.3 GB/s k=8 dà l'11-15% (§M1 punto 6). È un modello: un disco, una lettura per volta | con M1 che gira: `--expert-budget` al 50%, precaricamento spento e con k=8, su questo disco e su uno veloce (o sul file nella cache del sistema, che rende 12-26 GB/s); soglia nel piano automatico | dopo il primo M1 |
+| 43 | **Da che velocità di disco in su il precaricamento rende, e con quanti candidati?** Il modello a tempo dice: a 1.5 GB/s no (k=8 neutro, k=12 −40%), a 4.3 GB/s k=8 dà l'11-15% (§M1 punto 6) — modello, non misura: un disco, una lettura per volta  — e il decode ha ormai poco da nascondere: lontano dal prompt sbaglia 0.03-0.14 unità per token (§M1 misurato), quindi se il precaricamento serve è nel **prompt** | con M1 che gira: `--expert-budget` al 50%, precaricamento spento e con k=8, su questo disco e su uno veloce (o sul file nella cache del sistema, che rende 12-26 GB/s); soglia nel piano automatico | dopo il primo M1 |
 | 42 | **Come si prevede il primo layer?** La previsione col router del layer dopo prende il 92-95% ovunque tranne che al layer 0 (75-80%, domanda 13) | dalla traccia: gli esperti del layer 0 scelti per token uguale (dipendono quasi solo dall'embedding?); in alternativa il layer 0 sta sempre in RAM (64 esperti = 408 MiB, il 6% del modello) | progetto di M1 |
-| 44 | **Il comportamento del modello sul codice è un grafo piccolo e deterministico?** (Marcello, 2026-09-20). Dalla traccia che c'è (OLMoE-1B-7B, `code-1000`, 1204 token; calcolo una tantum sulla traccia, non ancora nel report): **piccolo no**: usate 1012 unità su 1024, l'89% già dopo 100 token; il 25% più usato copre il 68% delle attivazioni, il 50% l'88%, il 75% il 97%; entropia d'uso 5.1 bit su 6 per layer. **Statico no**: un grafo di co-occorrenze fra layer imparato sui primi 900 token indovina il 53.7% degli esperti del layer dopo sui 300 seguenti (frequenza sola: 40.3%; il router sullo stato vivo: 82-86%); nessun percorso intero si ripete (0 su 1204), il singolo insieme di 8 sì (32%); 3.6 esperti su 8 in comune col token prima (caso: 1.0), che è ciò che l'LRU sfrutta. Coerente col pin dall'uso che perde contro l'LRU (domanda 14) e con la loss di bilanciamento con cui i MoE si addestrano. Limiti: un modello generalista, un prompt, un linguaggio | mancano, con le soglie scritte **prima**: (1) id dei token nella traccia → stesso token, stessi esperti? (la versione «tabella» dell'ipotesi, plausibile al layer 0); (2) 4-6 tracce (file e linguaggi diversi, e prosa di controllo) → la sovrapposizione delle unità calde codice-codice supera quella codice-prosa?; (3) margine fra l'8° e il 9° esperto (probabilità nella traccia); (4) la prova che decide, funzionale e non di routing: **mascherare** gli esperti fuori dal X% più usato e misurare token uguali e KL contro il modello intero su codice mai visto (modo di sola misura) **Soglie scritte prima di misurare (2026-09-20, sì di Marcello)**: *piccolo* = il 25% delle unità copre ≥ 99% delle attivazioni su codice; *grafo del codice* = la sovrapposizione (Jaccard) del 25% più caldo fra due tracce di codice supera di ≥ 0.20 quella fra codice e prosa; *tabella* = stesso id di token → stesso insieme di esperti al layer 0 in ≥ 95% delle ripetizioni (gli altri layer si riportano); *funzionale* = con il 50% delle unità mascherate (le meno usate su un **altro** file di codice) il token greedy coincide in ≥ 99% delle posizioni e la KL media è ≤ 1e-2 su codice mai visto (il metro del progetto per un modo non esatto: llama.cpp sta a 9e-3). Una soglia mancata falsifica quella parte dell'ipotesi per OLMoE-1B-7B; per dirlo «dei modelli» serve almeno un secondo modello | **Risposta (§Il comportamento sul codice…)**: piccolo no, tabella no, statico no, funzionale no (già sul testo della maschera: 93.9% dei token col 50% spento); una **regione del codice** sì (Jaccard 0.68-0.77 fra C, Python e shell, 0.07-0.09 con la prosa inglese), e l'uso ordina gli esperti 40-50 volte meglio del caso. Restano da misurare i quattro testi mai visti della prova funzionale (run fermata per memoria) e un secondo modello |
-| 45 | **Una cache degli esperti già calda all'avvio, per chi fa codice?** L'insieme caldo di un file di codice copre il 68-71% delle attivazioni di un altro, in un altro linguaggio (domanda 44): salvare a fine sessione quali unità erano in RAM e ricaricarle all'avvio toglierebbe la partenza a freddo di M1 | con M1 che gira: mancati nei primi 100 token, cache fredda contro cache ricaricata dall'elenco di un'altra sessione di codice | dopo le misure di M1 a budget 25/50/75% |
+| 44 | ~~Il comportamento del modello sul codice è un grafo piccolo e deterministico?~~ **No, in tutti e quattro i sensi** (Marcello, 2026-09-20; chiusa il 2026-09-20 notte con i cinque testi della prova funzionale). Dalla traccia che c'è (OLMoE-1B-7B, `code-1000`, 1204 token; calcolo una tantum sulla traccia, non ancora nel report): **piccolo no**: usate 1012 unità su 1024, l'89% già dopo 100 token; il 25% più usato copre il 68% delle attivazioni, il 50% l'88%, il 75% il 97%; entropia d'uso 5.1 bit su 6 per layer. **Statico no**: un grafo di co-occorrenze fra layer imparato sui primi 900 token indovina il 53.7% degli esperti del layer dopo sui 300 seguenti (frequenza sola: 40.3%; il router sullo stato vivo: 82-86%); nessun percorso intero si ripete (0 su 1204), il singolo insieme di 8 sì (32%); 3.6 esperti su 8 in comune col token prima (caso: 1.0), che è ciò che l'LRU sfrutta. Coerente col pin dall'uso che perde contro l'LRU (domanda 14) e con la loss di bilanciamento con cui i MoE si addestrano. Limiti: un modello generalista, un prompt, un linguaggio | mancano, con le soglie scritte **prima**: (1) id dei token nella traccia → stesso token, stessi esperti? (la versione «tabella» dell'ipotesi, plausibile al layer 0); (2) 4-6 tracce (file e linguaggi diversi, e prosa di controllo) → la sovrapposizione delle unità calde codice-codice supera quella codice-prosa?; (3) margine fra l'8° e il 9° esperto (probabilità nella traccia); (4) la prova che decide, funzionale e non di routing: **mascherare** gli esperti fuori dal X% più usato e misurare token uguali e KL contro il modello intero su codice mai visto (modo di sola misura) **Soglie scritte prima di misurare (2026-09-20, sì di Marcello)**: *piccolo* = il 25% delle unità copre ≥ 99% delle attivazioni su codice; *grafo del codice* = la sovrapposizione (Jaccard) del 25% più caldo fra due tracce di codice supera di ≥ 0.20 quella fra codice e prosa; *tabella* = stesso id di token → stesso insieme di esperti al layer 0 in ≥ 95% delle ripetizioni (gli altri layer si riportano); *funzionale* = con il 50% delle unità mascherate (le meno usate su un **altro** file di codice) il token greedy coincide in ≥ 99% delle posizioni e la KL media è ≤ 1e-2 su codice mai visto (il metro del progetto per un modo non esatto: llama.cpp sta a 9e-3). Una soglia mancata falsifica quella parte dell'ipotesi per OLMoE-1B-7B; per dirlo «dei modelli» serve almeno un secondo modello | **Risposta (§Il comportamento sul codice…)**: piccolo no, tabella no, statico no, funzionale no (già sul testo della maschera: 93.9% dei token col 50% spento); una **regione del codice** sì (Jaccard 0.68-0.77 fra C, Python e shell, 0.07-0.09 con la prosa inglese), e l'uso ordina gli esperti 13-50 volte meglio del caso **dentro il codice** e per niente fuori (sulla prosa inglese la maschera per uso fa come quella a caso). Prova funzionale su cinque testi su cinque: col 50% spento il token coincide nel 93.9 / 92.8 / 86.0 / 81.4% (testo della maschera, altro C, Python, shell). Resta un secondo modello |
+| 45 | **Una cache degli esperti già calda all'avvio, per chi fa codice?** Vale molto più di prima (§M1 misurato): **tutto il costo di M1 sta nel prompt** — ogni sessione rilegge il modello intero (6.4-7.7 GiB, ~4.3 s di disco), mentre i token generati costano 0.03-0.6 unità l'uno. E con la lettura diretta la cache del sistema per definizione non aiuta: serve che **l'archivio** sopravviva alla sessione (demone, o le unità ricaricate all'avvio da un elenco), non una cache calda del sistema. Il guadagno però è di dominio: sulla prosa la graduatoria del codice vale quanto il caso (domanda 44) | con M1 che gira: prefill e mancati dei primi 100 token, cache fredda contro unità ricaricate dall'elenco di un'altra sessione di codice | è la leva più grande che resta su M1 |
+| 46 | **Perché il decode sotto budget migliora con la lunghezza della generazione?** 64 / 200 / 1000 token danno 24.3 / 30.1 / 32.0 tok/s al 50% e 20.6 / 27.2 / 30.8 al 25% (§M1 misurato). I mancati in più delle prime decine di token valgono ~2.7 ms per token al 25%, la differenza misurata è ~17 ms: il resto non è spiegato (sfratti durante il prompt? il primo token? cosa entra nel contatore del decode?) | profilo per zone a 64 e a 1000 token generati, stesso budget, e i mancati per finestra di 64 token | dice se il numero da promettere è 24 o 32 tok/s con metà modello in RAM |
+| 47 | ~~Il prefill sotto budget legge gli esperti una volta per prompt?~~ **No: una volta per passata** (2026-09-21, §Il prefill legge il modello una volta per passata). Il prompt si elabora a blocchi di 512 token (`OLMOE_DEFAULT_BATCH`) e ogni passata percorre tutti i layer, quindi sotto budget rilegge la tabella intera: a 2048 token **22 880 MiB invece di 6 528**, 3.65×, e cresce col prompt. Con una passata sola (`-b 2048`) il prefill fa 11.27 s invece di 23.51 (**2.09×**) e l'ultima riga di logit è identica al byte | il tempo dell'ordine per layer quando ci sarà, e la stessa misura a 4000 token (otto passate) | la leva più grossa del prefill sotto budget, e non costa precisione |
 
 Macchina di riferimento: Ryzen 9 7940HX (Zen 4, 16 core / 32 thread, AVX-512 VNNI/BF16), 31 GB
 RAM (2×16 GB DDR5-5200), NVMe Micron 1 TB, GPU RTX 4070 Laptop 8 GB e Radeon 610M (non usate fino
@@ -1658,7 +1660,7 @@ previsione presa **prima** degli esperti, che lascia al disco il tempo di un lay
 l'uscita del layer dà 2-3 punti in più e metà del tempo. Il primo layer è l'eccezione (75-80%): chi
 lo prevede è l'embedding, non un layer.
 
-Domanda 14, cache di unità (layer, esperto) simulata su tutta la traccia, contata sui soli token
+Domanda 14, cache di unità (layer, esperto) simulata su tutta la traccia (modello superato dalla misura: §M1 misurato), contata sui soli token
 generati; un esperto di un layer sono 6.375 MiB (tre matrici Q8_0), il modello ne ha 1024:
 
 | cache | LRU: mancati per token | LRU: MiB per token | pin dall'uso nel prompt: mancati | MiB |
@@ -1727,7 +1729,7 @@ seconda degli stessi blocchi **12-26 GB/s** (è una copia dalla RAM).
    la stessa LRU col precaricamento dei primi k di `pred_in` (per token generato, cache al 50%):
    gli stalli scendono da 22.4 a 7.2 (k=8) e 5.5 (k=12), ma le letture salgono da 22.4 a 29.9 e
    49.8, perché 5 e 21 sono di esperti che poi non servono. Il disco è il collo, quindi conta il
-   totale letto, non gli stalli. **Modello a tempo** (non è una misura: un disco, una lettura per
+   totale letto, non gli stalli. **Modello a tempo** (modello, non misura: un disco, una lettura per
    volta a 4.46 ms per unità, 33 ms di calcolo per token; `route_trace_report.py`, provato a mano
    in `--check` e con quattro mutazioni rosse):
 
@@ -1742,6 +1744,129 @@ seconda degli stessi blocchi **12-26 GB/s** (è una copia dalla RAM).
    **LRU e letture a richiesta, senza precaricamento**; il precaricamento (k = gli 8 più probabili,
    mai di più) resta un'opzione che il piano automatico accende solo su un disco veloce, dove vale
    l'11-15%. Domanda 43.
+
+## M1 misurato: cosa costa davvero leggere gli esperti dal disco (2026-09-20 notte)
+
+Il motore vero, Windows nativo, macchina ferma (carico di fondo 1.0-1.4 processori su 16, quasi
+tutto il processo System), `sh tools/experts_budget.sh measure | misses | long | direct`. Prompt di
+512 token, larghezza del decode **forzata a 8** (lo stimatore non è validato, punto 0), lettura
+diretta verificata prima di ogni sessione, ordine a rotazione e una copia A/A per ogni modo
+(`tools/ab_modes.sh`). Il modello ha 1024 unità (layer, esperto) da 6.375 MiB: 6528 MiB in tutto.
+
+**1. Velocità ai quattro budget** (mediana di 6, 64 token generati; fra parentesi la copia A/A):
+
+| budget | decode tok/s | vs 100% | prefill tok/s | miss della run | MiB letti |
+|---|---|---|---|---|---|
+| 100% (residente) | 35.45 (35.66) | 1.00× | 306.9 (319.4) | — | — |
+| 75% | 29.56 (29.32) | 0.83× | 80.5 (80.9) | 1009 | 6432 |
+| 50% | 24.27 (24.25) | 0.68× | 82.3 (82.1) | 1106 | 7051 |
+| 25% | 20.56 (20.64) | 0.58× | 84.0 (83.5) | 1204 | 7676 |
+
+**Il dirupo è fra residente e non residente, non fra i budget.** Il prefill fa 306.9 tok/s se il
+modello è in RAM e 80-84 con qualunque budget parziale — il 75% non aiuta più del 25%, perché il
+prompt legge comunque tutto il modello: 6432-7676 MiB contro i 6528 minimi (ogni unità una volta).
+Sono ~4.3 s di disco a 1.5 GB/s, pagati **una volta per sessione**. Il budget decide il decode.
+
+**2. Quanto costa un token generato** (differenza fra due lunghezze di generazione, così il prompt
+esce dal conto; i contatori non si muovono da run a run, spread 0.0%):
+
+| budget | 72 contro 8 token: miss/token | MiB/token | 1000 contro 200: miss/token | MiB/token |
+|---|---|---|---|---|
+| 75% | 0.1 | 0.5 | — | — |
+| 50% | 0.3 | 1.8 | 0.03 | 0.2 |
+| 25% | 0.6 | 3.7 | 0.14 | 0.9 |
+
+**La simulazione della domanda 14 (modello superato dalla misura) diceva 22.4 miss e 143 MiB per token al 50%: il motore ne fa
+0.3 subito dopo il prompt e 0.03 lontano dal prompt**, cioè 70-700 volte meno. Non è un errore di
+conto: quella simulazione (modello superato dalla misura) contava i miss su una generazione lunga di 1000 token partendo da una cache
+qualunque, mentre il motore arriva al decode con la LRU appena riempita dal prompt — che ha toccato
+quasi ogni unità. Le ultime 512 (o 256) unità toccate sono esattamente quelle che servono, e più la
+generazione va avanti **meno** sbaglia, non di più (LEZIONI #98).
+
+**3. Il decode migliora con la lunghezza della generazione**, e i miss non bastano a spiegarlo:
+
+| budget | 64 token | 200 token | 1000 token |
+|---|---|---|---|
+| 50% | 24.27 | 30.12 | 32.02 |
+| 25% | 20.56 | 27.16 | 30.82 |
+
+A 1000 token il budget al 50% sta a 0.90× del modello residente (32.0 contro 35.45) e il 25% a
+0.87×. I miss in più delle prime decine di token valgono ~2.7 ms per token al 25% (40 miss su 64,
+6.375 MiB a 1.5 GB/s) e la differenza misurata è ~17 ms: **il resto non è spiegato** — domanda 46.
+
+**4. La lettura diretta contro la cache del sistema** (budget 50%, mediana di 6, stessi miss e
+stessi MiB nei due modi: cambia solo da dove arrivano i byte):
+
+| | prefill tok/s | decode tok/s |
+|---|---|---|
+| `direct` (`FILE_FLAG_NO_BUFFERING`) | 81.4 | 24.2 |
+| `buffered` (`TR_EXPERT_DIRECT=0`) | 197.0 | 32.6 |
+| | **2.42×** | **1.35×** |
+
+Con 7 GiB letti e 31 GiB di RAM la cache del sistema tiene tutto il modello: «buffered» misura la
+RAM, non il disco. Per questo `experts_budget.sh` si rifiuta di partire se la riga `experts:` non
+dice `direct` — senza quella guardia ogni numero di M1 sarebbe gonfiato di 2.4× sul prompt.
+
+## Il prefill legge il modello una volta per passata (2026-09-21)
+
+Domanda 47, nata dalla domanda della sovrapposizione I/O-calcolo: quanto del prefill è attesa del
+disco e quanto calcolo. Il profilo separa le due cose (zona `weight_read`), e il conto ha trovato
+dell'altro. `sh tools/prefill_overlap.sh 5` (mediana di 5 giri più uno di riscaldamento, ordine a
+rotazione, macchina ferma a 1.07-1.19 processori su 16, binario `build/native2` perché Smart App
+Control bloccava il primo, LEZIONI #81):
+
+| modo | prefill s | disco s | calcolo s | MiB letti | GB/s | tetto sovrapposizione |
+|---|---|---|---|---|---|---|
+| prompt 512, residente | 1.65 | 0.00 | 1.65 | 0 | — | — |
+| prompt 512, budget 50% | 6.11 | 4.44 | 1.68 | 6 031 | 1.33 | 1.38× |
+| prompt 2048, residente | 7.11 | 0.00 | 7.11 | 0 | — | — |
+| prompt 2048, budget 50% | 23.51 | 16.26 | 7.24 | **22 880** | 1.37 | 1.45× |
+| prompt 2048, budget 50%, **una passata** (`-b 2048`) | **11.27** | 4.60 | 6.67 | **6 273** | 1.33 | 1.69× |
+
+Spread 0.7-8.7%. Il «tetto della sovrapposizione» è `totale / max(disco, calcolo)`: **modello, non
+misura**, è il limite di un lettore che non esiste ancora.
+
+**Il controllo torna al centesimo**: a 512 il prefill sotto budget meno il residente fa
+`6.11 − 1.68 = 4.43` contro i 4.44 s che la zona dichiara, e sui modi residenti il disco è 0.00.
+La contabilità del profilo è esatta, e il disco va a 1.33-1.37 GB/s come dice `make bench-disk`.
+
+**Il difetto**: 22 880 MiB sono **3.5 volte** la tabella degli esperti (6 528 MiB). Il prompt si
+elabora a blocchi di 512 token (`OLMOE_DEFAULT_BATCH` in `src/models/olmoe.c`) e **ogni passata
+percorre tutti i layer**: sotto budget la LRU non può tenere il modello fra una passata e l'altra,
+quindi ogni passata rilegge tutto. 2048 / 512 = 4 passate, 3.65× i byte. A 4000 token sono otto.
+
+**Esatto, e già dimostrabile senza toccare codice**: con `-b 2048` i byte scendono a 6 273 MiB
+(una volta sola, più il margine dei settori) e il prefill passa da 23.51 a 11.27 s. `logits -b 512`
+e `logits -b 2048` sullo stesso prompt danno l'**ultima riga identica al byte** (201 216 byte,
+`cmp`), che è quello che le due forme hanno in comune: la passata non cambia i numeri, cambia
+quante volte si legge il disco.
+
+**Il calcolo non peggiora con la passata grande**: 6.67 s contro 7.24 a quattro passate (e 7.11 il
+residente). Quindi il motivo per non alzare `-b` e basta **non sono i kernel, è la memoria**: le
+attivazioni, la KV e lo scratch di una passata crescono col numero di token, e a 4000 o 32000 una
+passata unica non sta in RAM.
+
+**La cura è l'ordine per layer**: per ogni layer, tutte le passate del prompt, poi il layer dopo.
+Ogni esperto si legge una volta per prompt (come `-b` grande) tenendo i blocchi piccoli (come
+adesso); serve solo lo stato nascosto di tutti i token fra un layer e l'altro, che a 4000 token
+sono 32 MiB. È una **modalità che il piano accende quando il modello non entra in RAM**: a budget
+pieno non serve.
+
+**Le leve del prefill sotto budget, in ordine di resa** (le prime due si moltiplicano):
+
+| leva | guadagno | costo |
+|---|---|---|
+| esperti letti una volta per prompt (ordine per layer) | **2.09×** a 2048, di più sui prompt lunghi | esatto, nessuno |
+| archivio che sopravvive alla sessione (domanda 45) | toglie il disco dalla seconda sessione in poi | un demone |
+| sovrapporre disco e calcolo | 1.38-1.69×, tetto (modello, non misura) | un lettore, un thread |
+| riordino del file per co-attivazione (mbolt, MIT) | ≤ 1.15× qui | un formato nostro |
+
+Su mbolt (`github.com/doramirdor/mbolt`): esiste, MIT, e il suo README dichiara 2.23× **sulle
+letture** e 1.55× end-to-end su Qwen3-Next-80B, 512 esperti per layer, con il modello più grande
+della RAM. Dice anche dove smette di rendere: «~4 MB slices cap gains at 1.3×» e «greatest benefit
+at deep offload (≳ 2.5× RAM ratio)». I nostri esperti sono 6.375 MiB e il modello sta in 7 GiB su
+31 di RAM: siamo fuori dal suo campo, e il nostro `bench-disk` (1.4-1.5 GB/s a blocchi da 2.125
+MiB contro 1.6-1.75 da 6.375) mette il tetto a ~1.15×. Non misurato da noi: è lettura, non misura.
 
 ## Il comportamento sul codice è un grafo piccolo e deterministico? (2026-09-20)
 
@@ -1808,32 +1933,49 @@ Col 50% più caldo: codice-codice 0.72-0.77 (85-90% delle attivazioni dentro), c
 
 **La prova funzionale** (`sh tools/mask_quality.sh`: esperti spenti con `--expert-mask`, modo di sola
 misura; maschera = le unità fuori dal 75 / 50 / 25% più usato in `code-1000`, e per controllo lo
-stesso numero estratto a caso; logit di ogni posizione contro il modello intero). **Fatti due testi
-su cinque**: la macchina è rimasta senza memoria due volte (3-5 GiB liberi su 31, con le altre
-finestre al lavoro) e la run è stata fermata. I due testi sono `code-1000`, cioè il caso **più
-favorevole** (è quello da cui la maschera è ricavata, 904 posizioni), e `trace-c2`, un file C che la
-maschera **non ha mai visto** (860 posizioni):
+stesso numero estratto a caso; logit di ogni posizione contro il modello intero). **Cinque testi su
+cinque** (2026-09-20 notte, `build/mask/quality.txt`): `code-1000` è il caso **più favorevole** (è
+quello da cui la maschera è ricavata, 904 posizioni), `trace-c2` un file C mai visto (860),
+`trace-py` Python (842), `trace-sh` shell (875), `trace-prose-en` prosa inglese (583), cioè il
+controllo fuori dominio:
 
 | unità tenute | | per uso: KL media | token diverso | a caso: KL media | token diverso |
 |---|---|---|---|---|---|
 | 75% (256 spente) | code-1000 | 0.0154 | 29 (3.2%) | 0.598 | 178 (19.7%) |
 | | trace-c2 | 0.0198 | 30 (3.5%) | 0.702 | 209 (24.3%) |
+| | trace-py | 0.0539 | 63 (7.5%) | 0.877 | 246 (29.2%) |
+| | trace-sh | 0.084 | 83 (9.5%) | 1.26 | 319 (36.5%) |
+| | trace-prose-en | 1.01 | 212 (36.4%) | 0.865 | 226 (38.8%) |
 | 50% (512 spente) | code-1000 | 0.0902 | 55 (6.1%) | 4.58 | 663 (73.3%) |
 | | trace-c2 | 0.103 | 62 (7.2%) | 4.70 | 644 (74.9%) |
+| | trace-py | 0.276 | 118 (14.0%) | 5.02 | 713 (84.7%) |
+| | trace-sh | 0.384 | 163 (18.6%) | 5.05 | 759 (86.7%) |
+| | trace-prose-en | 2.41 | 350 (60.0%) | 4.43 | 486 (83.4%) |
 | 25% (755 spente) | code-1000 | 0.309 | 121 (13.4%) | 8.27 | 880 (97.3%) |
 | | trace-c2 | 0.334 | 117 (13.6%) | 8.39 | 848 (98.6%) |
+| | trace-py | 0.691 | 199 (23.6%) | 8.84 | 822 (97.6%) |
+| | trace-sh | 0.976 | 264 (30.2%) | 8.47 | 867 (99.1%) |
+| | trace-prose-en | 6.37 | 550 (94.3%) | 6.35 | 549 (94.2%) |
 
 7. **Funzionale: no.** Soglia «col 50% spento, stesso token nel 99% delle posizioni e KL ≤ 1e-2»:
-   93.9% e KL 0.090 sul testo stesso della maschera, 92.8% e 0.103 su un file C mai visto; nemmeno
-   tenendo il 75% si passa (96.8% e 96.5%, KL 0.015 e 0.020). Il grafo piccolo non c'è nemmeno nel
-   senso debole: per tenere il comportamento servono quasi tutti gli esperti.
-8. **La maschera non si sgretola sul testo nuovo.** Le due colonne per uso sono a un punto
-   percentuale l'una dall'altra a ogni capacità: quel che l'uso impara su un file vale su un altro
-   file di codice (la regione del punto 4), e il poco che si perde non è memoria del testo.
-8. **Ma l'uso dice moltissimo su quali esperti servono**: a parità di unità spente, la maschera per
-   uso sposta l'uscita 40-50 volte meno di quella a caso (KL 0.09 contro 4.6 col 50% spento). Non è
-   un grafo piccolo, è una graduatoria ripida: il modello regge male la perdita degli esperti
-   giusti e quasi per niente quella degli esperti sbagliati.
+   93.9% e KL 0.090 sul testo stesso della maschera, 92.8% e 0.103 su un file C mai visto, e sugli
+   altri due linguaggi si scende (86.0% e 0.276 in Python, 81.4% e 0.384 in shell); nemmeno tenendo
+   il 75% si passa (96.8 / 96.5 / 92.5 / 90.5%, KL 0.015-0.084). Il grafo piccolo non c'è nemmeno
+   nel senso debole: per tenere il comportamento servono quasi tutti gli esperti.
+8. **La maschera regge sul C mai visto, si consuma sugli altri linguaggi.** Col 50% spento il token
+   coincide nel 93.9% (testo della maschera), 92.8% (altro C), 86.0% (Python), 81.4% (shell): la
+   regione del punto 4 esiste ma ha un centro, e più ci si allontana dal C più costa. Non è memoria
+   del testo (fra i due C c'è un punto percentuale), è distanza dal linguaggio da cui la maschera
+   viene.
+9. **Ma l'uso dice moltissimo su quali esperti servono**: a parità di unità spente, la maschera per
+   uso sposta l'uscita 13-50 volte meno di quella a caso (KL 0.09-0.38 contro 4.6-5.1 col 50%
+   spento, su tutti e tre i linguaggi). Non è un grafo piccolo, è una graduatoria ripida: il modello
+   regge male la perdita degli esperti giusti e quasi per niente quella degli esperti sbagliati.
+10. **Fuori dal dominio la graduatoria non vale più niente**, ed è il controllo che serviva: sulla
+    prosa inglese la maschera per uso fa come quella a caso (col 75% tenuto 36.4% contro 38.8% di
+    token diversi; col 25%, 94.3% contro 94.2%; KL 6.37 contro 6.35). Gli esperti caldi sul codice
+    non sono «i migliori esperti», sono quelli del codice: una cache scaldata su un dominio è un
+    guadagno per quel dominio e zero per un altro (domanda 45).
 
 ## Tentativi
 

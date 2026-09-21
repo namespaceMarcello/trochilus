@@ -581,3 +581,43 @@ da 100). `expf` nostro, la leva grande che resta, non è scritto: lo decide Marc
   `tests/test_base.c` prova la lettura corta nell'ultimo settore. Quindici mutazioni rosse e la riga di controllo verde:
   `MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src trochilus-dev:local sh
   tools/mutate_experts.sh`. Tutto in `make check`.
+
+### 2026-09-21 — M1 misurato (le quattro sessioni), domanda 44 chiusa, un controllo su MISURE
+
+Le misure di M1 sul modello vero, a macchina ferma: `experts_budget.sh measure | misses | long |
+direct` (`build/experts_budget/`) e `mask_quality.sh` sui tre testi che mancavano
+(`build/mask/quality.txt`). Numeri e conclusioni in `docs/MISURE.md` §M1 misurato e §Il
+comportamento sul codice, decisioni in `docs/STATO.md`. In breve: il costo di M1 è il **prompt**
+(ogni sessione rilegge il modello intero, ~4.3 s di disco), un token generato costa 0.03-0.6 unità,
+il decode a generazione lunga sta a 0.87-0.90× del modello residente, e la cache del sistema
+gonfierebbe il prefill di 2.42×. La simulazione della domanda 14 (22.4 unità per token) rispondeva
+a un'altra domanda: LEZIONI #98.
+
+Nuovi: `tools/experts_budget.sh long` (200 contro 1000 token generati, contesto 1600) con
+`experts_steady.awk` parametrizzato (`-v short_n= -v gap=`); `tools/check_misure.py`, agganciato a
+`lint` quindi a `make check`: una riga di MISURE che dà un numero da simulazione o da modello a
+tempo deve portare il tag «modello, non misura» (o «modello superato dalla misura» se è storia), e
+una domanda tagliata col primo tag non può essere barrata come chiusa.
+
+- **Come si prova**: `tools/.venv/Scripts/python.exe tools/check_misure.py` (verde; togliere un tag
+  a una delle righe taggate di MISURE lo fa fallire, e barrare la domanda 43 lo fa fallire con
+  l'altra regola). Le misure si ripetono con gli stessi comandi: servono un'ora o due di macchina
+  ferma, e ogni sessione dichiara il carico di fondo nel log.
+
+### 2026-09-21 — Il prefill sotto budget legge il modello una volta per passata (domanda 47)
+
+Nuovi `tools/prefill_overlap.sh` e `tools/prefill_overlap_report.py`: il prefill diviso nelle sue
+due metà (attesa del disco, dalla zona `weight_read`, e calcolo) a prompt 512 e 2048, con modello
+residente e a budget 50%, più il modo con una passata sola (`-b 2048`). Mediana di 5 giri più uno
+di riscaldamento, ordine a rotazione, macchina ferma, guardie delle altre misure native.
+
+Il conto ha trovato dell'altro: a 2048 token l'archivio legge 22 880 MiB, 3.5 volte la tabella
+degli esperti, una volta per passata da 512 token. Con una passata sola: 6 273 MiB e 11.27 s
+contro 23.51 (2.09×), calcolo invariato, ultima riga di logit identica al byte. Numeri e leve in
+`docs/MISURE.md` §Il prefill legge il modello una volta per passata, priorità in `docs/STATO.md`,
+lezione #99. Il codice del motore non è stato toccato.
+
+- **Come si prova**: `TROCHILUS=<binario> sh tools/prefill_overlap.sh 5` (~20 minuti, macchina
+  ferma; risultati e profili in `build/prefill_overlap/`). L'esattezza fra le due forme:
+  `trochilus logits ... -b 512` e `-b 2048` sullo stesso prompt, l'ultima riga dei due file
+  confrontata con `cmp`.

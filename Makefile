@@ -146,6 +146,7 @@ profile: $(BUILD)/trochilus$(EXE)
 lint:
 	$(PY) tools/lint.py
 	$(PY) tools/route_trace_report.py --check
+	$(PY) tools/check_misure.py
 
 # Tiny OLMoE: transformers reference -> GGUF -> engine, greedy tokens must match exactly.
 FIX := fixtures/tiny-olmoe

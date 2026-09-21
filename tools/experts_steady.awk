@@ -6,6 +6,9 @@
 # Input: the run lines of tools/ab_modes.sh, "<label> <phase> <round> <value>", where the labels
 # are <name>short and <name>long. Round 0 is dropped as warm-up, like the medians there.
 # Output: one line per budget, misses and MiB per generated token, and what the prompt alone cost.
+#
+# -v short_n=<n> -v gap=<n>: the two generation lengths of the session (default 8 and 72-8=64).
+# `experts_budget.sh long` passes 200 and 800, which measures a token far from the prompt.
 $3 > 0 && ($2 == "misses" || $2 == "mib") {
   label = $1
   kind = ""
@@ -18,6 +21,8 @@ $3 > 0 && ($2 == "misses" || $2 == "mib") {
   if (!(label in seen)) { seen[label] = 1; order[++n_labels] = label }
 }
 END {
+  if (gap == 0) gap = 64
+  if (short_n == 0) short_n = 8
   printf "%-10s %14s %14s %14s %14s\n", "budget", "misses/token", "MiB/token", "prompt misses", "prompt MiB"
   for (i = 1; i <= n_labels; i++) {
     b = order[i]
@@ -32,8 +37,8 @@ END {
     if (!ok) { printf "%-10s (incomplete)\n", b; continue }
     dm = (sum[b " misses long"] / n[b " misses long"]) - (sum[b " misses short"] / n[b " misses short"])
     db = (sum[b " mib long"] / n[b " mib long"]) - (sum[b " mib short"] / n[b " mib short"])
-    pm = sum[b " misses short"] / n[b " misses short"] - 8 * dm / 64
-    pb = sum[b " mib short"] / n[b " mib short"] - 8 * db / 64
-    printf "%-10s %14.1f %14.1f %14.0f %14.0f\n", b, dm / 64, db / 64, pm, pb
+    pm = sum[b " misses short"] / n[b " misses short"] - short_n * dm / gap
+    pb = sum[b " mib short"] / n[b " mib short"] - short_n * db / gap
+    printf "%-10s %14.1f %14.1f %14.0f %14.0f\n", b, dm / gap, db / gap, pm, pb
   }
 }

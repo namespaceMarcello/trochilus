@@ -14,6 +14,15 @@
 #       counters cover the prompt too, and the prompt touches almost every expert, so one run
 #       cannot tell the two apart: each budget is run twice, generating 8 and 72 tokens, and the
 #       difference over the 64 tokens between them is the steady state. About 25 minutes.
+#   sh tools/experts_budget.sh long [rounds]
+#       the same difference over a LONG generation: 200 and 1000 tokens, so the 800 between them
+#       are far from the prompt. The `misses` session measures the 64 tokens right after a 512
+#       token prompt, when the LRU still holds what the prompt just read: that is the best case,
+#       and the simulation of domanda 14 ran over a generation that drifts. This says which of
+#       the two the engine lives in. The counters do not move from run to run (spread 0.0% in
+#       every session so far), so two rounds are enough. About 30 minutes.
+#       The resident budget is in the session on purpose (domanda 46): if it gains from 200 to
+#       1000 tokens too, the fixed cost at the start of the decode is not about the disk.
 #   sh tools/experts_budget.sh direct [rounds]
 #       the same budget read without the system's cache and through it (TR_EXPERT_DIRECT=0): how
 #       much the cache flatters a measurement, and what it costs when the model does not fit.
@@ -37,7 +46,8 @@ M=models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf
 OUT=build/experts_budget
 case "$WHAT" in
   measure|misses|direct) R=${2:-6} ;;
-  *) echo "usage: experts_budget.sh measure [rounds] | misses [rounds] | direct [rounds]"; exit 2 ;;
+  long) R=${2:-2} ;;
+  *) echo "usage: experts_budget.sh measure | misses | long | direct [rounds]"; exit 2 ;;
 esac
 mkdir -p $OUT
 [ -f $B ] && [ -f $M ] || { echo "experts_budget: $B or $M is missing"; exit 1; }
@@ -97,10 +107,12 @@ measure_still experts_budget
 measure_declare "before the first run"
 
 # $1: budget in MiB (0: no flag, the plan decides), $2: generated tokens, $3: further arguments
+# CTX holds the context: it must take the 512 token prompt and every generated token.
+CTX=${CTX:-600}
 gen() {
   BUDGET=""
   [ "$1" = 0 ] || BUDGET="--expert-budget $1"
-  echo "$B generate -m $M -p 512 -n $2 -c 600 -t 16 --decode-threads 8 $BUDGET $3"
+  echo "$B generate -m $M -p 512 -n $2 -c $CTX -t 16 --decode-threads 8 $BUDGET $3"
 }
 
 # The store must be reading the disk, not the page cache: one short run, and the engine's own
@@ -142,6 +154,16 @@ elif [ "$WHAT" = misses ]; then
   echo
   echo "per generated token, from the difference between 72 and 8 tokens (64 tokens apart):"
   awk -f tools/experts_steady.awk $OUT/steady.txt
+elif [ "$WHAT" = long ]; then
+  CTX=1600
+  session steady-long \
+    "b100short=$(gen 0 200)" "b100long=$(gen 0 1000)" \
+    "b50short=$(gen $B50 200)" "b50long=$(gen $B50 1000)" \
+    "b25short=$(gen $B25 200)" "b25long=$(gen $B25 1000)"
+  echo
+  echo "per generated token, from the difference between 1000 and 200 tokens (800 apart),"
+  echo "that is a token far from the prompt:"
+  awk -v short_n=200 -v gap=800 -f tools/experts_steady.awk $OUT/steady-long.txt
 else
   session direct \
     "d50=$(gen $B50 64)" "b50=TR_EXPERT_DIRECT=0 $(gen $B50 64)" \
