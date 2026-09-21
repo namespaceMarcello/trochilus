@@ -64,7 +64,7 @@ si sposta nella sezione giusta con il numero quando è misurato.
 | 44 | ~~Il comportamento del modello sul codice è un grafo piccolo e deterministico?~~ **No, in tutti e quattro i sensi** (Marcello, 2026-09-20; chiusa il 2026-09-20 notte con i cinque testi della prova funzionale). Dalla traccia che c'è (OLMoE-1B-7B, `code-1000`, 1204 token; calcolo una tantum sulla traccia, non ancora nel report): **piccolo no**: usate 1012 unità su 1024, l'89% già dopo 100 token; il 25% più usato copre il 68% delle attivazioni, il 50% l'88%, il 75% il 97%; entropia d'uso 5.1 bit su 6 per layer. **Statico no**: un grafo di co-occorrenze fra layer imparato sui primi 900 token indovina il 53.7% degli esperti del layer dopo sui 300 seguenti (frequenza sola: 40.3%; il router sullo stato vivo: 82-86%); nessun percorso intero si ripete (0 su 1204), il singolo insieme di 8 sì (32%); 3.6 esperti su 8 in comune col token prima (caso: 1.0), che è ciò che l'LRU sfrutta. Coerente col pin dall'uso che perde contro l'LRU (domanda 14) e con la loss di bilanciamento con cui i MoE si addestrano. Limiti: un modello generalista, un prompt, un linguaggio | mancano, con le soglie scritte **prima**: (1) id dei token nella traccia → stesso token, stessi esperti? (la versione «tabella» dell'ipotesi, plausibile al layer 0); (2) 4-6 tracce (file e linguaggi diversi, e prosa di controllo) → la sovrapposizione delle unità calde codice-codice supera quella codice-prosa?; (3) margine fra l'8° e il 9° esperto (probabilità nella traccia); (4) la prova che decide, funzionale e non di routing: **mascherare** gli esperti fuori dal X% più usato e misurare token uguali e KL contro il modello intero su codice mai visto (modo di sola misura) **Soglie scritte prima di misurare (2026-09-20, sì di Marcello)**: *piccolo* = il 25% delle unità copre ≥ 99% delle attivazioni su codice; *grafo del codice* = la sovrapposizione (Jaccard) del 25% più caldo fra due tracce di codice supera di ≥ 0.20 quella fra codice e prosa; *tabella* = stesso id di token → stesso insieme di esperti al layer 0 in ≥ 95% delle ripetizioni (gli altri layer si riportano); *funzionale* = con il 50% delle unità mascherate (le meno usate su un **altro** file di codice) il token greedy coincide in ≥ 99% delle posizioni e la KL media è ≤ 1e-2 su codice mai visto (il metro del progetto per un modo non esatto: llama.cpp sta a 9e-3). Una soglia mancata falsifica quella parte dell'ipotesi per OLMoE-1B-7B; per dirlo «dei modelli» serve almeno un secondo modello | **Risposta (§Il comportamento sul codice…)**: piccolo no, tabella no, statico no, funzionale no (già sul testo della maschera: 93.9% dei token col 50% spento); una **regione del codice** sì (Jaccard 0.68-0.77 fra C, Python e shell, 0.07-0.09 con la prosa inglese), e l'uso ordina gli esperti 13-50 volte meglio del caso **dentro il codice** e per niente fuori (sulla prosa inglese la maschera per uso fa come quella a caso). Prova funzionale su cinque testi su cinque: col 50% spento il token coincide nel 93.9 / 92.8 / 86.0 / 81.4% (testo della maschera, altro C, Python, shell). Resta un secondo modello |
 | 45 | **Una cache degli esperti già calda all'avvio, per chi fa codice?** Vale molto più di prima (§M1 misurato): **tutto il costo di M1 sta nel prompt** — ogni sessione rilegge il modello intero (6.4-7.7 GiB, ~4.3 s di disco), mentre i token generati costano 0.03-0.6 unità l'uno. E con la lettura diretta la cache del sistema per definizione non aiuta: serve che **l'archivio** sopravviva alla sessione (demone, o le unità ricaricate all'avvio da un elenco), non una cache calda del sistema. Il guadagno però è di dominio: sulla prosa la graduatoria del codice vale quanto il caso (domanda 44) | con M1 che gira: prefill e mancati dei primi 100 token, cache fredda contro unità ricaricate dall'elenco di un'altra sessione di codice | è la leva più grande che resta su M1 |
 | 46 | **Perché il decode sotto budget migliora con la lunghezza della generazione?** 64 / 200 / 1000 token danno 24.3 / 30.1 / 32.0 tok/s al 50% e 20.6 / 27.2 / 30.8 al 25% (§M1 misurato). I mancati in più delle prime decine di token valgono ~2.7 ms per token al 25%, la differenza misurata è ~17 ms: il resto non è spiegato (sfratti durante il prompt? il primo token? cosa entra nel contatore del decode?) | profilo per zone a 64 e a 1000 token generati, stesso budget, e i mancati per finestra di 64 token | dice se il numero da promettere è 24 o 32 tok/s con metà modello in RAM |
-| 47 | ~~Il prefill sotto budget legge gli esperti una volta per prompt?~~ **No: una volta per passata** (2026-09-21, §Il prefill legge il modello una volta per passata). Il prompt si elabora a blocchi di 512 token (`OLMOE_DEFAULT_BATCH`) e ogni passata percorre tutti i layer, quindi sotto budget rilegge la tabella intera: a 2048 token **22 880 MiB invece di 6 528**, 3.65×, e cresce col prompt. Con una passata sola (`-b 2048`) il prefill fa 11.27 s invece di 23.51 (**2.09×**) e l'ultima riga di logit è identica al byte | il tempo dell'ordine per layer quando ci sarà, e la stessa misura a 4000 token (otto passate) | la leva più grossa del prefill sotto budget, e non costa precisione |
+| 47 | ~~Il prefill sotto budget legge gli esperti una volta per prompt?~~ **Adesso sì** (ordine per layer, 2026-09-21: 6 273 MiB e 12.41 s a 2048, **1.89×**). Prima: una volta per passata (2026-09-21, §Il prefill legge il modello una volta per passata). Il prompt si elabora a blocchi di 512 token (`OLMOE_DEFAULT_BATCH`) e ogni passata percorre tutti i layer, quindi sotto budget rilegge la tabella intera: a 2048 token **22 880 MiB invece di 6 528**, 3.65×, e cresce col prompt. Con una passata sola (`-b 2048`) il prefill fa 11.27 s invece di 23.51 (**2.09×**) e l'ultima riga di logit è identica al byte | il tempo dell'ordine per layer quando ci sarà, e la stessa misura a 4000 token (otto passate) | la leva più grossa del prefill sotto budget, e non costa precisione |
 
 Macchina di riferimento: Ryzen 9 7940HX (Zen 4, 16 core / 32 thread, AVX-512 VNNI/BF16), 31 GB
 RAM (2×16 GB DDR5-5200), NVMe Micron 1 TB, GPU RTX 4070 Laptop 8 GB e Radeon 610M (non usate fino
@@ -1846,11 +1846,30 @@ residente). Quindi il motivo per non alzare `-b` e basta **non sono i kernel, è
 attivazioni, la KV e lo scratch di una passata crescono col numero di token, e a 4000 o 32000 una
 passata unica non sta in RAM.
 
-**La cura è l'ordine per layer**: per ogni layer, tutte le passate del prompt, poi il layer dopo.
-Ogni esperto si legge una volta per prompt (come `-b` grande) tenendo i blocchi piccoli (come
-adesso); serve solo lo stato nascosto di tutti i token fra un layer e l'altro, che a 4000 token
-sono 32 MiB. È una **modalità che il piano accende quando il modello non entra in RAM**: a budget
-pieno non serve.
+**La cura è l'ordine per layer, scritta il 2026-09-21** (`src/models/olmoe.c`: il corpo di un
+layer estratto in `forward_layer`, e `forward_prompt_layer_major` che per ogni layer percorre tutte
+le passate del prompt; lo stato nascosto dell'intero prompt sta in `s->x_all`, allocato alla
+creazione della sessione e solo quando l'archivio è parziale — nella zona calda non si alloca).
+Ogni esperto si legge una volta per prompt tenendo i blocchi piccoli; a budget pieno il percorso è
+quello di prima, invariato.
+
+| prompt 2048, budget 50% | prima | dopo | |
+|---|---|---|---|
+| MiB letti | 22 880 | **6 273** | 3.65× meno |
+| prefill | 23.51 s | **12.41 s** | **1.89×** |
+| calcolo | 7.24 s | 7.73 s | non distinguibile |
+
+Mediana di 5 giri più uno di riscaldamento, spread 11.4%, macchina ferma (0.94-1.37 processori su
+16). Nella stessa sessione `-b 2048` (una passata) dà 12.03 s e gli stessi 6 273 MiB: le due forme
+coincidono entro il 3%, cioè l'ordine per layer arriva al tetto dell'esperimento senza far crescere
+le attivazioni. A prompt 512 (una passata sola) niente cambia: 6.27 s contro 6.11, dentro lo spread.
+
+Il controllo che chiude la lezione #99 è `tests/test_stream.c` §`once_per_prompt`: 36 token in
+passate da 12 sull'archivio minimo, le unità lette devono stare entro `n_units + n_slots`. Visto
+rosso prima del fix (33 lette, 16 in tabella) e verde dopo. **Con `--route-trace` attivo si resta
+sull'ordine di prima**: la traccia numera le righe da `n_tokens`, che avanza solo dopo l'ultimo
+layer, quindi in ordine per layer i blocchi si sovrascriverebbero; è un modo di sola misura e non
+vale un secondo modo di contare.
 
 **Le leve del prefill sotto budget, in ordine di resa** (le prime due si moltiplicano):
 

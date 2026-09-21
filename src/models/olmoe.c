@@ -118,6 +118,12 @@ typedef struct {
     int64_t n_workers;
 
     olmoe_route_trace *trace; /* NULL: tracing off (docs/MISURE.md domande 13-15) */
+
+    /* [n_ctx][n_embd]: the whole prompt's hidden state, layer by layer (docs/MISURE.md "Il
+     * prefill legge il modello una volta per passata"). NULL when the expert store is fully
+     * resident (nothing to save a re-read for); non-NULL only makes forward_prompt_layer_major
+     * reachable, it does not force it (olmoe_eval still needs n > n_batch). */
+    float *x_all;
 } olmoe_session;
 
 /* ---- loading helpers ---------------------------------------------------- */
@@ -718,6 +724,7 @@ static void olmoe_session_free(void *session) {
     tr_free_aligned(s->h3);
     tr_free_aligned(s->logits);
     tr_free_aligned(s->scores);
+    tr_free_aligned(s->x_all);
     free(s);
 }
 
@@ -752,7 +759,21 @@ static void *olmoe_session_create(void *model, int64_t n_ctx, int64_t n_batch, c
     uint64_t scratch_i64 = (uint64_t)B * (uint64_t)U * 2 + (uint64_t)m->n_expert + 1 + (uint64_t)m->n_expert;
     uint64_t scratch_bytes = scratch_f32 * sizeof(float) + scratch_i64 * sizeof(int64_t) +
                              (uint64_t)(n_workers * m->n_expert);
-    if (tr_mem_guard(kv_bytes + scratch_bytes, err, err_len) != 0) return NULL;
+
+    /* Layer-major prefill (docs/MISURE.md "Il prefill legge il modello una volta per passata")
+     * only pays for itself, and only helps, when the store cannot hold the whole table: ask it
+     * (tr_experts_get_stats), never guess from the budget the caller passed. Resident stores
+     * (n_slots >= n_units) keep x_all NULL, so olmoe_eval takes today's pass-major loop. */
+    int store_partial = 0;
+    uint64_t x_all_bytes = 0;
+    if (m->experts != NULL) {
+        tr_experts_stats est;
+        tr_experts_get_stats(m->experts, &est);
+        store_partial = est.n_slots < est.n_units;
+        if (store_partial) x_all_bytes = (uint64_t)actual_ctx * (uint64_t)m->n_embd * sizeof(float);
+    }
+
+    if (tr_mem_guard(kv_bytes + scratch_bytes + x_all_bytes, err, err_len) != 0) return NULL;
 
     olmoe_session *s = (olmoe_session *)calloc(1, sizeof *s);
     if (s == NULL) {
@@ -792,12 +813,14 @@ static void *olmoe_session_create(void *model, int64_t n_ctx, int64_t n_batch, c
     s->logits = alloc_f32(s->n_logits_max * m->vocab);
     s->score_stride = score_row_stride(actual_ctx);
     s->scores = alloc_f32(n_workers * OLMOE_ATTN_QUERIES * s->score_stride);
+    if (store_partial) s->x_all = alloc_f32(actual_ctx * m->n_embd);
 
     if (kv_rc != 0 || s->rope_cos == NULL || s->rope_sin == NULL || s->x == NULL ||
         s->normed == NULL || s->attn_out == NULL || s->ffn_out == NULL || s->q == NULL || s->attn_concat == NULL ||
         s->k == NULL || s->v == NULL || s->router == NULL || s->sel_id == NULL || s->sel_w == NULL ||
         s->place == NULL || s->offsets == NULL || s->acquire_ids == NULL || s->taken == NULL || s->xg == NULL ||
-        s->h1 == NULL || s->h2 == NULL || s->h3 == NULL || s->logits == NULL || s->scores == NULL) {
+        s->h1 == NULL || s->h2 == NULL || s->h3 == NULL || s->logits == NULL || s->scores == NULL ||
+        (store_partial && s->x_all == NULL)) {
         if (err != NULL) snprintf(err, err_len, "out of memory allocating session");
         olmoe_session_free(s);
         return NULL;
@@ -1061,31 +1084,50 @@ static void gather_body(void *ctx_, int64_t begin, int64_t end, int worker) {
 }
 
 /* Defined below, after the hot zone (docs/MISURE.md domande 13-15): records layer L's routing
- * of this pass's tokens into s->trace, called once per layer under one `if` in forward_pass. */
-static void route_trace_record(olmoe_session *s, int64_t L, const int32_t *tokens, int64_t n_tok);
+ * of this block's tokens into s->trace, called once per (layer, block) under one `if` in
+ * forward_layer. x: this layer's hidden state for the block (s->x in pass-major, a slice of
+ * s->x_all in layer-major). */
+static void route_trace_record(olmoe_session *s, int64_t L, const int32_t *tokens, int64_t n_tok, const float *x);
 
 /* Defined below, after the hot zone (docs/ARCHITETTURA.md Esperti M1): acquires layer L's
  * non-empty experts from the shared store (reading the missing ones from disk) and refreshes
- * every expert's tr_mat.data for this layer, called once per layer from forward_pass. Allocates
+ * every expert's tr_mat.data for this layer, called once per layer from forward_layer. Allocates
  * nothing: it only touches s->acquire_ids, sized at session create. -1 on a failed read. */
 static int olmoe_refresh_experts(olmoe_model *m, olmoe_session *s, int64_t L);
 
-/* One forward pass over n_tok tokens (1 <= n_tok <= n_batch) at positions pos..pos+n_tok-1.
- * Every value is computed with the same kernel call as when the tokens run one per pass:
- * a matmul element is one dot_row, norms/RoPE/routing/mixing are per token, and a token's
- * attention reads only cache positions up to its own. So the logits and the cache are
- * bit-identical for every split of the input into passes (tests/test_prefill.c).
- * Logits of the last n_logits tokens (0: none), one row each, oldest first. -1 if the shared
- * expert store fails to read a layer's missing units from disk: s's cache and s->pos are
- * untouched by this call (olmoe_eval restores s->pos across the whole eval on failure), so a
- * later eval of the same tokens can retry. */
-static int forward_pass(olmoe_model *m, olmoe_session *s, const int32_t *tokens, int64_t n_tok, int64_t n_logits) {
+/* Token embeddings of n_tok tokens into x ([n_tok][n_embd]). */
+static void forward_embed(olmoe_model *m, olmoe_session *s, const int32_t *tokens, int64_t n_tok, float *x) {
     tr_prof *prof = &s->prof;
-    uint64_t t_pass = tr_prof_begin(prof);
+    tr_pool *pool = m->pool;
+    const int64_t per_chunk = OLMOE_TOKENS_PER_CHUNK;
 
+    uint64_t t = tr_prof_begin(prof);
+    embed_ctx ec;
+    ec.w = &m->token_embd;
+    ec.tokens = tokens;
+    ec.x = x;
+    ec.n_embd = m->n_embd;
+    tr_parallel_for(pool, n_tok, per_chunk, embed_body, &ec);
+    tr_prof_end(prof, TR_PROF_EMBED, t);
+    tr_prof_count(prof, TR_PROF_EMBED,
+                  (uint64_t)n_tok * (uint64_t)tr_row_bytes(m->token_embd.type, m->token_embd.cols), 0);
+}
+
+/* One layer over n_tok tokens (1 <= n_tok <= n_batch) at positions pos0..pos0+n_tok-1, in place
+ * on x ([n_tok][n_embd]: read as this layer's input, written as its output). Every value is
+ * computed with the same kernel call as when the tokens run one per pass: a matmul element is
+ * one dot_row, norms/RoPE/routing/mixing are per token, and a token's attention reads only cache
+ * positions up to its own. So the logits and the cache are bit-identical for every split of the
+ * input into passes and for every order the layers and blocks of a prompt run in (forward_pass,
+ * forward_prompt_layer_major: tests/test_prefill.c). -1 if the shared expert store fails to read
+ * this layer's missing units from disk: the cache and s->pos are untouched by this call
+ * (olmoe_eval restores s->pos across the whole eval on failure), so a later eval of the same
+ * tokens can retry. */
+static int forward_layer(olmoe_model *m, olmoe_session *s, int64_t L, const int32_t *tokens, int64_t n_tok,
+                         int64_t pos0, float *x) {
+    tr_prof *prof = &s->prof;
     const tr_kernels *K = tr_kernels_get();
     tr_pool *pool = m->pool;
-    const int64_t pos0 = s->pos;
     int64_t n_embd = m->n_embd, n_qkv = m->n_qkv, n_kv = m->n_kv;
     int64_t n_head = m->n_head, n_head_kv = m->n_head_kv, head_dim = m->head_dim;
     int64_t n_ff = m->n_ff, n_expert = m->n_expert, n_used = m->n_expert_used;
@@ -1096,219 +1138,268 @@ static int forward_pass(olmoe_model *m, olmoe_session *s, const int32_t *tokens,
     const int64_t per_chunk = OLMOE_TOKENS_PER_CHUNK;
     norm_ctx nc;
     nc.eps = m->rms_eps;
+    uint64_t t;
+
+    olmoe_layer *layer = &m->layers[L];
+
+    /* ---- attention ---- */
+    t = tr_prof_begin(prof);
+    nc.src = x;
+    nc.dst = s->normed;
+    nc.weight = layer->attn_norm;
+    nc.n = n_embd;
+    tr_parallel_for(pool, n_tok, per_chunk, norm_body, &nc);
+    tr_prof_end(prof, TR_PROF_ATTN_NORM, t);
+
+    t = tr_prof_begin(prof);
+    tr_matmul(pool, &layer->wq, s->normed, n_tok, s->q);
+    tr_matmul(pool, &layer->wk, s->normed, n_tok, s->k);
+    tr_matmul(pool, &layer->wv, s->normed, n_tok, s->v);
+    tr_prof_end(prof, TR_PROF_QKV_PROJ, t);
+    tr_prof_count(prof, TR_PROF_QKV_PROJ, mat_bytes(&layer->wq) + mat_bytes(&layer->wk) + mat_bytes(&layer->wv),
+                  0);
+
+    t = tr_prof_begin(prof);
+    nc.src = nc.dst = s->q;
+    nc.weight = layer->q_norm;
+    nc.n = n_qkv;
+    tr_parallel_for(pool, n_tok, per_chunk, norm_body, &nc);
+    nc.src = nc.dst = s->k;
+    nc.weight = layer->k_norm;
+    nc.n = n_kv;
+    tr_parallel_for(pool, n_tok, per_chunk, norm_body, &nc);
+    tr_prof_end(prof, TR_PROF_QK_NORM, t);
+
+    if (m->have_clamp) {
+        clamp_inplace(s->q, n_tok * n_qkv, m->clamp);
+        clamp_inplace(s->k, n_tok * n_kv, m->clamp);
+        clamp_inplace(s->v, n_tok * n_kv, m->clamp);
+    }
+
+    t = tr_prof_begin(prof);
+    rope_ctx rc;
+    rc.q = s->q;
+    rc.k = s->k;
+    rc.rope_cos = s->rope_cos;
+    rc.rope_sin = s->rope_sin;
+    rc.n_qkv = n_qkv;
+    rc.n_kv = n_kv;
+    rc.n_head = n_head;
+    rc.n_head_kv = n_head_kv;
+    rc.head_dim = head_dim;
+    rc.pos0 = pos0;
+    tr_parallel_for(pool, n_tok, per_chunk, rope_body, &rc);
+    tr_prof_end(prof, TR_PROF_ROPE, t);
+
+    t = tr_prof_begin(prof);
+    kv_write_ctx wc;
+    wc.kv = &s->kv;
+    wc.k = s->k;
+    wc.v = s->v;
+    wc.layer = L;
+    wc.pos0 = pos0;
+    wc.n_kv = n_kv;
+    tr_parallel_for(pool, n_tok, per_chunk, kv_write_body, &wc);
+    tr_prof_end(prof, TR_PROF_KV_WRITE, t);
+
+    t = tr_prof_begin(prof);
+    attn_ctx ac;
+    ac.q = s->q;
+    ac.kv = &s->kv;
+    ac.scores = s->scores;
+    ac.out = s->attn_concat;
+    ac.scale = scale;
+    ac.layer = L;
+    ac.n_qkv = n_qkv;
+    ac.head_dim = head_dim;
+    ac.group = n_head / n_head_kv;
+    ac.n_tok = n_tok;
+    ac.pos0 = pos0;
+    ac.score_stride = s->score_stride;
+    /* an item costs ~30 ns per cached position: short contexts keep several per chunk */
+    tr_parallel_for(pool, n_head * n_tok, 1 + 256 / (pos0 + n_tok), attn_body, &ac);
+    tr_prof_end(prof, TR_PROF_ATTENTION, t);
+    if (prof->enabled) tr_prof_count_kv(prof, TR_PROF_ATTENTION, attn_kv_bytes(n_tok, pos0, n_head, head_dim));
+
+    t = tr_prof_begin(prof);
+    tr_matmul(pool, &layer->wo, s->attn_concat, n_tok, s->attn_out);
+    add_ctx dc;
+    dc.y = x;
+    dc.x = s->attn_out;
+    dc.n = n_embd;
+    tr_parallel_for(pool, n_tok, per_chunk, add_body, &dc);
+    tr_prof_end(prof, TR_PROF_ATTN_OUT_PROJ, t);
+    tr_prof_count(prof, TR_PROF_ATTN_OUT_PROJ, mat_bytes(&layer->wo), 0);
+
+    /* ---- MoE FFN ---- */
+    t = tr_prof_begin(prof);
+    nc.src = x;
+    nc.dst = s->normed;
+    nc.weight = layer->ffn_norm;
+    nc.n = n_embd;
+    tr_parallel_for(pool, n_tok, per_chunk, norm_body, &nc);
+    tr_prof_end(prof, TR_PROF_FFN_NORM, t);
+
+    /* route every token, then a counting sort of the (token, slot) pairs by expert:
+     * offsets[e] counts, then starts, place[] takes each pair's row, and the shift
+     * at the end turns the advanced starts back into starts */
+    t = tr_prof_begin(prof);
+    tr_matmul(pool, &layer->gate_inp, s->normed, n_tok, s->router);
+    route_ctx oc;
+    oc.m = m;
+    oc.router = s->router;
+    oc.off = m->expert_off != NULL ? m->expert_off + L * n_expert : NULL;
+    oc.sel_w = s->sel_w;
+    oc.taken = s->taken;
+    oc.sel_id = s->sel_id;
+    tr_parallel_for(pool, n_tok, per_chunk, route_body, &oc);
+    for (int64_t e = 0; e <= n_expert; e++) s->offsets[e] = 0;
+    for (int64_t j = 0; j < n_rows; j++) s->offsets[s->sel_id[j] + 1]++;
+    for (int64_t e = 0; e < n_expert; e++) s->offsets[e + 1] += s->offsets[e];
+    for (int64_t j = 0; j < n_rows; j++) s->place[j] = s->offsets[s->sel_id[j]]++;
+    for (int64_t e = n_expert; e > 0; e--) s->offsets[e] = s->offsets[e - 1];
+    s->offsets[0] = 0;
+    tr_prof_end(prof, TR_PROF_ROUTER, t);
+    tr_prof_count(prof, TR_PROF_ROUTER, mat_bytes(&layer->gate_inp), 0);
+
+    /* the shared store's turn (Esperti M1): acquire this layer's non-empty experts (missing
+     * ones read from disk here) and refresh every expert's data pointer, NULL for the ones
+     * not in RAM -- a wrong read then crashes instead of reading stale bytes. */
+    if (olmoe_refresh_experts(m, s, L) != 0) return -1;
+
+    /* experts in stages, each one job over every (token, slot) row grouped by expert */
+    t = tr_prof_begin(prof);
+    gather_ctx gc;
+    gc.normed = s->normed;
+    gc.place = s->place;
+    gc.xg = s->xg;
+    gc.n_embd = n_embd;
+    gc.n_used = n_used;
+    tr_parallel_for(pool, n_rows, per_chunk * n_used, gather_body, &gc);
+    tr_prof_end(prof, TR_PROF_EXPERT_GATHER, t);
+
+    t = tr_prof_begin(prof);
+    tr_matmul_grouped(pool, layer->gate_exps, s->offsets, n_expert, s->xg, s->h1);
+    tr_matmul_grouped(pool, layer->up_exps, s->offsets, n_expert, s->xg, s->h2);
+    tr_prof_end(prof, TR_PROF_EXPERT_GATE_UP, t);
+
+    t = tr_prof_begin(prof);
+    tr_swiglu(pool, s->h1, s->h2, n_rows * n_ff);
+    tr_prof_end(prof, TR_PROF_EXPERT_ACT, t);
+
+    t = tr_prof_begin(prof);
+    tr_matmul_grouped(pool, layer->down_exps, s->offsets, n_expert, s->h1, s->h3);
+    tr_prof_end(prof, TR_PROF_EXPERT_DOWN, t);
+    if (prof->enabled) {
+        for (int64_t e = 0; e < n_expert; e++)
+            if (s->offsets[e + 1] > s->offsets[e]) {
+                tr_prof_count(prof, TR_PROF_EXPERT_GATE_UP,
+                              mat_bytes(&layer->gate_exps[e]) + mat_bytes(&layer->up_exps[e]), 0);
+                tr_prof_count(prof, TR_PROF_EXPERT_DOWN, mat_bytes(&layer->down_exps[e]), 0);
+            }
+    }
+
+    t = tr_prof_begin(prof);
+    mix_ctx mc;
+    mc.K = K;
+    mc.h3 = s->h3;
+    mc.sel_w = s->sel_w;
+    mc.place = s->place;
+    mc.ffn_out = s->ffn_out;
+    mc.x = x;
+    mc.n_embd = n_embd;
+    mc.n_used = n_used;
+    tr_parallel_for(pool, n_tok, per_chunk, mix_body, &mc);
+    tr_prof_end(prof, TR_PROF_EXPERT_MIX, t);
+
+    if (s->trace != NULL) route_trace_record(s, L, tokens, n_tok, x);
+    return 0;
+}
+
+/* Logits of the last n_logits rows of x ([n_tok][n_embd]; 0: none). One row per kept position:
+ * every row is its own dot_row over the same weights, so a row is bit-identical to the logits
+ * that token gives alone (tests/test_spec.c). */
+static void forward_logits(olmoe_model *m, olmoe_session *s, float *x, int64_t n_tok, int64_t n_logits) {
+    if (n_logits <= 0) return;
+    tr_prof *prof = &s->prof;
+    tr_pool *pool = m->pool;
+    int64_t n_embd = m->n_embd;
+    float *rows = x + (n_tok - n_logits) * n_embd;
 
     uint64_t t = tr_prof_begin(prof);
-    embed_ctx ec;
-    ec.w = &m->token_embd;
-    ec.tokens = tokens;
-    ec.x = s->x;
-    ec.n_embd = n_embd;
-    tr_parallel_for(pool, n_tok, per_chunk, embed_body, &ec);
-    tr_prof_end(prof, TR_PROF_EMBED, t);
-    tr_prof_count(prof, TR_PROF_EMBED,
-                  (uint64_t)n_tok * (uint64_t)tr_row_bytes(m->token_embd.type, m->token_embd.cols), 0);
+    for (int64_t i = 0; i < n_logits; i++) tr_rmsnorm(rows + i * n_embd, m->output_norm, n_embd, m->rms_eps);
+    tr_prof_end(prof, TR_PROF_OUTPUT_NORM, t);
 
+    t = tr_prof_begin(prof);
+    tr_matmul(pool, &m->output, rows, n_logits, s->logits);
+    tr_prof_end(prof, TR_PROF_LM_HEAD, t);
+    tr_prof_count(prof, TR_PROF_LM_HEAD, mat_bytes(&m->output), 0);
+    s->n_logits = n_logits;
+}
+
+/* One forward pass over n_tok tokens (1 <= n_tok <= n_batch): embed, every layer in order, then
+ * logits of the last n_logits (0: none). -1 on a failed layer (see forward_layer). */
+static int forward_pass(olmoe_model *m, olmoe_session *s, const int32_t *tokens, int64_t n_tok, int64_t n_logits) {
+    tr_prof *prof = &s->prof;
+    uint64_t t_pass = tr_prof_begin(prof);
+    const int64_t pos0 = s->pos;
+
+    forward_embed(m, s, tokens, n_tok, s->x);
     for (int64_t L = 0; L < m->n_layers; L++) {
-        olmoe_layer *layer = &m->layers[L];
-
-        /* ---- attention ---- */
-        t = tr_prof_begin(prof);
-        nc.src = s->x;
-        nc.dst = s->normed;
-        nc.weight = layer->attn_norm;
-        nc.n = n_embd;
-        tr_parallel_for(pool, n_tok, per_chunk, norm_body, &nc);
-        tr_prof_end(prof, TR_PROF_ATTN_NORM, t);
-
-        t = tr_prof_begin(prof);
-        tr_matmul(pool, &layer->wq, s->normed, n_tok, s->q);
-        tr_matmul(pool, &layer->wk, s->normed, n_tok, s->k);
-        tr_matmul(pool, &layer->wv, s->normed, n_tok, s->v);
-        tr_prof_end(prof, TR_PROF_QKV_PROJ, t);
-        tr_prof_count(prof, TR_PROF_QKV_PROJ, mat_bytes(&layer->wq) + mat_bytes(&layer->wk) + mat_bytes(&layer->wv),
-                      0);
-
-        t = tr_prof_begin(prof);
-        nc.src = nc.dst = s->q;
-        nc.weight = layer->q_norm;
-        nc.n = n_qkv;
-        tr_parallel_for(pool, n_tok, per_chunk, norm_body, &nc);
-        nc.src = nc.dst = s->k;
-        nc.weight = layer->k_norm;
-        nc.n = n_kv;
-        tr_parallel_for(pool, n_tok, per_chunk, norm_body, &nc);
-        tr_prof_end(prof, TR_PROF_QK_NORM, t);
-
-        if (m->have_clamp) {
-            clamp_inplace(s->q, n_tok * n_qkv, m->clamp);
-            clamp_inplace(s->k, n_tok * n_kv, m->clamp);
-            clamp_inplace(s->v, n_tok * n_kv, m->clamp);
-        }
-
-        t = tr_prof_begin(prof);
-        rope_ctx rc;
-        rc.q = s->q;
-        rc.k = s->k;
-        rc.rope_cos = s->rope_cos;
-        rc.rope_sin = s->rope_sin;
-        rc.n_qkv = n_qkv;
-        rc.n_kv = n_kv;
-        rc.n_head = n_head;
-        rc.n_head_kv = n_head_kv;
-        rc.head_dim = head_dim;
-        rc.pos0 = pos0;
-        tr_parallel_for(pool, n_tok, per_chunk, rope_body, &rc);
-        tr_prof_end(prof, TR_PROF_ROPE, t);
-
-        t = tr_prof_begin(prof);
-        kv_write_ctx wc;
-        wc.kv = &s->kv;
-        wc.k = s->k;
-        wc.v = s->v;
-        wc.layer = L;
-        wc.pos0 = pos0;
-        wc.n_kv = n_kv;
-        tr_parallel_for(pool, n_tok, per_chunk, kv_write_body, &wc);
-        tr_prof_end(prof, TR_PROF_KV_WRITE, t);
-
-        t = tr_prof_begin(prof);
-        attn_ctx ac;
-        ac.q = s->q;
-        ac.kv = &s->kv;
-        ac.scores = s->scores;
-        ac.out = s->attn_concat;
-        ac.scale = scale;
-        ac.layer = L;
-        ac.n_qkv = n_qkv;
-        ac.head_dim = head_dim;
-        ac.group = n_head / n_head_kv;
-        ac.n_tok = n_tok;
-        ac.pos0 = pos0;
-        ac.score_stride = s->score_stride;
-        /* an item costs ~30 ns per cached position: short contexts keep several per chunk */
-        tr_parallel_for(pool, n_head * n_tok, 1 + 256 / (pos0 + n_tok), attn_body, &ac);
-        tr_prof_end(prof, TR_PROF_ATTENTION, t);
-        if (prof->enabled) tr_prof_count_kv(prof, TR_PROF_ATTENTION, attn_kv_bytes(n_tok, pos0, n_head, head_dim));
-
-        t = tr_prof_begin(prof);
-        tr_matmul(pool, &layer->wo, s->attn_concat, n_tok, s->attn_out);
-        add_ctx dc;
-        dc.y = s->x;
-        dc.x = s->attn_out;
-        dc.n = n_embd;
-        tr_parallel_for(pool, n_tok, per_chunk, add_body, &dc);
-        tr_prof_end(prof, TR_PROF_ATTN_OUT_PROJ, t);
-        tr_prof_count(prof, TR_PROF_ATTN_OUT_PROJ, mat_bytes(&layer->wo), 0);
-
-        /* ---- MoE FFN ---- */
-        t = tr_prof_begin(prof);
-        nc.src = s->x;
-        nc.dst = s->normed;
-        nc.weight = layer->ffn_norm;
-        nc.n = n_embd;
-        tr_parallel_for(pool, n_tok, per_chunk, norm_body, &nc);
-        tr_prof_end(prof, TR_PROF_FFN_NORM, t);
-
-        /* route every token, then a counting sort of the (token, slot) pairs by expert:
-         * offsets[e] counts, then starts, place[] takes each pair's row, and the shift
-         * at the end turns the advanced starts back into starts */
-        t = tr_prof_begin(prof);
-        tr_matmul(pool, &layer->gate_inp, s->normed, n_tok, s->router);
-        route_ctx oc;
-        oc.m = m;
-        oc.router = s->router;
-        oc.off = m->expert_off != NULL ? m->expert_off + L * n_expert : NULL;
-        oc.sel_w = s->sel_w;
-        oc.taken = s->taken;
-        oc.sel_id = s->sel_id;
-        tr_parallel_for(pool, n_tok, per_chunk, route_body, &oc);
-        for (int64_t e = 0; e <= n_expert; e++) s->offsets[e] = 0;
-        for (int64_t j = 0; j < n_rows; j++) s->offsets[s->sel_id[j] + 1]++;
-        for (int64_t e = 0; e < n_expert; e++) s->offsets[e + 1] += s->offsets[e];
-        for (int64_t j = 0; j < n_rows; j++) s->place[j] = s->offsets[s->sel_id[j]]++;
-        for (int64_t e = n_expert; e > 0; e--) s->offsets[e] = s->offsets[e - 1];
-        s->offsets[0] = 0;
-        tr_prof_end(prof, TR_PROF_ROUTER, t);
-        tr_prof_count(prof, TR_PROF_ROUTER, mat_bytes(&layer->gate_inp), 0);
-
-        /* the shared store's turn (Esperti M1): acquire this layer's non-empty experts (missing
-         * ones read from disk here) and refresh every expert's data pointer, NULL for the ones
-         * not in RAM -- a wrong read then crashes instead of reading stale bytes. */
-        if (olmoe_refresh_experts(m, s, L) != 0) return -1;
-
-        /* experts in stages, each one job over every (token, slot) row grouped by expert */
-        t = tr_prof_begin(prof);
-        gather_ctx gc;
-        gc.normed = s->normed;
-        gc.place = s->place;
-        gc.xg = s->xg;
-        gc.n_embd = n_embd;
-        gc.n_used = n_used;
-        tr_parallel_for(pool, n_rows, per_chunk * n_used, gather_body, &gc);
-        tr_prof_end(prof, TR_PROF_EXPERT_GATHER, t);
-
-        t = tr_prof_begin(prof);
-        tr_matmul_grouped(pool, layer->gate_exps, s->offsets, n_expert, s->xg, s->h1);
-        tr_matmul_grouped(pool, layer->up_exps, s->offsets, n_expert, s->xg, s->h2);
-        tr_prof_end(prof, TR_PROF_EXPERT_GATE_UP, t);
-
-        t = tr_prof_begin(prof);
-        tr_swiglu(pool, s->h1, s->h2, n_rows * n_ff);
-        tr_prof_end(prof, TR_PROF_EXPERT_ACT, t);
-
-        t = tr_prof_begin(prof);
-        tr_matmul_grouped(pool, layer->down_exps, s->offsets, n_expert, s->h1, s->h3);
-        tr_prof_end(prof, TR_PROF_EXPERT_DOWN, t);
-        if (prof->enabled) {
-            for (int64_t e = 0; e < n_expert; e++)
-                if (s->offsets[e + 1] > s->offsets[e]) {
-                    tr_prof_count(prof, TR_PROF_EXPERT_GATE_UP,
-                                  mat_bytes(&layer->gate_exps[e]) + mat_bytes(&layer->up_exps[e]), 0);
-                    tr_prof_count(prof, TR_PROF_EXPERT_DOWN, mat_bytes(&layer->down_exps[e]), 0);
-                }
-        }
-
-        t = tr_prof_begin(prof);
-        mix_ctx mc;
-        mc.K = K;
-        mc.h3 = s->h3;
-        mc.sel_w = s->sel_w;
-        mc.place = s->place;
-        mc.ffn_out = s->ffn_out;
-        mc.x = s->x;
-        mc.n_embd = n_embd;
-        mc.n_used = n_used;
-        tr_parallel_for(pool, n_tok, per_chunk, mix_body, &mc);
-        tr_prof_end(prof, TR_PROF_EXPERT_MIX, t);
-
-        if (s->trace != NULL) route_trace_record(s, L, tokens, n_tok);
+        if (forward_layer(m, s, L, tokens, n_tok, pos0, s->x) != 0) return -1;
     }
-
-    if (n_logits > 0) {
-        /* One row per kept position: every row is its own dot_row over the same weights, so
-         * a row is bit-identical to the logits that token gives alone (tests/test_spec.c). */
-        float *rows = s->x + (n_tok - n_logits) * n_embd;
-        t = tr_prof_begin(prof);
-        for (int64_t i = 0; i < n_logits; i++) tr_rmsnorm(rows + i * n_embd, m->output_norm, n_embd, m->rms_eps);
-        tr_prof_end(prof, TR_PROF_OUTPUT_NORM, t);
-
-        t = tr_prof_begin(prof);
-        tr_matmul(pool, &m->output, rows, n_logits, s->logits);
-        tr_prof_end(prof, TR_PROF_LM_HEAD, t);
-        tr_prof_count(prof, TR_PROF_LM_HEAD, mat_bytes(&m->output), 0);
-        s->n_logits = n_logits;
-    }
+    forward_logits(m, s, s->x, n_tok, n_logits);
 
     tr_prof_end(prof, TR_PROF_TOKEN, t_pass);
     if (prof->enabled) prof->tokens[prof->phase] += (uint64_t)n_tok;
     return 0;
 }
 
+/* The whole prompt (n > n_batch), layer by layer instead of pass by pass (docs/MISURE.md "Il
+ * prefill legge il modello una volta per passata"): every block is embedded into its own slice
+ * of s->x_all, then for each layer every block runs forward_layer in turn before the next layer
+ * starts, so olmoe_refresh_experts sees every block's need for that layer before moving on --
+ * under a partial expert store this reads each layer's units once for the whole prompt instead
+ * of once per block. Same kernel calls, same arguments as forward_pass on the same tokens (only
+ * the order blocks and layers run in changes), so the logits and the cache are bit-identical to
+ * splitting the same prompt into passes of n_batch (tests/test_prefill.c). Only reachable when
+ * s->x_all != NULL and n > s->n_batch (olmoe_eval); n_logits > 1 is never asked of this path
+ * (olmoe_eval already requires n <= s->n_batch for that, so this function is always n_logits <=
+ * 1 in practice, but takes any n_logits <= n like forward_pass). */
+static int forward_prompt_layer_major(olmoe_model *m, olmoe_session *s, const int32_t *tokens, int64_t n,
+                                      int64_t n_logits) {
+    tr_prof *prof = &s->prof;
+    uint64_t t_pass = tr_prof_begin(prof);
+    const int64_t pos_base = s->pos;
+    int64_t n_embd = m->n_embd;
+
+    for (int64_t off = 0; off < n; off += s->n_batch) {
+        int64_t len = n - off < s->n_batch ? n - off : s->n_batch;
+        forward_embed(m, s, tokens + off, len, s->x_all + off * n_embd);
+        if (prof->enabled) prof->tokens[prof->phase] += (uint64_t)len; /* once per block, not per layer */
+    }
+
+    for (int64_t L = 0; L < m->n_layers; L++) {
+        for (int64_t off = 0; off < n; off += s->n_batch) {
+            int64_t len = n - off < s->n_batch ? n - off : s->n_batch;
+            if (forward_layer(m, s, L, tokens + off, len, pos_base + off, s->x_all + off * n_embd) != 0) return -1;
+        }
+    }
+
+    forward_logits(m, s, s->x_all, n, n_logits);
+
+    tr_prof_end(prof, TR_PROF_TOKEN, t_pass);
+    return 0;
+}
+
 /* Passes of at most n_batch tokens; only the last one computes logits. More than one row of
- * logits needs them all in that pass, so the whole call must fit one pass. A failed pass (the
- * shared expert store could not read a missing unit) restores s->pos to what it was when this
- * function was called: the cache past that position is never read, so the session is exactly as
- * it was before this call, and the same tokens can be evaluated again. */
+ * logits needs them all in that pass, so the whole call must fit one pass. Under a partial
+ * expert store and a prompt longer than one pass, the whole prompt runs layer by layer instead
+ * (forward_prompt_layer_major) so every layer's experts are read once for the prompt, not once
+ * per pass; s->x_all being non-NULL is what makes that path reachable at all (only allocated at
+ * session create when the store cannot hold every unit). A failed call restores s->pos to what
+ * it was when this function was called: the cache past that position is never read, so the
+ * session is exactly as it was before this call, and the same tokens can be evaluated again. */
 static int olmoe_eval(void *session, const int32_t *tokens, int64_t n, int64_t n_logits) {
     olmoe_session *s = (olmoe_session *)session;
     olmoe_model *m = s->m;
@@ -1322,6 +1413,19 @@ static int olmoe_eval(void *session, const int32_t *tokens, int64_t n, int64_t n
     }
 
     int64_t pos0 = s->pos;
+    /* The route trace numbers its rows from tr->pub.n_tokens, which only advances once a token has
+     * been through its LAST layer: in layer-major order every block of a layer would write over the
+     * same rows. A trace is measurement only (--route-trace), so it takes the pass-major path and
+     * keeps its rows right, instead of the trace growing a second way of counting. */
+    if (s->x_all != NULL && n > s->n_batch && s->trace == NULL) {
+        if (forward_prompt_layer_major(m, s, tokens, n, n_logits) != 0) {
+            s->pos = pos0;
+            return -1;
+        }
+        s->pos += n;
+        return 0;
+    }
+
     for (int64_t off = 0; off < n; off += s->n_batch) {
         int64_t len = n - off < s->n_batch ? n - off : s->n_batch;
         if (forward_pass(m, s, tokens + off, len, off + len == n ? n_logits : 0) != 0) {
@@ -1500,7 +1604,7 @@ static const tr_route_trace *olmoe_route_trace_get(const void *session) {
  * own router read it: the gather that follows only copies from it) and s->x holds this layer's
  * own output (x after the residual). Uses only the scratch tr_session_route_trace_begin
  * allocated: nothing here allocates. */
-static void route_trace_record(olmoe_session *s, int64_t L, const int32_t *tokens, int64_t n_tok) {
+static void route_trace_record(olmoe_session *s, int64_t L, const int32_t *tokens, int64_t n_tok, const float *x) {
     olmoe_route_trace *tr = s->trace;
     const olmoe_model *m = s->m;
     int64_t n_expert = m->n_expert, n_used = m->n_expert_used, n_pred = tr->pub.n_pred;
@@ -1550,7 +1654,7 @@ static void route_trace_record(olmoe_session *s, int64_t L, const int32_t *token
 
         /* pred_out: the next layer's own ffn_norm and router applied to this layer's own
          * output -- known only after this layer's experts ran and added their residual. */
-        memcpy(tr->normed, s->x, (size_t)rec * n_embd * sizeof(float));
+        memcpy(tr->normed, x, (size_t)rec * n_embd * sizeof(float));
         for (int64_t i = 0; i < rec; i++) tr_rmsnorm(tr->normed + i * n_embd, next->ffn_norm, n_embd, m->rms_eps);
         tr_matmul(m->pool, &next->gate_inp, tr->normed, rec, tr->router);
         for (int64_t i = 0; i < rec; i++) {

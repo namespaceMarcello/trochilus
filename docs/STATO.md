@@ -282,13 +282,10 @@ I passi del 19/09 (decode a contesto lungo e la KV per testa, prefill su prompt 
 37, 40, aperte la 34, 35, 36, 38, 39.
 
 Fatto il 2026-09-19 sera e il 20 (`docs/MISURE.md` §M1, prima di scrivere codice; LEZIONI #91-#94):
-lo stimatore della larghezza riscritto, e il **primo pezzo di M1**, le misure 13-16 — la traccia
-del routing (`--route-trace`, `tools/route_trace_report.py`, `tests/test_route.c`) e il banco del
-disco (`make bench-disk`): il router del layer dopo prevede il 92-95% degli esperti con 12
-candidati (il layer 0 no: 75-80%), lo streaming per layer interi costa 15-53 volte quello per
-esperti, il disco dà ~1.5 GB/s con qualunque numero di lettori. Le attese per token di quelle
-simulazioni le ha poi smentite la misura (domanda 14, LEZIONI #98). Chiuse le domande 13-16 e,
-come «no», la 5, la 34 e la 39; aperte la 41, la 42 e la 43.
+lo stimatore della larghezza riscritto, e il primo pezzo di M1 — la traccia del routing e il banco
+del disco (misure 13-16). Chiuse le domande 13-16 e, come «no», la 5, la 34 e la 39; aperte la 41,
+la 42 e la 43. Le attese per token di quelle simulazioni le ha poi smentite la misura (domanda 14,
+LEZIONI #98).
 
 **M1 in corso** (progetto in `docs/ARCHITETTURA.md` §Esecuzione «Esperti (M1)», dai numeri sopra):
 archivio a slot allocati al caricamento, indice e LRU O(1), non il pin dall'uso (LEZIONI #93);
@@ -339,21 +336,24 @@ lo stato di fabbrica dei PC bersaglio, M1 si progetta su ~1.5 GB/s.
   A 2048 token: 22 880 MiB invece di 6 528 e 23.51 s; con una passata sola (`-b 2048`) 6 273 MiB e
   **11.27 s, 2.09×**, con l'ultima riga di logit identica al byte. Il calcolo non peggiora (6.67 s
   contro 7.24).
-- **La cura è l'ordine per layer, non `-b`**: per ogni layer tutte le passate del prompt, poi il
-  layer dopo. Stessa lettura unica, blocchi piccoli per i kernel, e scala a 4000 e oltre (serve lo
-  stato nascosto di tutti i token: 32 MiB a 4000). `-b` grande non si spedisce perché **le
-  attivazioni di una passata crescono col numero di token** — non per i kernel, che con la passata
-  grande vanno un filo meglio. È una **modalità che il piano accende quando il modello non entra**.
+- **Ordine per layer, scritto il 2026-09-21** (`forward_layer` + `forward_prompt_layer_major` in
+  `src/models/olmoe.c`; lo stato nascosto dell'intero prompt in `s->x_all`, allocato alla creazione
+  della sessione e solo con archivio parziale — nella zona calda non si alloca). A 2048 token:
+  **6 273 MiB invece di 22 880 e 12.41 s invece di 23.51, 1.89×**, calcolo non distinguibile; a 512
+  (una passata sola) niente cambia; a budget pieno il percorso è quello di prima. Con
+  `--route-trace` si resta sull'ordine vecchio: la traccia numera le righe da `n_tokens`, che
+  avanza solo dopo l'ultimo layer. Controllo in `make check`: `tests/test_stream.c`
+  §`once_per_prompt`, visto rosso (33 unità su 16 di tabella) e verde dopo (LEZIONI #99, chiusa).
 - **Ordine di lavoro su M1, deciso il 2026-09-21** (dai numeri, non dal piano):
-  1. **ordine per layer nel prefill sotto budget** — 2.09× a 2048 e di più sui prompt lunghi,
-     esatto, e non c'è ancora niente di scritto. Con il fix entra il controllo che chiude
-     LEZIONI #99: un prompt da 2048 sotto budget deve leggere entro ~1.1× la tabella degli esperti;
+  1. ~~ordine per layer nel prefill~~ **fatto** (riga sopra, 1.89×);
   2. **domanda 45**, l'archivio che sopravvive alla sessione: toglie il disco dalla seconda
-     sessione in poi;
-  3. **sovrapporre disco e calcolo**: tetto 1.38-1.69× (modello, non misura), si
-     moltiplica con il punto 1: 23.5 s → 11.3 → tetto 6.7, cioè 3.5×;
+     sessione in poi, e ora è la leva più grossa che resta (4.5 s su 12.4 di un prompt da 2048);
+  3. **sovrapporre disco e calcolo**: col nuovo ordine il tetto è 1.61× a 2048 (modello, non
+     misura: 12.41 s contro `max(4.68, 7.73)`), e il disco non è più la metà grossa — il calcolo sì;
   4. **riordino del file per co-attivazione** (mbolt, MIT): ≤ 1.15× su questo disco con questi
      esperti, e costa un formato nostro. In fondo.
+  Col nuovo ordine il prompt lungo fa 165 tok/s sotto budget invece di 87, contro i 288 del
+  residente: il dirupo è 1.75×, non 3.3×.
 - **Poi**: le domande 42 (il layer 0), 43 (da che disco in su il precaricamento rende), 46 (il
   costo fisso del decode). Tre matrici in una lettura sola: **no**, in GGUF i tre tensori sono
   separati (docs/ORIGINI.md §L'archivio degli esperti).

@@ -69,8 +69,15 @@
       "cosa": "Il motore che legge un file GGUF e genera testo, scritto in C senza librerie esterne. «Esatto» vuol dire che i numeri che produce sono identici a quelli di transformers, il riferimento Python: se sbagliamo, lo sappiamo subito invece di accorgercene dalle risposte strane.",
       "numeri": [],
       "domande": [],
-      "file": ["src/models/olmoe.c", "src/format/gguf.c", "src/tokenizer/"],
-      "comandi": ["make oracle", "make oracle-real"],
+      "file": [
+        "src/models/olmoe.c",
+        "src/format/gguf.c",
+        "src/tokenizer/"
+      ],
+      "comandi": [
+        "make oracle",
+        "make oracle-real"
+      ],
       "dipende": []
     },
     {
@@ -80,13 +87,26 @@
       "stato": "fatto",
       "cosa": "I conti pesanti (moltiplicazioni di matrici) scritti nelle istruzioni vettoriali della CPU, con una versione per ogni famiglia e la scelta a runtime. Ogni versione dà gli stessi bit della versione scalare, e il test lo verifica.",
       "numeri": [
-        { "v": "dot_row q8_0: da 1 957 a 19 837 M elementi/s (AVX-512)", "d": "2026-09-17" },
-        { "v": "righe F16 col kernel del tier: 49×", "d": "2026-09-19" }
+        {
+          "v": "dot_row q8_0: da 1 957 a 19 837 M elementi/s (AVX-512)",
+          "d": "2026-09-17"
+        },
+        {
+          "v": "righe F16 col kernel del tier: 49×",
+          "d": "2026-09-19"
+        }
       ],
       "domande": [],
-      "file": ["src/kernels/"],
-      "comandi": ["make bench", "make tier-check"],
-      "dipende": ["nucleo"]
+      "file": [
+        "src/kernels/"
+      ],
+      "comandi": [
+        "make bench",
+        "make tier-check"
+      ],
+      "dipende": [
+        "nucleo"
+      ]
     },
     {
       "id": "pool",
@@ -95,13 +115,32 @@
       "stato": "fatto",
       "cosa": "I core del portatile usati senza sprechi: il prompt su tutti, la generazione sulla larghezza che la sessione misura da sola. Il decode non usa tutti i core perché il limite è la memoria, non il calcolo.",
       "numeri": [
-        { "v": "prompt su tutto il pool, decode sulla larghezza misurata: 1.05-1.09×", "d": "2026-09-18" },
-        { "v": "SMT peggiora: 32 thread contro 16 → decode 2.2 contro 22.9 tok/s", "d": "2026-09-18" }
+        {
+          "v": "prompt su tutto il pool, decode sulla larghezza misurata: 1.05-1.09×",
+          "d": "2026-09-18"
+        },
+        {
+          "v": "SMT peggiora: 32 thread contro 16 → decode 2.2 contro 22.9 tok/s",
+          "d": "2026-09-18"
+        }
       ],
-      "domande": [{ "n": 31, "stato": "aperta", "testo": "lo stimatore della larghezza riscritto non ha ancora un numero sul modello vero" }],
-      "file": ["src/base/threads.c", "tests/test_phase.c"],
-      "comandi": ["sh tools/threads_phase.sh sweep"],
-      "dipende": ["kernel"]
+      "domande": [
+        {
+          "n": 31,
+          "stato": "aperta",
+          "testo": "lo stimatore della larghezza riscritto non ha ancora un numero sul modello vero"
+        }
+      ],
+      "file": [
+        "src/base/threads.c",
+        "tests/test_phase.c"
+      ],
+      "comandi": [
+        "sh tools/threads_phase.sh sweep"
+      ],
+      "dipende": [
+        "kernel"
+      ]
     },
     {
       "id": "kv",
@@ -110,12 +149,21 @@
       "stato": "fatto",
       "cosa": "La memoria del contesto messa in modo che la CPU la legga di seguito invece che a salti. Il contesto lungo era il caso peggiore: adesso legge alla velocità della RAM.",
       "numeri": [
-        { "v": "decode a contesto 4000: 1.15-1.18×; la zona passa da 32-35 a 47-48 GB/s", "d": "2026-09-19" }
+        {
+          "v": "decode a contesto 4000: 1.15-1.18×; la zona passa da 32-35 a 47-48 GB/s",
+          "d": "2026-09-19"
+        }
       ],
       "domande": [],
-      "file": ["src/kv/kv.c"],
-      "comandi": ["sh tools/decode_context.sh measure"],
-      "dipende": ["kernel"]
+      "file": [
+        "src/kv/kv.c"
+      ],
+      "comandi": [
+        "sh tools/decode_context.sh measure"
+      ],
+      "dipende": [
+        "kernel"
+      ]
     },
     {
       "id": "prefill",
@@ -124,13 +172,26 @@
       "stato": "fatto",
       "cosa": "Il prompt non si elabora un token per volta ma a blocchi di 512, così le matrici sono grandi e i core lavorano pieni. È anche il pezzo che l'ordine per layer (M1) dovrà riorganizzare.",
       "numeri": [
-        { "v": "prefill da 30.1 a 196.9 tok/s (blocchi + kernel a 4 token)", "d": "2026-09-17" },
-        { "v": "attenzione a gruppi su prompt lunghi: 1.09-1.13×", "d": "2026-09-19" }
+        {
+          "v": "prefill da 30.1 a 196.9 tok/s (blocchi + kernel a 4 token)",
+          "d": "2026-09-17"
+        },
+        {
+          "v": "attenzione a gruppi su prompt lunghi: 1.09-1.13×",
+          "d": "2026-09-19"
+        }
       ],
       "domande": [],
-      "file": ["src/models/olmoe.c"],
-      "comandi": ["sh tools/prefill_context.sh measure"],
-      "dipende": ["kernel", "kv"]
+      "file": [
+        "src/models/olmoe.c"
+      ],
+      "comandi": [
+        "sh tools/prefill_context.sh measure"
+      ],
+      "dipende": [
+        "kernel",
+        "kv"
+      ]
     },
     {
       "id": "expf",
@@ -139,12 +200,28 @@
       "stato": "fatto",
       "cosa": "L'esponenziale della libreria C costava il 30% del prompt lungo. Riscritto: più veloce e arrotondato correttamente su tutti i 4 miliardi di float, verificati uno per uno.",
       "numeri": [
-        { "v": "prefill 1.03-1.31× secondo la lunghezza; Windows e Linux ora danno gli stessi byte", "d": "2026-09-19" }
+        {
+          "v": "prefill 1.03-1.31× secondo la lunghezza; Windows e Linux ora danno gli stessi byte",
+          "d": "2026-09-19"
+        }
       ],
-      "domande": [{ "n": 39, "stato": "chiusa", "testo": "versione SIMD: no, lo scalare ha già preso quasi tutto" }],
-      "file": ["src/kernels/expf.c", "src/kernels/expf_table.h"],
-      "comandi": ["make bench-expf"],
-      "dipende": ["kernel"]
+      "domande": [
+        {
+          "n": 39,
+          "stato": "chiusa",
+          "testo": "versione SIMD: no, lo scalare ha già preso quasi tutto"
+        }
+      ],
+      "file": [
+        "src/kernels/expf.c",
+        "src/kernels/expf_table.h"
+      ],
+      "comandi": [
+        "make bench-expf"
+      ],
+      "dipende": [
+        "kernel"
+      ]
     },
     {
       "id": "m1-archivio",
@@ -153,13 +230,27 @@
       "stato": "fatto",
       "cosa": "La dispensa degli esperti. Tiene in RAM quanti esperti ci stanno nel budget; quando ne serve uno che non c'è, lo legge dal disco e butta via quello che non si usa da più tempo. Funziona perché due token vicini chiedono quasi gli stessi esperti.",
       "numeri": [
-        { "v": "1024 unità (layer, esperto) da 6.375 MiB: 6528 MiB in tutto", "d": "2026-09-20" },
-        { "v": "3.6-4.0 esperti su 8 in comune col token prima", "d": "2026-09-20" }
+        {
+          "v": "1024 unità (layer, esperto) da 6.375 MiB: 6528 MiB in tutto",
+          "d": "2026-09-20"
+        },
+        {
+          "v": "3.6-4.0 esperti su 8 in comune col token prima",
+          "d": "2026-09-20"
+        }
       ],
       "domande": [],
-      "file": ["src/memory/experts.c", "tests/test_experts.c"],
-      "comandi": ["make test", "sh tools/mutate_experts.sh"],
-      "dipende": ["nucleo"]
+      "file": [
+        "src/memory/experts.c",
+        "tests/test_experts.c"
+      ],
+      "comandi": [
+        "make test",
+        "sh tools/mutate_experts.sh"
+      ],
+      "dipende": [
+        "nucleo"
+      ]
     },
     {
       "id": "m1-motore",
@@ -168,12 +259,22 @@
       "stato": "fatto",
       "cosa": "Il motore prende gli esperti dall'archivio invece che dalla RAM, e `--expert-budget` dice quanta RAM dargli. Con qualunque budget i numeri prodotti sono identici al byte: il budget cambia la velocità, mai il risultato.",
       "numeri": [
-        { "v": "logit identici al byte da budget pieno a budget minimo", "d": "2026-09-20" }
+        {
+          "v": "logit identici al byte da budget pieno a budget minimo",
+          "d": "2026-09-20"
+        }
       ],
       "domande": [],
-      "file": ["src/models/olmoe.c", "tests/test_stream.c"],
-      "comandi": ["build/trochilus run ... --expert-budget 3264"],
-      "dipende": ["m1-archivio"]
+      "file": [
+        "src/models/olmoe.c",
+        "tests/test_stream.c"
+      ],
+      "comandi": [
+        "build/trochilus run ... --expert-budget 3264"
+      ],
+      "dipende": [
+        "m1-archivio"
+      ]
     },
     {
       "id": "m1-diretta",
@@ -182,13 +283,25 @@
       "stato": "fatto",
       "cosa": "Legge saltando la cache del sistema operativo. Senza, il modello starebbe in RAM due volte e ogni misura racconterebbe la velocità della RAM invece di quella del disco.",
       "numeri": [
-        { "v": "la cache del sistema gonfierebbe il prompt di 2.42× e la generazione di 1.35×", "d": "2026-09-21" },
-        { "v": "disco reale: 1.33-1.37 GB/s, come dice il banco", "d": "2026-09-21" }
+        {
+          "v": "la cache del sistema gonfierebbe il prompt di 2.42× e la generazione di 1.35×",
+          "d": "2026-09-21"
+        },
+        {
+          "v": "disco reale: 1.33-1.37 GB/s, come dice il banco",
+          "d": "2026-09-21"
+        }
       ],
       "domande": [],
-      "file": ["src/base/platform.c"],
-      "comandi": ["sh tools/experts_budget.sh direct"],
-      "dipende": ["m1-archivio"]
+      "file": [
+        "src/base/platform.c"
+      ],
+      "comandi": [
+        "sh tools/experts_budget.sh direct"
+      ],
+      "dipende": [
+        "m1-archivio"
+      ]
     },
     {
       "id": "m1-piano",
@@ -198,9 +311,15 @@
       "cosa": "All'avvio guarda quanta RAM c'è libera e sceglie il budget da solo, rifiutandosi di partire se lascerebbe la macchina senza memoria. Nessuna opzione da imparare: è il criterio della tappa.",
       "numeri": [],
       "domande": [],
-      "file": ["src/models/model.c"],
-      "comandi": ["TR_MEM_AVAILABLE_MIB=4096 build/trochilus run ..."],
-      "dipende": ["m1-motore"]
+      "file": [
+        "src/models/model.c"
+      ],
+      "comandi": [
+        "TR_MEM_AVAILABLE_MIB=4096 build/trochilus run ..."
+      ],
+      "dipende": [
+        "m1-motore"
+      ]
     },
     {
       "id": "m1-misure",
@@ -209,53 +328,119 @@
       "stato": "fatto",
       "cosa": "Quattro sessioni a macchina ferma per sapere quanto costa davvero leggere gli esperti dal disco. Hanno smentito la simulazione su cui era stato progettato M1, e hanno trovato lo spreco del prompt.",
       "numeri": [
-        { "v": "generazione: 35.45 / 29.56 / 24.27 / 20.56 tok/s al 100 / 75 / 50 / 25% del modello in RAM", "d": "2026-09-20" },
-        { "v": "a generazione lunga metà modello in RAM costa solo il 10% (32.0 contro 35.45)", "d": "2026-09-20" },
-        { "v": "un token generato manca 0.3 esperti subito dopo il prompt, 0.03 più avanti (la simulazione diceva 22.4)", "d": "2026-09-20" },
-        { "v": "il prompt: 306.9 tok/s col modello in RAM, 80-84 con qualunque budget parziale", "d": "2026-09-20" }
+        {
+          "v": "generazione: 35.45 / 29.56 / 24.27 / 20.56 tok/s al 100 / 75 / 50 / 25% del modello in RAM",
+          "d": "2026-09-20"
+        },
+        {
+          "v": "a generazione lunga metà modello in RAM costa solo il 10% (32.0 contro 35.45)",
+          "d": "2026-09-20"
+        },
+        {
+          "v": "un token generato manca 0.3 esperti subito dopo il prompt, 0.03 più avanti (la simulazione diceva 22.4)",
+          "d": "2026-09-20"
+        },
+        {
+          "v": "il prompt: 306.9 tok/s col modello in RAM, 80-84 con qualunque budget parziale",
+          "d": "2026-09-20"
+        }
       ],
       "domande": [
-        { "n": 14, "stato": "chiusa", "testo": "quanti byte per token restano da leggere: misurato, la simulazione rispondeva a un'altra domanda" },
-        { "n": 16, "stato": "chiusa", "testo": "quanto legge l'NVMe a blocchi grandi: ~1.5 GB/s" }
+        {
+          "n": 14,
+          "stato": "chiusa",
+          "testo": "quanti byte per token restano da leggere: misurato, la simulazione rispondeva a un'altra domanda"
+        },
+        {
+          "n": 16,
+          "stato": "chiusa",
+          "testo": "quanto legge l'NVMe a blocchi grandi: ~1.5 GB/s"
+        }
       ],
-      "file": ["tools/experts_budget.sh", "build/experts_budget/"],
-      "comandi": ["sh tools/experts_budget.sh measure | misses | long | direct"],
-      "dipende": ["m1-diretta", "m1-piano"]
+      "file": [
+        "tools/experts_budget.sh",
+        "build/experts_budget/"
+      ],
+      "comandi": [
+        "sh tools/experts_budget.sh measure | misses | long | direct"
+      ],
+      "dipende": [
+        "m1-diretta",
+        "m1-piano"
+      ]
     },
     {
       "id": "m1-ordine-layer",
       "tappa": "M1",
       "titolo": "Ordine per layer nel prompt",
-      "stato": "prossimo",
-      "cosa": "Oggi il prompt si elabora a blocchi di 512 token e ogni blocco attraversa tutti i layer: sotto budget questo vuol dire rileggere tutti gli esperti dal disco a ogni blocco. Invertendo i due cicli — per ogni layer, tutti i blocchi — ogni esperto si legge una volta sola per prompt. Stessi numeri, esattamente gli stessi: cambia solo quante volte si aspetta il disco.",
+      "stato": "fatto",
+      "cosa": "Il prompt si elabora a blocchi di 512 token. Prima ogni blocco attraversava tutti i layer, quindi sotto budget rileggeva dal disco tutti gli esperti a ogni blocco. Adesso i cicli sono invertiti — per ogni layer, tutti i blocchi — e ogni esperto si legge una volta sola per prompt. Stessi numeri esatti: cambia solo quante volte si aspetta il disco.",
       "numeri": [
-        { "v": "prompt da 2048: legge 22 880 MiB invece di 6 528, cioè 3.5 volte la tabella", "d": "2026-09-21" },
-        { "v": "provato con una passata sola: 11.27 s invece di 23.51, cioè 2.09×", "d": "2026-09-21" },
-        { "v": "l'ultima riga di logit è identica al byte fra le due forme", "d": "2026-09-21" }
+        {
+          "v": "prompt 2048 a budget 50%: 6 273 MiB letti invece di 22 880",
+          "d": "2026-09-21"
+        },
+        {
+          "v": "prefill 12.41 s invece di 23.51: 1.89×, calcolo non distinguibile",
+          "d": "2026-09-21"
+        },
+        {
+          "v": "a prompt 512 (una passata sola) niente cambia, come previsto",
+          "d": "2026-09-21"
+        }
       ],
       "domande": [
-        { "n": 47, "stato": "chiusa", "testo": "il prompt legge gli esperti una volta per prompt? no, una volta per passata" }
+        {
+          "n": 47,
+          "stato": "chiusa",
+          "testo": "il prompt legge gli esperti una volta per prompt? no, una volta per passata"
+        }
       ],
-      "file": ["src/models/olmoe.c (forward_pass)", "docs/LEZIONI.md #99"],
-      "comandi": ["sh tools/prefill_overlap.sh 5"],
-      "dipende": ["m1-misure", "prefill"]
+      "file": [
+        "src/models/olmoe.c (forward_layer, forward_prompt_layer_major)",
+        "tests/test_stream.c (once_per_prompt)"
+      ],
+      "comandi": [
+        "make check",
+        "sh tools/prefill_overlap.sh 5"
+      ],
+      "dipende": [
+        "m1-misure",
+        "prefill"
+      ]
     },
     {
       "id": "m1-cache-sessioni",
       "tappa": "M1",
       "titolo": "Archivio che sopravvive alla sessione",
-      "stato": "aperto",
+      "stato": "prossimo",
       "cosa": "Ogni volta che il motore parte rilegge il modello intero dal disco, ~4.4 s, perché l'archivio muore col processo e la lettura diretta non lascia niente nella cache del sistema. Se l'archivio restasse vivo fra una sessione e l'altra, dalla seconda in poi il prompt costerebbe quanto col modello in RAM.",
       "numeri": [
-        { "v": "4.4 s di disco a ogni avvio, a qualunque budget parziale", "d": "2026-09-21" },
-        { "v": "una cache scaldata sul codice vale per il codice: sulla prosa non vale niente (domanda 44)", "d": "2026-09-20" }
+        {
+          "v": "col nuovo ordine sono 4.5 s di disco su 12.4 di un prompt da 2048: la leva più grossa che resta",
+          "d": "2026-09-21"
+        },
+        {
+          "v": "4.4 s di disco a ogni avvio, a qualunque budget parziale",
+          "d": "2026-09-21"
+        },
+        {
+          "v": "una cache scaldata sul codice vale per il codice: sulla prosa non vale niente (domanda 44)",
+          "d": "2026-09-20"
+        }
       ],
       "domande": [
-        { "n": 45, "stato": "aperta", "testo": "una cache degli esperti già calda all'avvio, per chi fa codice" }
+        {
+          "n": 45,
+          "stato": "aperta",
+          "testo": "una cache degli esperti già calda all'avvio, per chi fa codice"
+        }
       ],
       "file": [],
       "comandi": [],
-      "dipende": ["m1-misure"]
+      "dipende": [
+        "m1-misure"
+      ]
     },
     {
       "id": "m1-sovrapposizione",
@@ -264,15 +449,29 @@
       "stato": "aperto",
       "cosa": "Oggi il motore legge, poi calcola, poi legge ancora: il disco e i core si aspettano a turno. Nel prompt si sa in anticipo quali esperti servono al layer dopo, quindi si potrebbero leggere mentre il layer di adesso lavora.",
       "numeri": [
-        { "v": "tetto 1.38-1.69× (è un limite calcolato, non una misura)", "d": "2026-09-21" },
-        { "v": "si moltiplica con l'ordine per layer: 23.5 s → 11.3 → tetto 6.7", "d": "2026-09-21" }
+        {
+          "v": "col nuovo ordine il tetto a 2048 è 1.61× (limite calcolato, non una misura)",
+          "d": "2026-09-21"
+        },
+        {
+          "v": "si moltiplica con l'ordine per layer: 23.5 s → 11.3 → tetto 6.7",
+          "d": "2026-09-21"
+        }
       ],
       "domande": [
-        { "n": 43, "stato": "aperta", "testo": "da che velocità di disco in su conviene precaricare, e con quanti candidati" }
+        {
+          "n": 43,
+          "stato": "aperta",
+          "testo": "da che velocità di disco in su conviene precaricare, e con quanti candidati"
+        }
       ],
       "file": [],
-      "comandi": ["sh tools/prefill_overlap.sh 5"],
-      "dipende": ["m1-ordine-layer"]
+      "comandi": [
+        "sh tools/prefill_overlap.sh 5"
+      ],
+      "dipende": [
+        "m1-ordine-layer"
+      ]
     },
     {
       "id": "m1-decode-fisso",
@@ -281,15 +480,29 @@
       "stato": "aperto",
       "cosa": "Generando 64 token il motore va a 20.6 tok/s, generandone 1000 a 30.8: c'è un costo di circa un secondo all'inizio che non sappiamo spiegare. Gli esperti mancati ne spiegano un quinto. Finché non lo sappiamo, non sappiamo quale numero promettere.",
       "numeri": [
-        { "v": "al 25% del modello in RAM: 48.6 / 36.8 / 32.4 ms per token a 64 / 200 / 1000 token", "d": "2026-09-20" },
-        { "v": "spiegato dai mancati: ~2.7 ms su ~17", "d": "2026-09-20" }
+        {
+          "v": "al 25% del modello in RAM: 48.6 / 36.8 / 32.4 ms per token a 64 / 200 / 1000 token",
+          "d": "2026-09-20"
+        },
+        {
+          "v": "spiegato dai mancati: ~2.7 ms su ~17",
+          "d": "2026-09-20"
+        }
       ],
       "domande": [
-        { "n": 46, "stato": "aperta", "testo": "perché il decode sotto budget migliora con la lunghezza della generazione" }
+        {
+          "n": 46,
+          "stato": "aperta",
+          "testo": "perché il decode sotto budget migliora con la lunghezza della generazione"
+        }
       ],
       "file": [],
-      "comandi": ["make profile SCENARIOS=bench/scenarios-olmoe-1b-7b.json"],
-      "dipende": ["m1-misure"]
+      "comandi": [
+        "make profile SCENARIOS=bench/scenarios-olmoe-1b-7b.json"
+      ],
+      "dipende": [
+        "m1-misure"
+      ]
     },
     {
       "id": "m1-mbolt",
@@ -298,12 +511,19 @@
       "stato": "aperto",
       "cosa": "Riscrivere il GGUF mettendo vicini gli esperti che si accendono insieme (l'idea di mbolt, MIT). Sul nostro disco e con i nostri esperti grossi vale poco: il loro README stesso dice che il guadagno si spegne sopra i 4 MB per pezzo, e i nostri sono 6.4.",
       "numeri": [
-        { "v": "tetto ≤ 1.15× qui (dal nostro banco del disco), contro il 2.23× che dichiarano sulle loro letture", "d": "2026-09-21" }
+        {
+          "v": "tetto ≤ 1.15× qui (dal nostro banco del disco), contro il 2.23× che dichiarano sulle loro letture",
+          "d": "2026-09-21"
+        }
       ],
       "domande": [],
       "file": [],
-      "comandi": ["make bench-disk"],
-      "dipende": ["m1-misure"]
+      "comandi": [
+        "make bench-disk"
+      ],
+      "dipende": [
+        "m1-misure"
+      ]
     },
     {
       "id": "m1-routing",
@@ -312,16 +532,37 @@
       "stato": "fatto",
       "cosa": "Registrare quali esperti sceglie il modello a ogni token, per capire se si possono prevedere o se si può tenerne in RAM solo una parte. Ha risposto a quattro domande, tutte con un «no» utile.",
       "numeri": [
-        { "v": "il router del layer dopo prevede il 92-95% degli esperti con 12 candidati", "d": "2026-09-20" },
-        { "v": "spegnendo metà degli esperti meno usati il token cambia nel 6-19% delle posizioni: non si può", "d": "2026-09-20" }
+        {
+          "v": "il router del layer dopo prevede il 92-95% degli esperti con 12 candidati",
+          "d": "2026-09-20"
+        },
+        {
+          "v": "spegnendo metà degli esperti meno usati il token cambia nel 6-19% delle posizioni: non si può",
+          "d": "2026-09-20"
+        }
       ],
       "domande": [
-        { "n": 44, "stato": "chiusa", "testo": "il comportamento sul codice è un grafo piccolo e deterministico? no, in tutti e quattro i sensi" },
-        { "n": 13, "stato": "chiusa", "testo": "il router del layer dopo indovina gli esperti? sì, ma su questo disco precaricare non rende" }
+        {
+          "n": 44,
+          "stato": "chiusa",
+          "testo": "il comportamento sul codice è un grafo piccolo e deterministico? no, in tutti e quattro i sensi"
+        },
+        {
+          "n": 13,
+          "stato": "chiusa",
+          "testo": "il router del layer dopo indovina gli esperti? sì, ma su questo disco precaricare non rende"
+        }
       ],
-      "file": ["tools/route_trace_report.py", "tools/mask_quality.sh"],
-      "comandi": ["build/trochilus run ... --route-trace <file>"],
-      "dipende": ["m1-archivio"]
+      "file": [
+        "tools/route_trace_report.py",
+        "tools/mask_quality.sh"
+      ],
+      "comandi": [
+        "build/trochilus run ... --route-trace <file>"
+      ],
+      "dipende": [
+        "m1-archivio"
+      ]
     },
     {
       "id": "m2-kquant",
@@ -330,12 +571,17 @@
       "stato": "aperto",
       "cosa": "Formati che tengono i pesi in meno byte (Q4_K, Q6_K, Q2_K, IQ2_XXS). Meno byte vuol dire meno disco e meno RAM: è la leva che si somma a tutto M1. Non sono esatti come Q8_0, quindi diventano un modo dichiarato, non il default.",
       "numeri": [
-        { "v": "gli esperti in Q4 dimezzerebbero il disco del prompt (3.3 GiB invece di 6.5)", "d": "2026-09-21" }
+        {
+          "v": "gli esperti in Q4 dimezzerebbero il disco del prompt (3.3 GiB invece di 6.5)",
+          "d": "2026-09-21"
+        }
       ],
       "domande": [],
       "file": [],
       "comandi": [],
-      "dipende": ["m1-ordine-layer"]
+      "dipende": [
+        "m1-ordine-layer"
+      ]
     },
     {
       "id": "m2-assembly",
@@ -345,11 +591,19 @@
       "cosa": "Riscrivere in assembly i kernel più caldi, uno alla volta. Resta solo se il test lo trova identico al C e il banco lo trova più veloce; il C resta come riserva per le altre CPU.",
       "numeri": [],
       "domande": [
-        { "n": 10, "stato": "aperta", "testo": "più corsie (32 o 64) sbloccano la catena delle somme su un thread?" }
+        {
+          "n": 10,
+          "stato": "aperta",
+          "testo": "più corsie (32 o 64) sbloccano la catena delle somme su un thread?"
+        }
       ],
       "file": [],
-      "comandi": ["make bench"],
-      "dipende": ["kernel"]
+      "comandi": [
+        "make bench"
+      ],
+      "dipende": [
+        "kernel"
+      ]
     },
     {
       "id": "m3-cuda",
@@ -361,7 +615,10 @@
       "domande": [],
       "file": [],
       "comandi": [],
-      "dipende": ["m1-cache-sessioni", "m2-kquant"]
+      "dipende": [
+        "m1-cache-sessioni",
+        "m2-kquant"
+      ]
     },
     {
       "id": "m4-v4",
@@ -371,9 +628,13 @@
       "cosa": "Una seconda famiglia di modelli, per dimostrare che il motore non è cucito addosso a OLMoE. Ha attenzione e routing diversi.",
       "numeri": [],
       "domande": [],
-      "file": ["docs/DeepSeek_V41_Tech_Report.md"],
+      "file": [
+        "docs/DeepSeek_V41_Tech_Report.md"
+      ],
       "comandi": [],
-      "dipende": ["m3-cuda"]
+      "dipende": [
+        "m3-cuda"
+      ]
     },
     {
       "id": "m5-spec",
@@ -382,14 +643,27 @@
       "stato": "fatto",
       "cosa": "Indovinare più token in una volta riusando pezzi del prompt, e verificarli tutti insieme. Gli stessi token di prima, solo più in fretta quando il testo si ripete — come succede nel codice.",
       "numeri": [
-        { "v": "--spec 0/1/4/8/15 danno lo stesso testo; il guadagno dipende dal prompt", "d": "2026-09-18" }
+        {
+          "v": "--spec 0/1/4/8/15 danno lo stesso testo; il guadagno dipende dal prompt",
+          "d": "2026-09-18"
+        }
       ],
       "domande": [
-        { "n": 32, "stato": "aperta", "testo": "quante righe di bozza conviene tirare, dalla lunghezza del match" }
+        {
+          "n": 32,
+          "stato": "aperta",
+          "testo": "quante righe di bozza conviene tirare, dalla lunghezza del match"
+        }
       ],
-      "file": ["src/gen/lookup.c"],
-      "comandi": ["sh tools/ab_spec.sh <gguf> <binario> bench/prompts/code.txt 8"],
-      "dipende": ["nucleo"]
+      "file": [
+        "src/gen/lookup.c"
+      ],
+      "comandi": [
+        "sh tools/ab_spec.sh <gguf> <binario> bench/prompts/code.txt 8"
+      ],
+      "dipende": [
+        "nucleo"
+      ]
     },
     {
       "id": "m5-kv-disco",
@@ -399,11 +673,18 @@
       "cosa": "Salvare la memoria del contesto di un file già letto, così riaprirlo non costa un altro prompt intero. È la leva più grossa per chi lavora sempre sugli stessi file.",
       "numeri": [],
       "domande": [
-        { "n": 17, "stato": "aperta", "testo": "ricaricare la KV costa meno del prefill? e la KV in q8 cambia i token?" }
+        {
+          "n": 17,
+          "stato": "aperta",
+          "testo": "ricaricare la KV costa meno del prefill? e la KV in q8 cambia i token?"
+        }
       ],
       "file": [],
       "comandi": [],
-      "dipende": ["kv", "m1-cache-sessioni"]
+      "dipende": [
+        "kv",
+        "m1-cache-sessioni"
+      ]
     },
     {
       "id": "m5-server",
@@ -415,7 +696,9 @@
       "domande": [],
       "file": [],
       "comandi": [],
-      "dipende": ["m1-cache-sessioni"]
+      "dipende": [
+        "m1-cache-sessioni"
+      ]
     },
     {
       "id": "m6-vulkan",
@@ -427,7 +710,9 @@
       "domande": [],
       "file": [],
       "comandi": [],
-      "dipende": ["m3-cuda"]
+      "dipende": [
+        "m3-cuda"
+      ]
     }
   ]
 }

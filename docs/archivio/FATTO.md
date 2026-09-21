@@ -641,3 +641,23 @@ anche in `docs/stato.json`, e l'artifact si rigenera e si ripubblica sullo stess
 - **Come si prova**: `tools/.venv/Scripts/python.exe tools/stato_html.py` scrive
   `build/stato/index.html` (deve dire quanti blocchi sono fatti e quante voci di glossario);
   `node ~/.claude/hooks/misura-claude-md.cjs CLAUDE.md` per i tetti della mappa.
+
+### 2026-09-21 — Ordine per layer nel prefill: 1.89× sotto budget, esperti letti una volta per prompt
+
+Il corpo di un layer estratto in `forward_layer(m, s, L, tokens, n_tok, pos0, x)` e l'embedding e i
+logit nei loro `forward_embed` / `forward_logits`; `forward_pass` li chiama nello stesso ordine di
+prima, con `x = s->x`. Nuovo `forward_prompt_layer_major`: embedding di ogni blocco nella sua fetta
+di `s->x_all`, poi per ogni layer tutte le passate del prompt, poi i logit. `s->x_all` ([n_ctx]
+[n_embd]) è allocato alla creazione della sessione e solo quando l'archivio degli esperti è parziale
+(glielo chiede `tr_experts_get_stats`), contato nella guardia di memoria: nella zona calda non si
+alloca. `olmoe_eval` prende il percorso nuovo con `x_all != NULL && n > n_batch && trace == NULL`;
+a budget pieno, e con `--route-trace`, resta quello di prima.
+
+Misura (`sh tools/prefill_overlap.sh 5`, macchina ferma): a prompt 2048 e budget 50%, **6 273 MiB
+letti invece di 22 880 e 12.41 s invece di 23.51 (1.89×)**, calcolo non distinguibile. A 512 niente
+cambia. Numeri in `docs/MISURE.md` §Il prefill legge il modello una volta per passata.
+
+- **Come si prova**: `make check` (il caso `once_per_prompt` di `tests/test_stream.c` conta le unità
+  lette per un prompt di 36 token in passate da 12 e vuole al massimo `n_units + n_slots`; rosso
+  prima del fix con 33 su 16). Sul modello vero: `sh tools/prefill_overlap.sh 5`, risultati in
+  `build/prefill_overlap/report.txt`.

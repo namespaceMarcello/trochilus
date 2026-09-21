@@ -31,6 +31,8 @@
  *                a one-token pass, and inside the SECOND internal pass of a prompt longer than
  *                n_batch: eval returns -1, tr_session_pos is exactly what it was before that
  *                eval call; the reader restored, the same eval retried gives the reference logits
+ *   once_per_prompt  a prompt of 36 tokens in passes of 12, on the smallest store: the units
+ *                read must be at most n_units + n_slots, not passes x n_units
  *   rewind       rewind to 0 and re-evaluate the same tokens under the min store: identical
  *                logits (the store has no notion of position)
  *   direct       a real model loaded with the direct path (docs/ARCHITETTURA.md Esperti M1, Step
@@ -478,6 +480,46 @@ static void test_failure(const char *argv0) {
 
 /* ---- rewind: the store has no notion of position ---- */
 
+/* ---- once_per_prompt: a prompt longer than n_batch reads every unit ONCE, not once per
+ * internal pass. The prompt runs in passes of n_batch tokens and each pass walked every layer,
+ * so under a store too small to hold the model each pass read the whole table again (3.5x the
+ * bytes on the real model at 2048 tokens: docs/MISURE.md domanda 47, docs/LEZIONI.md #99). The
+ * layer-major order of the prefill -- every pass of one layer, then the next layer -- reads each
+ * unit once per prompt instead. Exercises that order; without it the count is passes x units. */
+static void test_once_per_prompt(const char *argv0) {
+    char path[512];
+    TR_CHECK(synth_write(&P_F32, argv0, "stream_once.gguf", path, sizeof path) == 0);
+    /* Long enough that a single pass already asks for (nearly) every expert of a layer, like a
+     * real prompt does: otherwise a pass touches a handful of units and re-reading them costs
+     * too little to show. 36 tokens in passes of 12 = three passes. */
+    enum { N_LONG = 36, N_BATCH = 12 };
+    int32_t tokens[N_LONG];
+    for (int i = 0; i < N_LONG; i++) tokens[i] = prompt_token(i);
+    int checked = 0;
+    tr_model *m = load_budget(path, NULL, UINT64_MAX); /* the smallest store: a layer at a time */
+    if (m != NULL) {
+        tr_session *s = create_session(m, N_BATCH);
+        tr_experts_stats before, after;
+        if (s != NULL && tr_model_expert_stats(m, &before) == 0) {
+            TR_CHECK(tr_session_eval(s, tokens, N_LONG) == 0);
+            TR_CHECK(tr_model_expert_stats(m, &after) == 0);
+            uint64_t read = after.misses - before.misses;
+            /* the branch really ran: the store had to fetch something */
+            TR_CHECK(read > 0);
+            /* every unit at most once for the whole prompt, plus one store's worth of slack */
+            TR_CHECK(read <= (uint64_t)after.n_units + (uint64_t)after.n_slots);
+            if (read > (uint64_t)after.n_units + (uint64_t)after.n_slots)
+                fprintf(stderr, "  %llu units read for %d tokens in passes of %d, %lld in the table\n",
+                        (unsigned long long)read, (int)N_LONG, (int)N_BATCH, (long long)after.n_units);
+            checked++;
+        }
+        if (s != NULL) tr_session_free(s);
+        tr_model_free(m);
+    }
+    TR_CHECK(checked > 0);
+    remove(path);
+}
+
 static void test_rewind(const char *argv0) {
     char path[512];
     TR_CHECK(synth_write(&P_F32, argv0, "stream_rewind.gguf", path, sizeof path) == 0);
@@ -740,6 +782,7 @@ int main(int argc, char **argv) {
     test_resident(argv0);
     test_budget_gate(argv0);
     test_failure(argv0);
+    test_once_per_prompt(argv0);
     test_rewind(argv0);
     test_direct(argv0);
     test_mem_available(argv0);
