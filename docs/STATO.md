@@ -305,7 +305,7 @@ lo stato di fabbrica dei PC bersaglio, M1 si progetta su ~1.5 GB/s.
 - **Misurato la notte del 2026-09-20** (`docs/MISURE.md` §M1 misurato; macchina ferma, carico di
   fondo 1.0-1.4 processori su 16, larghezza del decode forzata a 8, A/A su ogni modo):
   `experts_budget.sh measure | misses | long | direct`, risultati in `build/experts_budget/`.
-  **M1 funziona, e il costo è il prompt.**
+  **M1 funziona: il costo è il prompt.**
   - decode 35.45 / 29.56 / 24.27 / 20.56 tok/s al 100 / 75 / 50 / 25% (64 token generati), ma
     **a generazione lunga il budget conta poco**: a 1000 token 32.02 al 50% e 30.82 al 25%,
     cioè 0.90× e 0.87× del modello residente;
@@ -321,15 +321,12 @@ lo stato di fabbrica dei PC bersaglio, M1 si progetta su ~1.5 GB/s.
   - la lettura diretta contro la cache del sistema, stesso budget e stessi byte: prefill 81.4
     contro 197.0 (**2.42×**), decode 24.2 contro 32.6. La guardia che rifiuta di misurare senza
     `direct` era giusta: senza, ogni numero di M1 sarebbe gonfiato di 2.4× sul prompt.
-- **Deciso da qui**: (a) **niente precaricamento nel decode** — non c'è quasi niente da nascondere
-  (0.03-0.14 unità per token lontano dal prompt); se il precaricamento serve è nel **prompt**
-  (domanda 43); (b) il budget non è la leva che sembrava: fra 25% e 75% ballano il 4% a
-  generazione lunga, mentre fra residente e non ballano 3.8× sul prompt; (c) **la leva più grande
-  che resta su M1 è la domanda 45**, l'archivio che sopravvive alla sessione — ogni avvio rilegge
-  il modello intero, e con la lettura diretta la cache del sistema non aiuta per definizione.
+- **Deciso da qui**: (a) **niente precaricamento nel decode** — lontano dal prompt mancano
+  0.03-0.14 unità per token, non c'è niente da nascondere; se serve è nel prompt (domanda 43);
+  (b) il budget non è la leva che sembrava: fra 25% e 75% ballano il 4% a generazione lunga.
 - **Aperta, nuova**: domanda 46 — il decode sotto budget migliora con la lunghezza della
-  generazione (20.6 → 30.8 tok/s al 25% da 64 a 1000 token) e i mancati spiegano ~2.7 ms dei ~17
-  di differenza. Finché non si sa, il numero da promettere con metà modello in RAM è fra 24 e 32.
+  generazione (20.6 → 30.8 tok/s al 25% da 64 a 1000 token): i mancati spiegano ~2.7 ms dei ~17.
+  La run a budget pieno che decide se è l'archivio o il metro è ancora da fare.
 - **Misurato il 2026-09-21, domanda 47** (`docs/MISURE.md` §Il prefill legge il modello una volta
   per passata; `sh tools/prefill_overlap.sh`): il prompt si elabora a blocchi di 512 token e ogni
   passata percorre tutti i layer, quindi sotto budget **rilegge la tabella intera a ogni passata**.
@@ -346,14 +343,16 @@ lo stato di fabbrica dei PC bersaglio, M1 si progetta su ~1.5 GB/s.
   §`once_per_prompt`, visto rosso (33 unità su 16 di tabella) e verde dopo (LEZIONI #99, chiusa).
 - **Ordine di lavoro su M1, deciso il 2026-09-21** (dai numeri, non dal piano):
   1. ~~ordine per layer nel prefill~~ **fatto** (riga sopra, 1.89×);
-  2. **domanda 45**, l'archivio che sopravvive alla sessione: toglie il disco dalla seconda
-     sessione in poi, e ora è la leva più grossa che resta (4.5 s su 12.4 di un prompt da 2048);
+  2. **il costo del primo prompt** (domande 45, 48, 49): sotto budget ogni avvio rilegge il
+     modello intero, 4.7 s, ed è tutto il divario che resta col modello residente (12.41 contro
+     7.47 s a 2048). Due strade, non alternative: **nasconderlo** dietro il tempo che l'utente
+     impiega a scrivere (fase di preparazione dichiarata, Marcello 2026-09-21: niente di nuovo da
+     costruire, domanda 48) e **toglierlo** con un archivio che vive più della sessione (49).
+     Ricaricare un *elenco* all'avvio non serve: rileggere dal disco è quel tempo;
   3. **sovrapporre disco e calcolo**: col nuovo ordine il tetto è 1.61× a 2048 (modello, non
      misura: 12.41 s contro `max(4.68, 7.73)`), e il disco non è più la metà grossa — il calcolo sì;
   4. **riordino del file per co-attivazione** (mbolt, MIT): ≤ 1.15× su questo disco con questi
      esperti, e costa un formato nostro. In fondo.
-  Col nuovo ordine il prompt lungo fa 165 tok/s sotto budget invece di 87, contro i 288 del
-  residente: il dirupo è 1.75×, non 3.3×.
 - **Poi**: le domande 42 (il layer 0), 43 (da che disco in su il precaricamento rende), 46 (il
   costo fisso del decode). Tre matrici in una lettura sola: **no**, in GGUF i tre tensori sono
   separati (docs/ORIGINI.md §L'archivio degli esperti).

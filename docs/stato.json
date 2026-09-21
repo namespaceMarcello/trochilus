@@ -412,28 +412,34 @@
     {
       "id": "m1-cache-sessioni",
       "tappa": "M1",
-      "titolo": "Archivio che sopravvive alla sessione",
+      "titolo": "Il costo del primo prompt",
       "stato": "prossimo",
-      "cosa": "Ogni volta che il motore parte rilegge il modello intero dal disco, ~4.4 s, perché l'archivio muore col processo e la lettura diretta non lascia niente nella cache del sistema. Se l'archivio restasse vivo fra una sessione e l'altra, dalla seconda in poi il prompt costerebbe quanto col modello in RAM.",
+      "cosa": "Sotto budget ogni avvio rilegge il modello intero dal disco: 4.7 secondi, ed è tutto quello che separa un budget parziale dal modello tutto in RAM. Due strade: nasconderlo (il motore comincia a leggere appena la sessione si apre, mentre tu scrivi la domanda, e lo dice) oppure toglierlo (l'archivio resta vivo fra una sessione e l'altra, in un processo che non muore). Ricaricare un elenco dal disco all'avvio invece non serve: rileggere È quel tempo.",
       "numeri": [
         {
-          "v": "col nuovo ordine sono 4.5 s di disco su 12.4 di un prompt da 2048: la leva più grossa che resta",
+          "v": "4.7 s di disco a ogni avvio; è il divario che resta (12.41 contro 7.47 s a 2048)",
           "d": "2026-09-21"
         },
         {
-          "v": "4.4 s di disco a ogni avvio, a qualunque budget parziale",
+          "v": "su un prompt corto pesa di più: 4.5 s su 6.3 totali a 512 token",
           "d": "2026-09-21"
-        },
-        {
-          "v": "una cache scaldata sul codice vale per il codice: sulla prosa non vale niente (domanda 44)",
-          "d": "2026-09-20"
         }
       ],
       "domande": [
         {
+          "n": 48,
+          "stato": "aperta",
+          "testo": "quanto se ne nasconde dietro il tempo che l'utente impiega a scrivere"
+        },
+        {
+          "n": 49,
+          "stato": "aperta",
+          "testo": "un processo che resta acceso fra le sessioni regge il costo che ha"
+        },
+        {
           "n": 45,
           "stato": "aperta",
-          "testo": "una cache degli esperti già calda all'avvio, per chi fa codice"
+          "testo": "il costo del primo prompt si può togliere, o solo nascondere"
         }
       ],
       "file": [],
