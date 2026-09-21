@@ -1,0 +1,271 @@
+{
+  "nota": "Le parole che ricorrono nella mappa del progetto, spiegate da zero. Ogni voce: alias da riconoscere nel testo, titolo, spiegazione, e i termini collegati. Le usa tools/stato_html.py.",
+  "voci": [
+    {
+      "id": "token",
+      "alias": ["token"],
+      "titolo": "Token",
+      "testo": "Il pezzetto di testo con cui il modello ragiona: di solito una parola corta, un pezzo di parola lunga, o un segno di punteggiatura. «inferenza» può essere due token, «il» uno. Il modello non vede lettere: vede una sequenza di numeri, uno per token.",
+      "vedi": ["prompt", "tokenizer"]
+    },
+    {
+      "id": "tokenizer",
+      "alias": ["tokenizer"],
+      "titolo": "Tokenizer",
+      "testo": "Il pezzo che traduce il testo in token e viceversa. Deve dare esattamente gli stessi numeri del tokenizer originale del modello: se sbaglia anche un pezzo, il modello legge una frase diversa da quella che hai scritto.",
+      "vedi": ["token"]
+    },
+    {
+      "id": "prompt",
+      "alias": ["prompt"],
+      "titolo": "Prompt",
+      "testo": "Tutto quello che dai in pasto al modello prima che cominci a rispondere: la domanda, il file che ha letto, la conversazione fin lì. Più è lungo, più lavoro c'è da fare prima della prima parola di risposta.",
+      "vedi": ["prefill", "contesto"]
+    },
+    {
+      "id": "prefill",
+      "alias": ["prefill", "prompt a blocchi"],
+      "titolo": "Prefill (la lettura del prompt)",
+      "testo": "La prima fase: il modello legge tutto il prompt in una volta e si costruisce la memoria di quel testo. Tutti i token insieme, quindi i core lavorano pieni ed è la fase «grassa». In Trochilus è anche la fase dove, se il modello non sta in RAM, si paga tutto il disco.",
+      "vedi": ["decode", "kv", "token"]
+    },
+    {
+      "id": "decode",
+      "alias": ["decode", "generazione", "token generato", "token generati"],
+      "titolo": "Decode (la generazione)",
+      "testo": "La seconda fase: il modello produce un token per volta, e ognuno dipende da quello prima, quindi non si possono fare in parallelo. È lavoro «magro»: si rileggono tutti i pesi per sfornare una parola sola, per cui il collo di bottiglia è la velocità della memoria, non i core.",
+      "vedi": ["prefill", "banda", "tok-s"]
+    },
+    {
+      "id": "contesto",
+      "alias": ["contesto"],
+      "titolo": "Contesto",
+      "testo": "Quanto testo il modello si tiene in testa in quel momento: prompt più risposta. Più cresce, più la memoria del contesto (la KV) diventa grossa e più ogni nuovo token costa, perché deve guardarsi indietro tutto.",
+      "vedi": ["kv", "attenzione"]
+    },
+    {
+      "id": "attenzione",
+      "alias": ["attenzione"],
+      "titolo": "Attenzione",
+      "testo": "Il meccanismo con cui, per scrivere il token nuovo, il modello guarda tutti i token di prima e decide a quali dare peso. È il motivo per cui capisce a cosa si riferisce un «lo» scritto venti righe sopra, ed è anche il motivo per cui un contesto lungo costa.",
+      "vedi": ["kv", "contesto"]
+    },
+    {
+      "id": "kv",
+      "alias": ["KV", "cache KV", "memoria del contesto"],
+      "titolo": "KV (la memoria del contesto)",
+      "testo": "Per ogni token già letto il modello si salva due vettori — chiave e valore, key e value — così non deve rifare i conti su tutto il testo a ogni parola nuova. È una specie di riassunto già masticato di ciò che ha visto. Cresce con il contesto e si legge tutta a ogni token, quindi come è messa in memoria conta parecchio.",
+      "vedi": ["attenzione", "contesto", "banda"]
+    },
+    {
+      "id": "moe",
+      "alias": ["MoE", "mixture of experts"],
+      "titolo": "MoE (modello a esperti)",
+      "testo": "Un modello fatto di tanti pezzi specializzati invece di un blocco unico. Per ogni token ne usa solo pochi — nel nostro caso 8 su 64 per layer — quindi è enorme sul disco ma fa i conti come uno piccolo. Il rovescio: non sai in anticipo quali pezzi ti serviranno.",
+      "vedi": ["esperto", "router", "layer"]
+    },
+    {
+      "id": "esperto",
+      "alias": ["esperto", "esperti", "unità"],
+      "titolo": "Esperto",
+      "testo": "Uno dei pezzi specializzati del modello: in pratica tre matrici di numeri. Nel nostro modello ce ne sono 64 per layer, 1024 in tutto, e ognuno pesa 6.375 MiB — sono loro a occupare quasi tutto il file del modello.",
+      "vedi": ["moe", "router", "layer"]
+    },
+    {
+      "id": "router",
+      "alias": ["router", "routing"],
+      "titolo": "Router",
+      "testo": "Il pezzo che, per ogni token e per ogni layer, sceglie quali 8 esperti usare. È piccolo e veloce, ma è lui a decidere cosa bisognerà andare a leggere dal disco: da qui l'idea di sbirciare in anticipo le sue scelte.",
+      "vedi": ["esperto", "moe"]
+    },
+    {
+      "id": "layer",
+      "alias": ["layer"],
+      "titolo": "Layer",
+      "testo": "Uno strato del modello. Il token attraversa gli strati uno dopo l'altro e a ogni passaggio la sua rappresentazione viene raffinata. Il nostro modello ne ha 16, e ogni strato ha i suoi 64 esperti.",
+      "vedi": ["esperto", "prefill"]
+    },
+    {
+      "id": "logit",
+      "alias": ["logit", "logits"],
+      "titolo": "Logit",
+      "testo": "I punteggi che il modello dà a ogni parola possibile prima di sceglierne una: 50 304 numeri, uno per ogni token del vocabolario. Sono il risultato grezzo, prima di qualunque scelta: se due versioni del motore danno logit identici, stanno facendo esattamente la stessa cosa.",
+      "vedi": ["al-byte", "oracolo"]
+    },
+    {
+      "id": "al-byte",
+      "alias": ["identici al byte", "identico al byte", "bit-identico", "bit-identiche", "identiche al byte", "al byte"],
+      "titolo": "Identico al byte",
+      "testo": "Non «quasi uguale»: proprio gli stessi numeri, bit per bit. È il metro del progetto — una versione veloce di un calcolo si tiene solo se dà gli stessi bit di quella lenta. Così un'ottimizzazione non può peggiorare di nascosto la qualità delle risposte.",
+      "vedi": ["logit", "oracolo", "mutazione"]
+    },
+    {
+      "id": "quantizzazione",
+      "alias": ["quantizzazione", "quantizzare", "Q8_0", "Q4_K", "Q6_K", "Q2_K", "K-quant", "in Q4", "quantizzati"],
+      "titolo": "Quantizzazione",
+      "testo": "Scrivere i pesi del modello con meno cifre per farli occupare meno spazio: da 4 byte a 1 (Q8_0), o meno ancora (Q4). Meno byte vuol dire meno disco da leggere e meno RAM, ma i numeri non sono più esatti, quindi le risposte possono cambiare un po'. Per questo nel progetto è un modo che si dichiara, mai il comportamento di default.",
+      "vedi": ["esperto", "gguf", "al-byte"]
+    },
+    {
+      "id": "gguf",
+      "alias": ["GGUF"],
+      "titolo": "GGUF",
+      "testo": "Il formato di file in cui sta un modello pronto da usare: un unico file con tutti i pesi e le informazioni per interpretarli. È lo standard nato con llama.cpp, e leggerlo è la porta d'ingresso del motore.",
+      "vedi": ["quantizzazione", "esperto"]
+    },
+    {
+      "id": "budget",
+      "alias": ["budget", "expert-budget"],
+      "titolo": "Budget degli esperti",
+      "testo": "Quanta RAM diamo alla dispensa degli esperti. Budget pieno: il modello sta tutto in memoria. Budget a metà: metà in memoria, il resto si va a prendere sul disco quando serve. È così che un modello più grande della RAM può comunque girare.",
+      "vedi": ["lru", "esperto", "lettura-diretta"]
+    },
+    {
+      "id": "lru",
+      "alias": ["LRU"],
+      "titolo": "LRU (chi non si usa, esce)",
+      "testo": "La regola con cui si decide chi buttare fuori quando la dispensa è piena: esce quello che non si usa da più tempo (Least Recently Used). Funziona perché il passato somiglia al futuro: due token vicini chiedono quasi sempre gli stessi esperti, 3.6 su 8 in media. È lo stesso criterio con cui tieni sulla scrivania i libri che stai consultando e rimetti gli altri sullo scaffale.",
+      "vedi": ["budget", "cache", "esperto"]
+    },
+    {
+      "id": "cache",
+      "alias": ["cache"],
+      "titolo": "Cache",
+      "testo": "Una scorta di roba tenuta vicina perché la si userà ancora. Qui ce ne sono di due tipi: la nostra dispensa di esperti in RAM, e quella che fa il sistema operativo per conto suo su ogni file letto. La seconda, nelle misure, è un problema: fa sembrare il disco veloce quanto la RAM.",
+      "vedi": ["lru", "lettura-diretta"]
+    },
+    {
+      "id": "lettura-diretta",
+      "alias": ["lettura diretta", "letture dirette", "direct", "cache del sistema"],
+      "titolo": "Lettura diretta",
+      "testo": "Chiedere al sistema operativo di leggere dal disco senza tenersi una copia per sé. Serve a due cose: non avere il modello due volte in RAM, e misurare il disco vero invece della sua copia in memoria — senza, il prompt sembrerebbe 2.42 volte più veloce di quello che è.",
+      "vedi": ["cache", "nvme"]
+    },
+    {
+      "id": "nvme",
+      "alias": ["NVMe", "SSD", "disco"],
+      "titolo": "Disco NVMe",
+      "testo": "Il disco a stato solido del portatile. Veloce rispetto a un disco meccanico, lentissimo rispetto alla RAM: ~1.5 GB/s contro i ~57 GB/s della memoria, cioè quasi quaranta volte meno. Per questo, se il modello non sta in RAM, il disco diventa il collo di bottiglia di tutto.",
+      "vedi": ["banda", "lettura-diretta"]
+    },
+    {
+      "id": "banda",
+      "alias": ["banda", "GB/s", "banda della RAM"],
+      "titolo": "Banda di memoria",
+      "testo": "Quanti byte al secondo si riescono a leggere. Conta più della potenza di calcolo in questo motore: generare un token vuol dire soprattutto trascinare pesi dalla memoria ai core, e i core finiscono per aspettare. La RAM di questa macchina fa ~57 GB/s, il disco ~1.5.",
+      "vedi": ["decode", "nvme"]
+    },
+    {
+      "id": "tok-s",
+      "alias": ["tok/s", "token al secondo"],
+      "titolo": "tok/s (token al secondo)",
+      "testo": "La velocità del motore. Nel prompt sono i token letti al secondo (centinaia), nella generazione i token prodotti al secondo (decine). Due numeri diversi che non si confrontano fra loro: leggere è molto più veloce che scrivere.",
+      "vedi": ["prefill", "decode"]
+    },
+    {
+      "id": "thread",
+      "alias": ["thread", "core", "pool"],
+      "titolo": "Thread e core",
+      "testo": "I core sono le unità di calcolo del processore (questa macchina ne ha 16 veri), i thread sono i lavori che ci girano sopra. Il pool è la squadra di thread già pronti, per non pagare ogni volta il costo di svegliarli. Più thread non vuol dire sempre più veloce: nella generazione, oltre 8, aspettano tutti la memoria.",
+      "vedi": ["decode", "banda"]
+    },
+    {
+      "id": "simd",
+      "alias": ["SIMD", "AVX-512", "AVX2", "vettoriali"],
+      "titolo": "SIMD (istruzioni vettoriali)",
+      "testo": "Istruzioni che fanno lo stesso conto su 8 o 16 numeri in un colpo solo, invece che uno per volta. È da lì che viene la maggior parte della velocità dei kernel. Ogni processore ne ha un set diverso, quindi il motore ne porta più versioni e sceglie a runtime.",
+      "vedi": ["kernel", "tier"]
+    },
+    {
+      "id": "kernel",
+      "alias": ["kernel"],
+      "titolo": "Kernel",
+      "testo": "Qui non è quello del sistema operativo: è una funzioncina che fa un conto ripetuto milioni di volte — moltiplicare una riga di pesi per un vettore. È il pezzo più caldo del motore, quello che si riscrive in SIMD o in assembly guadagnando anche 10-20 volte.",
+      "vedi": ["simd", "zona-calda"]
+    },
+    {
+      "id": "tier",
+      "alias": ["tier"],
+      "titolo": "Tier",
+      "testo": "Il gradino di istruzioni che una CPU sa fare (scalare, AVX2, AVX-512). Il motore li prova tutti nei test e sceglie il migliore all'avvio, sulla macchina che trova: gira su un portatile nuovo come su uno di dieci anni fa, con lo stesso risultato.",
+      "vedi": ["simd", "kernel"]
+    },
+    {
+      "id": "zona-calda",
+      "alias": ["zona calda", "zona", "zone"],
+      "titolo": "Zona calda / zone del profilo",
+      "testo": "«Zona calda» è il codice che gira a ogni token, dove non si alloca memoria e non si scrivono stringhe: lì anche una piccolezza costa. Le «zone» del profilo sono invece i pezzi in cui dividiamo il tempo (attenzione, esperti, router, lettura dei pesi) per sapere dove va.",
+      "vedi": ["profilo", "kernel"]
+    },
+    {
+      "id": "profilo",
+      "alias": ["profilo", "profiler", "profilazione"],
+      "titolo": "Profilo",
+      "testo": "La misura di dove finisce il tempo dentro una run, zona per zona. Serve a non ottimizzare a naso: prima si guarda quale pezzo pesa, poi si tocca quello. È da un profilo che è saltato fuori che il prompt rilegge gli esperti a ogni passata.",
+      "vedi": ["zona-calda", "mediana"]
+    },
+    {
+      "id": "mediana",
+      "alias": ["mediana", "spread", "A/A"],
+      "titolo": "Mediana, spread, A/A",
+      "testo": "Come si misura in questo progetto: mai una run sola. Si fanno N run e si prende il valore di mezzo (mediana), si dichiara quanto ballano (spread), e si misura anche la stessa identica cosa due volte (A/A) per sapere qual è il rumore di fondo. Un guadagno conta solo se è più grande del rumore.",
+      "vedi": ["profilo", "macchina-ferma"]
+    },
+    {
+      "id": "macchina-ferma",
+      "alias": ["macchina ferma", "carico di fondo"],
+      "titolo": "Macchina ferma",
+      "testo": "Le misure si fanno quando il computer non sta facendo altro: niente container accesi, niente processi nostri rimasti in giro. Ogni sessione scrive nel log quanto era occupata la macchina, perché con il carico sbagliato i numeri mentono e le conclusioni pure.",
+      "vedi": ["mediana"]
+    },
+    {
+      "id": "oracolo",
+      "alias": ["oracolo", "oracoli"],
+      "titolo": "Oracolo",
+      "testo": "Il confronto con la verità: gli stessi input dati a transformers (l'implementazione Python di riferimento) e al nostro motore, e i risultati devono coincidere. Gira su modelli minuscoli, generati apposta, così è veloce e sta dentro i test automatici.",
+      "vedi": ["al-byte", "logit"]
+    },
+    {
+      "id": "mutazione",
+      "alias": ["mutazione", "mutazioni"],
+      "titolo": "Mutazione",
+      "testo": "Il test dei test: si rompe il codice apposta, in un punto preciso, e si guarda se qualche test se ne accorge. Se restano tutti verdi, quel test non stava controllando niente. È il modo per non avere una rete di sicurezza fatta di buchi.",
+      "vedi": ["al-byte", "oracolo"]
+    },
+    {
+      "id": "kl",
+      "alias": ["KL"],
+      "titolo": "KL (quanto due modelli la pensano diversamente)",
+      "testo": "Un numero che dice quanto la previsione di un modello si discosta da quella di un altro sullo stesso testo. Zero: identici. Sotto 0.01: differenza trascurabile. Sopra 1: stanno dicendo cose diverse. Serve a giudicare i modi non esatti, dove i bit non coincidono per costruzione.",
+      "vedi": ["logit", "quantizzazione"]
+    },
+    {
+      "id": "speculazione",
+      "alias": ["speculazione", "speculativa", "--spec", "bozza"],
+      "titolo": "Decodifica speculativa",
+      "testo": "Invece di produrre un token alla volta, se ne tirano a indovinare diversi in blocco (per esempio copiandoli da un pezzo di testo già visto) e poi si verificano tutti insieme in una passata sola. Quelli giusti si tengono, gli altri si buttano: il risultato è identico, ma quando il testo si ripete — come nel codice — è più veloce.",
+      "vedi": ["decode", "prompt"]
+    },
+    {
+      "id": "sanitizer",
+      "alias": ["sanitizer", "ASan", "TSan"],
+      "titolo": "Sanitizer",
+      "testo": "Versioni del programma compilate con dei controlli in più che fanno esplodere subito gli errori di memoria (ASan) o le corse fra thread (TSan). Sono lentissime, quindi non si spediscono: girano nei test, dove servono a scoprire i bug che altrimenti si presentano a caso mesi dopo.",
+      "vedi": ["mutazione"]
+    },
+    {
+      "id": "slot",
+      "alias": ["slot", "archivio"],
+      "titolo": "Archivio a slot",
+      "testo": "La dispensa vera e propria: un pezzo di RAM diviso in caselle della misura di un esperto, allocate una volta all'avvio. Quando serve un esperto che non c'è, lo si legge dal disco dentro una casella libera (o liberata dalla LRU). Nessuna allocazione durante la generazione: quella è zona calda.",
+      "vedi": ["lru", "budget", "zona-calda"]
+    },
+    {
+      "id": "passata",
+      "alias": ["passata", "passate", "blocco di 512", "blocchi di 512"],
+      "titolo": "Passata (blocco del prompt)",
+      "testo": "Il prompt non si elabora tutto insieme ma a gruppi di 512 token: ogni gruppo attraversa tutti i layer, poi tocca al gruppo dopo. È fatto così per non tenere in RAM troppi risultati intermedi — ed è proprio questo che, sotto budget, fa rileggere gli esperti dal disco a ogni gruppo.",
+      "vedi": ["prefill", "layer", "budget"]
+    }
+  ]
+}

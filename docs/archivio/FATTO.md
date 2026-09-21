@@ -621,3 +621,23 @@ lezione #99. Il codice del motore non è stato toccato.
   ferma; risultati e profili in `build/prefill_overlap/`). L'esattezza fra le due forme:
   `trochilus logits ... -b 512` e `-b 2048` sullo stesso prompt, l'ultima riga dei due file
   confrontata con `cmp`.
+
+### 2026-09-21 — La mappa del progetto, il glossario, e il CLAUDE.md rimesso in misura
+
+`docs/stato.json` tiene lo stato del progetto come dato: le tappe M0-M6, un blocco per pezzo con
+stato (fatto / in corso / prossimo / aperto), cosa vuol dire in parole semplici, i numeri misurati
+con la data, le domande di MISURE collegate, i file, i comandi e le dipendenze. `tools/stato_html.py`
+ne fa una pagina sola (colonne per tappa, frecce fra i blocchi, pannello al clic), pubblicata come
+artifact `6mx3NS4KtQrBFPRLkAYupr`. `docs/glossario.json` spiega da zero 38 parole chiave (LRU, KV,
+prefill, quantizzare, tier, oracolo, mutazione, KL...): nel pannello ogni parola riconosciuta
+diventa cliccabile e apre un fumetto con i termini imparentati.
+
+Il `CLAUDE.md` era fuori dai tetti (169 righe, 12.1 KB): i comandi interi sono passati a
+`docs/COMANDI.md` senza cancellarne nessuno, nella mappa restano quelli di ogni giorno, ed è
+tornato a 136 righe / 8.5 KB, timbrato con l'impronta delle preferenze. Nella tabella «prima di
+ogni commit» c'è ora la riga che tiene viva la mappa: un passo chiuso o una decisione si scrivono
+anche in `docs/stato.json`, e l'artifact si rigenera e si ripubblica sullo stesso URL.
+
+- **Come si prova**: `tools/.venv/Scripts/python.exe tools/stato_html.py` scrive
+  `build/stato/index.html` (deve dire quanti blocchi sono fatti e quante voci di glossario);
+  `node ~/.claude/hooks/misura-claude-md.cjs CLAUDE.md` per i tetti della mappa.
