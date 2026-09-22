@@ -61,11 +61,14 @@ typedef struct {
     unsigned short pin_cpu[TR_CPU_MAX_SMT];
 } slot;
 
-/* one slot per cache line: workers polling their state never share a line */
-typedef union {
-    slot s;
-    char pad[64];
+/* Slots on lines of their own: a worker polling its state never shares a line with another
+ * slot. The slot is 72 bytes, so a union with char[64] packed them at 72-byte strides and put
+ * worker k's state on the line of worker k-1's begin/end, which the dispatcher writes on every
+ * call (docs/LESSONS.md #104). */
+typedef struct {
+    _Alignas(64) slot s;
 } slot_line;
+_Static_assert(sizeof(slot_line) % 64 == 0, "a slot_line must fill whole cache lines");
 
 struct tr_pool {
     int size; /* includes the calling thread */
@@ -143,9 +146,19 @@ static void worker_loop(slot *w) {
 }
 /* hot: end */
 
+/* MinGW keeps _Thread_local in emulated TLS: a thread's first touch of each variable mallocs its
+ * storage. Touched when a thread joins a pool, so that its first chunk of work, in the hot path,
+ * allocates nothing (tests/test_hot.c; docs/LESSONS.md #106). Elsewhere a plain load and store. */
+static void touch_tls(void) {
+    volatile int *depth = &t_depth, *id = &t_worker_id;
+    *depth = *depth;
+    *id = *id;
+}
+
 /* A worker pins itself, once, before it ever waits for work: affinity applies to the
  * calling thread, and this is the only moment the new thread is outside the hot loop. */
 static void worker_start(slot *w) {
+    touch_tls();
     /* A worker without a slot belongs to the scheduler, wherever the caller could run before it
      * was pinned: on Linux a new thread inherits its creator's affinity, which by now is slot 0. */
     if (w->pin > 0) tr_thread_pin(w->pin_group, w->pin_cpu, w->pin, NULL);
@@ -172,6 +185,7 @@ tr_pool *tr_pool_create(int n_threads) {
 
     tr_pool *p = calloc(1, sizeof *p);
     if (p == NULL) return NULL;
+    touch_tls(); /* the calling thread runs chunk 0 */
     p->size = n_threads;
     p->active = n_threads;
     p->slots = tr_alloc_aligned(sizeof(slot_line) * (size_t)n_threads, 64);

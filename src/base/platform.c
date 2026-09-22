@@ -209,6 +209,8 @@ int tr_file_pread(const tr_file *f, void *buf, size_t n, uint64_t offset) {
          * sector then comes back short (eof, or got == 0), which is not an error (platform.h) */
         if (eof) return 0;
         if (got == 0) return f->direct ? 0 : -1; /* end of file before n bytes were read */
+        /* short of a sector boundary: the real end; the rest, asked from here, is error 87 */
+        if (f->direct && got % TR_FILE_DIRECT_ALIGN != 0) return 0;
         p += got;
         offset += got;
         n -= got;
@@ -361,6 +363,8 @@ int tr_file_pread(const tr_file *f, void *buf, size_t n, uint64_t offset) {
         /* a direct handle's aligned range can run past the file's real end: the last, partial
          * sector then comes back short, which is not an error (platform.h) */
         if (got == 0) return f->direct ? 0 : -1; /* end of file before n bytes were read */
+        /* short of a sector boundary: the real end (an unaligned retry is EINVAL on some filesystems) */
+        if (f->direct && (size_t)got % TR_FILE_DIRECT_ALIGN != 0) return 0;
         p += got;
         offset += (uint64_t)got;
         n -= (size_t)got;

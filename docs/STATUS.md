@@ -212,6 +212,9 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
   (event log `CodeIntegrity`, event 3118). Correctness in Docker, native measurements when
   binary passes; after 30 minutes waiting a **second copy in another folder** is built, without
   touching the first, and measured with the one that starts (`TROCHILUS=<binary>`; LESSONS #12, #81).
+  Since 2026-09-22 links carry no PE timestamp (same code, same bytes, same verdict) and `make check`
+  runs the C tests natively too, a blocked one SKIPPED: the Windows branches of `src/base` had never
+  run in the gate, and two bugs lived there (LESSONS #103, #106).
 - **Measurements protect themselves and the machine is queried** (LESSONS #82, #84–#89): measurement
   scripts take a lock (one measurement at a time), keep the machine awake, refuse to start if
   `tools/orphans.sh` finds something of ours left running, wait for CPU quiet before session and
@@ -270,6 +273,12 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
   vs. 4–16%). Long measurements launched when other windows idle.
 
 ## Next steps
+
+**Review (Opus 5.5, 2026-09-22)**: reader, expert store, pool and platform done (LESSONS #102–#110;
+`docs/MEASUREMENTS.md` §The gate, §Generated mutations). `make check` now runs the C tests natively
+too and takes 335 s instead of ~935. Next, in order: `src/models/olmoe.c` (hot path, layer-major
+prefill), then `src/kernels/`, `src/tokenizer/`, `src/app/main.c`, each file through
+`tools/mutate_auto.py`. Open: the printed report of `prof.c` (pin it, or declare it outside the tests).
 
 Steps of 17–19/09 (block prefill, `--spec`, thread pinning, adaptive draft, adversarial revision,
 remeasure with A/A, threads per phase; decode at long context and KV per head, prefill on long

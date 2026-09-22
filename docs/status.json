@@ -1,7 +1,7 @@
 {
   "progetto": "Trochilus",
   "sottotitolo": "motore di inferenza per modelli MoE in C, senza dipendenze",
-  "aggiornato": "2026-09-21",
+  "aggiornato": "2026-09-22",
   "stati": {
     "fatto": "finito e provato: test verdi in make check",
     "in-corso": "ci stiamo lavorando adesso",
@@ -221,6 +221,46 @@
       ],
       "dipende": [
         "kernel"
+      ]
+    },
+    {
+      "id": "revisione-0922",
+      "tappa": "M0",
+      "titolo": "Revisione e gate",
+      "stato": "in-corso",
+      "cosa": "Revisione del lettore GGUF, dell'archivio degli esperti, del pool e della piattaforma, e del cancello stesso. Sette errori corretti, due dei quali vivevano solo su Windows, dove il cancello non faceva girare nessun test: adesso i test C girano anche nativi. Il cancello impiega circa un terzo del tempo, e un mutatore generico trova le righe che nessun test guarda. Prossimo: olmoe.c, poi kernel, tokenizer, main.c.",
+      "numeri": [
+        {
+          "v": "make check: ~935 s prima, 335 s adesso (gruppi in parallelo, fixture sul volume, test_cleanup)",
+          "d": "2026-09-22"
+        },
+        {
+          "v": "test nativi su Windows: 18 passati (test_hot compreso, dopo la correzione del TLS)",
+          "d": "2026-09-22"
+        },
+        {
+          "v": "mutanti sopravvissuti: gguf.c 89 → 43, experts.c 27 → 9, threads.c 33 → 23",
+          "d": "2026-09-22"
+        },
+        {
+          "v": "calibrazione del profiler: errore peggiore 9.9995% → 0.00000% con uno stallo di 2 ms",
+          "d": "2026-09-22"
+        }
+      ],
+      "domande": [],
+      "file": [
+        "src/base/platform.c (lettura diretta a fine file)",
+        "src/base/threads.c (TLS toccato all'ingresso, slot su linee intere)",
+        "src/base/prof.c (tr_prof_calibrate)",
+        "tools/native_tests.sh, tools/mutate_auto.py, tools/gate_times.py"
+      ],
+      "comandi": [
+        "make check",
+        "python3 tools/mutate_auto.py <src/file.c> <test> --asan"
+      ],
+      "dipende": [
+        "nucleo",
+        "m1-diretta"
       ]
     },
     {

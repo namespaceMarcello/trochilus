@@ -80,6 +80,17 @@ void tr_prof_reset(tr_prof *p);
 uint64_t tr_prof_ticks(void);
 double tr_prof_ticks_per_sec(void);
 
+/* Ticks per second of `ticks` measured against `sec` (seconds) over at least window_sec. Each
+ * end of the window is read bracketed -- ticks, sec, ticks -- and the narrowest of 8 brackets
+ * wins, so a preemption between two reads is thrown away instead of skewing the rate. The engine
+ * calls it once with RDTSC and tr_time_sec; tests with fake clocks (tests/test_prof.c). */
+typedef struct {
+    uint64_t (*ticks)(void *ctx);
+    double (*sec)(void *ctx);
+    void *ctx;
+} tr_prof_clocks;
+double tr_prof_calibrate(const tr_prof_clocks *c, double window_sec);
+
 /* hot: begin */
 static inline uint64_t tr_prof_begin(const tr_prof *p) {
     return (p != NULL && p->enabled) ? tr_prof_ticks() : 0;

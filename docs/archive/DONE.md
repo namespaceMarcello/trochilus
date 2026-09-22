@@ -803,3 +803,23 @@ first.
   edited.
 - **What is left**: the Italian bodies of `LESSONS.md` and `MEASUREMENTS.md`, one section at a
   time, and then the line in README that still calls the documents Italian.
+
+### 2026-09-22 — Review of the reader, the expert store, the pool and the platform; a faster, native gate
+A review of `src/format/gguf.c`, `src/memory/experts.c`, `src/base/threads.c`, `src/base/platform.c`
+(Opus 5.5) and of the gate itself. Seven errors fixed and two discoveries, each with a check (LESSONS #102-#110):
+- `tr_file_pread` on a direct handle failed at the end of the file on NTFS (error 87 on the retry
+  from an unaligned offset): an expert ending the file could not be read on Windows (#103);
+- generating a token allocated on Windows: MinGW's emulated TLS mallocs on a thread's first touch
+  (#106); the pool's slots shared cache lines (#104); the GGUF arena gave 8-byte alignment, not 16
+  (#105); the profiler's clock was calibrated on one unguarded pair of reads (#108);
+- the gate was red on `main` since the translation (#102), and the C tests had never run natively.
+
+The gate: the C tests run natively on Windows too (`tools/native_tests.sh`, SKIPPED where Smart App
+Control blocks), links are reproducible (`-Wl,--no-insert-timestamp`) so a rebuilt binary keeps its
+verdict, the four compiler builds run at once, the tiny-model steps beside the real model's, the
+2-layer cut lives on the models volume, `test_cleanup.sh` no longer waits out its orphan, and the
+gate prints its time. `tools/mutate_auto.py` generates mutations for any file; `test_gguf`,
+`test_experts`, `test_base`, `test_prof` gained the cases its survivors asked for.
+
+- **How to check it**: `make check` (green, "check passed in N s", "native tests: 18 passed");
+  `python3 tools/mutate_auto.py src/format/gguf.c test_gguf --asan` in the container.

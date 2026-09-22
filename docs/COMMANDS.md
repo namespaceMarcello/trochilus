@@ -4,7 +4,10 @@ From `CLAUDE.md` (2026-09-21): the complete list of project commands. In the map
 those used every day; here is everything, including measurements and rarely used tools.
 
 ```bash
-make check               # the gate: lint, build 0 warning, test, ASan, TSan, repeated tests, oracles
+make check               # the gate: lint, build 0 warning, test, ASan, TSan, repeated tests, oracles, C tests natively; prints its time
+make check 2>&1 | awk '{ print strftime("%H:%M:%S"), $0; fflush() }' > build/check.log   # the gate with a time on every line
+tools/.venv/Scripts/python.exe tools/gate_times.py build/check.log   # seconds per step of that log (docs/MEASUREMENTS.md §The gate)
+sh tools/native_tests.sh build/tests/test_*.exe   # the C tests on Windows itself; SKIPPED where Smart App Control blocks
 make                     # build/trochilus (core, no dependencies)
 make test                # C tests: kernel SIMD = scalar, malformed GGUF, pool, profiler
 make oracle              # tiny models: generate, convert, compare with transformers
@@ -39,6 +42,7 @@ sh tools/mask_quality.sh   # experts off: KL and tokens against whole model (mea
 sh tools/experts_budget.sh measure | misses | direct   # M1: tok/s at 4 budgets, cost of a token, cache yes/no
 build/trochilus run ... --expert-budget <MiB|min>   # expert RAM (default: the plan); TR_EXPERT_BUDGET_MIB in tests
 sh tools/mutate_{route,tune,experts,stream}.sh | tools/mutate_reports.py   # in container: the mutations, all red
+python3 tools/mutate_auto.py <src/file.c> <test> [test...] [--lines A-B] [--list]   # in container: generated mutations, survivors listed
 make bench-attn          # attention on prompt (512/2048/4000) on one layer, broken down by phases, with bit control
 make bench-expf          # tr_expf on all 2^32 floats against rounded value and C library
 tools/.venv/Scripts/python.exe tools/gen_expf_table.py [--check | --scan]   # tr_expf constants from mpmath (src/kernels/expf_table.h)
@@ -55,4 +59,5 @@ tools/.venv/Scripts/python.exe tools/<script>.py    # on Linux/macOS: tools/.ven
 
 Before delivering: `make check` green. `make profile` comes with the profiler hooked to the engine.
 On Windows correctness runs in Docker (`trochilus-dev:local`, `tools/docker/Dockerfile`):
-Smart App Control blocks freshly compiled binaries (LESSONS #12).
+Smart App Control blocks freshly compiled binaries (LESSONS #12); the C tests run natively too, and
+a binary it blocks is reported SKIPPED (LESSONS #103).

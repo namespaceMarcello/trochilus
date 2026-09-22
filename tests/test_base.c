@@ -22,29 +22,25 @@
 #include <string.h>
 
 #if defined(_WIN32)
-#include <direct.h>
 #include <windows.h>
-#else
-#include <sys/stat.h>
-#if defined(__linux__)
+#elif defined(__linux__)
 #include <sched.h>
 #endif
-#endif
 
-static void ensure_dir(const char *path) {
-#if defined(_WIN32)
-    _mkdir(path);
-#else
-    mkdir(path, 0777);
-#endif
+/* Temporary files go next to this binary, as in the other tests: the gcc, clang and ASan builds
+ * of this test then never share a file, and can run at once. */
+static char g_dir[512] = ".";
+
+static const char *tmp_path(char *out, size_t n, const char *name) {
+    snprintf(out, n, "%s/%s", g_dir, name);
+    return out;
 }
 
 /* ---- tr_file ----------------------------------------------------------- */
 
 static void test_file(void) {
-    ensure_dir("build");
-    ensure_dir("build/tests");
-    const char *path = "build/tests/test_base_tmp.bin";
+    char path_buf[600];
+    const char *path = tmp_path(path_buf, sizeof path_buf, "test_base_tmp.bin");
 
     unsigned char data[4096];
     for (size_t i = 0; i < sizeof data; i++) data[i] = (unsigned char)(i * 37u + 11u);
@@ -92,7 +88,7 @@ static void test_file(void) {
 
     /* opening a nonexistent file fails and reports an error */
     err[0] = '\0';
-    tr_file *bad = tr_file_open("build/tests/does_not_exist_xyz.bin", err, sizeof err);
+    tr_file *bad = tr_file_open(tmp_path(path_buf, sizeof path_buf, "does_not_exist_xyz.bin"), err, sizeof err);
     TR_CHECK(bad == NULL);
     TR_CHECK(err[0] != '\0');
     if (bad != NULL) tr_file_close(bad);
@@ -104,9 +100,8 @@ static void test_file(void) {
  * proven with a trial read, not merely a successful open, since some filesystems accept
  * FILE_FLAG_NO_BUFFERING/O_DIRECT at open and then cannot service a read on it. */
 static void test_file_direct(void) {
-    ensure_dir("build");
-    ensure_dir("build/tests");
-    const char *path = "build/tests/test_base_direct.bin";
+    char path_buf[600];
+    const char *path = tmp_path(path_buf, sizeof path_buf, "test_base_direct.bin");
 
     /* not a multiple of TR_FILE_DIRECT_ALIGN: the file's real end falls inside its last aligned
      * sector, exactly the case Step A must tolerate. */
@@ -202,9 +197,8 @@ static void pread_fn(void *ctx_, int64_t begin, int64_t end, int worker) {
 }
 
 static void test_file_concurrent(tr_pool *p) {
-    ensure_dir("build");
-    ensure_dir("build/tests");
-    const char *path = "build/tests/test_base_tmp2.bin";
+    char path_buf[600];
+    const char *path = tmp_path(path_buf, sizeof path_buf, "test_base_tmp2.bin");
 
     unsigned char data[8192];
     for (size_t i = 0; i < sizeof data; i++) data[i] = (unsigned char)(i * 13u + 7u);
@@ -374,6 +368,23 @@ static void test_parallel_null_pool(void) {
     }
     free(count);
     free(worker_id);
+}
+
+/* An empty range runs no body, on a pool or not (a mutation that let n == 0 through lived:
+ * tools/mutate_auto.py, 2026-09-22). */
+static int g_empty_calls;
+static void empty_fn(void *ctx, int64_t begin, int64_t end, int worker) {
+    (void)ctx; (void)begin; (void)end; (void)worker;
+    g_empty_calls++;
+}
+static void test_parallel_empty(tr_pool *p) {
+    g_empty_calls = 0;
+    tr_parallel_for(p, 0, 1, empty_fn, NULL);
+    tr_parallel_for(NULL, 0, 1, empty_fn, NULL);
+    tr_parallel_for(p, -3, 1, empty_fn, NULL);
+    TR_CHECK_EQ_INT(g_empty_calls, 0);
+    tr_parallel_for(p, 1, 0, empty_fn, NULL); /* min_chunk 0 counts as 1: one call */
+    TR_CHECK_EQ_INT(g_empty_calls, 1);
 }
 
 /* Nested parallel_for: outer_fn runs on every outer chunk (one per worker id,
@@ -733,6 +744,11 @@ static void test_cpu(void) {
 }
 
 int main(int argc, char **argv) {
+    if (argc > 0) {
+        const char *sl = strrchr(argv[0], '/'), *bs = strrchr(argv[0], '\\');
+        if (bs != NULL && (sl == NULL || bs > sl)) sl = bs;
+        if (sl != NULL) snprintf(g_dir, sizeof g_dir, "%.*s", (int)(sl - argv[0]), argv[0]);
+    }
 #if defined(__linux__)
     if (argc > 1 && strcmp(argv[1], "--oversubscribed") == 0) return oversubscribed_child();
 #endif
@@ -749,6 +765,7 @@ int main(int argc, char **argv) {
         test_file_concurrent(p);
         test_parallel_coverage(p);
         test_parallel_null_pool();
+        test_parallel_empty(p);
         test_parallel_nested(p);
         test_parallel_repeated(p);
         tr_pool_destroy(p);

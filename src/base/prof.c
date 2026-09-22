@@ -55,6 +55,36 @@ void tr_prof_reset(tr_prof *p) {
 static int tick_mode = -1;          /* global-ok: clock of the machine; -1 unknown, 0 OS clock (ns), 1 RDTSC */
 static double tick_rate = 1e9;      /* global-ok: calibrated once for the machine */
 
+/* Both clocks at one instant: the tick counter on both sides of the OS clock, the narrowest
+ * bracket of 8. A single unbracketed pair took a preemption between its two reads into the rate:
+ * 1 ms of it over the 20 ms window was 5% on every time the profiler printed (LESSONS #108). */
+static void read_pair(const tr_prof_clocks *c, double *sec, double *ticks) {
+    uint64_t best = UINT64_MAX;
+    for (int i = 0; i < 8; i++) {
+        uint64_t a = c->ticks(c->ctx);
+        double s = c->sec(c->ctx);
+        uint64_t b = c->ticks(c->ctx);
+        if (b - a < best) {
+            best = b - a;
+            *sec = s;
+            *ticks = (double)a + (double)(b - a) / 2;
+        }
+    }
+}
+
+double tr_prof_calibrate(const tr_prof_clocks *c, double window_sec) {
+    double s0 = 0, k0 = 0, s1 = 0, k1 = 0;
+    read_pair(c, &s0, &k0);
+    while (c->sec(c->ctx) - s0 < window_sec) {}
+    read_pair(c, &s1, &k1);
+    return (k1 - k0) / (s1 - s0);
+}
+
+#if TR_HAVE_RDTSC
+static uint64_t rdtsc_ticks(void *ctx) { (void)ctx; return __rdtsc(); }
+static double os_sec(void *ctx) { (void)ctx; return tr_time_sec(); }
+#endif
+
 static void tick_init(void) {
     if (tick_mode >= 0) return;
 #if TR_HAVE_RDTSC
@@ -62,12 +92,8 @@ static void tick_init(void) {
     if (__get_cpuid(0x80000000u, &a, &b, &c, &d) && a >= 0x80000007u &&
         __get_cpuid(0x80000007u, &a, &b, &c, &d) && (d & (1u << 8))) {
         /* invariant TSC: calibrate against the OS monotonic clock over ~20 ms */
-        double t0 = tr_time_sec();
-        uint64_t r0 = __rdtsc();
-        double t1;
-        do { t1 = tr_time_sec(); } while (t1 - t0 < 0.02);
-        uint64_t r1 = __rdtsc();
-        tick_rate = (double)(r1 - r0) / (t1 - t0);
+        const tr_prof_clocks clocks = {rdtsc_ticks, os_sec, NULL};
+        tick_rate = tr_prof_calibrate(&clocks, 0.02);
         tick_mode = 1;
         return;
     }

@@ -9,7 +9,7 @@
 #   logits   the same tokens through build/trochilus.exe and through build/linux-gcc/trochilus
 #            in the container, one token a pass, one row of logits per position: the tiny
 #            fixtures (f32, f16, q8_0; 120 positions, their whole context) and the real model
-#            cut to 2 layers (fixtures/olmoe-2layer, skipped when it is not there). Same bytes
+#            cut to 2 layers (models/olmoe-2layer, skipped when it is not there). Same bytes
 #            or not, and if not the first position that differs, the largest difference, the KL.
 #   rope     the RoPE tables of the two platforms (tests/dump_rope.c) entry by entry, and the
 #            first position where they differ: if the table is the only source, no row of logits
@@ -27,7 +27,7 @@ OUT=build/platform_bits
 WIN=build/trochilus.exe
 LIN=build/linux-gcc/trochilus
 PY=tools/.venv/Scripts/python.exe
-REAL=fixtures/olmoe-2layer/model.gguf
+REAL=models/olmoe-2layer/model.gguf
 # DUMP_ROPE=<binary>: a second copy of the tool built elsewhere (make BUILD=build/after2
 # build/after2/tests/dump_rope.exe) when Smart App Control still blocks the first (docs/LESSONS.md #81)
 DUMP=${DUMP_ROPE:-build/tests/dump_rope.exe}

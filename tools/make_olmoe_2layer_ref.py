@@ -24,8 +24,8 @@ Output directory:
 
 Usage:
   tools/.venv/Scripts/python.exe tools/make_olmoe_2layer_ref.py \
-      --gguf fixtures/olmoe-2layer/model.gguf --hf fixtures/olmoe-1b-7b-0125-instruct-tokenizer \
-      --output fixtures/olmoe-2layer
+      --gguf models/olmoe-2layer/model.gguf --hf fixtures/olmoe-1b-7b-0125-instruct-tokenizer \
+      --output models/olmoe-2layer
 """
 from __future__ import annotations
 

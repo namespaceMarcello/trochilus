@@ -35,7 +35,9 @@ endif
 
 ifeq ($(OS),Windows_NT)
 EXE     := .exe
-LDLIBS  := $(EXTRA_LDFLAGS)
+# no link timestamp in the PE header: the same code links to the same bytes, so Smart App Control
+# keeps its verdict on a rebuilt binary instead of blocking a new hash (docs/LESSONS.md #12, #103)
+LDLIBS  := -Wl,--no-insert-timestamp $(EXTRA_LDFLAGS)
 PY      ?= tools/.venv/Scripts/python.exe
 else
 EXE     :=
@@ -54,7 +56,7 @@ ATTN_BIN := $(BUILD)/tests/bench_attn$(EXE)
 EXPF_BIN := $(BUILD)/tests/bench_expf$(EXE)
 DISK_BIN := $(BUILD)/tests/bench_disk$(EXE)
 
-.PHONY: all test oracle tier-check oracle-tokenizer chat-check oracle-real spec-check bench bench-mem bench-attn bench-expf bench-disk lint profile check check-linux clean-machine clean platform-guard
+.PHONY: all test check-gcc check-clang check-asan check-tsan check-tiny check-real oracle tier-check oracle-tokenizer chat-check oracle-real spec-check bench bench-mem bench-attn bench-expf bench-disk lint profile check check-linux clean-machine clean platform-guard
 all: $(BUILD)/trochilus$(EXE)
 
 # Objects of two platforms must never share a BUILD directory: a build in the container with
@@ -84,6 +86,13 @@ $(BUILD)/%.o: %.c Makefile | platform-guard
 $(BUILD)/tests/%$(EXE): tests/%.c $(CORE_OBJ)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $< $(CORE_OBJ) -o $@ $(LDLIBS)
+
+# test_base covers src/base and links only it: its bytes then change only with src/base, and the
+# native run in `make check` is not blocked anew by every change elsewhere (tools/native_tests.sh)
+BASE_OBJ := $(filter $(BUILD)/src/base/%,$(CORE_OBJ))
+$(BUILD)/tests/test_base$(EXE): tests/test_base.c $(BASE_OBJ)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $< $(BASE_OBJ) -o $@ $(LDLIBS)
 
 # test_hot counts the engine's allocator calls by routing them through wrappers (GNU ld and
 # lld --wrap; Apple's linker has none, the test then skips the count).
@@ -191,8 +200,10 @@ chat-check: $(BUILD)/trochilus$(EXE) $(TOKFIX)/tokenizer.json
 # Real OLMoE weights cut to 2 layers (tools/make_olmoe_2layer_gguf.py, tensors copied
 # unchanged from the real Q8_0 file) against transformers on those same weights,
 # dequantized (tools/make_olmoe_2layer_ref.py): an exact-reference oracle that does not
-# depend on the tiny random fixture. Skipped (message, exit 0) without the real model.
-REALFIX := fixtures/olmoe-2layer
+# depend on the tiny random fixture. Skipped (message, exit 0) without the real model. The cut lives
+# beside the real model: in the container that is the models volume, on ext4, where the run under
+# the smallest expert store takes 57 s instead of 306 s over the Windows bind mount (LESSONS #109).
+REALFIX := models/olmoe-2layer
 REAL_MODEL := models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf
 $(REALFIX)/model.gguf: $(REAL_MODEL) tools/make_olmoe_2layer_gguf.py
 	$(PY) tools/make_olmoe_2layer_gguf.py $(REAL_MODEL) $@
@@ -233,6 +244,7 @@ DOCKER_IMG := trochilus-dev:local
 # beside a measurement spoils it: docs/LESSONS.md #84, #57); and a script that is told to stop
 # takes its children with it (tools/cleanup.lib), seen failing without the trap at every run.
 clean-machine:
+	@mkdir -p $(BUILD) && date +%s > $(BUILD)/.check-start
 	sh tools/orphans.sh
 	sh tools/test_cleanup.sh
 ifeq ($(OS),Windows_NT)
@@ -246,30 +258,29 @@ check: clean-machine lint
 	@# give the Docker VM's file cache back to Windows (docs/LESSONS.md #38)
 	MSYS_NO_PATHCONV=1 docker run --rm --privileged $(DOCKER_IMG) sh -c "sync; echo 3 > /proc/sys/vm/drop_caches"
 	sh tools/check_argv_utf8.sh $(BUILD)/trochilus$(EXE) $(TOKFIX)/vocab.gguf
-	@echo "== check passed (native Windows build: 0 warnings; tests, ASan and oracles: Linux)"
+	@# the C tests once more on Windows itself: its branches of src/base never run in the container
+	@# (docs/LESSONS.md #103, #106); a binary Smart App Control blocks is SKIPPED, not failed
+	sh tools/native_tests.sh $(TEST_BIN)
+	@echo "== check passed in $$(( $$(date +%s) - $$(cat $(BUILD)/.check-start) )) s (native Windows build: 0 warnings, C tests natively; tests, ASan and oracles: Linux)"
 else
 check: clean-machine lint check-linux
-	@echo "== check passed"
+	@echo "== check passed in $$(( $$(date +%s) - $$(cat $(BUILD)/.check-start) )) s"
 endif
 
+# The four builds of the C tests own their BUILD directories and share nothing, so they run at
+# once (their tests write next to their own binaries); -Orecurse keeps each one's output in one
+# piece. The steps on the tiny and the real models follow in order: they share build/linux-gcc,
+# and the real model's memory.
+NPROC := $(shell nproc 2>/dev/null || echo 4)
 check-linux:
-	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 test
-	$(MAKE) BUILD=build/linux-clang CC=clang WERROR=1 test
-	$(MAKE) BUILD=build/linux-asan CC=gcc WERROR=1 \
-		EXTRA_CFLAGS="-O1 -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all" \
-		EXTRA_LDFLAGS="-fsanitize=address,undefined" test
-	@# ThreadSanitizer on the pool; setarch -R: TSan cannot map its shadow memory with full ASLR
-	$(MAKE) BUILD=build/linux-tsan CC=gcc WERROR=1 EXTRA_CFLAGS="-O1 -g -fsanitize=thread" \
-		EXTRA_LDFLAGS="-fsanitize=thread" build/linux-tsan/tests/test_base build/linux-tsan/tests/test_hot
-	TSAN_OPTIONS=halt_on_error=1 setarch $$(uname -m) -R build/linux-tsan/tests/test_base
-	TSAN_OPTIONS=halt_on_error=1 setarch $$(uname -m) -R build/linux-tsan/tests/test_hot
-	@# a race shows up once in many runs: the threaded model test runs 20 times
-	@for i in $$(seq 20); do build/linux-gcc/tests/test_hot > /dev/null || exit 1; done; echo "== test_hot 20/20"
-	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 build/linux-gcc/tests/bench_kernels build/linux-gcc/tests/bench_mem \
-		build/linux-gcc/tests/bench_attn build/linux-gcc/tests/bench_disk build/linux-gcc/tests/dump_rope
-	@# tr_expf is the correctly rounded exp on every float, as gcc and as clang compile it (7 s each)
-	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 bench-expf
-	$(MAKE) BUILD=build/linux-clang CC=clang WERROR=1 bench-expf
+	$(MAKE) -j$(NPROC) -Orecurse check-gcc check-clang check-asan check-tsan
+	@# then, on build/linux-gcc: the tiny models and the tokenizer run beside the real model's steps,
+	@# which stay one after the other (each loads the model). What both sides need is made first.
+	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} build/linux-gcc/trochilus \
+		$(FIX)/model-f32.gguf $(FIX)/model-f16.gguf $(FIX)/model-q8_0.gguf $(TOKFIX)/vocab.gguf
+	$(MAKE) -j2 -Orecurse check-tiny check-real
+
+check-tiny:
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle
 	@# the same tiny models again, with a store too small to hold every expert (Esperti M1):
 	@# TR_EXPERT_BUDGET_MIB=min forces the smallest store that can run, so this exercises eviction
@@ -281,10 +292,6 @@ check-linux:
 	@echo "== expert budget min evicts on the tiny model"
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} tier-check
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle-tokenizer
-	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} chat-check
-	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle-real
-	TR_EXPERT_BUDGET_MIB=min $(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle-real
-	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} spec-check
 	$(PY) tools/profile_suite.py --binary build/linux-gcc/trochilus$(EXE) --smoke
 	@# -c is honoured: 6 + 4 tokens fit a context of 16, and do not fit one of 8
 	build/linux-gcc/trochilus generate -m $(FIX)/model-f32.gguf -p 6 -n 4 -c 16 > /dev/null
@@ -294,6 +301,34 @@ check-linux:
 	@# tools/speed_compare.py reads this line)
 	build/linux-gcc/trochilus generate -m $(FIX)/model-f32.gguf -p 6 -n 4 2>&1 >/dev/null | grep -q "generate: 4 tokens, 3 evaluations in"
 	@echo "== speed line ok"
+
+check-real:
+	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} chat-check
+	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle-real
+	TR_EXPERT_BUDGET_MIB=min $(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle-real
+	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} spec-check
+
+check-gcc:
+	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 test
+	@# a race shows up once in many runs: the threaded model test runs 20 times
+	@for i in $$(seq 20); do build/linux-gcc/tests/test_hot > /dev/null || exit 1; done; echo "== test_hot 20/20"
+	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 build/linux-gcc/tests/bench_kernels build/linux-gcc/tests/bench_mem \
+		build/linux-gcc/tests/bench_attn build/linux-gcc/tests/bench_disk build/linux-gcc/tests/dump_rope
+	@# tr_expf is the correctly rounded exp on every float, as gcc and as clang compile it
+	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 bench-expf
+check-clang:
+	$(MAKE) BUILD=build/linux-clang CC=clang WERROR=1 test
+	$(MAKE) BUILD=build/linux-clang CC=clang WERROR=1 bench-expf
+check-asan:
+	$(MAKE) BUILD=build/linux-asan CC=gcc WERROR=1 \
+		EXTRA_CFLAGS="-O1 -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all" \
+		EXTRA_LDFLAGS="-fsanitize=address,undefined" test
+check-tsan:
+	@# ThreadSanitizer on the pool; setarch -R: TSan cannot map its shadow memory with full ASLR
+	$(MAKE) BUILD=build/linux-tsan CC=gcc WERROR=1 EXTRA_CFLAGS="-O1 -g -fsanitize=thread" \
+		EXTRA_LDFLAGS="-fsanitize=thread" build/linux-tsan/tests/test_base build/linux-tsan/tests/test_hot
+	TSAN_OPTIONS=halt_on_error=1 setarch $$(uname -m) -R build/linux-tsan/tests/test_base
+	TSAN_OPTIONS=halt_on_error=1 setarch $$(uname -m) -R build/linux-tsan/tests/test_hot
 
 clean:
 	rm -rf $(BUILD)

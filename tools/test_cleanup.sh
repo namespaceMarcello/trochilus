@@ -49,7 +49,9 @@ remove() {
 }
 # $1: trap | notrap, $2: the count that marks this victim's child
 stop_victim() {
-  sh tools/test_cleanup.sh victim $1 $2 &
+  # not on our stdout: the orphan left by the victim without the trap would hold the pipe of the
+  # $(stop_victim ...) below open, and the gate waited out its whole ping, 96 s (LESSONS #107)
+  sh tools/test_cleanup.sh victim $1 $2 > /dev/null 2>&1 &
   VICTIM=$!
   TRY=0
   while [ "$(alive $2)" = 0 ]; do

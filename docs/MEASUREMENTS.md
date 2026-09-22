@@ -58,8 +58,8 @@ on fast disks (question 43) |
 | 14 | ~~How many bytes per token remain to read from disk with expert cache 25, 50, 75% of model?~~
 **Measured on real engine** (2026-09-20 night, §M1 measured): **3.7 / 1.8 / 0.5 MiB per token**
 right after prompt and **0.9 / 0.2 / — far from prompt** (0.6 / 0.3 / 0.1 and 0.14 / 0.03
-misses). Trace simulation said 348 / 143 / 32 MiB (54.6 / 22.4 / 5.0 units; model beaten by
-measure): answered different question, engine enters decode with LRU filled by prompt, reads
+misses). Trace simulation said 348 / 143 / 32 MiB (54.6 / 22.4 / 5.0 units; model superseded by measurement):
+answered different question, engine enters decode with LRU filled by prompt, reads
 whole model anyway. Strategy comparison holds: static pin-by-use loses to LRU at all capacity |
 second model and prose (mask for use invalid outside domain, question 44) | M1 default: LRU,
 on-demand reads; cost in prompt, not token |
@@ -2107,6 +2107,55 @@ controllo fuori dominio:
     token diversi; col 25%, 94.3% contro 94.2%; KL 6.37 contro 6.35). Gli esperti caldi sul codice
     non sono «i migliori esperti», sono quelli del codice: una cache scaldata su un dominio è un
     guadagno per quel dominio e zero per un altro (domanda 45).
+
+## The gate: where its time goes (2026-09-22)
+
+`make check` on this machine, gate in Docker, one run per configuration: these are wall times that
+size the steps, not medians that compare code. Background: the OpenEMR stack of another window
+running its own tests the whole time (declared, not measured). Logs `build/check-serial.log`,
+`build/check-par.log`, `build/check.log`; tables by `tools/gate_times.py`.
+
+| step | before | after | why |
+|---|---|---|---|
+| `tools/test_cleanup.sh` | 101 s | 5 s | an orphan kept on purpose held the pipe of `$(...)` open (LESSONS #107) |
+| C tests: gcc, clang, ASan, TSan | 56 + 46 + 71 + 42 s, in a row | at once, ~2 min for the four | own BUILD dirs, own temp files (`test_base` wrote to a fixed path) |
+| `oracle-real` under the smallest store | 308 s | 57–73 s | the 2-layer cut read over the 9p bind mount (LESSONS #109) |
+| tokenizer, tiny oracles, tier-check | 39 + 4 + 3 + 14 s, in a row | beside the real model's steps | they share nothing with them but the binary |
+| **whole gate** | **~935 s** (839 s measured with the cleanup already fixed, + 96 s) | **335 s** ("check passed in 335 s"; 423 s with the model steps still in a row) | 2.8× |
+
+The four builds share the processors, so each is slower than alone (ASan 71 → ~100 s): the gain is
+in the overlap, not in any single step. The real model's steps stay in a row: each loads the model,
+and two at once would ask the engine's memory guard for twice the room.
+
+## Generated mutations (2026-09-22)
+
+`tools/mutate_auto.py` swaps operators, drops `± 1`, swaps `return 0` / `return -1`, drops `(!`,
+one at a time, rebuilds, runs the given tests; a mutant whose object file is byte-identical to the
+original (a branch this platform does not compile, or folded by the compiler) is set aside. Linux
+container, `--jobs 14`; `--asan` where a mutant can read out of bounds without crashing.
+
+| file | tests | mutants | killed | survived first | survived now | same object |
+|---|---|---|---|---|---|---|
+| `src/format/gguf.c` (ASan) | `test_gguf` | 221 | 163 (+9 timed out) | 89 | 43 | 6 |
+| `src/memory/experts.c` (ASan) | `test_experts`, `test_stream` | 100 | 87 | 27 (`test_experts` alone) | 9 | 4 |
+| `src/base/threads.c` | `test_base`, `test_hot` | 75 | 35 (+9 timed out) | 33 | 23 | 7 |
+| `src/base/platform.c` | `test_base` | 170 | 9 (+35 timed out) | 77 | 22 | 104 (Windows branches) |
+| `src/base/prof.c` | `test_prof`, `test_model_prof` | 46 | 4 | 42 | 42 | 0 |
+
+What the survivors that are left are, read one by one:
+- `gguf.c`: `return -1` → `0` after a failed read (parsing goes on over the garbage and the file is
+  refused a few bytes later, with another message); boundaries at the limits (a 64 MiB string, 2^28
+  array elements, 2^40 per dimension); the arena's and the hash table's rounding (equivalent);
+  out-of-memory paths.
+- `experts.c`: the out-of-memory paths of `tr_experts_create` (reachable only with an allocator that
+  fails on demand, which the tests do not have).
+- `threads.c`: the spin budget's arithmetic (a different wait, the same result), the pinning of
+  threads beyond the machine's slots, the Win32 branch of thread creation (which the container
+  compiles out: those are the "same object").
+- `platform.c`: the POSIX error paths (`open` or `pread` failing mid-way) and the affinity calls; its
+  Windows half is tested natively since #103, not here.
+- `prof.c`: all in `tr_prof_print`, the report for people; the JSON the tools read is checked.
+  **Open**: pin the printed report too, or declare it outside the tests.
 
 ## Attempts
 

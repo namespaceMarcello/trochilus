@@ -66,17 +66,21 @@ typedef struct arena_block {
 
 typedef struct { arena_block *head; } arena;
 
+/* Data starts past the header rounded up to 16: right after the 24-byte header it would sit at
+ * 8 mod 16 (docs/LESSONS.md #105). 16-byte alignment holds where malloc gives 16. */
+#define ARENA_HDR ((sizeof(arena_block) + 15) & ~(size_t)15)
+
 static void *arena_alloc(arena *a, size_t n) {
     size_t align = 16;
     n = (n + align - 1) & ~(align - 1);
     if (a->head == NULL || a->head->cap - a->head->used < n) {
         size_t cap = n > READ_CHUNK ? n : READ_CHUNK;
-        arena_block *b = malloc(sizeof(arena_block) + cap);
+        arena_block *b = malloc(ARENA_HDR + cap);
         if (b == NULL) return NULL;
         b->next = a->head; b->used = 0; b->cap = cap;
         a->head = b;
     }
-    void *p = (char *)(a->head + 1) + a->head->used;
+    void *p = (char *)a->head + ARENA_HDR + a->head->used;
     a->head->used += n;
     return p;
 }

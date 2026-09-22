@@ -222,6 +222,40 @@ static void test_arithmetic(uint64_t align) {
     TR_CHECK(tr_experts_create(&bad, err, sizeof err) == NULL);
     checked++;
 
+    /* every refusal says why, and one without an error buffer refuses all the same (mutations of
+     * the err != NULL guards and of the shape checks lived: tools/mutate_auto.py, 2026-09-22) */
+    bad = cfg;
+    bad.n_used = 0;
+    err[0] = '\0';
+    TR_CHECK(tr_experts_create(&bad, err, sizeof err) == NULL && strstr(err, "positive") != NULL);
+    bad.part_bytes = bad_part_bytes;
+    bad.n_used = cfg.n_used;
+    err[0] = '\0';
+    TR_CHECK(tr_experts_create(&bad, err, sizeof err) == NULL && strstr(err, "zero bytes") != NULL);
+    TR_CHECK(tr_experts_create(&bad, NULL, 0) == NULL);
+    bad = cfg;
+    bad.budget_bytes = 0;
+    TR_CHECK(tr_experts_create(&bad, NULL, 0) == NULL);
+    tr_experts_free(NULL);
+    checked++;
+
+    /* a part of exactly 64 bytes takes 64 in a buffered slot, not 128 (round up, not past) */
+    size_t exact[TR_EXPERT_PARTS] = {64, 128, 192};
+    TR_CHECK_EQ_INT(tr_experts_slot_bytes(exact, 1, 1), 64 + 128 + 192);
+    TR_CHECK_EQ_INT(tr_experts_slot_bytes(exact, 1, 4096), 3 * (4096 + 4096));
+    checked++;
+
+    /* the store says whether it reads direct */
+    x = tr_experts_create(&cfg, err, sizeof err);
+    TR_CHECK(x != NULL);
+    if (x != NULL) {
+        tr_experts_stats st;
+        tr_experts_get_stats(x, &st);
+        TR_CHECK_EQ_INT(st.direct, align > 1);
+        tr_experts_free(x);
+    }
+    checked++;
+
     TR_CHECK_EQ_INT(f.bad_align, 0);
     TR_CHECK(checked > 0);
 }
@@ -562,6 +596,17 @@ static void test_arg_errors(uint64_t align) {
         int should_be_present = (e == 1 || e == 2 || e == 4);
         TR_CHECK(should_be_present ? unit_ok(x, 0, e, align) : unit_absent(x, 0, e));
     }
+    checked++;
+
+    /* tr_experts_part outside the store: NULL, never a read past its tables. (layer 1, expert 0)
+     * is present first, so a bound that let expert == N_EXPERT through would find that unit
+     * right behind the last expert of layer 0 and return it (tools/mutate_auto.py, 2026-09-22) */
+    int64_t first[1] = {0};
+    TR_CHECK(tr_experts_acquire(x, 1, first, 1) == 0 && tr_experts_part(x, 1, 0, 0) != NULL);
+    TR_CHECK(tr_experts_part(x, 0, 1, 0) != NULL);
+    TR_CHECK(tr_experts_part(x, -1, 1, 0) == NULL && tr_experts_part(x, N_LAYERS, 1, 0) == NULL);
+    TR_CHECK(tr_experts_part(x, 0, -1, 0) == NULL && tr_experts_part(x, 0, N_EXPERT, 0) == NULL);
+    TR_CHECK(tr_experts_part(x, 0, 1, -1) == NULL && tr_experts_part(x, 0, 1, TR_EXPERT_PARTS) == NULL);
     checked++;
 
     TR_CHECK_EQ_INT(f.bad_align, 0);

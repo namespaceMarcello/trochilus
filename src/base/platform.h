@@ -31,8 +31,10 @@ int64_t tr_file_alignment(const tr_file *f);
  * Returns 0 on success, -1 on error or end of file before n bytes -- except on a handle from
  * tr_file_open_direct, where a read whose aligned range runs past the real end of the file still
  * succeeds (the last, partial sector of the file is not an error): bytes past the real end of the
- * file are then left as whatever buf already held. Positional: concurrent calls on the same
- * tr_file are allowed. */
+ * file are then left as whatever buf already held. A direct read that comes back short of a
+ * sector boundary has met that end and the call returns there: asking for the rest from the
+ * unaligned position it stopped at is refused on NTFS (docs/LESSONS.md #103). Positional:
+ * concurrent calls on the same tr_file are allowed. */
 int tr_file_pread(const tr_file *f, void *buf, size_t n, uint64_t offset);
 
 /* Aligned allocation; align is a power of two >= sizeof(void *). Contents are
