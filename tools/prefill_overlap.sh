@@ -23,7 +23,7 @@
 # Same rules as the other native measurements: the containers of the other projects are stopped
 # and started again at the end, a binary Smart App Control blocks is waited for and never rebuilt
 # (TROCHILUS=<binary> to use a second copy, docs/LESSONS.md #12, #81), the machine must be still
-# (AB_GUARD, LEZIONI #73) and stays awake for the duration (LEZIONI #82). About 20 minutes.
+# (AB_GUARD, LESSONS #73) and stays awake for the duration (LESSONS #82). About 20 minutes.
 set -e
 # The body is one function, called on the last line (docs/LESSONS.md #69).
 main() {

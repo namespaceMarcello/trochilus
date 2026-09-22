@@ -18,7 +18,7 @@
 #      "pin1=TR_POOL_PIN=1 build/trochilus.exe generate -m models/x.gguf -p 512 -n 24 -t 16"
 #
 # Round 0 is dropped as warm-up. Prints every run, then per mode and phase: median, min, max,
-# spread and the ratio to the first mode. Native runs on a still machine only (LEZIONI #47, #57).
+# spread and the ratio to the first mode. Native runs on a still machine only (LESSONS #47, #57).
 #
 # AB_GUARD, when set, is a shell command run before every run: if it fails the machine is no
 # longer the one the comparison started on, and the comparison stops there instead of mixing

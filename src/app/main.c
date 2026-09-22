@@ -544,7 +544,7 @@ static int cmd_generate(int argc, char **argv) {
     print_experts(model);
 
     if (do_profile) tr_prof_print(prof, stderr);
-    /* fewer tokens than asked is a failure, not a success with short output (LEZIONI #17) */
+    /* fewer tokens than asked is a failure, not a success with short output (LESSONS #17) */
     int rc = context_full ? 3 : 0;
     if (profile_json_path != NULL &&
         write_profile_json(profile_json_path, prof, model_path, n_prompt, produced, tr_pool_size(pool),
@@ -1401,7 +1401,7 @@ static int real_main(int argc, char **argv) {
 
 #ifdef _WIN32
 /* Windows hands main() its arguments in the local code page, so a prompt or path with
- * accents arrives mangled (LEZIONI #13): take them as UTF-16 and convert. Linked with
+ * accents arrives mangled (LESSONS #13): take them as UTF-16 and convert. Linked with
  * -municode (MinGW) so that wmain is the entry point. */
 int wmain(int argc, wchar_t **wargv) {
     char **argv = tr_utf8_argv(argc, wargv);

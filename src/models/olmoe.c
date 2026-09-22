@@ -840,7 +840,7 @@ static void clamp_inplace(float *x, int64_t n, float c) {
 }
 
 /* Bytes of a matmul weight actually touched for one token: every output row,
- * each row_bytes(type, cols) long (docs/ARCHITECTURE.md §Profilazione). */
+ * each row_bytes(type, cols) long (docs/ARCHITECTURE.md §Profiling). */
 static uint64_t mat_bytes(const tr_mat *w) {
     return (uint64_t)w->rows * (uint64_t)tr_row_bytes(w->type, w->cols);
 }

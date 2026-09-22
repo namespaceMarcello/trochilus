@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// LEZIONI #14: testo con barre rovesciate scritto da un comando di shell (heredoc Python, echo,
+// LESSONS #14: testo con barre rovesciate scritto da un comando di shell (heredoc Python, echo,
 // printf) arriva corrotto: le sequenze diventano tab, a capo o spariscono. Successo quattro volte.
 // Rifiuta un comando Bash che scrive file da Python o shell e contiene una barra rovesciata
 // seguita da una lettera di escape: quel testo va scritto con gli strumenti Write/Edit.

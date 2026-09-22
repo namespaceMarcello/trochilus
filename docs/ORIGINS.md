@@ -1,123 +1,123 @@
-# Origini del codice
+# Code origins
 
-Registro di ogni file portato da colibri o ds4. Serve a due cose: rispettare le licenze
-(Apache-2.0 chiede di dire cosa è cambiato) e sapere da dove riportare i miglioramenti futuri.
-Si aggiorna nello stesso commit che porta il codice.
+Record of every file ported from colibri or ds4. It serves two purposes: respect licenses
+(Apache-2.0 asks to say what changed) and know where to report improvements later.
+Updated in the same commit that brings the code.
 
-## Riferimenti fissati
+## Fixed references
 
-| Progetto | Licenza | Commit | Worktree locale | Clone d'origine |
+| Project | License | Commit | Local worktree | Origin clone |
 |---|---|---|---|---|
 | colibri (`JustVugg/colibri`, branch `dev`) | Apache-2.0 | `a90bed9` (2026-09-17) | `ref/colibri` | `Desktop\colibri` |
-| ds4 (`antirez/ds4`, branch `main`) | MIT (contiene codice ggml, MIT) | `8db1d1d` (2026-09-16) | `ref/ds4` | `Desktop\ds4` |
-| llama.cpp (`ggml-org/llama.cpp`, `master`) — riferimento di confronto e fonte di idee, nessun codice portato | MIT | `b49650a` (2026-09-17) | `ref/llama.cpp` (clone superficiale; build in `build-trochilus/` con `tools/build_llamacpp.sh`) | — |
+| ds4 (`antirez/ds4`, branch `main`) | MIT (contains ggml code, MIT) | `8db1d1d` (2026-09-16) | `ref/ds4` | `Desktop\ds4` |
+| llama.cpp (`ggml-org/llama.cpp`, `master`) — reference for comparison and source of ideas, no code ported | MIT | `b49650a` (2026-09-17) | `ref/llama.cpp` (shallow clone; build in `build-trochilus/` with `tools/build_llamacpp.sh`) | — |
 
-Per spostare un riferimento: `git -C <clone> fetch`, poi `git -C ref/<progetto> checkout --detach <commit>`,
-e si aggiorna la tabella. I file già portati restano legati al commit scritto nella loro riga.
+To move a reference: `git -C <clone> fetch`, then `git -C ref/<project> checkout --detach <commit>`,
+and update the table. Files already ported remain tied to the commit written in their row.
 
-## Intestazione obbligatoria di un file derivato
+## Mandatory header of a derived file
 
 ```c
-/* <nome file> — <cosa fa>.
- * Derived from <colibri|ds4> <commit> <percorso> (<licenza>), modified: <cosa è cambiato, una riga>. */
+/* <filename> — <what it does>.
+ * Derived from <colibri|ds4> <commit> <path> (<license>), modified: <what changed, one line>. */
 ```
 
-## File portati
+## Ported files
 
-| File Trochilus | Da | Commit | Percorso d'origine | Cosa è cambiato |
+| Trochilus file | From | Commit | Origin path | What changed |
 |---|---|---|---|---|
-| `src/format/gguf.c` (solo la tabella dei tipi) | ds4 | `8db1d1d` | `ds4.c` `gguf_types[]` | aggiunti tq1_0/tq2_0, iq4_nl corretto a blocco da 32 × 18 byte; il parser è nuovo |
-| `tools/make_tiny_olmoe.py` | colibri | `a90bed9` | `c/tools/make_olmoe_tiny.py` | GQA 4/2, 16 token, logit di riferimento per ogni posizione |
+| `src/format/gguf.c` (type table only) | ds4 | `8db1d1d` | `ds4.c` `gguf_types[]` | added tq1_0/tq2_0, iq4_nl fixed to 32 × 18 byte blocks; parser is new |
+| `tools/make_tiny_olmoe.py` | colibri | `a90bed9` | `c/tools/make_olmoe_tiny.py` | GQA 4/2, 16 tokens, logit reference per position |
 
-## Idee prese senza codice
+## Ideas taken without code
 
-Non richiedono attribuzione, si registrano per sapere dove guardare quando si migliora quel pezzo.
+Do not require attribution, recorded to know where to look when that piece improves.
 
-| Idea | Da | Dove l'origine | In Trochilus |
+| Idea | From | Where in origin | In Trochilus |
 |---|---|---|---|
-| pool di thread persistente, niente OpenMP | ds4 | `ds4.c` `ds4_parallel_for` | `src/base/threads.c` |
-| thread sui core fisici, non logici | colibri | `c/omp_tune.h` | `tr_pool_create(0)` |
-| ogni thread del pool fissato a un processore logico suo | llama.cpp (le due chiamate di sistema, e l'idea di una maschera per thread di `--cpu-strict`) | `ggml-cpu.c` `ggml_thread_apply_affinity`, `ggml_thread_cpumask_next` | `src/base/platform.c` `tr_thread_pin`, ordine degli slot in `src/base/cpu.c`, pin nel pool in `src/base/threads.c` |
-| pesi con `pread` invece di `mmap` | colibri | `c/st.h` (commento sul bug RSS) | `src/base/platform.h` |
-| oracolo su modelli minuscoli generati | colibri | `c/tools/make_*_tiny.py`, job CI | `tools/`, `make oracle` |
-| tokenizer letto dai metadati GGUF, merge "a b" come chiave del rango | ds4 | `ds4.c` `vocab_load`, `bpe_rank` | `src/tokenizer/tokenizer.c` (il merge diventa coppia di id → rango e risultato) |
-| pretokenizer che rigioca la regex in C sui codepoint; classi Unicode da tabelle generate | colibri | `c/tok.h` `pretok_chunk`, `c/tok_unicode.h` | `src/tokenizer/tokenizer.c` `split_gpt2`, `tools/gen_unicode_tables.py` (tabelle sondate su HF, non su Python) |
-| prompt in passate da al più 512 token | llama.cpp | `common/common.h` `n_ubatch` | `olmoe.c` `OLMOE_DEFAULT_BATCH`, `-b` |
-| coppie (token, esperto) ordinate per esperto con un counting sort, un lavoro per esperto | ds4 (llama.cpp con una mappa di indici) | `ds4.c` `layer_routed_moe_batch`; `ggml-cpu.c` `ggml_compute_forward_mul_mat_id` | `olmoe.c` `forward_pass`, `tr_matmul_grouped` |
-| una riga di pesi contro un blocco di token, invece di tutta la matrice per ogni token | llama.cpp (blocchi 16 × 16), ds4 e colibri (riga × tutti i token) | `ggml-cpu.c` `..._mul_mat_id_one_chunk`; `ds4.c` `matmul_q8_0_batch_worker`; `c/olmoe.c` `matmul` | `kernels.c` `matmul_tiled` (blocchi di `TR_MATMUL_TILE` token) |
-| una riga di pesi contro più token nei registri (2 in ds4, 4 in Trochilus): un solo carico e una sola conversione per tutti | ds4 | `ds4.c` `dot_q8_0_row_2` | `kernels.c` `k_dot_row_x4_q8_0`, `kernels_x86.c` `avx512_dot_row_x4_q8_0` |
-| K e V del lotto scritti tutti, poi attenzione in parallelo per (testa, token) | colibri (ds4 in opzione) | `c/olmoe.c` `attention`; `ds4.c` `layer_attention_prefix_batch` | `olmoe.c` `attn_body` |
-| logit solo dell'ultimo token del prompt | tutte e tre | `c/olmoe.c` `step`; `ds4.c` `output_logits_one` | `olmoe_eval` |
-| bozza dal testo già nel prompt: cerca all'indietro l'ultima occorrenza dell'n-gramma di coda e propone ciò che la seguiva | colibri (scansione esatta, senza cache), llama.cpp (cache di n-grammi con conteggi) | `c/deepseek_v4.c` `v4_ngram_draft`; `common/ngram-cache.cpp` `common_ngram_cache_draft` | `src/gen/lookup.c` `tr_lookup_draft` (codice nuovo) |
-| verifica di 1 + k posizioni in una passata sola, accetta finché il token proposto è quello che il modello avrebbe scelto | tutte e tre | `examples/lookup/lookup.cpp`; `ds4.c` `metal_graph_verify_decode2_exact`; `c/deepseek_v4.c` (ciclo di accettazione) | `src/gen/greedy.c` `tr_greedy_step` |
-| annullare la bozza rifiutata troncando l'indice della cache | llama.cpp (ds4 e colibri non possono: attenzione ricorrente, devono ripristinare un'istantanea) | `llama_memory_seq_rm` | `tr_session_rewind` (`s->pos = n`) |
+| persistent thread pool, no OpenMP | ds4 | `ds4.c` `ds4_parallel_for` | `src/base/threads.c` |
+| threads on physical cores, not logical | colibri | `c/omp_tune.h` | `tr_pool_create(0)` |
+| each thread of the pool pinned to its own logical processor | llama.cpp (the two system calls, and the idea of a per-thread mask for `--cpu-strict`) | `ggml-cpu.c` `ggml_thread_apply_affinity`, `ggml_thread_cpumask_next` | `src/base/platform.c` `tr_thread_pin`, slot order in `src/base/cpu.c`, pinning in pool in `src/base/threads.c` |
+| weights with `pread` instead of `mmap` | colibri | `c/st.h` (comment on RSS bug) | `src/base/platform.h` |
+| oracle on tiny generated models | colibri | `c/tools/make_*_tiny.py`, CI job | `tools/`, `make oracle` |
+| tokenizer read from GGUF metadata, "a b" merge as rank key | ds4 | `ds4.c` `vocab_load`, `bpe_rank` | `src/tokenizer/tokenizer.c` (merge becomes id pair → rank and result) |
+| pretokenizer replays regex in C on codepoints; Unicode classes from generated tables | colibri | `c/tok.h` `pretok_chunk`, `c/tok_unicode.h` | `src/tokenizer/tokenizer.c` `split_gpt2`, `tools/gen_unicode_tables.py` (tables probed on HF, not Python) |
+| prompt in passes of at most 512 tokens | llama.cpp | `common/common.h` `n_ubatch` | `olmoe.c` `OLMOE_DEFAULT_BATCH`, `-b` |
+| (token, expert) pairs ordered by expert with a counting sort, one job per expert | ds4 (llama.cpp with an index map) | `ds4.c` `layer_routed_moe_batch`; `ggml-cpu.c` `ggml_compute_forward_mul_mat_id` | `olmoe.c` `forward_pass`, `tr_matmul_grouped` |
+| one weight row against a token block, instead of whole matrix per token | llama.cpp (16 × 16 blocks), ds4 and colibri (row × all tokens) | `ggml-cpu.c` `..._mul_mat_id_one_chunk`; `ds4.c` `matmul_q8_0_batch_worker`; `c/olmoe.c` `matmul` | `kernels.c` `matmul_tiled` (blocks of `TR_MATMUL_TILE` tokens) |
+| one weight row against many tokens in registers (2 in ds4, 4 in Trochilus): one load and one conversion only for all | ds4 | `ds4.c` `dot_q8_0_row_2` | `kernels.c` `k_dot_row_x4_q8_0`, `kernels_x86.c` `avx512_dot_row_x4_q8_0` |
+| K and V of batch written all, then attention in parallel for (head, token) | colibri (ds4 optional) | `c/olmoe.c` `attention`; `ds4.c` `layer_attention_prefix_batch` | `olmoe.c` `attn_body` |
+| logit only of the last token of the prompt | all three | `c/olmoe.c` `step`; `ds4.c` `output_logits_one` | `olmoe_eval` |
+| draft from text already in prompt: search backward for the last occurrence of the tail n-gram and propose what followed | colibri (exact scan, no cache), llama.cpp (n-gram cache with counts) | `c/deepseek_v4.c` `v4_ngram_draft`; `common/ngram-cache.cpp` `common_ngram_cache_draft` | `src/gen/lookup.c` `tr_lookup_draft` (new code) |
+| verify 1 + k positions in one pass, accept while the proposed token is what the model would choose | all three | `examples/lookup/lookup.cpp`; `ds4.c` `metal_graph_verify_decode2_exact`; `c/deepseek_v4.c` (acceptance loop) | `src/gen/greedy.c` `tr_greedy_step` |
+| undo rejected draft by truncating cache index | llama.cpp (ds4 and colibri cannot: recurrent attention, must restore snapshot) | `llama_memory_seq_rm` | `tr_session_rewind` (`s->pos = n`) |
 
-### Prefill a blocchi: le tre fonti (2026-09-17)
+### Prefill in blocks: three sources (2026-09-17)
 
 | | llama.cpp `b49650a` | ds4 `8db1d1d` | colibri `a90bed9` |
 |---|---|---|---|
-| spezzatura del prompt | `n_ubatch` 512 | nessuna su CPU: tutto il prompt; FFN a sotto-lotti da 128 (`DS4_PREFILL_BATCH`) | tutto il prompt in `step()` |
-| proiezioni | sgemm, attivazioni Q8_0 | riga di pesi × token a coppie, attivazioni Q8_0 | riga di pesi × token, float |
-| MoE | righe per esperto con mappa di indici, blocchi 16 × 16, dot Q8 × Q8 | counting sort per esperto; gate e up con una sola quantizzazione; down e somma per riga, esperti in ordine di id | nessun raggruppamento: token per token |
-| attenzione | flash attention o matrice con maschera | scrittura KV seriale, poi attenzione per token (in opzione per testa e token) | K e V tutti, poi (testa, token) in parallelo |
-| esattezza contro un token per passata | no (attivazioni int8) | no, nessun test | non dichiarata né provata |
+| prompt split | `n_ubatch` 512 | none on CPU: whole prompt; FFN in sub-batches of 128 (`DS4_PREFILL_BATCH`) | whole prompt in `step()` |
+| projections | sgemm, Q8_0 activations | weight row × tokens pairwise, Q8_0 activations | weight row × tokens, float |
+| MoE | rows per expert with index map, 16 × 16 blocks, dot Q8 × Q8 | counting sort per expert; gate and up with one quantization only; down and sum per row, experts in id order | no grouping: token by token |
+| attention | flash attention or matrix with mask | serial KV write, then attention per token (optional per head and token) | all K and V, then (head, token) in parallel |
+| exactness against one token per pass | no (int8 activations) | no, no test | not declared or proved |
 
-Non preso: le attivazioni int8 (non esatte: leva 2, opzione a parte) e la somma di ds4 per riga su
-tutti gli esperti, che a ogni riga di pesi rilegge le attivazioni intermedie di tutto il lotto (con 512
-token ~16 MB per riga): Trochilus tiene l'ordine per esperto a blocchi di token, e somma per token.
+Not taken: int8 activations (not exact: lever 2, separate option) and ds4's per-row sum over all
+experts, which rereads intermediate activations of the whole batch at every weight row (with 512
+tokens ~16 MB per row): Trochilus keeps expert order in token blocks, and sums per token.
 
-### Collocamento dei thread: le tre fonti (2026-09-17)
+### Thread placement: three sources (2026-09-17)
 
 | | llama.cpp | colibri | ds4 |
 |---|---|---|---|
-| quanti thread | `logici / 2`, o i core fisici dove il conteggio Windows è compilato (escluso su MinGW-w64, UPSTREAM #4) | core fisici contati davvero (`GetLogicalProcessorInformationEx`, `thread_siblings_list`, `hw.perflevel0`), e mai indovinati | `omp_get_max_threads()` |
-| dove vanno | in nessun posto: senza `--cpu-mask` non chiama l'affinità | `OMP_PROC_BIND=close` passato a libgomp, solo Linux, con un re-exec del processo | niente |
-| chi decide la maschera | l'utente, a mano (`--cpu-mask`, `--cpu-strict` = un processore per thread) | libgomp | — |
-| oltre 64 processori | non ci arriva (`SetThreadAffinityMask`, UPSTREAM #3) | dipende da libgomp | — |
+| how many threads | `logical / 2`, or physical cores where Windows count is compiled (excluded on MinGW-w64, UPSTREAM #4) | physical cores counted truly (`GetLogicalProcessorInformationEx`, `thread_siblings_list`, `hw.perflevel0`), never guessed | `omp_get_max_threads()` |
+| where they go | nowhere: without `--cpu-mask` does not call affinity | `OMP_PROC_BIND=close` passed to libgomp, Linux only, with process re-exec | nothing |
+| who decides the mask | the user, by hand (`--cpu-mask`, `--cpu-strict` = one processor per thread) | libgomp | — |
+| beyond 64 processors | does not reach (`SetThreadAffinityMask`, UPSTREAM #3) | depends on libgomp | — |
 
-Preso: le due chiamate di sistema (Windows e Linux) e l'idea di `--cpu-strict`, cioè una maschera
-da un processore solo per ogni thread invece di una maschera comune. Non preso: la maschera scritta
-a mano dall'utente (qui la topologia la conta il motore), `OMP_PROC_BIND` con il re-exec (nessun
-OpenMP, e le variabili d'ambiente lette dentro il motore sono un anti-pattern di colibri), e
-`SetThreadAffinityMask` (sostituito da `SetThreadGroupAffinity`, che arriva a ogni gruppo).
-Nuovo qui: l'**ordine** degli slot (un thread per core fisico prima di ogni fratello SMT, e i core
-presi a giro sulle cache di ultimo livello, perché 4+4 sui due chiplet batte 8 sullo stesso), il
-rispetto di una maschera già imposta al processo (`taskset`, `start /affinity`), il ripristino
-dell'affinità del chiamante quando il pool muore, e un test che **chiede al sistema operativo** su
-quale processore ha girato ogni chunk (`tests/test_base.c`): nessuna delle tre fonti lo verifica.
+Taken: the two system calls (Windows and Linux) and the idea of `--cpu-strict`, that is, a mask
+of one processor only per thread instead of a common mask. Not taken: the mask written by hand
+by the user (here the topology is counted by the engine), `OMP_PROC_BIND` with re-exec (no
+OpenMP, and environment variables read inside the engine are anti-pattern from colibri), and
+`SetThreadAffinityMask` (replaced by `SetThreadGroupAffinity`, which reaches every group).
+New here: the **order** of slots (one thread per physical core before any SMT sibling, and cores
+taken in rotation across last-level caches, because 4+4 on two chiplets beats 8 on one), respect
+of a mask already set on the process (`taskset`, `start /affinity`), restore of caller's affinity
+when the pool dies, and a test that **asks the operating system** which processor ran each chunk
+(`tests/test_base.c`): none of the three sources verify this.
 
-### Speculazione sul prompt: le tre fonti (2026-09-17)
+### Speculation from prompt: three sources (2026-09-17)
 
 | | llama.cpp | ds4 | colibri |
 |---|---|---|---|
-| da dove viene la bozza | tre cache di n-grammi (contesto, sessione precedente, corpus), n da 4 a 1, voto `conteggio × conteggio nel corpus` | nessun prompt lookup: DSpark e MTP, cioè teste addestrate (`docs/SPECULATIVE_DECODING.md`) | `v4_ngram_draft`: n-gramma 3 poi 2, scansione all'indietro, occorrenza più recente |
-| verifica | una `llama_decode` sul lotto della bozza, logit a ogni posizione | 2-3 righe per passata, `row0_top == draft1` | ciclo `predictions[i] == drafts[i]` |
-| annullare un rifiuto | troncamento della cache per indice | scambio di buffer con un'istantanea (stato ricorrente) | `spec_attention_restore` e riesecuzione del prefisso (misurata così cara da disattivare MTP) |
-| token identici alla generazione senza speculazione | algebricamente sì, bit a bit **non dichiarato** (il lotto può sommare in un altro ordine) | dichiarato **non** identico al bit sulle continuazioni lunghe | non dichiarato |
+| where the draft comes from | three n-gram caches (context, previous session, corpus), n from 4 to 1, vote `count × corpus count` | no prompt lookup: DSpark and MTP, that is, trained heads (`docs/SPECULATIVE_DECODING.md`) | `v4_ngram_draft`: 3-gram then 2-gram, backward scan, most recent occurrence |
+| verify | one `llama_decode` on draft batch, logits at each position | 2–3 rows per pass, `row0_top == draft1` | loop `predictions[i] == drafts[i]` |
+| undo a rejection | cache truncation by index | buffer swap with snapshot (recurrent state) | `spec_attention_restore` and prefix re-execution (measured so costly it was disabled for MTP) |
+| tokens identical to generation without speculation | algebraically yes, bit by bit **not declared** (batch may sum in another order) | declared **not** identical to bit on long continuations | not declared |
 
-Preso: l'idea della bozza dal contesto (colibri, la più semplice: nessuno stato) e la verifica in una
-passata sola con i logit di ogni posizione (tutte e tre). Non preso: le cache con conteggi di
-llama.cpp (allocazioni e stato, da valutare solo se le misure lo chiedono), le teste addestrate
-(DSpark, MTP, EAGLE3: sono altri modelli), il campionamento «opportunistico» di ds4. Il ripristino per
-istantanea non serve: la nostra cache è indicizzata per posizione, si torna indietro con `s->pos = n`.
-In più, qui i token sono **identici al bit**, perché ogni riga del lotto è lo stesso calcolo della
-passata da un token (`tests/test_prefill.c`, `tests/test_spec.c`): nessuna delle tre fonti lo prova.
+Taken: the idea of draft from context (colibri, simplest: no state) and verify in one pass with
+logits at each position (all three). Not taken: llama.cpp's caches with counts (allocations and
+state, to evaluate only if measurements ask), trained heads (DSpark, MTP, EAGLE3: other models),
+ds4's "opportunistic" sampling. Restore by snapshot is not needed: our cache is indexed per
+position, we go back with `s->pos = n`. Plus, here tokens are **byte-identical**, because each
+row of the batch is the same computation as the one-token pass (`tests/test_prefill.c`,
+`tests/test_spec.c`): none of the three sources prove this.
 
 
-### L'archivio degli esperti: cosa si è preso da colibri e cosa no (2026-09-20)
+### Expert store: what was taken from colibri and what was not (2026-09-20)
 
-`src/memory/experts.{h,c}` è codice nuovo (nessuna riga portata), scritto dopo aver letto
-`ref/colibri/c/olmoe.c` (`LCache`, `Slot`, `expert_get`, `pilot_worker`) e con le misure delle
-domande 13-16 davanti (`docs/MEASUREMENTS.md` §M1). Tre difetti trovati in quella lettura stanno in
-`docs/UPSTREAM.md` #7-#9.
+`src/memory/experts.{h,c}` is new code (no line ported), written after reading
+`ref/colibri/c/olmoe.c` (`LCache`, `Slot`, `expert_get`, `pilot_worker`) and with measurements
+of questions 13–16 in front (`docs/MEASUREMENTS.md` §M1). Three bugs found in that reading are in
+`docs/UPSTREAM.md` #7–#9.
 
-| Scelta | colibri | Trochilus | Perché |
+| Choice | colibri | Trochilus | Why |
 |---|---|---|---|
-| trovare un esperto in cache | array `slot_by_expert[eid]`, O(1) (`olmoe.c:158`) | `slot_of[unit]`, O(1), unità = (layer, esperto) | preso: è la cosa giusta |
-| un esperto in memoria | un solo blocco per le tre matrici (`load_expert_merged`, `olmoe.c:636`) | uno slot per unità, le tre parti allineate a 64 dentro lo slot | preso a metà: nel nostro GGUF i tre tensori sono separati, quindi le tre parti si leggono comunque con tre `pread` (lettura unica impossibile senza un formato nostro, escluso il 2026-09-17) |
-| scegliere chi sfrattare | scansione lineare di tutti gli slot a ogni mancato, O(capacità) (`olmoe.c:696`) | lista doppiamente concatenata, O(1) | rifiutato: peggiora al crescere del budget, ed è proprio il caso che ci interessa |
-| tenere in RAM gli esperti più usati (pin) | `pin_hot_experts` dopo 5 token, con una via di fuga se tutti gli slot sono bloccati (`olmoe.c:745`) | niente pin: solo LRU | rifiutato **coi numeri**: sulla traccia del routing il pin dall'uso legge di più dell'LRU a ogni capacità (al 75%: 94 contro 32 MiB per token, domanda 14) |
-| precaricare gli esperti del layer dopo | un thread dedicato, previsione con un mini-matmul del router più una media mobile (`PILOT`, `olmoe.c:1110`) | niente, per ora | rifiutato **coi numeri**: la previsione è buona (92-95%, domanda 13) ma su un disco da 1.5 GB/s ogni candidato sbagliato è una lettura e il totale letto peggiora (domanda 43) |
-| thread di I/O | uno, solo per il precaricamento | nessuno: la lettura è sul thread che chiama | il disco dà la stessa banda a 1 e a 8 lettori (domanda 16): un thread servirebbe solo a sovrapporre, e senza precaricamento non c'è niente da sovrapporre |
-| un errore di lettura | `exit(1)` dentro `st_pread_full` (`st.h:268`), anche per un precaricamento facoltativo | la valutazione torna -1 e la sessione resta com'era | un motore in una libreria non può chiudere il processo |
-| da dove si legge | formato proprio convertito (`model-*.safetensors`, `st.h`) | il GGUF standard, alle posizioni dei tensori | decisione del 2026-09-17: i file di Hugging Face si aprono senza conversione |
+| find an expert in cache | array `slot_by_expert[eid]`, O(1) (`olmoe.c:158`) | `slot_of[unit]`, O(1), unit = (layer, expert) | taken: the right thing |
+| one expert in memory | one block for three matrices (`load_expert_merged`, `olmoe.c:636`) | one slot per unit, three parts aligned to 64 inside the slot | taken halfway: in our GGUF the three tensors are separate, so three parts are still read with three `pread` (single read impossible without our format, excluded 2026-09-17) |
+| choose who to evict | linear scan of all slots on every miss, O(capacity) (`olmoe.c:696`) | doubly-linked list, O(1) | rejected: worsens as budget grows, the very case we care about |
+| keep in RAM the most-used experts (pin) | `pin_hot_experts` after 5 tokens, with escape if all slots blocked (`olmoe.c:745`) | no pin: LRU only | rejected **by numbers**: on routing trace pin from use reads more than LRU at every capacity (at 75%: 94 vs 32 MiB per token, question 14) |
+| preload experts of the next layer | one thread, prediction with mini-matmul of router plus moving average (`PILOT`, `olmoe.c:1110`) | none, for now | rejected **by numbers**: prediction is good (92–95%, question 13) but on a 1.5 GB/s disk every wrong candidate is a read and total read regresses (question 43) |
+| I/O thread | one, preload only | none: read on calling thread | disk gives same bandwidth to 1 and 8 readers (question 16): a thread would serve only to overlap, and without preloading there is nothing to overlap |
+| a read error | `exit(1)` inside `st_pread_full` (`st.h:268`), even for optional preload | eval returns -1 and session stays as it was | an engine in a library cannot close the process |
+| where to read from | own format converted (`model-*.safetensors`, `st.h`) | standard GGUF, at tensor positions | decision 2026-09-17: Hugging Face files open without conversion |

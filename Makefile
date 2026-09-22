@@ -137,7 +137,7 @@ bench-expf: $(EXPF_BIN)
 	./$(EXPF_BIN) $(EXPF_CHECK)
 
 # Scenarios with the engine profiler (bench/scenarios.json), compared with the
-# previous run on this machine. See docs/ARCHITECTURE.md §Profilazione.
+# previous run on this machine. See docs/ARCHITECTURE.md §Profiling.
 # SCENARIOS=bench/scenarios-olmoe-1b-7b.json for the real model (skipped if not downloaded)
 SCENARIOS ?= bench/scenarios.json
 profile: $(BUILD)/trochilus$(EXE)

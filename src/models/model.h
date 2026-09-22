@@ -98,7 +98,7 @@ int64_t tr_session_max_logit_rows(const tr_session *s);
  * position n exactly as if only those n tokens had been evaluated. The logits are
  * not valid again until the next eval. -1 if n is out of range (nothing changes). */
 int tr_session_rewind(tr_session *s, int64_t n);
-/* The session's own profiler (docs/ARCHITECTURE.md §Profilazione), disabled by
+/* The session's own profiler (docs/ARCHITECTURE.md §Profiling), disabled by
  * default: set ->enabled and ->phase to turn it on. Never NULL. */
 tr_prof *tr_session_prof(tr_session *s);
 

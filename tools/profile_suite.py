@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""profile_suite.py — scenario profiling suite (docs/ARCHITECTURE.md §Profilazione).
+"""profile_suite.py — scenario profiling suite (docs/ARCHITECTURE.md §Profiling).
 
 Runs `trochilus generate -p <prompt_tokens> -n <gen_tokens> --profile-json <tmp>`
 for each scenario in bench/scenarios.json, several times (median + spread), and
@@ -30,7 +30,7 @@ from datetime import datetime
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SAFETY_TIMEOUT_S = 60          # docs/ARCHITECTURE.md: at most 60 s per scenario run
 SAC_RETRY_INTERVAL_S = 15
-SAC_RETRY_BUDGET_S = 5 * 60    # Windows Smart App Control can block a fresh binary (LEZIONI #12)
+SAC_RETRY_BUDGET_S = 5 * 60    # Windows Smart App Control can block a fresh binary (LESSONS #12)
 
 
 def default_binary():
@@ -49,7 +49,7 @@ def parse_tokens_line(stdout):
 
 
 def launch(binary, args):
-    """Runs `binary args`, retrying on a permission error (LEZIONI #12: Windows
+    """Runs `binary args`, retrying on a permission error (LESSONS #12: Windows
     Smart App Control blocks a freshly built .exe for minutes) every 15 s for up
     to 5 minutes, then gives up. A run over SAFETY_TIMEOUT_S is a hard failure."""
     if not os.path.isfile(binary):
@@ -322,7 +322,7 @@ def main():
     args = ap.parse_args()
 
     # os.path.abspath: on Windows, CreateProcess does not reliably resolve a
-    # relative forward-slash path even from the right cwd (LEZIONI #15).
+    # relative forward-slash path even from the right cwd (LESSONS #15).
     binary = os.path.abspath(args.binary or default_binary())
     scenarios_path = args.scenarios or os.path.join(ROOT, "bench", "scenarios.json")
     with open(scenarios_path, encoding="utf-8") as f:

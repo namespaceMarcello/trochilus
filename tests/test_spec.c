@@ -245,7 +245,7 @@ static void test_adaptive_grows_on_repeat(tr_model *model, const int32_t *prompt
 /* The pause after a draft where nothing was accepted: that step must be followed by steps that
  * draft nothing at all (a wrong draft costs more than half a pass, docs/MEASUREMENTS.md). Checked on
  * every step of a real run, and the test fails if no such rejection ever happened, so it cannot
- * pass for the wrong reason (LEZIONI #43, #50, #55). */
+ * pass for the wrong reason (LESSONS #43, #50, #55). */
 static int64_t test_adaptive_pauses_after_a_wrong_draft(tr_model *model, const int32_t *prompt) {
     tr_session *s = tr_session_create(model, ADAPT_CTX, 64, NULL, 0);
     TR_CHECK(s != NULL);

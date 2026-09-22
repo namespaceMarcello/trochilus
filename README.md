@@ -189,7 +189,7 @@ only for conversion and for the oracles; the engine itself never needs them.
 
 ## Documents
 
-The engineering log lives in `docs/`, in Italian:
+The engineering log lives in `docs/`:
 
 | Document | Content |
 |---|---|

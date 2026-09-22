@@ -1,6 +1,6 @@
 #!/bin/sh
 # experts_budget.sh — what M1 costs: the engine's speed with 25, 50, 75 and 100% of the experts in
-# RAM, the rest read from the disk when a token asks for them (docs/ARCHITECTURE.md §Esecuzione
+# RAM, the rest read from the disk when a token asks for them (docs/ARCHITECTURE.md §Execution
 # Esperti M1, docs/MEASUREMENTS.md §M1). Native Windows, still machine, rotating order, A/A control
 # (tools/ab_modes.sh, docs/LESSONS.md #66). Run from the repo root in Git Bash. Results in
 # build/experts_budget/.

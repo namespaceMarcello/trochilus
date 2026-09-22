@@ -1,55 +1,155 @@
-# Misure
+# Measurements
 
-Ogni tentativo di ottimizzazione, riuscito o scartato, con il suo numero. Regola
-(`docs/ARCHITECTURE.md` §C e assembly): un guadagno conta solo se sposta la mediana più dello
-spread misurato sulla stessa riga. Si sostituiscono le tabelle di base quando cambiano; i
-tentativi si aggiungono in coda.
+Every optimization attempt, successful or rejected, with its number. Rule
+(`docs/ARCHITECTURE.md` §C and assembly): a gain counts only if it shifts the median by more
+than the spread measured on the same row. Base tables are replaced when they change; attempts
+are added at the end.
 
-**Mai un numero da una run sola** (Marcello, 2026-09-17): ogni misura è la mediana di N run con
-minimo, massimo e spread, e i token generati devono essere identici in tutte le run e con ogni
-numero di thread (`tools/profile_suite.py` lo verifica ed esce con errore se no). Le righe più
-sotto marcate «una run» sono precedenti alla regola e vanno rimisurate.
+**Never a number from a single run** (Marcello, 2026-09-17): every measurement is the median
+of N runs with min, max, and spread, and the generated tokens must be identical across all
+runs and with every number of threads (`tools/profile_suite.py` verifies it and exits with an
+error if not). Rows marked below as «one run» predate the rule and need to be remeasured.
 
-## Da misurare: domande aperte
+## Open questions: what to measure
 
-Test per scendere nel dettaglio e trovare dove mettere mano. Si aggiunge quando nasce un dubbio,
-si sposta nella sezione giusta con il numero quando è misurato.
+Tests to drill down and find where to focus. Added when a doubt arises, moved to the right
+section with its number when measured.
 
-| # | Domanda | Come si misura | Perché conta |
+| # | Question | How to measure | Why it matters |
 |---|---|---|---|
-| 1 | ~~Quanto costa svegliare i thread su Windows nativo?~~ Misurato: §Pool di thread | — | — |
-| 2 | ~~8 thread vincono perché stanno in un solo gruppo di core (CCD, L3 da 32 MB)?~~ No: 4+4 sui due CCD vanno **meglio** di 8 su uno solo. Misurato: §Dove vanno i thread | — | — |
-| 3 | ~~Le copie SMT aiutano o peggiorano?~~ **Peggiorano**: 32 thread pinnati (i due fratelli di ogni core) contro 16 (uno per core) danno prefill 110 contro 164 e decode 2.2 contro 22.9. Misurato: §SMT | — | — |
-| 4 | ~~Qual è la banda reale della RAM di questa macchina?~~ **~57 GB/s** in lettura con 4-6 thread, poi cala (8: 55.7, 12: 54.4, 16: 49.5; un thread 26, due 52): rimisurato a macchina pulita il 2026-09-19 (§Rimisura a macchina pulita; i «~54, un thread 22-25, due 43-49» di prima avevano sotto quattro core presi, LEZIONI #84), uguale in fila e a blocchi sparsi da 2 MiB o 256 KiB; a pagine sparse da 4 KiB 7 GB/s a un thread e 34-41 a 6-16. Il matmul del motore ne tira 46-58. I «41 GB/s» erano la velocità del motore del 17/09, non il tetto. Il `memcpy` non è stato misurato: il decode legge, non scrive. Misurato: §Decode a contesto lungo | — | — |
-| 5 | ~~Quanti TLB miss per token, e quanto valgono le pagine da 2 MB?~~ **Chiusa come «no» su Windows il 2026-09-19 (Marcello)**: le pagine grandi chiedono un privilegio (`SeLockMemoryPrivilege`) che un utente normale non ha, e il bersaglio è il PC senza opzioni. Su Linux resta una misura facoltativa, non un passo | Linux: pesi con `madvise(MADV_HUGEPAGE)` contro senza, stessi token/s mediani | 300 000 pagine da 4 KB toccate per token |
-| 6 | Il portatile rallenta quando si scalda? | 60 s di decode continuo, token/s ogni 5 s | una misura breve può non valere per un uso reale |
-| 7 | ~~Quanto costa l'attenzione quando il contesto cresce (128, 1024, 4096 token)?~~ **Nel decode** (§Decode a contesto lungo): 0.5 ms a contesto 32, 2.9 a 512, 11.5 a 2048, 22.6 a 4000 su 25-48 ms di token, cioè byte di KV letti a 47 GB/s. **Nel prefill** (§Prefill su prompt lunghi): la zona valeva il 5%, il 18% e il 31-35% a 512, 2048 e 4000, e dentro c'è soprattutto il softmax (51-72%: `expf` della libreria C a 30 ns), poi prodotti e somma pesata (27-37%), e la lettura ripetuta di chiavi e valori solo a 4000 (dallo 0 al 39% secondo la run). Con l'attenzione a gruppi la zona fa 1.09×, 1.12× e 1.13×; quello che resta è la domanda 37 | — | — |
-| 8 | Quanto costa il profiler acceso sul modello vero? | stessi scenari con e senza `--profile` | per fidarsi delle percentuali delle zone |
-| 9 | Windows nativo e Linux sulla stessa macchina vanno alla stessa velocità? | stesso scenario nativo e in Docker/WSL | in Docker svegliare un thread costava ~20 µs |
-| 10 | Più corsie (32 o 64) sbloccano la catena delle somme su un thread? | kernel sperimentale, `make bench` | AVX-512 va come AVX2 per quel limite; cambierebbe i numeri (dichiarato) |
-| 11 | Quanto pesa la divisione per riga e la chiamata indiretta in `matmul_body`? | kernel che riceve tutta la matrice contro uno per riga | 1024 chiamate e 2 divisioni a 64 bit per matrice |
-| 12 | ~~Gli esperti scelti in token consecutivi si ripetono?~~ **In parte sì** (§Revisione): una riga in più nella stessa passata fa leggere 2.3-4.7 esperti nuovi per layer su 8, cioè il 40-70% dei suoi esperti è già letto dalle altre righe. A tempo (zone native, macchina ferma): una riga in più costa **17.6 ms** se è la sola e **13.7 ms** l'una se sono otto, contro 31.3 di una passata; negli esperti sta il **91%** e il **61%**, e lì il tempo segue i MiB di esperti nuovi (30 MiB/ms ai due punti); le moltiplicazioni dense sono gratis per la prima riga e valgono 4.1 ms per riga a nove. Il costo di una bozza si attacca dal lato dei pesi | — | — |
-| 13 | ~~Il router del layer successivo, applicato allo stato del layer corrente, indovina gli esperti che verranno scelti?~~ **Sì** (2026-09-20, §M1 prima di scrivere codice): prevedendone 12 si trova il 92.4% degli scelti già con lo stato che entra nel FFN (prima che girino gli esperti del layer), il 94.9% con l'uscita del layer; il primo layer è l'eccezione (75-80%) | — | la previsione c'è, ma **su un disco da 1.5 GB/s precaricare non rende** (§M1 punto 6: ogni candidato sbagliato è una lettura, e la lettura è il collo): il primo M1 legge a richiesta; precaricamento solo su dischi veloci (domanda 43) |
-| 14 | ~~Quanti byte per token restano da leggere dal disco con una cache degli esperti grande il 25, 50, 75% del modello?~~ **Misurato sul motore vero** (2026-09-20 notte, §M1 misurato): **3.7 / 1.8 / 0.5 MiB per token** subito dopo il prompt e **0.9 / 0.2 / — lontano dal prompt** (0.6 / 0.3 / 0.1 e 0.14 / 0.03 unità mancate). La simulazione su traccia diceva 348 / 143 / 32 MiB (54.6 / 22.4 / 5.0 unità; modello superato dalla misura): rispondeva a un'altra domanda, perché il motore entra nel decode con la LRU riempita dal prompt, che legge comunque tutto il modello. Regge invece il confronto fra strategie: il pin statico dall'uso perde contro la LRU a ogni capacità | un secondo modello, e la prosa (la maschera per uso non vale fuori dal dominio, domanda 44) | default di M1: LRU, letture a richiesta; il costo sta nel prompt, non nel token |
-| 15 | ~~Streaming dal disco per layer interi (DeepSpeed) o per esperti: quanti byte per token?~~ **Per esperti**: per layer interi 5106 / 3404 / 1702 MiB per token, 15-53 volte di più (§M1 prima di scrivere codice) | — | — |
-| 16 | ~~Quanto legge davvero l'NVMe in blocchi grandi quanto un esperto, a posizioni casuali, senza cache?~~ **~1.5 GB/s** (1.4-1.5 a blocchi da 2.125 MiB, 1.6-1.75 da 6.375 MiB), uguale con 1, 4 o 8 lettori; con la domanda 14: 7-10 tok/s con la cache al 50%, 17 e oltre al 75%, ~4 al 25% (§M1 prima di scrivere codice). Criterio «≥ 5 tok/s al 50%»: passato. KV vecchia su SSD: non misurata, attesa no | `make bench-disk` su altre macchine | M1 per esperti; 1-2 thread di I/O bastano |
-| 17 | Ricaricare dal disco la KV di un file già letto costa meno del prefill? La KV in q8 cambia i token? | checkpoint: logit identici al bit dopo il ricaricamento, tempo almeno 10 volte sotto il prefill; q8: token greedy uguali ≥ 99% su 1000 token di codice | leve del coding (file già letti, contesti lunghi), M5 |
-| 18 | ~~Perché il decode perde l'11-13% da 32 a 512 token di contesto, e llama.cpp solo il 5-7%?~~ Perché la KV si leggeva **più piano dei pesi**: 32-36 GB/s contro 47-54, con una testa che leggeva 512 byte ogni 8 KiB. Con le posizioni di una testa in fila la KV si legge a 47 GB/s e da 32 a 512 il decode perde l'8.8% (38.9 → 35.5), che è il costo dei byte in più. Misurato: §Decode a contesto lungo. Il confronto con llama.cpp a run alternate resta la domanda 19 | — | — |
-| 19 | Decode a 4-16 thread: llama.cpp è davvero avanti dell'8-12%? | `tools/speed_compare.py` con i due motori alternati run per run nella stessa sessione (fra due sessioni la mediana di llama.cpp si è spostata del 3-7%) | dice se c'è una leva nel decode a più thread o solo rumore |
-| 20 | ~~Il prefill rende 1.16× da 8 a 16 thread: è il limite di potenza del portatile?~~ No, e nemmeno il CCD: è lo scheduler che mette due thread sullo stesso core fisico. Misurato: §Dove vanno i thread | — | — |
-| 22 | Fissare i thread ai core fisici vale anche **sul decode** e **con la macchina occupata**? Misurato (§Il pin dei thread): sul decode a 16 thread **non distinguibile** da nessun pin (rimisura con A/A: −1.8%, soglia 2.2%; il vecchio 0.82× del pin al processore non si riproduce) e **sì a 4-8** (1.14-1.32×, pin al processore, 3 giri); con la macchina occupata il prefill tiene (1.19×) e il decode perde (0.67×, 3 giri, non rimisurato). Resta la sola parte **Linux**: su questa macchina non è misurabile (niente Linux nativo, e in WSL2 la topologia è sintetica, LEZIONI #47); il codice Linux gira ed è provato in `make check`, i numeri no | una macchina Linux vera, stessi scenari | il pin è una decisione di prodotto: sulle altre righe è già presa (acceso) |
-| 26 | ~~Quanti thread vuole **ogni fase**?~~ **Rimisurato a macchina pulita il 2026-09-19** (§Rimisura a macchina pulita; i numeri del 18/09 avevano sotto quattro core presi, LEZIONI #84). Il prefill tutti (16 contro 8: 1.49× a 512, 1.57× a 2048). Il decode **pochi**: 4 a contesto corto (a 512 l'automatico, che sceglie 4, batte 8 del 4-6%, sopra la soglia), 8 a contesto lungo, e 16 non vince a nessun contesto ma **non è distinguibile da 8** (1.00-1.02× a 512, 0.99-1.09× a 2048, soglia 4.6%): il «1.10× a 8 thread» del 18/09 era l'effetto dei core presi. Il perché è la banda della RAM, che tocca il tetto con 4-6 lettori e oltre cala (domanda 4). Il motore non porta il numero scritto: ogni sessione misura la sua larghezza e `--decode-threads` la forza; ma lo stimatore che la misura va riscritto (domanda 31) | — | — |
-| 31 | **Lo stimatore della larghezza del decode, riscritto il 2026-09-19, sceglie sul modello vero ciò che la verità forzata indica?** (LEZIONI #88, §Rimisura a macchina pulita punto 3). Quello di prima tirava a sorte: la più ampia entro un 1% fisso dalla più veloce su tre passate da un token, che hanno il 2-5% di rumore (una scelta diversa su otto a macchina quieta, 4×4 1×8 3×16 appena c'è rumore, 3-5 cambi su 8 a 2048 coi `yes`; la mediana non lo mostrava). Quello nuovo (`src/models/model.h`): centro = la passata più veloce, rumore = distacco della seconda; la più **stretta** entro il rumore della coppia (lei e la più veloce, mai quello di una terza larghezza); se decide il margine altre passate sulle due, fino a 6; rimisura a ogni raddoppio del contesto da 32; si cambia solo con due misure concordi (la seconda al più dopo 128 passate); niente sondaggi sotto 4 thread. **Nessun numero ancora sul modello vero.** Poi: regge sulle altre macchine (4-8 core, più canali di memoria, Apple Silicon senza pin, core P/E)? | fatto: tre funzioni pure e la sessione con un orologio finto in `tests/test_phase.c`, dieci mutazioni viste rosse (`tools/mutate_tune.sh`), la storia delle scelte nella riga `threads:`. Da fare **a macchina quieta, di notte**: `decode_context.sh widths` (la verità forzata: 16 contro 8, 4 contro 8), `decode_context.sh measure 16`, `decode_context.sh long` (1500 token dopo un prompt di 1000: due rimisure, i cambi contati dalla storia), `threads_phase.sh widths`. Criterio: l'automatico entro l'A/A dalla migliore forzata a ogni contesto, cambi a zero fra run, al più un cambio 4 → 8 nella run lunga | primo dei prossimi passi: la regola sceglie il default di ogni sessione di ogni utente |
-| 32 | `--spec`: si può decidere **prima di provare** se la bozza conviene, invece di scoprirlo sbagliando (idea di Marcello, 2026-09-19)? Oggi basta che le ultime 2 parole compaiano già nel testo (`TR_LOOKUP_NGRAM_MIN` 2) per tentare, e su codice nuovo una coppia torna per caso | contare, senza cronometro, bozze accettate e proposte **per lunghezza del match** (2, 3, 4) su `code.txt` e `code-edit.txt`; poi il replay esatto coi costi misurati (17.6 e 13.7 ms per riga) di una regola che chiede match più lunghi quando le bozze stanno fallendo | il caso peggiore sta a 0.95× e le costanti della pausa non bastano (al massimo 0.97-0.98×): se i match corti sono quelli che falliscono, il −5% scende senza toccare il +17% |
-| 33 | Fra float (esatto) e int8 (1.8-2.3× sul kernel, non esatto) c'è una via di mezzo per il prefill (domanda di Marcello, 2026-09-19)? Candidato: attivazioni a **16 bit** con `vpdpwssd` (VNNI), errore di arrotondamento 256 volte più piccolo dell'int8 | nel banco, come per l'int8 (`tests/bench_kernels.c`, stessa struttura del kernel a 4 token, run alternate), più di quanto si spostano i logit sul modello a 2 layer | attese basse sulla velocità (metà delle corsie dell'int8, più l'allargamento dei pesi a 16 bit), ma costa poco saperlo; le altre strade: parte seriale del prefill (domanda 30, esatta) e i modelli a 4 bit, che accelerano il decode e restano esatti rispetto ai propri pesi |
-| 27 | ~~Perché il decode a 16 thread pinnati va il 17% più piano che senza pin?~~ **La premessa non regge**: con 8 giri e controllo A/A il pin a un processore sta a −3.4% da nessun pin e a −1.6% dal pin al core (non distinguibile), non a −17%. Il pin al **core** resta il default per il prefill (1.27× su nessun pin, +9% sul pin al processore). Misurato: §Il pin dei thread, §Revisione | — | — |
-| 23 | ~~Quante bozze vengono accettate su lavoro di codice vero?~~ Misurato: §Speculazione dal prompt. 64% riscrivendo un file già nel prompt (1.42×), 13% scrivendo codice nuovo (0.62×) | — | — |
-| 24 | ~~Una bozza sbagliata quanto costa?~~ **Molto più di quanto diceva la misura in container** (5.2 ms): nativo, col pin, una riga in più costa **13.7-17.6 ms** contro i 31.3 di una passata (zone del profiler, §Revisione; dai tok/s usciva 15-27), perché il token in bozza sceglie altri esperti e la passata legge anche i loro pesi. Il pareggio non è al 15% di bozze accettate ma al **44-56%** (§Bozza adattiva, LEZIONI #59) | — | — |
-| 25 | ~~Una bozza che si accorcia dopo un rifiuto e si allunga dopo un'accettazione toglie il caso peggiore?~~ **Lo riduce, non lo toglie.** Accorciarla non basta (0.89×): serve **fermarla** dopo una bozza tutta sbagliata, con pausa che raddoppia. Con quella, rimisurato con A/A su 8 giri: **0.953×** quando il modello inventa (i 3 giri di prima dicevano 1.01×) e **1.175×** quando ricopia (§Bozza adattiva, §Revisione) | — | — |
-| 21 | ~~Quanto del divario col prefill di llama.cpp è il dot int8 VNNI contro il nostro float?~~ **Quasi tutto** (§Revisione, LEZIONI #65; la prima risposta, «niente», confrontava una riga contro un token): con la struttura del nostro kernel a 4 token il dot int8 VNNI a 512 bit è **1.8-2.3×** il nostro x4 float, e llama.cpp è avanti 1.57× a un thread. L'int8 non è esatto: scriverlo o no, e come modo esplicito, lo decide Marcello | — | — |
+| 1 | ~~How much does waking threads on native Windows cost?~~ Measured: §Thread pool | — | — |
+| 2 | ~~Do 8 threads win because they're in one core group (CCD, 32 MB L3)?~~ No: 4+4 on two CCDs go **better** than 8 on one. Measured: §Where threads go | — | — |
+| 3 | ~~Do SMT copies help or hurt?~~ **Hurt**: 32 pinned threads (two siblings of each core) vs 16 (one per core) give prefill 110 vs 164 and decode 2.2 vs 22.9. Measured: §SMT | — | — |
+| 4 | ~~What is real RAM bandwidth on this machine?~~ **~57 GB/s** reading with 4-6 threads, then drops
+(8: 55.7, 12: 54.4, 16: 49.5; one thread 26, two 52): remeasured clean machine 2026-09-19
+(§Clean machine remeasure; earlier «~54, one thread 22-25, two 43-49» had four cores taken,
+LESSONS #84), same sequential and 2 MiB or 256 KiB sparse blocks; 4 KiB page sparse 7 GB/s
+one thread and 34-41 from 6-16. Engine matmul reads 46-58. Earlier «41 GB/s» was 17/09 engine
+speed, not limit. `memcpy` not measured: decode reads, doesn't write. Measured: §Decode at
+long context | — | — |
+| 5 | ~~How many TLB misses per token, and value of 2 MB pages?~~ **Closed as "no" on Windows
+2026-09-19 (Marcello)**: large pages need privilege (`SeLockMemoryPrivilege`) normal user
+doesn't have, target is PC without options. On Linux optional measurement, not a step | Linux:
+weights with `madvise(MADV_HUGEPAGE)` vs without, same median tok/s | 300,000 4 KB pages
+touched per token |
+| 6 | Does laptop slow when hot? | 60 s continuous decode, tok/s every 5 s | short measure may not hold for real use |
+| 7 | ~~How much does attention cost as context grows (128, 1024, 4096 tokens)?~~ **In decode**
+(§Decode at long context): 0.5 ms at context 32, 2.9 at 512, 11.5 at 2048, 22.6 at 4000 on
+25-48 ms token, i.e., KV bytes read at 47 GB/s. **In prefill** (§Prefill on long prompts): zone
+was 5%, 18%, and 31-35% at 512, 2048, 4000, mostly softmax (51-72%: C lib `expf` at 30 ns),
+then products and weighted sum (27-37%), and repeated key/value read only at 4000 (0-39% per
+run). With grouped attention zone is 1.09×, 1.12×, 1.13×; what remains is question 37 | — | — |
+| 8 | What does profiler cost on real model? | same scenarios with and without `--profile` | to trust zone percentages |
+| 9 | Native Windows and Linux on same machine same speed? | same scenario native and Docker/WSL | in Docker waking thread cost ~20 µs |
+| 10 | Do more lanes (32 or 64) unlock sum chain on one thread? | experimental kernel, `make bench` | AVX-512 goes like AVX2 for that limit; would change numbers (stated) |
+| 11 | Cost of division per row and indirect call in `matmul_body`? | kernel takes whole matrix vs one per row | 1024 calls and 2 64-bit divisions per matrix |
+| 12 | ~~Do experts chosen in consecutive tokens repeat?~~ **Partly yes** (§Adversarial review): one more
+row in same pass reads 2.3-4.7 new experts per layer of 8, i.e., 40-70% of its experts already
+read by other rows. By time (native zones, idle machine): one more row costs **17.6 ms** if only
+one and **13.7 ms** each if eight, vs 31.3 per pass; experts have **91%** and **61%**, time
+follows MiB of new experts (30 MiB/ms at both points); dense multiplies free for first row and
+cost 4.1 ms per row at nine. Draft cost attaches on weights side | — | — |
+| 13 | ~~Does next-layer router applied to current-layer state guess experts that will be chosen?~~
+**Yes** (2026-09-20, §M1 before writing code): predicting 12 finds 92.4% of chosen ones already
+with state entering FFN (before experts run), 94.9% with layer output; first layer exception
+(75-80%) | — | prediction exists, but **on 1.5 GB/s disk prefetch doesn't pay** (§M1 point 6:
+each wrong candidate is a read, read is bottleneck): first M1 reads on demand; prefetch only
+on fast disks (question 43) |
+| 14 | ~~How many bytes per token remain to read from disk with expert cache 25, 50, 75% of model?~~
+**Measured on real engine** (2026-09-20 night, §M1 measured): **3.7 / 1.8 / 0.5 MiB per token**
+right after prompt and **0.9 / 0.2 / — far from prompt** (0.6 / 0.3 / 0.1 and 0.14 / 0.03
+misses). Trace simulation said 348 / 143 / 32 MiB (54.6 / 22.4 / 5.0 units; model beaten by
+measure): answered different question, engine enters decode with LRU filled by prompt, reads
+whole model anyway. Strategy comparison holds: static pin-by-use loses to LRU at all capacity |
+second model and prose (mask for use invalid outside domain, question 44) | M1 default: LRU,
+on-demand reads; cost in prompt, not token |
+| 15 | ~~Stream from disk whole layers (DeepSpeed) or experts: bytes per token?~~ **Per experts**:
+whole layers 5106 / 3404 / 1702 MiB per token, 15-53× more (§M1 before writing code) | — | — |
+| 16 | ~~What does NVMe really read in expert-sized blocks at random positions, no cache?~~
+**~1.5 GB/s** (1.4-1.5 at 2.125 MiB blocks, 1.6-1.75 at 6.375 MiB), same with 1, 4, or 8
+readers; with question 14: 7-10 tok/s cache 50%, 17+ at 75%, ~4 at 25% (§M1 before writing
+code). Criterion «≥ 5 tok/s at 50%»: passed. Old KV on SSD: not measured, expect no | `make
+bench-disk` on other machines | M1 for experts; 1-2 I/O threads enough |
+| 17 | Reloading KV from disk for already-read file cheaper than prefill? KV in q8 changes token? |
+checkpoint: logits identical to bit after reload, time ≥ 10× below prefill; q8: greedy tokens
+same ≥ 99% on 1000 code tokens | coding levers (files already read, long contexts), M5 |
+| 18 | ~~Why does decode lose 11-13% from 32 to 512 token context, llama.cpp only 5-7%?~~ Because
+KV read **slower than weights**: 32-36 GB/s vs 47-54, one head reading 512 bytes every 8 KiB.
+With one head's positions in a row KV reads at 47 GB/s and 32-512 decode loses 8.8% (38.9 →
+35.5), cost of extra bytes. Measured: §Decode at long context. Comparison with llama.cpp
+alternating runs stays question 19 | — | — |
+| 19 | Decode 4-16 threads: is llama.cpp really ahead 8-12%? | `tools/speed_compare.py` two engines
+alternating run per run in same session (between sessions llama.cpp median moved 3-7%) | says
+if leverage in multi-thread decode or just noise |
+| 20 | ~~Prefill yields 1.16× 8 to 16 threads: laptop power limit?~~ No, not CCD either: scheduler
+puts two threads on same physical core. Measured: §Where threads go | — | — |
+| 22 | Pin threads to physical cores worth **on decode** and **with machine busy**? Measured
+(§Thread pinning): on 16-thread decode **not distinguishable** from no pin (A/A remeasure:
+−1.8%, threshold 2.2%; old 0.82× processor pin doesn't reproduce) and **yes at 4-8** (1.14-1.32×,
+processor pin, 3 rounds); machine busy prefill holds (1.19×) and decode loses (0.67×, 3 rounds,
+not remeasured). Only **Linux** part remains: not measurable on this machine (no native Linux,
+WSL2 topology synthetic, LESSONS #47); Linux code runs and tested in `make check`, numbers no |
+real Linux machine, same scenarios | pin is product decision: other rows already decided (on) |
+| 26 | ~~How many threads does **each phase** want?~~ **Remeasured clean machine 2026-09-19**
+(§Clean machine remeasure; 18/09 numbers had four cores taken, LESSONS #84). Prefill all (16
+vs 8: 1.49× at 512, 1.57× at 2048). Decode **few**: 4 short context (512 auto picks 4, beats 8
+by 4-6%, above threshold), 8 long context, 16 wins nowhere but **not distinguishable from 8**
+(1.00-1.02× at 512, 0.99-1.09× at 2048, threshold 4.6%): «1.10× at 8 threads» 18/09 was
+taken-cores effect. Why: RAM bandwidth hits ceiling 4-6 readers then drops (question 4). Engine
+doesn't carry written number: each session measures its width and `--decode-threads` forces;
+but estimator needs rewrite (question 31) | — | — |
+| 31 | **Does decode width estimator rewritten 2026-09-19 choose on real model what forced truth
+indicates?** (LESSONS #88, §Clean machine remeasure point 3). Old one guessed: widest within fixed
+1% of fastest on three one-token passes, which have 2-5% noise (different choice every 8 quiet
+machine, 4×4 1×8 3×16 with noise, 3-5 changes on 8 at 2048 with `yes`; median didn't show). New
+one (`src/models/model.h`): center = fastest pass, noise = second's gap; **narrowest** within
+pair's noise (it and fastest, never third width's); if margin decides other passes on both, up to
+6; remeasure each context doubling from 32; change only with two agreeing measures (second
+after ≤ 128 passes); no probes below 4 threads. **No real-model numbers yet.** Then: holds on
+other machines (4-8 core, more channels, Apple Silicon no pin, P/E cores)? | done: three pure
+functions and session with fake clock in `tests/test_phase.c`, ten red mutations
+(`tools/mutate_tune.sh`), choice history in `threads:` row. To do **quiet machine, night**:
+`decode_context.sh widths` (forced truth: 16 vs 8, 4 vs 8), `decode_context.sh measure 16`,
+`decode_context.sh long` (1500 tokens after 1000-token prompt: two remeasures, changes from
+history), `threads_phase.sh widths`. Criterion: auto within A/A of best forced each context,
+zero changes between runs, at most 4→8 change in long run | first next step: rule picks each
+user's each session default |
+| 32 | `--spec`: can decide **before trying** if draft is worth it, instead of discovering wrong
+(Marcello idea, 2026-09-19)? Today just last 2 words appearing in text (`TR_LOOKUP_NGRAM_MIN` 2)
+tries it, new code pair returns by chance | count without stopwatch, accepted and proposed
+drafts **by match length** (2, 3, 4) on `code.txt` and `code-edit.txt`; then exact replay with
+measured costs (17.6 and 13.7 ms per row) of rule asking longer matches when drafts failing | worst
+case 0.95× and pause constants not enough (max 0.97-0.98×): if short matches fail, −5% drops
+without touching +17% |
+| 33 | Between float (exact) and int8 (1.8-2.3× kernel, not exact) middle path for prefill (Marcello
+question, 2026-09-19)? Candidate: **16-bit** activations with `vpdpwssd` (VNNI), rounding error
+256× smaller than int8 | in bench like int8 (`tests/bench_kernels.c`, same 4-token kernel
+structure, alternating runs), more than logits move on 2-layer model | speed expectations low
+(half int8's lanes plus 16-bit weight widening) but cheap to know; other paths: prefill serial
+part (question 30, exact) and 4-bit models accelerating decode, exact for own weights |
+| 27 | ~~Why does 16-thread pinned decode go 17% slower than no pin?~~ **Premise doesn't hold**:
+with 8 rounds and A/A check processor pin at −3.4% from no pin and −1.6% from core pin (not
+distinguishable), not −17%. **Core** pin stays default for prefill (1.27× on no pin, +9% on
+processor pin). Measured: §Thread pinning, §Adversarial review | — | — |
+| 23 | ~~How many drafts accepted on real code work?~~ Measured: §Speculation from prompt. 64%
+rewriting file already in prompt (1.42×), 13% writing new code (0.62×) | — | — |
+| 24 | ~~How much does wrong draft cost?~~ **Much more than container measure said** (5.2 ms):
+native with pin, one more row costs **13.7-17.6 ms** vs 31.3 per pass (profiler zones,
+§Adversarial review; tok/s gave 15-27), because draft token picks different experts and pass
+reads their weights too. Break-even not at 15% draft acceptance but **44-56%** (§Adaptive draft,
+LESSONS #59) | — | — |
+| 25 | ~~Draft shortening after reject, lengthening after accept removes worst case?~~ **Reduces,
+doesn't remove.** Shortening not enough (0.89×): need **stop** after full-wrong draft, pause
+doubles. With it, A/A remeasured 8 rounds: **0.953×** when model invents (earlier 3 rounds said
+1.01×) and **1.175×** when copies (§Adaptive draft, §Adversarial review) | — | — |
+| 21 | ~~How much of prefill gap vs llama.cpp is int8 VNNI dot vs our float?~~ **Almost all**
+(§Adversarial review, LESSONS #65; first answer «nothing» compared one row vs one token):
+with our 4-token kernel structure int8 VNNI 512-bit dot is **1.8-2.3×** our x4 float, llama.cpp
+ahead 1.57× one thread. Int8 not exact: whether to write it and how as explicit mode, Marcello
+decides | — | — |
 | 28 | ~~Il divario di prefill che resta con llama.cpp dov'è, se non è nell'int8?~~ Era nell'int8 (domanda 21). La strada esatta «più token nei registri» è misurata e non rende: una riga contro 8 token dà 1.13× a n=1024, **0.79×** a 2048 e 0.93× a 4096 (§Revisione) | — | — |
 
-| 29 | ~~Quanto vale una variante SIMD per **F16**?~~ **49×** sul kernel (`make bench`, n=2048: 466 M el/s lo scalare, 22.8 G el/s AVX2 con F16C, 22.7 AVX-512; prima ogni tier faceva i 466-824 dello scalare). La conversione half→float è esatta, quindi resta bit-identico (`tests/test_kernels.c`, anche con subnormali, infiniti e NaN). Scritta il 2026-09-19 perché il controllo nuovo, `tests/test_tier_used.c`, pretende che **ogni tipo** di peso passi per i kernel del tier (LEZIONI #78) | — | — |
+| 29 | ~~Quanto vale una variante SIMD per **F16**?~~ **49×** sul kernel (`make bench`, n=2048: 466 M el/s lo scalare, 22.8 G el/s AVX2 con F16C, 22.7 AVX-512; prima ogni tier faceva i 466-824 dello scalare). La conversione half→float è esatta, quindi resta bit-identico (`tests/test_kernels.c`, anche con subnormali, infiniti e NaN). Scritta il 2026-09-19 perché il controllo nuovo, `tests/test_tier_used.c`, pretende che **ogni tipo** di peso passi per i kernel del tier (LESSONS #78) | — | — |
 | 30 | ~~La parte seriale del prefill (copia per esperto, scrittura della KV, norme, RoPE) si può dividere per token?~~ **Sì** (§Prefill su prompt lunghi): valeva l'8% del prefill a 512 e il 5-6% a 4000, contando la scelta del router (57 ms su 512 token) che stava dentro la zona `router`. Divisa sul pool per token (almeno 8 a pezzo) passa da 121 a 48 ms a 512 e da 880 a 353 a 4000: norme e RoPE si dividono per 6, le copie in memoria (righe per gli esperti, scrittura della KV: 27 → 19 ms) solo per 2 e per 1.1-1.4, perché lì il limite è scrivere in RAM. Con l'int8 (domanda 21) il peso di ciò che resta raddoppia | — | — |
 | 34 | **Chiusa come «no» il 2026-09-19 (Marcello)**: 2.1% stimato a contesto 4000, sotto la soglia delle misure; si riapre se un modello con contesti oltre 4000 la porta sopra. ~~Larghezza per zona~~: l'attenzione del decode su tutto il pool e il resto sulla larghezza del decode (esatto: il contratto del pool). Potenziale misurato per zona (§Decode a contesto lungo): a contesto 4000 l'attenzione fa 21.6 ms su 16 thread e 22.6 su 8, mentre esperti e proiezioni su 16 perdono 1.3 ms; tenendo il meglio dei due si toglie **1.0 ms su 48.1 (2.1%)**, a 2048 0.24 ms su 36.4 (0.7%) | `tr_pool_set_active` attorno alla zona `attention` nelle passate corte; serve una soglia più bassa del 3.8% di questa notte (più giri, o 200 token generati invece di 48) | cresce col contesto: oltre 4000 l'attenzione supera metà del token. Sotto la soglia oggi, quindi non scritta |
 | 35 | Cosa resta sotto il tetto nel decode, dal lato esatto? `attn_out_proj` legge a 43-52 GB/s dove le altre moltiplicazioni stanno a 52-55 (0.2-0.3 ms per token); le zone senza byte (norme, RoPE, copia per esperto, attivazione, somma, scelta del token) valgono **1.1 ms per token**, il 4.4% a contesto corto; l'attenzione legge a 47 GB/s dove la sola lettura degli stessi byte fa 52-56 (il calcolo di prodotto, softmax e somma pesata vale il 12% della zona) | profilo per zona con le zone piccole divise; `bench_mem kv` con il kernel a pezzi | in tutto il 6-11% che separa i 48-51 GB/s del decode dai 54 della RAM |
@@ -68,15 +168,15 @@ si sposta nella sezione giusta con il numero quando è misurato.
 | 48 | **Quanto del primo prompt si nasconde dietro il tempo che l'utente impiega a scrivere?** Una fase di preparazione dichiarata (idea di Marcello, 2026-09-21): appena la sessione si apre, e prima che il prompt arrivi, il motore comincia a leggere gli esperti e lo dice («leggo il modello, 6.5 GiB»). Non elimina i 4.7 s, li mette dove non danno fastidio; costa nessun bit di precisione e non serve un processo nuovo. Da decidere: cosa leggere per primo quando ancora non si sa il prompt (l'ordine dei layer è quello giusto, il layer 0 serve per primo) | tempo fra l'apertura e il primo token, con e senza la lettura anticipata, su un prompt che arriva dopo 5, 15 e 30 secondi | è la leva più economica: nessuna struttura nuova |
 | 49 | **Un processo che resta acceso fra le sessioni regge il costo che ha?** L'unico modo di togliere davvero i 4.7 s: l'archivio degli esperti vive più della sessione. Da decidere: un demone che parla coi comandi, o memoria condivisa che i processi mappano. Costo: un protocollo, il ciclo di vita, e la RAM tenuta occupata quando nessuno la usa | tempo del primo prompt della seconda sessione, archivio vivo contro archivio nuovo | toglie il divario col modello residente, non lo sposta |
 
-Macchina di riferimento: Ryzen 9 7940HX (Zen 4, 16 core / 32 thread, AVX-512 VNNI/BF16), 31 GB
-RAM (2×16 GB DDR5-5200), NVMe Micron 1 TB, GPU RTX 4070 Laptop 8 GB e Radeon 610M (non usate fino
-a M3/M6), Windows 11, MinGW-w64 gcc 15.2 `-O2`. Portatile in corrente, altri programmi aperti
-(container Docker attivi): lo spread lo dice.
+Reference machine: Ryzen 9 7940HX (Zen 4, 16 core / 32 thread, AVX-512 VNNI/BF16), 31 GB
+RAM (2×16 GB DDR5-5200), NVMe Micron 1 TB, GPU RTX 4070 Laptop 8 GB and Radeon 610M (not used
+until M3/M6), Windows 11, MinGW-w64 gcc 15.2 `-O2`. Laptop on power, other programs open
+(Docker containers active): the spread reflects this.
 
-## Kernel CPU — base scalare (2026-09-17)
+## CPU kernels — scalar baseline (2026-09-17)
 
-`build/bench/bench_kernels.exe --runs 5 --ms 100` (`tests/bench_kernels.c`). Milioni di elementi
-al secondo per un prodotto scalare fra una riga di pesi e un vettore f32, un thread.
+`build/bench/bench_kernels.exe --runs 5 --ms 100` (`tests/bench_kernels.c`). Million elements
+per second for a dot product between a weight row and an f32 vector, one thread.
 
 | Kernel | n=64 | n=1024 | n=2048 | n=4096 | spread |
 |---|---|---|---|---|---|
@@ -84,67 +184,67 @@ al secondo per un prodotto scalare fra una riga di pesi e un vettore f32, un thr
 | dot_row f16 | 699 | 700 | 632 | 639 | 1-14% |
 | dot_row q8_0 | 1728 | 1796 | 1909 | 1952 | 4-15% |
 
-`tr_matmul` q8_0 1024×2048 (forma di una proiezione di esperto OLMoE), un token:
+`tr_matmul` q8_0 1024×2048 (shape of an OLMoE expert projection), one token:
 1 thread 1.070 ms (spread 1.6%); 16 thread 0.350 ms (spread 74%).
 
-Letture:
-- f16 è il più lento: la conversione half → float elemento per elemento costa più del prodotto.
-- Con 16 thread una sola matrice va solo 3 volte più veloce, con spread enorme: per un lavoro da
-  un millisecondo svegliare i thread pesa quanto il calcolo. I thread vanno usati su blocchi più
-  grandi (un intero strato, tutti gli esperti di un token), non per matrice.
+Notes:
+- f16 is slowest: converting half → float element-by-element costs more than the product.
+- With 16 threads a single matrix is only 3× faster, with huge spread: for a one-millisecond
+  task, waking threads costs as much as the calculation. Threads should be used on larger
+  blocks (a whole layer, all experts for one token), not per matrix.
 
-## Profilo del motore — modello minuscolo (2026-09-17)
+## Engine profile — tiny model (2026-09-17)
 
-`make profile` (3 scenari su OLMoE minuscolo: hidden 64, 4 strati), kernel scalari, nativo Windows.
-Numeri che servono solo a provare la suite: con dimensioni così piccole il costo fisso di ogni
-chiamata domina, e le proporzioni non valgono per un modello vero.
+`make profile` (3 scenarios on tiny OLMoE: hidden 64, 4 layers), scalar kernels, native Windows.
+Numbers that only serve to test the suite: with such small sizes the fixed cost of each call
+dominates, and the proportions don't hold for a real model.
 
-| Scenario | Prefill tok/s | Decode tok/s | Zone più pesanti in decode |
+| Scenario | Prefill tok/s | Decode tok/s | Heaviest zones in decode |
 |---|---|---|---|
-| f32, prompt 6 → 64 token | 13380 (±3.5%) | 10909 (±0.9%) | attenzione 28%, rope 17%, gate_up esperti 13%, proiezioni qkv 13% |
-| f32, prompt 96 → 8 token | 9784 (±4.1%) | 7318 (±3.7%) | attenzione 51%, rope 12% |
-| q8_0, prompt 6 → 64 token | 10704 (±18%) | 8872 (±2.3%) | attenzione 24%, gate_up 16%, qkv 16%, rope 14% |
+| f32, prompt 6 → 64 token | 13380 (±3.5%) | 10909 (±0.9%) | attention 28%, rope 17%, expert gate_up 13%, qkv projections 13% |
+| f32, prompt 96 → 8 token | 9784 (±4.1%) | 7318 (±3.7%) | attention 51%, rope 12% |
+| q8_0, prompt 6 → 64 token | 10704 (±18%) | 8872 (±2.3%) | attention 24%, gate_up 16%, qkv 16%, rope 14% |
 
-Costo del profiler acceso: +0.25% (dentro il rumore). Da verificare sul modello vero: rope al 17%
-fa pensare a seno e coseno ricalcolati a ogni chiamata (una tabella precalcolata sarebbe esatta).
+Cost of profiler on: +0.25% (within noise). To verify on real model: rope at 17% suggests
+sine and cosine recalculated on each call (a precomputed table would be correct).
 
-## Profilo del motore — OLMoE-1B-7B Q8_0, kernel scalari (2026-09-17)
+## Engine profile — OLMoE-1B-7B Q8_0, scalar kernels (2026-09-17)
 
-`build/trochilus generate -m models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf -p 32 -n 16 -c 128 --profile`,
-nativo Windows, 16 thread (core fisici), un solo run: base di partenza, non ancora mediana.
-RAM libera prima del caricamento 10.8 GiB (container Docker attivi).
+`build/trochilus generate -m models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf -p 32 -n 16 -c 128
+--profile`, native Windows, 16 threads (physical cores), one run: baseline, not yet median.
+Free RAM before loading 10.8 GiB (Docker containers active).
 
-| Fase | Token/s | Pesi toccati per token | Traffico di memoria |
+| Phase | Token/s | Weights touched per token | Memory traffic |
 |---|---|---|---|
-| prefill (un token alla volta) | 6.92 | 1200 MiB | 8.7 GB/s |
+| prefill (one token at a time) | 6.92 | 1200 MiB | 8.7 GB/s |
 | decode | 6.87 | 1200 MiB | 8.7 GB/s |
 
-Dove va il tempo in decode: esperti gate+up 44.9%, esperti down 22.3%, proiezioni q/k/v 14.3%,
-proiezione di uscita dell'attenzione 5.0%, lm_head 4.8%, attivazione degli esperti 3.5%, rope 2.7%,
-attenzione 1.3%, router 0.9%, tutto il resto sotto lo 0.2%.
+Where decode time goes: expert gate+up 44.9%, expert down 22.3%, q/k/v projections 14.3%,
+attention output projection 5.0%, lm_head 4.8%, expert activation 3.5%, rope 2.7%, attention
+1.3%, router 0.9%, everything else below 0.2%.
 
-Letture:
-- **Limitati dal calcolo, non dalla memoria**: 8.7 GB/s contro gli ~80 GB/s teorici della RAM.
-  I kernel SIMD sono la leva giusta adesso; la memoria diventerà il limite solo dopo.
-- **Il 92% del tempo è in prodotti matrice-vettore q8_0** (esperti 67%, proiezioni 19%, lm_head 5%):
-  il primo kernel da vettorizzare, e poi da portare in assembly, è `dot_row q8_0`.
-- Il prefill va alla stessa velocità del decode perché elabora un token alla volta: il prefill a
-  blocchi (più token nella stessa moltiplicazione) è la seconda leva.
-- Rope al 2.7%: sul modello vero non è una priorità (sul minuscolo sembrava 17%).
-- I token generati da un prompt sintetico ripetono `64,301`: normale per greedy su input senza
-  senso, ma la correttezza sul modello vero non è ancora verificata (serve il confronto con un
-  riferimento: llama.cpp o transformers).
+Notes:
+- **Limited by compute, not memory**: 8.7 GB/s versus ~80 GB/s theoretical RAM. SIMD kernels
+  are the right lever now; memory will become the limit only later.
+- **92% of time is in q8_0 matrix-vector products** (experts 67%, projections 19%, lm_head 5%):
+  the first kernel to vectorize, then move to assembly, is `dot_row q8_0`.
+- Prefill runs at the same speed as decode because it processes one token at a time: batched
+  prefill (multiple tokens in the same multiplication) is the second lever.
+- Rope at 2.7%: not a priority on the real model (on the tiny one it looked like 17%).
+- Tokens generated from a synthetic prompt repeat `64,301`: normal for greedy on nonsense
+  input, but correctness on the real model isn't yet verified (needs comparison with a
+  reference: llama.cpp or transformers).
 
-## Kernel CPU — AVX2 e AVX-512, bit-identici (2026-09-17)
+## CPU kernels — AVX2 and AVX-512, bit-identical (2026-09-17)
 
-`make bench` nativo, stessa macchina, milioni di elementi al secondo su un thread (n = 2048):
+`make bench` native, same machine, million elements per second on one thread (n = 2048):
 
-| Kernel | scalare | AVX2 | AVX-512 |
+| Kernel | scalar | AVX2 | AVX-512 |
 |---|---|---|---|
 | `dot_f32` | 3 310 | 26 356 (8.0×) | 31 807 (9.6×) |
 | `dot_row q8_0` | 1 957 | 19 532 (10.0×) | 19 837 (10.1×) |
 
-`tr_matmul` q8_0 1024×2048 (una matrice di esperto, 1 token): 1 thread 0.100 ms, 16 thread 0.146 ms.
+`tr_matmul` q8_0 1024×2048 (one expert matrix, 1 token): 1 thread 0.100 ms, 16 threads 0.146 ms.
 
 Letture:
 - AVX-512 va quasi quanto AVX2: il limite è la **catena delle somme**. Ogni corsia somma un
@@ -152,45 +252,44 @@ Letture:
   al massimo 16 elementi ogni 3-4 cicli, con registri da 256 o da 512 bit. Più corsie romperebbero
   la definizione scalare (numeri diversi): da valutare solo se un thread singolo torna il limite.
 - Sulla carta 16 thread da 20 000 M el/s supererebbero la banda della RAM (~80 GB/s); sul modello
-  vero no: il traffico si ferma a 22 GB/s perché i thread non rendono (sezione sotto).
-- Su una matrice di esperto 16 thread sono **più lenti** di uno: svegliare il pool costa più del
-  lavoro (0.1 ms). Confermato sul modello vero (sezione sotto).
+  on real model: traffic stops at 22 GB/s because threads don't pay (section below).
+- On an expert matrix 16 threads are **slower** than one: waking the pool costs more than
+  the work (0.1 ms). Confirmed on real model (section below).
 
-## Profilo del motore — OLMoE-1B-7B Q8_0, kernel AVX-512 (2026-09-17)
+## Engine profile — OLMoE-1B-7B Q8_0, AVX-512 kernels (2026-09-17)
 
-`trochilus generate -p 32 -n 16 -c 128 --profile`, una run per riga (non ancora mediana di 5).
-Token generati identici in tutte le righe e con `TR_CPU_MAX=scalar`.
+`trochilus generate -p 32 -n 16 -c 128 --profile`, one run per row (not yet median of 5).
+Generated tokens identical across all rows and with `TR_CPU_MAX=scalar`.
 
-| Kernel | Thread | Decode tok/s | Prefill tok/s | Traffico memoria |
+| Kernel | Threads | Decode tok/s | Prefill tok/s | Memory traffic |
 |---|---|---|---|---|
-| scalare | 16 | 6.87 | 6.92 | 8.7 GB/s |
-| scalare | 8 | 7.18 | — | — |
+| scalar | 16 | 6.87 | 6.92 | 8.7 GB/s |
+| scalar | 8 | 7.18 | — | — |
 | AVX-512 | 16 | 17.72 | 17.83 | 22.3 GB/s |
 | AVX-512 | 8 | **21.08** | — | — |
 | AVX-512 | 4 | 20.68 | — | — |
 | AVX-512 | 1 | 13.85 | — | — |
 
-Zone del decode a 8 thread: gate+up degli esperti 34.8%, rope 13.0%, q/k/v 11.3%, attivazione degli
-esperti 8.5%.
+Decode zones at 8 threads: expert gate+up 34.8%, rope 13.0%, q/k/v 11.3%, expert activation 8.5%.
 
-Letture:
-- **3× sul modello vero** (6.87 → 21.08), ma 16 thread vanno più piano di 8 e 1 thread fa già
-  13.85: i thread rendono solo 1.5×. Il pool si sveglia 464 volte per token per matrici da 0.1 ms.
-  Il default (thread = core fisici) oggi è sbagliato per il decode; la cura non è un numero fisso
-  ma parallelizzare lavori più grossi (gli 8 esperti di un token, lo strato intero).
-- **Rope è salito al 13%**: calcola `pow`, `cos` e `sin` per ogni elemento a ogni token. Una tabella
-  per posizione dà gli stessi numeri (stesse operazioni in double) e toglie quasi tutto.
-- **Attivazione degli esperti all'8.5%**: `expf` scalare su 1024 elementi per esperto.
-- Il traffico (22 GB/s) è ancora sotto la banda della RAM (~80 GB/s): il limite resta il calcolo
-  e il coordinamento dei thread, non la memoria.
+Notes:
+- **3× on real model** (6.87 → 21.08), but 16 threads are slower than 8 and 1 thread already
+  does 13.85: threads only yield 1.5×. The pool wakes 464 times per token for 0.1 ms matrices.
+  The default (threads = physical cores) is wrong for decode today; the fix isn't a fixed
+  number but parallelizing larger jobs (the 8 experts for one token, the whole layer).
+- **Rope rose to 13%**: computes `pow`, `cos` and `sin` for every element at every token.
+  A table per position gives the same numbers (same operations in double) and removes almost all.
+- **Expert activation at 8.5%**: scalar `expf` on 1024 elements per expert.
+- Traffic (22 GB/s) is still below RAM bandwidth (~80 GB/s): the limit is still compute
+  and thread coordination, not memory.
 
-## Pool di thread: attesa attiva invece del sonno (2026-09-17)
+## Thread pool: busy-wait instead of sleep (2026-09-17)
 
-`bench_kernels --runs 7 --ms 60` in Linux (Docker su WSL2, stessa macchina), mediana di 7 run.
-Dispatch = una `tr_parallel_for` vuota che dà un pezzo a ogni thread; matmul = una matrice di
-esperto q8_0 1024×2048, mediana di 50 chiamate di fila.
+`bench_kernels --runs 7 --ms 60` on Linux (Docker on WSL2, same machine), median of 7 runs.
+Dispatch = an empty `tr_parallel_for` that assigns a piece to each thread; matmul = a q8_0
+expert matrix 1024×2048, median of 50 consecutive calls.
 
-| Thread | Dispatch prima | Dispatch dopo | Matmul prima | Matmul dopo |
+| Thread | Dispatch before | Dispatch after | Matmul before | Matmul after |
 |---|---|---|---|---|
 | 1 | 0.002 µs | 0.002 µs | 0.099 ms | 0.098 ms |
 | 2 | 41.0 µs | 0.10 µs | 0.100 ms | 0.049 ms |
@@ -198,15 +297,15 @@ esperto q8_0 1024×2048, mediana di 50 chiamate di fila.
 | 8 | 181.8 µs | 1.62 µs | 0.211 ms | 0.015 ms |
 | 16 | 361.9 µs | 2.80 µs | 0.376 ms | 0.014 ms |
 
-Letture:
-- Prima ogni thread svegliato dal sistema costava ~20 µs in Docker: più thread, più lento.
-- Adesso i thread aspettano svegli fino a 2 ms (istruzione `pause`), poi dormono: la matrice
-  scala 2× a 2 thread, 4× a 4, 6.5× a 8; a 16 quasi non guadagna più (0.015 → 0.014 ms): da
-  capire se è la banda della RAM o i due gruppi di core (domande 2 e 4).
+Notes:
+- Before each system-woken thread cost ~20 µs in Docker: more threads, slower.
+- Now threads busy-wait up to 2 ms (instruction `pause`), then sleep: the matrix scales 2× at
+  2 threads, 4× at 4, 6.5× at 8; at 16 it barely gains more (0.015 → 0.014 ms): unclear if
+  it's RAM bandwidth or two core groups (questions 2 and 4).
 
-Windows nativo, stesso benchmark (pool vecchio compilato a parte), mediana di 7 run:
+Native Windows, same benchmark (old pool compiled separately), median of 7 runs:
 
-| Thread | Dispatch prima | Dispatch dopo | Matmul prima | Matmul dopo |
+| Thread | Dispatch before | Dispatch after | Matmul before | Matmul after |
 |---|---|---|---|---|
 | 1 | 0.024 µs | 0.017 µs | 0.123 ms | 0.099 ms |
 | 2 | 0.48 µs | 0.05 µs | 0.106 ms | 0.092 ms |
@@ -214,117 +313,120 @@ Windows nativo, stesso benchmark (pool vecchio compilato a parte), mediana di 7 
 | 8 | 5.7 µs | 0.89 µs | 0.052 ms | 0.024 ms |
 | 16 | 53.5 µs | 1.48 µs | 0.079 ms | 0.014 ms |
 
-- Windows sveglia i thread molto più in fretta di Docker (53 µs contro 362 a 16 thread), ma il
-  guadagno resta grande da 8 thread in su: a 16 la matrice va 5.6× più veloce.
-- Spread alti (fino al 1305% sul dispatch a 2 thread): un singolo risveglio dal sonno pesa
-  su una misura da 0.05 µs. Le matmul, più lunghe, stanno sotto il 36%.
+- Windows wakes threads much faster than Docker (53 µs versus 362 at 16 threads), but gains
+  remain large from 8 threads on: at 16 the matrix is 5.6× faster.
+- High spread (up to 1305% on dispatch at 2 threads): a single wake from sleep weighs on
+  a 0.05 µs measurement. Matmuls, longer, stay below 36%.
 
-## Profilo del motore — OLMoE-1B-7B Q8_0, AVX-512 + pool nuovo (2026-09-17)
+## Engine profile — OLMoE-1B-7B Q8_0, AVX-512 + new pool (2026-09-17)
 
-`make profile SCENARIOS=bench/scenarios-olmoe-1b-7b.json`: prompt 32, 32 token generati, contesto
-128, Windows nativo, **mediana di 5 run** (più una di riscaldamento). Token identici in tutte le
-20 run e con ogni numero di thread.
+`make profile SCENARIOS=bench/scenarios-olmoe-1b-7b.json`: prompt 32, 32 generated tokens,
+context 128, native Windows, **median of 5 runs** (plus one warmup). Tokens identical across
+all 20 runs and with every number of threads.
 
-| Thread | Decode tok/s (min–max) | Prima (pool vecchio, una run) | Traffico memoria |
+| Thread | Decode tok/s (min–max) | Before (old pool, one run) | Memory traffic |
 |---|---|---|---|
 | 16 | **26.90** (26.54–27.53) | 17.72 | 33.9 GB/s |
 | 8 | **27.02** (26.42–27.06) | 21.08 | 34.0 GB/s |
 | 4 | 24.48 (24.37–25.45) | 20.68 | 30.8 GB/s |
 | 1 | 13.99 (12.47–14.39) | 13.85 | 17.6 GB/s |
 
-Zone del decode a 16 thread: gate+up esperti 32.9%, down esperti 16.7%, q/k/v 12.3%, **attivazione
-esperti 10.7%**, **rope 9.2%**, lm_head 5.9%, **attenzione 5.4%**, uscita attenzione 5.3%.
+Decode zones at 16 threads: expert gate+up 32.9%, expert down 16.7%, q/k/v 12.3%,
+**expert activation 10.7%**, **rope 9.2%**, lm_head 5.9%, **attention 5.4%**, attention
+output 5.3%.
 
-Letture:
-- 16 thread non vanno più piano di 8, ma nemmeno più forte: 27 tok/s per entrambi.
-- **Un quarto del token gira su un thread solo**: attivazione degli esperti, rope e attenzione
-  (in grassetto sopra) valgono il 25%. Con 16 thread quella parte non accelera (Amdahl): è il
-  prossimo lavoro esatto (tabella per rope, esperti in parallelo, attenzione vettorizzata).
-- **Gli esperti ora sono limitati dalla memoria**: una moltiplicazione di esperto nel modello vero
-  dura ~48 µs a 16 thread, contro 14 µs nel benchmark dove la matrice è già in cache. Ogni matrice
-  è 2.2 MB da leggere dalla RAM: 2.2 MB in 48 µs sono ~46 GB/s, vicino alla banda reale di due
-  moduli DDR5. Da misurare quella banda (domanda 4) prima di cercare altro sugli esperti.
+Notes:
+- 16 threads aren't slower than 8, but also not faster: 27 tok/s for both.
+- **A quarter of the token runs on one thread only**: expert activation, rope and attention
+  (bold above) account for 25%. With 16 threads that part doesn't speed up (Amdahl): it's
+  the next exact work (table for rope, experts in parallel, vectorized attention).
+- **Experts are now memory-limited**: an expert multiplication on the real model takes ~48 µs
+  at 16 threads, versus 14 µs in the benchmark where the matrix is already cached. Each
+  matrix is 2.2 MB to read from RAM: 2.2 MB in 48 µs is ~46 GB/s, near the real bandwidth
+  of two DDR5 modules. Measure that bandwidth (question 4) before looking elsewhere on experts.
 
-## Profilo del motore — OLMoE-1B-7B Q8_0, parte a thread singolo parallela (2026-09-17)
+## Engine profile — OLMoE-1B-7B Q8_0, single-thread part parallelized (2026-09-17)
 
-Stesso comando del profilo sopra (`make profile SCENARIOS=bench/scenarios-olmoe-1b-7b.json`,
-Windows nativo, mediana di 5), prima e dopo nella stessa ora: rope da tabella per posizione,
-attivazioni di tutti gli esperti come un solo lavoro parallelo, attenzione divisa per testa con la
-somma pesata AVX-512 (`axpy_f32`). Token identici fra prima e dopo, fra run e fra thread; logit
-del modello vero identici al bit a prima (200 token con 16, 3 e 1 thread, e con `TR_CPU_MAX=scalar`).
+Same command as profile above (`make profile SCENARIOS=bench/scenarios-olmoe-1b-7b.json`,
+native Windows, median of 5), before and after in the same hour: rope from table per position,
+all expert activations as one parallel job, attention split per head with AVX-512 weighted sum
+(`axpy_f32`). Tokens identical before and after, across runs and threads; real model logits
+identical to the bit at baseline (200 tokens with 16, 3, and 1 threads, and with
+`TR_CPU_MAX=scalar`).
 
-| Thread | Decode prima (min–max) | Decode dopo (min–max) | Guadagno | Traffico memoria dopo |
+| Thread | Decode before (min–max) | Decode after (min–max) | Gain | Memory traffic after |
 |---|---|---|---|---|
 | 16 | 26.34 (26.15–26.51) | **32.78** (32.35–33.27) | +24% | 41.3 GB/s |
 | 8 | 26.02 (25.68–26.40) | **33.88** (30.39–34.91) | +30% | 42.6 GB/s |
 | 4 | 23.69 (23.60–24.54) | **32.93** (32.06–33.60) | +39% | 41.5 GB/s |
 | 1 | 13.11 (12.04–13.32) | 14.47 (14.36–14.61) | +10% | 18.2 GB/s |
 
-Zone del decode a 16 thread, ms su 32 token:
+Decode zones at 16 threads, ms over 32 tokens:
 
-| Zona | Prima | Dopo |
+| Zone | Before | After |
 |---|---|---|
-| attivazione esperti | 124.2 (10.6%) | 10.0 (1.1%) |
+| expert activation | 124.2 (10.6%) | 10.0 (1.1%) |
 | rope | 107.6 (9.1%) | 0.8 (0.1%) |
-| attenzione | 62.2 (5.2%) | 23.6 (2.5%) |
-| gate+up esperti | 389.8 (33.1%) | 397.5 (41.9%) |
-| down esperti | 196.3 (16.7%) | 199.2 (20.9%) |
+| attention | 62.2 (5.2%) | 23.6 (2.5%) |
+| expert gate+up | 389.8 (33.1%) | 397.5 (41.9%) |
+| expert down | 196.3 (16.7%) | 199.2 (20.9%) |
 | q/k/v | 143.6 (12.2%) | 144.9 (15.3%) |
 
-Letture:
-- La parte a thread singolo è passata dal 25% al 4% del token: il guadagno previsto c'è tutto.
-- **4 thread vanno come 16** (32.9 contro 32.8 tok/s): quello che resta sono moltiplicazioni di
-  matrici che leggono 1.2 GB di pesi per token, e a 41 GB/s il limite è la memoria, non i core.
-  La domanda 4 (banda reale della RAM: 2×16 GB DDR5-5200, ~83 GB/s teorici) è ora la prima.
-- A un thread +10%: rope e somma pesata vettorizzata, niente parallelismo.
-- Spread 13% a 8 thread (una run a 30.4): rumore della macchina, le altre righe stanno sotto il 5%.
+Notes:
+- The single-thread part went from 25% to 4% of the token: all the expected gain is there.
+- **4 threads perform like 16** (32.9 versus 32.8 tok/s): what remains are matrix multiplications
+  that read 1.2 GB of weights per token, and at 41 GB/s the limit is memory, not cores. Question 4
+  (real RAM bandwidth: 2×16 GB DDR5-5200, ~83 GB/s theoretical) is now the first priority.
+- At one thread +10%: rope and vectorized weighted sum, no parallelism.
+- 13% spread at 8 threads (one run at 30.4): machine noise, other rows are below 5%.
 
-## Correttezza sul modello vero — Trochilus contro llama.cpp (2026-09-17)
+## Correctness on real model — Trochilus vs llama.cpp (2026-09-17)
 
-`tools/compare_llamacpp.py` nel container, OLMoE-1B-7B-0125-Instruct Q8_0, prompt
-`bench/prompts/dante.txt` (template di chat), 128 token greedy, llama.cpp `b49650a` su CPU.
+`tools/compare_llamacpp.py` in container, OLMoE-1B-7B-0125-Instruct Q8_0, prompt
+`bench/prompts/dante.txt` (chat template), 128 greedy tokens, llama.cpp `b49650a` on CPU.
 
-| Cosa | Risultato |
+| What | Result |
 |---|---|
-| token del prompt (27) | identici a `llama-tokenize` |
-| generazione greedy | identica per i primi 19 token, poi le strade si separano |
-| stessa parola migliore, 155 posizioni (prompt + generati, teacher forcing) | 149/155; nelle 6 diverse il margine di Trochilus fra le prime due è 0.04–0.18 |
-| KL(llama.cpp ‖ Trochilus) | media 8.9e-3, massimo 0.30 |
-| massima differenza di un logit | 3.63 |
+| prompt tokens (27) | identical to `llama-tokenize` |
+| greedy generation | identical for first 19 tokens, then paths diverge |
+| same best word, 155 positions (prompt + generated, teacher forcing) | 149/155; in 6 different Trochilus' margin between top two is 0.04–0.18 |
+| KL(llama.cpp ‖ Trochilus) | mean 8.9e-3, max 0.30 |
+| maximum logit difference | 3.63 |
 
-Non conclusivo: llama.cpp moltiplica i pesi Q8_0 con attivazioni quantizzate a 8 bit e tiene la
-cache KV in f16, Trochilus usa attivazioni esatte. La prova che decide è transformers sugli stessi
-pesi (sezione sotto). Entrambi i motori inventano i versi di Dante: limite del modello.
+Inconclusive: llama.cpp multiplies Q8_0 weights with 8-bit quantized activations and keeps KV
+cache in f16, Trochilus uses exact activations. The decisive test is transformers on the same
+weights (section below). Both engines invent Dante verses: model's limit.
 
-## Correttezza sul modello vero — Trochilus contro transformers, 2 layer (2026-09-17)
+## Correctness on real model — Trochilus vs transformers, 2 layers (2026-09-17)
 
-`make oracle-real`: i primi 2 layer del GGUF Q8_0 vero copiati byte per byte
-(`tools/make_olmoe_2layer_gguf.py`); transformers 5.14.1 float32 con gli stessi pesi dequantizzati e
-la configurazione letta dal GGUF (`tools/make_olmoe_2layer_ref.py`). 32 token greedy e logit a ogni
-posizione (teacher forcing). Container Linux, gcc.
+`make oracle-real`: first 2 layers of real GGUF Q8_0 copied byte-for-byte
+(`tools/make_olmoe_2layer_gguf.py`); transformers 5.14.1 float32 with same weights dequantized
+and config read from GGUF (`tools/make_olmoe_2layer_ref.py`). 32 greedy tokens and logits at
+every position (teacher forcing). Linux container, gcc.
 
-| Prompt | Token | Greedy | Parola migliore | Massima differenza di un logit |
+| Prompt | Token | Greedy | Best word | Maximum logit difference |
 |---|---|---|---|---|
-| `bench/prompts/dante.txt` | 27 + 32 | identici | 59/59 | 1.3e-5 (posizione 8) |
-| primi 1024 token di `src/models/olmoe.c` | 1024 + 32 | identici | 1056/1056 | 2.4e-4 (posizione 813) |
+| `bench/prompts/dante.txt` | 27 + 32 | identical | 59/59 | 1.3e-5 (position 8) |
+| first 1024 tokens of `src/models/olmoe.c` | 1024 + 32 | identical | 1056/1056 | 2.4e-4 (position 813) |
 
-Soglia del controllo: 1e-3. La differenza residua viene dall'aritmetica, non dal modello: Trochilus
-moltiplica i blocchi Q8_0 con attivazioni esatte, torch moltiplica matrici già dequantizzate; cresce
-con la posizione (sommatorie dell'attenzione più lunghe). Costo: riferimento 29 s e 6.0 GB di picco
-(solo quando manca), confronto 33 s e 1.1 GB a ogni `make check`.
+Check threshold: 1e-3. Residual difference comes from arithmetic, not the model: Trochilus
+multiplies Q8_0 blocks with exact activations, torch multiplies already-dequantized matrices;
+grows with position (longer attention sums). Cost: reference 29 s and 6.0 GB peak (only when
+missing), comparison 33 s and 1.1 GB at every `make check`.
 
-## Velocità — Trochilus contro llama.cpp e colibri, OLMoE-1B-7B (2026-09-17)
+## Speed — Trochilus vs llama.cpp and colibri, OLMoE-1B-7B (2026-09-17)
 
-`tools/speed_compare.py` nel container Linux (`trochilus-dev`, gcc; la VM di Docker vede 32 CPU e
-15 GB), modelli nel volume Docker `trochilus-models` (non dal disco di Windows: LEZIONI #41), un motore
-alla volta, **mediana di 5 run** (min–max) più una di riscaldamento; container degli altri progetti
-accesi ma fermi. Trochilus e llama.cpp sullo stesso GGUF Q8_0; colibri (`a90bed9`, `ARCH=native`) sulla
-sua conversione int8 da Hugging Face, cache di 64 esperti per layer (tutti), processo nuovo a ogni run.
-llama.cpp `b49650a` con `GGML_NATIVE`: `llama-bench`, prefill a contesto vuoto e decode dopo un
-contesto grande quanto il prompt (`-d`). Decode = valutazioni di un token al secondo (LEZIONI #40).
-Token del prompt: codice vero (`src/models/olmoe.c`) per Trochilus e colibri, casuali per llama-bench.
+`tools/speed_compare.py` in Linux container (`trochilus-dev`, gcc; Docker VM sees 32 CPUs and
+15 GB), models in Docker volume `trochilus-models` (not Windows disk: LESSONS #41), one engine
+at a time, **median of 5 runs** (min–max) plus one warmup; other projects' containers on but
+idle. Trochilus and llama.cpp on same GGUF Q8_0; colibri (`a90bed9`, `ARCH=native`) on its
+int8 conversion from Hugging Face, cache of 64 experts per layer (all), new process each run.
+llama.cpp `b49650a` with `GGML_NATIVE`: `llama-bench`, prefill with empty context and decode
+after context as large as the prompt (`-d`). Decode = evaluations of one token per second
+(LESSONS #40). Prompt tokens: real code (`src/models/olmoe.c`) for Trochilus and colibri,
+random for llama-bench.
 
-**Prompt 32, 32 generati** (tok/s)
+**Prompt 32, 32 generated** (tok/s)
 
 | Thread | Trochilus prefill | Trochilus decode | llama.cpp prefill | llama.cpp decode | colibri prefill | colibri decode |
 |---|---|---|---|---|---|---|
@@ -333,242 +435,243 @@ Token del prompt: codice vero (`src/models/olmoe.c`) per Trochilus e colibri, ca
 | 4 | 33.7 (32.9–34.1) | 33.3 (30.3–34.5) | 126.0 (124.7–129.5) | 36.1 (35.7–36.4) | 12.3 (12.2–12.8) | 12.5 (10.8–13.6) |
 | 1 | 15.4 (13.8–15.6) | 15.4 (15.0–15.5) | 38.3 (37.9–38.9) | 22.5 (22.0–22.7) | 8.3 (7.9–8.6) | 6.2 (5.4–6.5) |
 
-**Prompt 512, 128 generati** (tok/s; colibri non misurato)
+**Prompt 512, 128 generated** (tok/s; colibri not measured)
 
 | Thread | Trochilus prefill | Trochilus decode | llama.cpp prefill | llama.cpp decode |
 |---|---|---|---|---|
 | 16 | 29.6 (28.7–29.9) | 27.7 (27.5–29.0) | 376.6 (361.3–382.5) | 33.1 (32.5–34.2) |
 | 8 | 31.8 (31.1–32.4) | 29.7 (28.2–31.0) | 270.2 (262.7–275.3) | 34.2 (33.9–34.5) |
 
-**Tokenizer** su 2.2 MB di codice e testo (sorgenti di llama.cpp, README di colibri in italiano,
-inglese e cinese), tempo senza il caricamento del vocabolario:
+**Tokenizer** on 2.2 MB of code and text (llama.cpp sources, colibri README in Italian,
+English, and Chinese), time excluding vocabulary loading:
 
-| Tokenizer | Secondi (min–max) | MB/s | Token |
+| Tokenizer | Seconds (min–max) | MB/s | Tokens |
 |---|---|---|---|
 | Trochilus | 0.100 (0.097–0.104) | 22.0 | 815 460 |
-| HF `tokenizers` 0.22.2 (in processo) | 1.31 (1.24–1.45) | 1.7 | 815 460 |
-| llama.cpp `llama-tokenize` | 3.60 (3.52–3.64) | 0.6 | 814 194 (diversi da HF, non indagato) |
+| HF `tokenizers` 0.22.2 (in-process) | 1.31 (1.24–1.45) | 1.7 | 815 460 |
+| llama.cpp `llama-tokenize` | 3.60 (3.52–3.64) | 0.6 | 814 194 (different from HF, not investigated) |
 
-Letture:
-- **Prefill: llama.cpp 8× più veloce a 16 thread con prompt 32, 13× con prompt 512** (2.5× a 1
-  thread). Moltiplica tutti i token del prompt insieme; in Trochilus prefill = decode. È il primo lavoro.
-- **Decode a 4-16 thread: llama.cpp avanti dell'8-12%** a contesto corto, del 15-19% a contesto 512.
-  Con prompt 512 Trochilus perde l'11-13%, llama.cpp il 5-7%: il costo del contesto lungo è nostro
-  (domanda 18). La prima serie di llama.cpp (decode a contesto vuoto) dava 33.2 / 34.4 / 33.6: fra due
-  sessioni la mediana si sposta del 3-7%, il numero preciso chiede run alternate (domanda 19).
-- **1 thread: llama.cpp 1.46× nel decode**: attivazioni in int8 con VNNI (leva 2, non esatta).
-- 8 thread battono 16 in entrambi i motori: il limite è la banda della memoria.
-- colibri a 12-13 tok/s riparte ogni run con la cache degli esperti vuota (hit 90%): misura del suo
-  avvio a freddo, non del suo regime.
-- **Tokenizer: Trochilus 13× HF e 36× llama.cpp**, stessi token di HF.
-- Trochilus nel container va ~5% sotto Windows nativo (31.1 contro 32.8 tok/s a 16 thread).
+Notes:
+- **Prefill: llama.cpp 8× faster at 16 threads with prompt 32, 13× with prompt 512** (2.5× at 1
+  thread). Multiplies all prompt tokens together; in Trochilus prefill = decode. It's the first
+  job.
+- **Decode at 4-16 threads: llama.cpp ahead by 8-12%** at short context, 15-19% at context 512.
+  With prompt 512 Trochilus loses 11-13%, llama.cpp 5-7%: the cost of long context is ours
+  (question 18). The first llama.cpp series (decode with empty context) gave 33.2 / 34.4 / 33.6:
+  between two sessions the median shifts by 3-7%, precise number needs alternating runs
+  (question 19).
+- **1 thread: llama.cpp 1.46× in decode**: int8 activations with VNNI (lever 2, not exact).
+- 8 threads beat 16 in both engines: the limit is memory bandwidth.
+- colibri at 12-13 tok/s restarts each run with empty expert cache (90% hits): measures its
+  cold start, not its steady state.
+- **Tokenizer: Trochilus 13× HF and 36× llama.cpp**, same tokens as HF.
+- Trochilus in container is ~5% below native Windows (31.1 versus 32.8 tok/s at 16 threads).
 
-## Prefill a blocchi in C esatto + kernel a 4 token — OLMoE-1B-7B Q8_0 (2026-09-17)
+## Batched prefill in exact C + 4-token kernel — OLMoE-1B-7B Q8_0 (2026-09-17)
 
-Container, volume `trochilus-models`, prompt 512 token sintetici, 16 generati, **run alternate**
-binario vecchio / binario nuovo a ogni giro (`tools/ab_speed.sh`; LEZIONI #46: misurando prima tutto
-A e poi tutto B la macchina che si scalda falsa il confronto), mediana di 5 giri più uno di
-riscaldamento. «Prima» = binario di `38d0771` (un token per passata). «Dopo» = passate da 512 token,
-coppie (token, esperto) ordinate per esperto, matrici a blocchi di 16 token con una riga di pesi
-contro 4 token nei registri, logit solo dell'ultimo token.
+Container, volume `trochilus-models`, prompt 512 synthetic tokens, 16 generated, **alternating
+runs** old binary / new binary each round (`tools/ab_speed.sh`; LESSONS #46: measuring all A
+then all B lets machine warmup distort comparison), median of 5 rounds plus one warmup. «Before»
+= binary at `38d0771` (one token per pass). «After» = passes of 512 tokens, (token, expert)
+pairs sorted by expert, matrices in blocks of 16 tokens with one weight row against 4 tokens
+in registers, logits of last token only.
 
-| Thread | Prefill prima | Prefill dopo | Guadagno | Decode prima | Decode dopo |
+| Thread | Prefill before | Prefill after | Gain | Decode before | Decode after |
 |---|---|---|---|---|---|
 | 16 | 30.1 (26.9–31.1) | **196.9** (158.3–211.2) | 6.5× | 27.9 (24.9–30.9) | 29.4 (24.8–30.9) |
 | 8 | 31.0 (29.5–31.9) | **170.3** (147.9–185.1) | 5.5× | 29.6 (26.9–31.6) | 29.7 (28.3–29.8) |
 | 4 | 31.0 (30.7–32.0) | **100.0** (94.4–101.2) | 3.2× | 29.4 (26.0–31.1) | 27.0 (26.6–30.1) |
 | 1 | 14.4 (13.4–14.6) | **28.4** (26.8–29.0) | 2.0× | 13.5 (12.8–13.7) | 13.4 (12.7–13.8) |
 
-Contro llama.cpp, anche qui alternati run per run (stesso GGUF, `llama-bench -p 512 -n 0 -r 1`):
+Against llama.cpp, also alternating runs (same GGUF, `llama-bench -p 512 -n 0 -r 1`):
 
-| Thread | Trochilus | llama.cpp | Divario |
+| Thread | Trochilus | llama.cpp | Gap |
 |---|---|---|---|
 | 16 | 162.8 (121.8–173.8) | 321.0 (184.9–349.7) | 1.97× |
 | 8 | 156.7 (154.2–163.2) | 216.8 (180.0–251.6) | 1.38× |
 | 4 | 93.6 (90.4–96.8) | 146.3 (136.9–148.3) | 1.56× |
 | 1 | 26.1 (24.3–27.0) | 41.0 (40.9–41.2) | 1.57× |
 
-Esattezza sul modello intero (16 layer), 200 token: `logits` del binario di prima e di dopo, un token
-per passata, identici al bit (`cmp`), e identici fra 16 e 3 thread; passate da 16, 64 e 200 token
-identiche al bit alle stesse posizioni. Sul modello a 2 layer (`make oracle-real`) passate da 3, 64 e
-1056 token identiche al bit; `generate` sul prompt da 1024 token dà i token greedy di transformers.
+Correctness on entire model (16 layers), 200 tokens: `logits` from before and after binary,
+one token per pass, identical to the bit (`cmp`), and identical between 16 and 3 threads; passes
+of 16, 64, and 200 tokens identical to the bit at same positions. On 2-layer model (`make
+oracle-real`) passes of 3, 64, and 1056 tokens identical to the bit; `generate` on 1024-token
+prompt gives transformers' greedy tokens.
 
-Letture:
-- **Prefill 6.5× a 16 thread** (30 → 197 tok/s), 2.0× anche a 1 thread. Il divario con llama.cpp
-  scende da 11.8× a **1.97×** (1.4-1.6× con meno thread).
-- **Decode invariato** (differenze dentro lo spread): stesso codice con una passata da un token,
-  logit identici al bit.
-- **Scala ancora male**: da 4 a 16 thread rende 2.0×, da 8 a 16 solo 1.16×; llama.cpp 2.2× da 4 a 16.
-  Le due misure di Trochilus a 16 thread di questa sessione (197 e 163) hanno spread ampio: a 16
-  thread la macchina è al limite di potenza e la variabilità sale (domanda 20).
-- **A 1 thread llama.cpp è 1.57× avanti**: stesso lavoro con dot int8 VNNI (leva 2, domanda 21).
+Notes:
+- **Prefill 6.5× at 16 threads** (30 → 197 tok/s), 2.0× also at 1 thread. Gap with llama.cpp
+  drops from 11.8× to **1.97×** (1.4-1.6× with fewer threads).
+- **Decode unchanged** (differences within spread): same code with one-token pass, logits
+  identical to the bit.
+- **Still scales poorly**: 4 to 16 threads yields 2.0×, 8 to 16 only 1.16×; llama.cpp 2.2× from
+  4 to 16. The two Trochilus measurements at 16 threads this session (197 and 163) have wide
+  spread: at 16 threads the machine is at power limit and variability rises (question 20).
+- **At 1 thread llama.cpp ahead by 1.57×**: same work with int8 VNNI dot (lever 2, question 21).
 
-## Profilo del prefill — dove va il tempo (2026-09-17)
+## Prefill profile — where time goes (2026-09-17)
 
-`bench/scenarios-olmoe-1b-7b.json` (scenari `prefill512-t*`, `tools/profile_suite.py` ora riporta le
-zone anche in prefill), prompt 512, mediana di 5, prima del kernel a 4 token.
+`bench/scenarios-olmoe-1b-7b.json` (scenarios `prefill512-t*`, `tools/profile_suite.py` now
+reports zones in prefill too), prompt 512, median of 5, before 4-token kernel.
 
-| Thread | Prefill tok/s | matmul | attenzione | seriale (norme, RoPE, KV, router, copia per esperto, mix) |
+| Thread | Prefill tok/s | matmul | attention | serial (norms, RoPE, KV, router, gather, mix) |
 |---|---|---|---|---|
 | 16 | 144.3 | 89.8% | 2.4% | 7.6% |
 | 8 | 114.9 | 91.1% | 2.3% | 6.4% |
 | 4 | 66.2 | 93.6% | 2.2% | 4.0% |
 | 1 | 18.2 | 95.5% | 2.1% | 2.3% |
 
-Zona per zona a 16 thread: `expert_gate_up` 43.9%, `expert_down` 23.2%, `qkv_proj` 17.2%,
+Zone by zone at 16 threads: `expert_gate_up` 43.9%, `expert_down` 23.2%, `qkv_proj` 17.2%,
 `attn_out_proj` 5.5%, `attention` 2.4%, `kv_write` 1.6%, `router` 1.5%, `expert_gather` 1.5%.
-Byte di pesi distinti 12.5 MiB/token (1.9 GB/s): il prefill non è al limite della banda come il
-decode (1.2 GiB/token, 41 GB/s), il tempo sta nelle moltiplicazioni.
+Distinct weight bytes 12.5 MiB/token (1.9 GB/s): prefill isn't bandwidth-limited like decode
+(1.2 GiB/token, 41 GB/s), time is in multiplications.
 
-## Dove vanno i thread — il prefill a 16 thread (2026-09-17)
+## Where threads go — 16-thread prefill (2026-09-17)
 
-Windows **nativo** (nel container la topologia non è quella vera, LEZIONI #47), binario di
-`5db8117`, OLMoE-1B-7B Q8_0 dal disco, prompt sintetico di 2048 token, `-n 0`. Affinità del
-processo fissata appena parte, prima che il pool lavori; i casi girano alternati a ogni giro
-(LEZIONI #46), mediana di 3 giri dopo uno di riscaldamento. Il clock viene dal contatore di
-Windows «Informazioni processore(_Total)\Prestazioni processore %» (nominale 2400 MHz),
-campionato mentre il prefill gira.
+Native Windows (container topology isn't real, LESSONS #47), binary at `5db8117`, OLMoE-1B-7B
+Q8_0 from disk, synthetic 2048-token prompt, `-n 0`. Process affinity set at start, before pool
+runs; cases alternate each round (LESSONS #46), median of 3 rounds plus one warmup. Clock from
+Windows counter «Processor Information(_Total)\% Processor Performance» (nominal 2400 MHz),
+sampled while prefill runs.
 
-| Collocamento | Thread | Core usati | Prefill tok/s (min-max) | Clock mediano |
+| Placement | Threads | Cores used | Prefill tok/s (min-max) | Median clock |
 |---|---|---|---|---|
-| default, nessuna affinità | 16 | li sceglie Windows fra 32 logici | 134.1 (134.1-138.2) | 4.4-4.6 GHz |
-| uno per core fisico (`0x55555555`) | 16 | 16 fisici, i due CCD | **173.9** (173.3-183.1) | 4.2-4.5 GHz |
-| un solo CCD (`0x0000FFFF`) | 8 | core 0-7, una L3 da 32 MB | 78.6 (77.7-80.8) | 4.4-4.6 GHz |
-| l'altro CCD (`0xFFFF0000`) | 8 | core 8-15 | 80.8 (79.1-82.8) | 4.6-4.7 GHz |
-| 4+4 sui due CCD (`0x00FF00FF`) | 8 | core 0-3 e 8-11 | **86.1** (84.2-89.0) | 4.7-4.8 GHz |
+| default, no affinity | 16 | Windows picks from 32 logical | 134.1 (134.1-138.2) | 4.4-4.6 GHz |
+| one per physical core (`0x55555555`) | 16 | 16 physical, both CCDs | **173.9** (173.3-183.1) | 4.2-4.5 GHz |
+| one CCD only (`0x0000FFFF`) | 8 | cores 0-7, one 32 MB L3 | 78.6 (77.7-80.8) | 4.4-4.6 GHz |
+| other CCD (`0xFFFF0000`) | 8 | cores 8-15 | 80.8 (79.1-82.8) | 4.6-4.7 GHz |
+| 4+4 across CCDs (`0x00FF00FF`) | 8 | cores 0-3 and 8-11 | **86.1** (84.2-89.0) | 4.7-4.8 GHz |
 
-Clock durante il prefill senza affinità, mediane di 3 giri: 1 thread 4.66-4.80 GHz, 4 thread
-4.64-4.78, 8 thread 4.53-4.69, 16 thread 4.46-4.54.
+Clock during prefill without affinity, medians of 3 rounds: 1 thread 4.66-4.80 GHz, 4 threads
+4.64-4.78, 8 threads 4.53-4.69, 16 threads 4.46-4.54.
 
-Letture:
-- **Non è il limite di potenza** (domanda 20): da 1 a 16 thread il clock scende del 6-8%, non
-  del 40% che servirebbe a spiegare 1.16×. In corrente la macchina tiene ~4.5 GHz su tutti i core.
-- **Non è il CCD** (domanda 2): 8 thread divisi 4+4 sui due chiplet vanno il **7-9% meglio** di 8
-  sullo stesso chiplet. Due L3 da 32 MB e il doppio di L2 battono la località, e il clock sale.
-- **È dove finiscono i thread**: con 16 thread su 32 processori logici Windows ne appoggia due
-  sullo stesso core fisico e lascia core liberi. Un thread per core fisico dà **+30%**
-  (134 → 174 tok/s). Da 8 core (86.1) a 16 (173.9) il prefill rende **2.02×**: il parallelo
-  scala, era il collocamento a non scalare (LEZIONI #48).
-- A 2048 token di prompt il prefill fa 174 tok/s contro i 197 misurati a 512 senza pin:
-  l'attenzione per token cresce col contesto, da misurare a parte (domanda 7).
+Notes:
+- **Not power limit** (question 20): 1 to 16 threads clock drops 6-8%, not 40% needed to explain
+  1.16×. On power the machine holds ~4.5 GHz on all cores.
+- **Not the CCD** (question 2): 8 threads split 4+4 across chiplets go **7-9% better** than 8 on
+  one chiplet. Two 32 MB L3s and double L2 beat locality, and clock rises.
+- **It's where threads end up**: with 16 threads on 32 logical processors Windows puts two on
+  same physical core and leaves cores free. One thread per physical core gives **+30%** (134 →
+  174 tok/s). From 8 cores (86.1) to 16 (173.9) prefill scales **2.02×**: parallelism scales,
+  placement didn't (LESSONS #48).
+- At 2048-token prompt prefill does 174 tok/s versus 197 measured at 512 without pin: attention
+  per token grows with context, measure separately (question 7).
 
-Prossimo passo che ne discende: fissare i thread del pool ai core fisici, e rimisurare le righe
-di velocità con quella base.
+Next step from this: pin pool threads to physical cores, and remeasure speed rows with that base.
 
-## Il pin dei thread ai core fisici (2026-09-18)
+## Thread pinning to physical cores (2026-09-18)
 
-Windows **nativo** (LEZIONI #47), macchina ferma: container degli altri progetti fermati e cache
-della VM di Docker restituita, 15.9 GB liberi (misurare mentre un agente compila in Docker dà numeri
-falsi, LEZIONI #57). Un solo binario e tre modi, scelti con `TR_POOL_PIN`: **0** nessuna affinità,
-**1** ogni thread su un processore logico suo, **2** (il default) ogni thread sul suo **core fisico**
-intero, cioè libero fra i due fratelli SMT di quel core ma solo di quello. Run **alternate**
-(`tools/ab_speed.sh`, LEZIONI #46), mediana dei giri dopo uno di riscaldamento, OLMoE-1B-7B Q8_0 dal
-disco di Windows, prompt 512, 24 token generati.
+Native Windows (LESSONS #47), idle machine: other projects' containers stopped and Docker VM
+cache returned, 15.9 GB free (measuring while an agent compiles in Docker gives false numbers,
+LESSONS #57). One binary and three modes, chosen with `TR_POOL_PIN`: **0** no affinity, **1**
+each thread on its own logical processor, **2** (the default) each thread on its whole
+**physical core**, i.e., free among the two SMT siblings of that core but only that core.
+**Alternating runs** (`tools/ab_speed.sh`, LESSONS #46), median of rounds after one warmup,
+OLMoE-1B-7B Q8_0 from Windows disk, prompt 512, 24 generated tokens.
 
-**Il default contro nessun pin** (2 contro 0), 6 giri:
+**Default vs no pin** (2 vs 0), 6 rounds:
 
-| thread | prefill core | prefill senza | | decode core | decode senza | |
+| threads | prefill core | prefill none | | decode core | decode none | |
 |---|---|---|---|---|---|---|
 | 16 | **217.8** (184.9-220.3) | 175.1 (148.4-183.4) | **1.24×** | 28.7 (26.4-29.8) | 29.9 (27.2-30.3) | 0.96× |
 | 8 | **147.3** (141.9-151.4) | 113.4 (105.6-117.3) | **1.30×** | 31.0 (28.4-31.5) | 30.4 (26.4-30.9) | 1.02× |
 
-**I due modi di pin** (2 contro 1), 3 giri: a 16 thread il core intero dà prefill 212.5 contro 178.6
-e decode 27.2 contro 21.5; a 8 thread 145.9 contro 141.4 e 29.4 contro 31.1. *I numeri a 16 thread
-sono superati dalla rimisura con A/A più sotto.*
+**Two pin modes** (2 vs 1), 3 rounds: at 16 threads whole core gives prefill 212.5 vs 178.6
+and decode 27.2 vs 21.5; at 8 threads 145.9 vs 141.4 and 29.4 vs 31.1. *16-thread numbers
+superseded by A/A remeasure below.*
 
-**Il pin al singolo processore contro nessun pin** (1 contro 0), 3 giri, la strada scartata:
+**Logical processor pin vs no pin** (1 vs 0), 3 rounds, the abandoned path:
 
-| thread | prefill | senza | | decode | senza | |
+| threads | prefill | none | | decode | none | |
 |---|---|---|---|---|---|---|
 | 16 | 231.9 | 191.3 | 1.21× | 25.1 | **30.5** | **0.82×** |
 | 8 | 171.0 | 125.9 | 1.36× | 32.7 | 28.6 | 1.14× |
 | 4 | 90.5 | 60.4 | 1.50× | 32.5 | 24.6 | 1.32× |
 | 1 | 24.0 | 24.0 | 1.00× | 12.2 | 10.7 | 1.14× |
 
-Stesso modo (1 contro 0) a prompt 2048, 16 token: 16 thread prefill 159.2 contro 147.2 (1.08×) e
-decode 19.5 contro 23.4 (0.83×); 8 thread prefill 130.1 contro 86.7 (1.50×) e decode 21.4 contro
-22.0. Macchina occupata (4 processi che girano a vuoto, prompt 512, 16 thread): prefill 206.5 contro
-173.6 (**1.19×**), decode 20.3 contro 30.4 (0.67×).
+Same mode (1 vs 0) at 2048-token prompt, 16 tokens: 16 threads prefill 159.2 vs 147.2 (1.08×)
+and decode 19.5 vs 23.4 (0.83×); 8 threads prefill 130.1 vs 86.7 (1.50×) and decode 21.4 vs 22.0.
+Machine busy (4 processes running idle, prompt 512, 16 threads): prefill 206.5 vs 173.6
+(**1.19×**), decode 20.3 vs 30.4 (0.67×).
 
-**Rimisura a 16 thread con controllo A/A** (8 giri, ordine a rotazione, `tools/ab_modes.sh`; tabella
-e soglie in §Revisione). Prefill: al core **242.9**, al processore 223.3 (0.92×, e instabile:
-185-240), senza pin 190.8 (0.79×); differenze tutte sopra la soglia (1.2%). Decode: 31.26, 30.74 e
-31.82; fra il pin al core e gli altri due **non distinguibile** (−1.6% e +1.8%, soglia 2.2%). Il
-decode a 16 thread del pin al processore (25.1 e 21.5 nelle tabelle sopra, 0.82×) **non si
-riproduce**: contro nessun pin è 0.97×.
+**16-thread A/A remeasure** (8 rounds, round-robin order, `tools/ab_modes.sh`; table and
+thresholds in §Adversarial review). Prefill: to core **242.9**, to processor 223.3 (0.92×,
+unstable: 185-240), no pin 190.8 (0.79×); all differences above threshold (1.2%). Decode: 31.26,
+30.74, and 31.82; between core pin and the other two **not distinguishable** (−1.6% and +1.8%,
+threshold 2.2%). 16-thread decode of processor pin (25.1 and 21.5 in tables above, 0.82×)
+**does not reproduce**: vs no pin is 0.97×.
 
-Letture:
-- **Il prefill guadagna sempre**, e tanto più quanto meno thread ci sono: a 4 thread vale 1.50×,
-  perché senza affinità Windows appoggia quei 4 thread su 2 core fisici. Col default (pin al core) a
-  16 thread è 1.24× (**1.27×** nella rimisura con A/A). Anche con la macchina occupata il guadagno
-  resta (1.19×): il pin non è fragile sotto contesa (domanda 22).
-- **Il modo di pinnare si vede nel prefill, non nel decode** (corretto dalla rimisura con A/A). La
-  prima misura (3 giri, ordine fisso) dava al pin a **un processore** un costo del 17-18% sul decode
-  a 16 thread: con 8 giri e controllo A/A non si riproduce (−3.4% contro nessun pin; −1.6% contro
-  il pin al core, non distinguibile). Quello che il pin al **core** dà in più è prefill: **+9%** sul
-  pin al processore, in 8 giri su 8, e stabile (spread 5% contro 25%). Resta il default: impedisce
-  che due thread finiscano sullo stesso core senza inchiodarli. Il dato a macchina occupata (0.67×)
-  non è stato rimisurato. Domanda 27: la premessa non regge.
-- Non era la latenza di risveglio: allungando lo spin da 2 a 20 ms il decode a 16 thread pinnati al
-  processore andava 21.0 invece di 23.6, cioè peggio.
-- **Il decode preferisce 8 thread a 16**: col default 34.7 contro 31.0-31.7 nella rimisura con A/A
-  (**1.09-1.12×**, intervalli disgiunti, soglia 2.2%; prima 31.0 contro 28.7 con intervalli
-  sovrapposti). Il prefill vuole tutti i core (242.5 contro 170.9 a 8, 1.42×), il decode no. Oggi il
-  numero di thread è uno solo per tutte e due le fasi: è una leva aperta (domanda 26).
-- A 1 thread il pin non cambia il prefill (non c'è niente da collocare) e dà +14% sul decode.
+Notes:
+- **Prefill always gains**, more with fewer threads: at 4 threads worth 1.50×, because without
+  affinity Windows puts those 4 threads on 2 physical cores. With default (core pin) at 16
+  threads is 1.24× (**1.27×** in A/A remeasure). Even with machine busy gain remains (1.19×):
+  pin isn't fragile under contention (question 22).
+- **Pin mode shows in prefill, not decode** (corrected by A/A remeasure). First measure (3
+  rounds, fixed order) gave **logical processor** pin 17-18% cost on 16-thread decode: with 8
+  rounds and A/A control doesn't reproduce (−3.4% vs no pin; −1.6% vs core pin, not
+  distinguishable). What **core** pin adds more is prefill: **+9%** over processor pin, 8 rounds
+  out of 8, stable (spread 5% vs 25%). Keeps the default: prevents two threads landing on same
+  core without pinning them tight. Busy-machine data (0.67×) not remeasured. Question 27:
+  premise doesn't hold.
+- Not wakeup latency: lengthening spin from 2 to 20 ms made 16-thread decode pinned to
+  processor 21.0 instead of 23.6, i.e., worse.
+- **Decode prefers 8 threads to 16**: with default 34.7 vs 31.0-31.7 in A/A remeasure
+  (**1.09-1.12×**, disjoint intervals, threshold 2.2%; before 31.0 vs 28.7 with overlapping).
+  Prefill wants all cores (242.5 vs 170.9 at 8, 1.42×), decode doesn't. Today thread count is
+  one for both phases: it's an open lever (question 26).
+- At 1 thread pin doesn't change prefill (nothing to place) and gives +14% on decode.
 
-## Attivazioni int8 con VNNI: quanto darebbe la leva 2 (2026-09-18)
+## Int8 activations with VNNI: what lever 2 would give (2026-09-18)
 
-Domanda 21. Candidato scritto **nel benchmark**, non nei kernel (`tests/bench_kernels.c`): quantizza
-le attivazioni a int8 a blocchi di 32 come Q8_0 e usa `_mm256_dpbusd_epi32`, con la stessa struttura
-di ggml (accumulo int32 per blocco, conversione e scala in un accumulatore float, somme dei pesi del
-blocco precalcolate per la correzione +128). Non è e non sarà un kernel nostro: le attivazioni a 8
-bit sono un altro numero, quindi non può essere bit-identico. `make bench`, 9 run da 40 ms, mediana.
+Question 21. Candidate written **in benchmark**, not in kernels (`tests/bench_kernels.c`):
+quantizes activations to int8 in blocks of 32 like Q8_0 and uses `_mm256_dpbusd_epi32`, with
+same ggml structure (int32 accumulate per block, convert and scale in float accumulator, block
+weight sums precomputed for +128 correction). Not ours and won't be: 8-bit activations are
+another number, so can't be bit-identical. `make bench`, 9 runs of 40 ms, median.
 
-| kernel | attivazioni | n=1024 | n=2048 | n=4096 |
+| kernel | activations | n=1024 | n=2048 | n=4096 |
 |---|---|---|---|---|
 | `dot_row q8_0` (AVX-512) | float | 11 083 | 11 278 | 11 379 |
-| `dot q8_0 x q8_0` VNNI (candidato) | int8 | 11 184 | 11 398 | 12 310 |
-| `dot_row q8_0 x4` (già nostro) | float, 4 token | **28 644** | **29 969** | **30 565** |
+| `dot q8_0 x q8_0` VNNI (candidate) | int8 | 11 184 | 11 398 | 12 310 |
+| `dot_row q8_0 x4` (already ours) | float, 4 tokens | **28 644** | **29 969** | **30 565** |
 
-Milioni di elementi al secondo per riga di attivazioni. Quantizzare le attivazioni costa 467 M
-elem/s (scalare), che un matmul paga una volta ogni 1024 righe: trascurabile.
+Million elements per second per activation row. Quantizing activations costs 467 M elem/s
+(scalar), which one matmul pays once every 1024 rows: negligible.
 
-Letture (**corrette dalla revisione del 2026-09-18**, §Revisione avversariale e LEZIONI #65: la
-tabella è giusta, la conclusione che ne era stata tirata no):
-- Questa tabella confronta una riga contro **un** token, int8 contro float: lì l'int8 vale +1-8%.
-  Ma il candidato ha mezza riga di lavoro scalare per blocco (half→float, catena della
-  correzione), e il prefill non gira con quel kernel: gira col kernel a 4 token.
-- Il nostro kernel a 4 token è 2.6-2.7× più veloce di entrambi perché riusa la riga di pesi. La
-  domanda giusta era che cosa dà l'int8 **con quella stessa struttura**: misurato dopo, dà
-  **1.8-2.3×** in più, mentre «blocchi più larghi» in float (8 token) non rende. Il divario con
-  llama.cpp sta nelle attivazioni a 8 bit, non nei blocchi più larghi.
-- A questi n il dot non è limitato dalla memoria (12 GB/s contro i ~41 misurati): è latenza e
-  istruzioni per blocco. Una istruzione che fa 4 prodotti non cambia il totale solo finché le
-  istruzioni per blocco restano quelle del candidato; tolte, lo cambia.
+Notes (**corrected by 2026-09-18 review**, §Adversarial review and LESSONS #65: table is
+right, the conclusion drawn from it isn't):
+- This table compares one row against **one** token, int8 vs float: there int8 is worth +1-8%.
+  But the candidate has half a row scalar work per block (half→float, correction chain), and
+  prefill doesn't run with that kernel: runs with 4-token kernel.
+- Our 4-token kernel is 2.6-2.7× faster than both because it reuses weight row. The right
+  question was what int8 gives **with that same structure**: measured later, gives **1.8-2.3×**
+  more, while «wider blocks» in float (8 tokens) doesn't pay. Gap with llama.cpp is in 8-bit
+  activations, not wider blocks.
+- At these n the dot isn't memory-limited (12 GB/s vs ~41 measured): it's latency and
+  instructions per block. One instruction doing 4 products doesn't change the total only while
+  instructions per block stay the candidate's; remove them, it changes.
 
-## SMT: 32 thread contro 16 (2026-09-18)
+## SMT: 32 threads vs 16 (2026-09-18)
 
-Stesso metodo, prompt 2048, 16 token, entrambi i casi **pinnati**: A = 16 thread, uno per core
-fisico; B = 32 thread, uno per processore logico (i due fratelli di ogni core).
+Same method, 2048-token prompt, 16 tokens, both cases **pinned**: A = 16 threads, one per
+physical core; B = 32 threads, one per logical processor (two siblings of each core).
 
 | | 16 thread (un core ciascuno) | 32 thread (fratelli SMT) |
 |---|---|---|
 | prefill tok/s | **163.6** | 110.2 |
 | decode tok/s | **22.9** | 2.2 |
 
-Il prefill perde un terzo, il decode crolla di **dieci volte**: due thread sullo stesso core si
-tolgono la cache a vicenda e, con 464 dispatch per token, ognuno aspetta il fratello. Chiude la
-domanda 3: le copie SMT non aiutano, e il default (thread = core fisici) è quello giusto.
+Prefill loses a third, decode crashes **tenfold**: two threads on same core fight over cache and,
+with 464 dispatches per token, each waits for its sibling. Closes question 3: SMT copies don't
+help, and the default (threads = physical cores) is right.
 
-## Speculazione dal prompt — quanto rende e quando perde (2026-09-17)
+## Speculation from prompt — how much it helps and hurts (2026-09-17)
 
 Container, volume `trochilus-models`, OLMoE-1B-7B Q8_0 intero, `run -f <prompt> -n 200`,
-`--spec 0` e `--spec k` **alternati run per run** (`tools/ab_spec.sh`, LEZIONI #46), mediana di 3
+`--spec 0` e `--spec k` **alternati run per run** (`tools/ab_spec.sh`, LESSONS #46), mediana di 3
 giri dopo uno di riscaldamento. Il testo generato è identico in ogni giro: lo script si ferma se
 non lo è. Nessun pin dei thread e misure in container: rifatte native e col pin in §Bozza adattiva,
 dove il costo di una riga in più risulta circa 3 volte quello scritto qui sotto (13.7-17.6 ms
-misurati per zona contro 5.2; LEZIONI #59).
+misurati per zona contro 5.2; LESSONS #59).
 
 | Prompt | Bozza | Decode tok/s (min-max) | Bozze accettate | Contro `--spec 0` |
 |---|---|---|---|---|
@@ -593,7 +696,7 @@ Letture:
 - Conseguenza: `--spec` resta **spento di default** finché la bozza non si accorcia da sola dopo un
   rifiuto (llama.cpp lo fa). Con la bozza adattiva il caso peggiore diventa «come senza».
 
-## Bozza adattiva: quanto costa davvero una riga in più (2026-09-18)
+## Adaptive draft: what one more row really costs (2026-09-18)
 
 Windows **nativo**, macchina ferma, pin al core (il default), 16 thread, `run -f <prompt> -n 200`,
 `--spec 0` e `--spec 8` **alternati run per run** (`tools/ab_spec.sh`), mediana di 3 giri dopo uno
@@ -622,7 +725,7 @@ Letture:
   altri, e la passata legge anche quelli. Una riga in più costa così mezza passata o più, e il
   pareggio sta al **44-56% di bozze accettate** (costo della riga / costo della passata, misurati
   per zona in §Revisione; la stima dai tok/s diceva 60-75%), non al 15% che diceva la misura fatta
-  in container (LEZIONI #59). È anche il motivo per cui la bozza lunga rende solo dove il testo è
+  in container (LESSONS #59). È anche il motivo per cui la bozza lunga rende solo dove il testo è
   già nel prompt: lì gli esperti scelti sono gli stessi, perché i token sono gli stessi.
 - **Accorciare la bozza non bastava**: con il 41% di accettate si perdeva ancora l'11%. Fermarla del
   tutto dopo una bozza tutta sbagliata (pausa 1, 3, 7, 15 passi, capped 16) porta il caso peggiore a
@@ -633,10 +736,10 @@ Letture:
 - La bozza fissa resta la più veloce dove il modello ricopia (1.34×): chi sa che sta riscrivendo un
   file può ancora chiedere `--spec 8 --spec-fixed`.
 
-## Kernel: una riga di pesi contro 4 token (2026-09-17)
+## Kernel: one weight row vs 4 tokens (2026-09-17)
 
-`make bench` (`tests/bench_kernels.c`, container, mediana di 5 × 100 ms, un thread), milioni di
-elementi al secondo **per riga di input**:
+`make bench` (`tests/bench_kernels.c`, container, median of 5 × 100 ms, one thread), million
+elements per second **per input row**:
 
 | Kernel | n=1024 | n=2048 | n=4096 |
 |---|---|---|---|
@@ -660,10 +763,10 @@ Letture:
 - Da 1 a 16 thread la stessa matrice rende 6.5×, non 16: a 16 thread la macchina è al limite di
   potenza (domanda 20).
 
-## Leve di velocità: cosa dice la ricerca (2026-09-17)
+## Speed levers: what research says (2026-09-17)
 
-Numeri delle fonti, su altre macchine: indicano la direzione, non promettono. Esatto = stessi
-numeri; dichiarato = numeri diversi, differenza da misurare sul modello vero prima di adottarlo.
+Numbers from sources, on other machines: point the direction, don't promise. Exact = same
+numbers; declared = different numbers, difference to measure on real model before adopting.
 
 | # | Leva | Tipo | Guadagno riportato | Per noi |
 |---|---|---|---|---|
@@ -684,14 +787,14 @@ Una riga di esperto (2 KB) e il vettore (8 KB) stanno già in L1: nel decode un 
 volta per token, e non c'è niente da tenere in cache. Il blocking conta quando più token
 riusano le stesse righe (leve 3-6).
 
-## Revisione avversariale (2026-09-18)
+## Adversarial review (2026-09-18)
 
-Rilettura di tutto il repository da parte di un altro modello (Fable 5.1), con l'ordine di
-portare prove e non opinioni. Errori e controlli nuovi: LEZIONI #60-#68. Qui i numeri.
-Container `trochilus-dev`, altri container accesi: per questo i confronti sono solo quelli con
-effetti molto sopra lo spread (kernel su un core, run alternate) o **senza cronometro**
-(contatori, replay). Niente di quello che segue è una misura di velocità del prodotto, tranne
-l'ultimo blocco (**Rimisura nativa con controllo A/A**), che è nativo e a macchina ferma.
+Re-read of entire repository by another model (Fable 5.1), instructed to bring evidence not
+opinions. New errors and checks: LESSONS #60-#68. Here are the numbers. Container
+`trochilus-dev`, other containers on: so comparisons are only those with effects well above
+spread (kernel on one core, alternating runs) or **no stopwatch** (counters, replay). None of
+what follows is a product speed measurement except the last section (**Native A/A remeasure**),
+which is native and machine idle.
 
 **Invarianti: reggono.** `trochilus logits` su 40-70 token, 3 tier (`TR_CPU_MAX` scalar, avx2,
 avx512) × 3 numeri di thread (1, 5, 16) × 3 passate (`-b` 1, 7, 512): 27 file per modello,
@@ -702,7 +805,7 @@ per rompere (tempeste di segni combinanti, jamo, ogni spazio Unicode, contrazion
 incollati a segni e spazi) × 2 modi contro HF `tokenizers`: 0 differenze, e 12 000 decodifiche
 uguali.
 
-**Attivazioni int8, seconda misura** (domanda 21, LEZIONI #65). `make bench`, sezione «one row,
+**Attivazioni int8, seconda misura** (domanda 21, LESSONS #65). `make bench`, sezione «one row,
 by»: i quattro kernel girano alternati sulla stessa riga, 9 run da 40 ms, un core. Nanosecondi
 per riga di input e rapporto col nostro kernel; il float x8 è verificato identico al bit al x4,
 gli int8 contro il loro dot in C puro.
@@ -723,7 +826,7 @@ Spread 3-8% per riga; con clang 1.78× / 1.84× / 2.13× e 1.15× / 0.79× / 0.9
   **non è esatto**: i logit del prefill non sarebbero più quelli del token per token. Può
   esistere solo come modo dichiarato; la decisione è di Marcello.
 
-**Quanto legge una riga di bozza** (domanda 12, LEZIONI #67). Contatore `weight_bytes` del
+**Quanto legge una riga di bozza** (domanda 12, LESSONS #67). Contatore `weight_bytes` del
 profiler diviso per le passate: deterministico, modello vero, 200 token, `generate --spec k`.
 
 | prompt | bozza | righe/passata | MiB di pesi/passata | MiB per riga in più | esperti nuovi per layer (su 8) |
@@ -744,7 +847,7 @@ zone dense (`qkv_proj`, `attn_out_proj`, `lm_head`), dove non c'è nessun peso n
 La parte a tempo è misurata nativa più sotto (**Quanto costa una riga di bozza, a zone**): negli
 esperti sta il 61-91% del costo, e le zone dense pesano solo con le bozze lunghe.
 
-**Le costanti della pausa, senza cronometro** (LEZIONI #60, #67). Che una bozza venga accettata
+**Le costanti della pausa, senza cronometro** (LESSONS #60, #67). Che una bozza venga accettata
 dipende solo dai token, e i token sono gli stessi con ogni politica: ogni politica si può
 rigiocare sulla continuazione registrata. Il replay riproduce alla riga i contatori del motore
 (77 passate, 180 bozze, 125 accettate su `code-edit`; 172, 65, 28 su `code`). Tempo = passate ×
@@ -764,16 +867,16 @@ Letture: le costanti spostano il 2-3%, meno di quanto una misura a tempo su ques
 possa vedere; restano quelle. Il caso peggiore «1.01×» misurato nativo su 3 giri corrisponde a
 C ≈ 15 ms; con C = 20-22 (il valore che la stessa sezione ricava per le bozze corte) il replay
 dà 0.94-0.96×. La domanda «`--spec` acceso di default» va decisa su una misura con più giri e
-un controllo A/A (`tools/ab_modes.sh`, LEZIONI #66): fatta, è il blocco **Rimisura nativa** più
+un controllo A/A (`tools/ab_modes.sh`, LESSONS #66): fatta, è il blocco **Rimisura nativa** più
 sotto, e dà **0.953×**.
 
-**Il pool con più di un pool** (LEZIONI #61-#63). Programma di prova, Linux: `H1` chiamante
+**Il pool con più di un pool** (LESSONS #61-#63). Programma di prova, Linux: `H1` chiamante
 prima `[0-31]`, dopo due pool creati e distrutti nell'ordine di nascita `[0,1]`; `H2` processo
 ristretto a `[0,2]`, pool da 4: worker 2 e 3 su `[0]`; `H3` worker 1 di due pool vivi entrambi
 su `[2,3]`; `H4` pool interno da 2, id del worker arrivato al body: 3. H1 e H2 corretti e sotto
 test; H3 e H4 restano un debito dichiarato in `threads.h`.
 
-**Rimisura nativa con controllo A/A** (LEZIONI #66 e #67; `sh tools/remeasure.sh`, ogni run in
+**Rimisura nativa con controllo A/A** (LESSONS #66 e #67; `sh tools/remeasure.sh`, ogni run in
 `build/remeasure/`). Windows nativo, macchina ferma: lo script ferma i 9 container degli altri
 progetti e li riavvia alla fine. Binario del commit 87297b4, OLMoE-1B-7B Q8_0, 16 thread dove non
 è detto altro. `tools/ab_modes.sh`: 8 giri dopo uno di riscaldamento, il primo modo del giro
@@ -823,7 +926,7 @@ Letture:
   intervalli disgiunti (33.9-35.0 contro 30.4-32.1), 8 giri su 8. Il prefill vuole 16: 1.42×
   contro 8. Conferma la premessa della domanda 26, che prima stava dentro lo spread.
 
-**Quanto costa una riga di bozza, a zone** (domanda 12, la metà a tempo; LEZIONI #67). Stessa
+**Quanto costa una riga di bozza, a zone** (domanda 12, la metà a tempo; LESSONS #67). Stessa
 sessione: `generate --tokens <code-edit> -n 200 --profile-json`, tre modi alternati per 3 giri
 (`--spec 0`, `--spec 1 --spec-fixed`, `--spec 8 --spec-fixed`). Millisecondi per passata, mediana
 (min-max). «Dense» sono `qkv_proj`, `attn_out_proj`, `lm_head`; «esperti» sono `expert_gate_up`
@@ -863,12 +966,12 @@ Letture:
   migliore, pausa 2, 5, 11, 16, dà 0.97-0.98×): le costanti della pausa non bastano, la leva è il
   costo della riga.
 
-## Thread per fase (2026-09-18)
+## Threads per phase (2026-09-18)
 
-Domanda 26. Windows nativo, macchina ferma (`tools/threads_phase.sh` ferma i 9 container degli
-altri progetti e li riavvia alla fine), OLMoE-1B-7B Q8_0, pin al core, `tools/ab_modes.sh`: 8 giri
-dopo uno di riscaldamento, il primo modo del giro ruota, controllo A/A. Mediana (min-max),
-rapporto col primo modo. Ogni run in `build/threads_phase/`.
+Question 26. Native Windows, machine idle (`tools/threads_phase.sh` stops 9 containers of
+other projects and restarts at end), OLMoE-1B-7B Q8_0, pinned to cores, `tools/ab_modes.sh`:
+8 rounds after one warmup, first mode of round rotates, A/A control. Median (min-max), ratio
+to first mode. Each run in `build/threads_phase/`.
 
 **1. Quanti thread vuole ogni fase** (`sh tools/threads_phase.sh sweep`: un solo `-t` per tutte e
 due le fasi, binario del commit b231b28, `generate -p <contesto> -n 48`).
@@ -896,7 +999,7 @@ Soglia, il peggiore A/A della sessione: decode 0.6%, prefill 0.9%.
   4 torna indietro (−1.2% e −0.6%: non distinguibile da 16, e −3.6% da 8) e 12 è il peggiore
   (−3.6%, −3.0%).
 - **Scelta: n = 8**, il solo numero sopra la soglia a tutti e due i contesti. 4 vince di poco dove
-  il contesto è corto e perde dove è lungo, e nel coding il contesto è lungo (LEZIONI #70).
+  il contesto è corto e perde dove è lungo, e nel coding il contesto è lungo (LESSONS #70).
 - Perché: il decode legge 1.2 GB di pesi per token e 4 thread riempiono già il bus (34 tok/s sono
   41 GB/s); oltre quel punto ogni thread in più aggiunge solo attesa alla barriera di ogni
   `parallel_for`. Col contesto cresce l'attenzione, che è calcolo e si divide per testa: lì i
@@ -947,7 +1050,7 @@ di `ab_modes.sh`, 16 run per contesto):
 
 A 2048 le run che scelgono 8 fanno 24.0-25.1 tok/s e quelle che scelgono 16 fanno 23.4-23.8: ogni
 scelta sbagliata costa il 4%, e succede perché il tempo migliore di tre passate ha un rumore del
-2% circa, quanto la distanza fra 16 e 8 a quel contesto (LEZIONI #71). Con l'1% a 512 la scelta
+2% circa, quanto la distanza fra 16 e 8 a quel contesto (LESSONS #71). Con l'1% a 512 la scelta
 cade su 4 una volta su tre: lì 4 e 8 vanno uguale, e la rimisura ogni 1024 token la riporta su 8
 quando il contesto cresce. Uno stimatore più robusto è la domanda 31.
 
@@ -1003,17 +1106,16 @@ Soglia della sessione: decode 1.0%, prefill 0.6%.
 - **Prefill: non distinguibile** a nessuno dei due contesti (da −0.7% a +0.4%).
 - Su una risposta di 48 token la misura pesa; su una di 200 sono 9 passate su 200, e poi 9 ogni 1024.
 
-## Decode a contesto lungo e banda della RAM (2026-09-19)
+## Decode at long context and RAM bandwidth (2026-09-19)
 
-Domande 4 e 18, punto 6 dei prossimi passi. Windows nativo, macchina ferma, OLMoE-1B-7B Q8_0, pin al
-core, tutto in **una finestra sola** (`sh tools/decode_context.sh change build/trochilus-before.exe`,
-105 minuti, ogni run in `build/decode_context/`): `tools/ab_modes.sh`, 8 giri dopo uno di
-riscaldamento, `generate -p <contesto> -n 48 -t 16`. I quattro contesti stanno nella **stessa
-sessione**, 16 modi in un ordine che mette ogni contesto dopo ogni altro una volta sola (sequenza di
-de Bruijn): una run sulla macchina scaldata da un prompt da 4000 non è sempre lo stesso contesto, e
-un modo e la sua copia A/A non seguono mai lo stesso contesto. «Prima» è il binario del commit
-6734910; «dopo» ha la KV con le posizioni di una testa in fila (sotto). Le tabelle escono da
-`tools/decode_context_report.py speed | model | zones`.
+Questions 4 and 18, point 6 of next steps. Native Windows, machine idle, OLMoE-1B-7B Q8_0,
+pinned to cores, all in **one window** (`sh tools/decode_context.sh change
+build/trochilus-before.exe`, 105 minutes, each run in `build/decode_context/`): `tools/ab_modes.sh`,
+8 rounds after one warmup, `generate -p <context> -n 48 -t 16`. Four contexts in **same session**,
+16 modes in order putting each context after each other once (de Bruijn sequence): one run on
+machine warmed by 4000-token prompt isn't always same context, and one mode and its A/A copy never
+follow same context. «Before» = binary at commit 6734910; «After» = KV with one head's positions
+in a row (below). Tables from `tools/decode_context_report.py speed | model | zones`.
 
 **1. La banda della RAM** (`make bench-mem`, `tests/bench_mem.c`: 2 GiB letti dai thread del pool,
 pinnati come nel motore; mediana di 7; due run nella stessa notte, a due ore di distanza, concordi
@@ -1162,7 +1264,7 @@ che tiene la KV a 16 bit **e** le attivazioni a 8, sta a KL 9e-3 da noi. Non imp
 Marcello. Il confronto col decode di llama.cpp a contesto lungo (domanda 19) va rifatto adesso: il suo
 vantaggio lì era anche questo.
 
-## Prefill su prompt lunghi (2026-09-19)
+## Prefill on long prompts (2026-09-19)
 
 Punto 4 dei prossimi passi, domande 7 e 30. Windows nativo, macchina ferma, OLMoE-1B-7B Q8_0, 16
 thread, pin al core. Tre finestre di `tools/prefill_context.sh`: `measure` alle 05:27 (il binario del
@@ -1253,7 +1355,7 @@ La parte seriale non è solo quella: dentro `router` la scelta degli esperti tok
 su un thread, e lo scenario a **un thread** lo dice (prompt 512: `router` 415 ms a un thread, 80 a
 16: circa 57 ms non si dividono). E l'altra metà della zona era un kernel mancante: la matrice del
 router è **F32**, e le righe F32 giravano sul ciclo scalare in ogni tier (0.11 GB/s nella zona;
-LEZIONI #78). In tutto il lavoro su un thread solo valeva l'**8%** del prefill a 512 e il 5-6% a 4000.
+LESSONS #78). In tutto il lavoro su un thread solo valeva l'**8%** del prefill a 512 e il 5-6% a 4000.
 
 **4. Le tre leve esatte.** Ognuna cambia dove e quando si fa un calcolo, mai il calcolo: stesse
 chiamate di kernel sugli stessi float nello stesso ordine per ogni uscita.
@@ -1278,7 +1380,7 @@ passata (120 MB, 16 thread), a passate da 64 su 8 thread, su un prompt da 4000 a
 
 **5. Prima e dopo** (`sh tools/prefill_context.sh change build/trochilus-before.exe`; tok/s, mediana
 (min-max) di 8; soglia della sessione, il peggiore A/A: **prefill 2.1%, decode 2.4%**; «dopo» è la
-seconda copia del binario nuovo, LEZIONI #81, hash in `build/prefill_context/binaries.sha256`):
+seconda copia del binario nuovo, LESSONS #81, hash in `build/prefill_context/binaries.sha256`):
 
 | prefill | prima | prima, copia | dopo | dopo, copia | dopo / prima |
 |---|---|---|---|---|---|
@@ -1289,7 +1391,7 @@ seconda copia del binario nuovo, LEZIONI #81, hash in `build/prefill_context/bin
 Il decode dopo quei prompt **non è distinguibile**: 33.0 contro 33.1 tok/s a 512 (1.000-1.013×),
 25.7 contro 25.6 a 2048 (0.973-1.005×), 19.9 contro 19.9 a 4000 (0.972-1.001×). (In questa sessione
 il binario di prima fa 160 tok/s a 4000 dove al mattino ne faceva 169: la macchina era appena uscita
-da due ore di standby, LEZIONI #82. Conta il confronto dentro la sessione.)
+da due ore di standby, LESSONS #82. Conta il confronto dentro la sessione.)
 
 Per zona (profilo del mattino contro profilo del binario nuovo, ms del prompt):
 
@@ -1411,15 +1513,15 @@ giorno: lo scalare, coi numeri misurati, sta in §`tr_expf`.** I tre numeri chie
 | i test vedono gli errori? | `tools/mutate_prefill.sh` nel container | 45 minuti |
 
 
-## Rimisura a macchina pulita (2026-09-19)
+## Clean machine remeasure (2026-09-19)
 
 Quattro processi `yes`, residui di una prova del 17/09, sono rimasti al 100% di un core l'uno sotto
-**ogni misura nativa del 18 e del 19/09** (LEZIONI #84). Rimisurato il 19/09 dalle 16:09 alle 17:52,
+**ogni misura nativa del 18 e del 19/09** (LESSONS #84). Rimisurato il 19/09 dalle 16:09 alle 17:52,
 senza di loro, ciò da cui era stato scelto il default del motore: thread per fase e decode a
 contesto lungo. Binario con `tr_expf` (hash in `build/prefill_context/binaries.sha256`), 8 giri,
 A/A, ogni run in `build/threads_phase/` e `build/decode_context/`; le sessioni coi `yes` restano in
 `build/threads_phase-with-yes/` e `build/decode_context-with-yes/`. Ogni sessione dichiara nel log
-il **carico di fondo** (LEZIONI #85): il processo `System` del kernel tiene da solo 0.7-0.9 core,
+il **carico di fondo** (LESSONS #85): il processo `System` del kernel tiene da solo 0.7-0.9 core,
 sempre; è un fatto di questa macchina e sta sotto ogni numero di questo documento.
 
 | sessione | ora | carico di fondo prima → dopo (processori logici occupati, di cui `System`) | peggiore A/A |
@@ -1478,7 +1580,7 @@ Le larghezze forzate a 512 della prima sessione (rumorosa) dicono lo stesso: 16 
 32.3), 12 31.1, 8 31.1, 6 33.1, 4 33.1, automatico 33.6 (scelte 4×4 1×8 3×16, 3 cambi); coi `yes`
 erano 30.9, 31.6, 34.1, 34.6, 33.8 e 33.8.
 
-**Lo stimatore tira a sorte** (LEZIONI #88, domanda 31). Le scelte cambiano da una run all'altra: poco a
+**Lo stimatore tira a sorte** (LESSONS #88, domanda 31). Le scelte cambiano da una run all'altra: poco a
 macchina quieta (una run su otto), molto appena c'è rumore (4×4 1×8 3×16), e succedeva già coi `yes`,
 dove a 2048 cambiava 3-5 volte su 8: la velocità mediana non lo mostrava, perché dove le larghezze si
 equivalgono una scelta instabile non costa. Il margine (la più ampia entro l'**1%** dalla più veloce,
@@ -1514,7 +1616,7 @@ tools/decode_context.sh measure`, `sh tools/threads_phase.sh sweep`; le tabelle 
 `tools/decode_context_report.py speed <file>` (scelte e cambi compresi) e `model`.
 
 
-## `tr_expf`: l'esponenziale nostro, scalare (2026-09-19)
+## `tr_expf`: our exponential, scalar (2026-09-19)
 
 Domanda 37, primo tempo: **solo lo scalare**, che è la definizione. Il SIMD è una decisione a parte
 (punto 7). Velocità misurate sulla macchina pulita della sezione sopra, dalle 17:58 alle 18:39:
@@ -1531,7 +1633,7 @@ y·(1 + 2^-50) arrotondano allo stesso float, exp(x) arrotonda lì. Gli argoment
 a 400: uguale). Un argomento che fallisse il test senza essere in tabella darebbe un NaN: un
 arrotondamento che nessuno ha provato non esce dalla funzione come numero. Dentro non c'è nessuna
 chiamata alla libreria C, e nessuna costante viene da una libreria: le scrive `tools/gen_expf_table.py`
-con mpmath (`src/kernels/expf_table.h`, confrontato col suo generatore da `tools/lint.py`, LEZIONI
+con mpmath (`src/kernels/expf_table.h`, confrontato col suo generatore da `tools/lint.py`, LESSONS
 #83). Le 8 eccezioni le trovano uguali tre strade: il C su Windows (MinGW gcc 15.2), il C su Linux
 (gcc 13.3), e un mirror numpy bit a bit della strada veloce su tutti i float in campo
 (`gen_expf_table.py --scan`, 4 minuti). Softmax (attenzione e router) e SwiGLU la usano;
@@ -1578,7 +1680,7 @@ fra il binario nativo e quello del container sulle fixture minuscole F32, F16 e 
 sul **modello vero a 2 layer su 1000 posizioni (201 MB)**. Il sospetto sulla tabella RoPE (`pow`, `cos`
 e `sin` della libreria C, in double, arrotondati a float: il solo posto rimasto dove i numeri vengono
 da una libreria) è misurato voce per voce (`tests/dump_rope.c`, `tools/rope_table_compare.py`; la
-seconda copia dello strumento, LEZIONI #81, perché Smart App Control bloccava la prima): su 4096
+seconda copia dello strumento, LESSONS #81, perché Smart App Control bloccava la prima): su 4096
 posizioni × 64 coppie i **double** di `cos` e `sin` differiscono fra le due librerie nello 0.8% delle
 voci (2175 coseni, 2216 seni su 262 144), `pow` mai, e i **float** della tabella del motore **mai**:
 l'arrotondamento a float assorbe l'ultima cifra del double. Domanda 40 chiusa: fino al contesto di
@@ -1632,7 +1734,7 @@ sotto la soglia di una buona sessione. Decide Marcello (domanda 39).
 | logit al byte, prima e dopo con A/A, banco, zone | `GEN_EXTRA="--decode-threads 8" PROF_BEFORE=<prima> sh tools/prefill_context.sh change <prima>` | 45 minuti |
 
 
-## M1, prima di scrivere codice: routing e disco (2026-09-19/20)
+## M1, before writing code: routing and disk (2026-09-19/20)
 
 Domande 13-16. Una traccia del routing sul modello vero e un banco del disco; nessun cronometro sul
 motore, quindi nessuna dipendenza dallo stimatore della larghezza non ancora validato.
@@ -1688,7 +1790,7 @@ misses, 3723 MiB read in 2.96 s`, e con `TR_EXPERT_DIRECT=0` gli stessi colpiti,
 davvero dal disco anche su un volume cifrato; e gli slot sono **511 contro 512**, perché in diretta
 ognuno porta un settore di margine per parte (3 × 4 KiB su 6.4 MiB: lo 0.2%).
 
-**Il costo di una chiamata di lettura** (LEZIONI #94, misurato il 2026-09-20 in nativo,
+**Il costo di una chiamata di lettura** (LESSONS #94, misurato il 2026-09-20 in nativo,
 `bench_event_overhead` in `tests/bench_disk.c`): su Windows `tr_file_pread` crea e chiude un evento
 a ogni chiamata. Su un blocco da 4 KiB già in cache, 20 000 giri: **2.54-2.61 µs** contro
 **2.11-2.20 µs** con un evento tenuto vivo, cioè 0.41-0.44 µs a chiamata su tre run. Una lettura da
@@ -1747,7 +1849,7 @@ seconda degli stessi blocchi **12-26 GB/s** (è una copia dalla RAM).
    mai di più) resta un'opzione che il piano automatico accende solo su un disco veloce, dove vale
    l'11-15%. Domanda 43.
 
-## M1 misurato: cosa costa davvero leggere gli esperti dal disco (2026-09-20 notte)
+## M1 measured: what experts really cost from disk (2026-09-20 night)
 
 Il motore vero, Windows nativo, macchina ferma (carico di fondo 1.0-1.4 processori su 16, quasi
 tutto il processo System), `sh tools/experts_budget.sh measure | misses | long | direct`. Prompt di
@@ -1783,7 +1885,7 @@ esce dal conto; i contatori non si muovono da run a run, spread 0.0%):
 conto: quella simulazione (modello superato dalla misura) contava i miss su una generazione lunga di 1000 token partendo da una cache
 qualunque, mentre il motore arriva al decode con la LRU appena riempita dal prompt — che ha toccato
 quasi ogni unità. Le ultime 512 (o 256) unità toccate sono esattamente quelle che servono, e più la
-generazione va avanti **meno** sbaglia, non di più (LEZIONI #98).
+generazione va avanti **meno** sbaglia, non di più (LESSONS #98).
 
 **3. Il decode migliora con la lunghezza della generazione**, e il colpevole è l'archivio:
 
@@ -1817,13 +1919,13 @@ Con 7 GiB letti e 31 GiB di RAM la cache del sistema tiene tutto il modello: «b
 RAM, non il disco. Per questo `experts_budget.sh` si rifiuta di partire se la riga `experts:` non
 dice `direct` — senza quella guardia ogni numero di M1 sarebbe gonfiato di 2.4× sul prompt.
 
-## Il prefill legge il modello una volta per passata (2026-09-21)
+## Prefill reads model once per pass (2026-09-21)
 
 Domanda 47, nata dalla domanda della sovrapposizione I/O-calcolo: quanto del prefill è attesa del
 disco e quanto calcolo. Il profilo separa le due cose (zona `weight_read`), e il conto ha trovato
 dell'altro. `sh tools/prefill_overlap.sh 5` (mediana di 5 giri più uno di riscaldamento, ordine a
 rotazione, macchina ferma a 1.07-1.19 processori su 16, binario `build/native2` perché Smart App
-Control bloccava il primo, LEZIONI #81):
+Control bloccava il primo, LESSONS #81):
 
 | modo | prefill s | disco s | calcolo s | MiB letti | GB/s | tetto sovrapposizione |
 |---|---|---|---|---|---|---|
@@ -1897,7 +1999,7 @@ at deep offload (≳ 2.5× RAM ratio)». I nostri esperti sono 6.375 MiB e il mo
 31 di RAM: siamo fuori dal suo campo, e il nostro `bench-disk` (1.4-1.5 GB/s a blocchi da 2.125
 MiB contro 1.6-1.75 da 6.375) mette il tetto a ~1.15×. Non misurato da noi: è lettura, non misura.
 
-## Il comportamento sul codice è un grafo piccolo e deterministico? (2026-09-20)
+## Is code behavior a small, deterministic graph? (2026-09-20)
 
 Domanda 44 (Marcello), con le soglie scritte prima di misurare (riga 44 di §Da misurare). Sei
 tracce del routing su OLMoE-1B-7B Q8_0, 300 token generati ciascuna, nel container (si contano
@@ -2006,7 +2108,7 @@ controllo fuori dominio:
     non sono «i migliori esperti», sono quelli del codice: una cache scaldata su un dominio è un
     guadagno per quel dominio e zero per un altro (domanda 45).
 
-## Tentativi
+## Attempts
 
 | Data | Cosa | Prima | Dopo | Spread | Esito |
 |---|---|---|---|---|---|
@@ -2019,19 +2121,19 @@ controllo fuori dominio:
 | 2026-09-17 | prefill a blocchi in C esatto: passate da 512 token, token per esperto, matrici a blocchi di 16 token, logit solo dell'ultimo (logit identici al bit) | prefill 30.1 tok/s (16 thread, prompt 512) | 196.9 tok/s col kernel a 4 token | 14% / 27% | tenuto; decode invariato; scala 1.16× da 8 a 16 thread (domanda 20) |
 | 2026-09-17 | riga q8_0 decompressa una volta per blocco di token in uno scratch per worker, poi `dot_f32` (esatto per contratto) | prefill 144 tok/s (16 thread) | 140 tok/s | 6% / 6% | **scartato**: nessun guadagno (legge 4 byte per elemento invece di 1, e la misura non era alternata); l'idea buona è tenere il peso compresso e dividerlo fra più token (riga sotto) |
 | 2026-09-17 | kernel `dot_row_x4`: una riga di pesi contro 4 token nei registri (scalare, AVX2, AVX-512), risultati identici al bit a `dot_row` | prefill 124 tok/s (16 thread, run alternate) | 180 tok/s | 12% / 16% | tenuto; da solo il kernel vale 2.1× (44 contro 21 G elementi/s) |
-| 2026-09-17 | accumulatori del kernel a 4 token in un array `__m512 acc[4]` invece che in registri con nome | — | — | — | **scartato**: il compilatore li tiene sullo stack e il guadagno sparisce (LEZIONI #45) |
+| 2026-09-17 | accumulatori del kernel a 4 token in un array `__m512 acc[4]` invece che in registri con nome | — | — | — | **scartato**: il compilatore li tiene sullo stack e il guadagno sparisce (LESSONS #45) |
 | 2026-09-17 | blocco di token di `tr_matmul` a 32, 64, 128 invece di 16 | prefill 180.5 tok/s (16 thread, tile 16) | 176.9 / 183.3 / 172.5 | 10-13% | scartato: tutto dentro il rumore, resta 16 |
 | 2026-09-18 | una riga di pesi contro **8** token (float, identico al bit a x4), solo nel banco | x4: 25.6 / 47.6 / 114.1 ns per riga (n = 1024 / 2048 / 4096) | 1.13× / 0.79× / 0.93× | 3-8% | **scartato**: a n=2048 le attivazioni di 8 righe (64 KB) escono dalla L1 (§Revisione) |
-| 2026-09-18 | dot int8 VNNI con la struttura del x4 (256 bit col trucco del segno; 512 bit a due blocchi), solo nel banco, non esatto | x4 float come sopra | 256 bit 1.64× / 1.62× / 1.96×; 512 bit **1.83× / 1.79× / 2.26×** | 3-8% | misurato, non adottato: l'int8 non è bit-identico, può essere solo un modo dichiarato. Decisione aperta (§Revisione, LEZIONI #65) |
+| 2026-09-18 | dot int8 VNNI con la struttura del x4 (256 bit col trucco del segno; 512 bit a due blocchi), solo nel banco, non esatto | x4 float come sopra | 256 bit 1.64× / 1.62× / 1.96×; 512 bit **1.83× / 1.79× / 2.26×** | 3-8% | misurato, non adottato: l'int8 non è bit-identico, può essere solo un modo dichiarato. Decisione aperta (§Revisione, LESSONS #65) |
 | 2026-09-18 | tetto della pausa della bozza adattiva corretto (31 → 16) | replay esatto: 172 passate, 65 righe di bozza (`code`) | 172 passate, 66 righe | — | tenuto: è una correzione, non una leva; le costanti spostano ±2-3% (§Revisione) |
 | 2026-09-18 | thread per fase: prompt su tutto il pool, passate corte (fino a 4 righe) sui primi n slot, n misurato dalla sessione (16/8/4, la più ampia entro l'1% dalla più veloce, di nuovo ogni 1024 token), `--decode-threads` lo forza; token identici al bit | decode 30.82 tok/s a contesto 512, 23.79 a 2048 (16 thread) | 33.45 (**1.085×**) e 24.43 (**1.027×**); con 8 forzato 33.50 e 24.98 (1.050×); prefill invariato; `--spec 8` caso peggiore 1.064× | A/A 1.0% | **tenuto**, acceso di default. Margine del 3% e del 2% misurati e scartati (a 2048 tenevano 16 thread in 10 e in 5 run su 16); confine a 16 righe invece di 4: non distinguibile (§Thread per fase) |
 | 2026-09-19 | KV con le posizioni di una testa in fila (`[layer][testa][posizione]`, `src/kv/`), logit identici al byte | decode a contesto 512 / 2048 / 4000: 32.30 / 24.18 / 17.91 tok/s (8 thread forzati) | 35.48 (**1.06-1.10×**) / 27.32 (**1.12-1.14×**) / 20.84 (**1.15-1.18×**); prefill a 2048 **1.10×**, a 4000 **1.39-1.43×**; a contesto 32 non distinguibile | A/A 3.8% | **tenuto**: la zona `attention` passa da 32-35 a 47-48 GB/s letti, su 54 della RAM (§Decode a contesto lungo) |
 | 2026-09-19 | larghezza per zona: l'attenzione del decode su 16 thread e il resto su 8 (esatto), stimata dalle zone di due profili | token a contesto 4000: 48.1 ms | 47.1 ms stimati (−2.1%); a 2048 −0.7% | A/A 3.8% | **non scritta**: sotto la soglia della sessione; domanda 34 |
 | 2026-09-19 | attenzione del prompt a gruppi di 16 token per testa, blocchi di 64 posizioni, `dot_f32_x4` e `axpy_f32_x4` (logit identici al byte) | zona `attention` a 512 / 2048 / 4000: 116 / 1883 / 7420 ms | 106 / 1688 / 6568 (1.09× / 1.12× / **1.13×**) | A/A 2.1% | **tenuto**; nel banco 1.15× a 4000, 1.38× quando la L3 è in affanno (§Prefill su prompt lunghi) |
 | 2026-09-19 | lavoro di un token solo sul pool (norme, RoPE, KV, router, righe per gli esperti) e righe F32 col kernel del tier | zone per token 121 / 455 / 880 ms, `router` 80 / 324 / 627 | 48 / 174 / 353 e 6 / 22 / 45 | A/A 2.1% | **tenuto**; con la riga sopra il prefill fa **1.05-1.08× / 1.07-1.08× / 1.11-1.14×** a 512 / 2048 / 4000, decode non distinguibile (A/A 2.4%) |
-| 2026-09-19 | righe di pesi **F16** con i kernel del tier (`vcvtph2ps`, conversione esatta), bit-identiche allo scalare; nate dal controllo `test_tier_used` (LEZIONI #78) | `dot_row f16` 466 M el/s in ogni tier (n=2048) | 22.8 G el/s AVX2, 22.7 AVX-512 (**49×**) | 3-7% | **tenuto**; nessun modello F16 negli scenari: il numero è del kernel, non di un prefill |
+| 2026-09-19 | righe di pesi **F16** con i kernel del tier (`vcvtph2ps`, conversione esatta), bit-identiche allo scalare; nate dal controllo `test_tier_used` (LESSONS #78) | `dot_row f16` 466 M el/s in ogni tier (n=2048) | 22.8 G el/s AVX2, 22.7 AVX-512 (**49×**) | 3-7% | **tenuto**; nessun modello F16 negli scenari: il numero è del kernel, non di un prefill |
 | 2026-09-19 | gruppo da 4 o 64 query, blocco da 16 o 256 posizioni invece di 16 × 64 (solo nel banco) | 355 ms per layer a 4000 | 352-387 | 2-15% | scartato: tutto dentro lo spread, resta 16 × 64 |
 | 2026-09-19 | **`tr_expf` scalare**, arrotondato correttamente su tutti i 2^32 float (prova esaustiva in `make check`), al posto dell'`expf` della libreria in softmax e SwiGLU; Windows: logit identici al byte; Linux: KL 3.9e-13, stessi byte dell'emulazione | prefill 296 / 249 / 211 tok/s a 512 / 2048 / 4000; decode a 8 thread 35.1 / 28.0 / 21.4; `attention` 92 / 1537 / 5960 ms, `expert_act` 138 / 595 / 1201 | 306-315 / 303-308 / 276; 36.0 / 29.3 / 23.2; 41 / 591 / 2331 e 25 / 108 / 218 | A/A 3.0% prefill, 1.9% decode | **tenuto**: prefill 1.03-1.08× / 1.20-1.23× / 1.29-1.31×, decode 1.02-1.10×; Windows e Linux ora danno gli stessi byte (§`tr_expf`) |
 | 2026-09-19 | `tr_expf` in SIMD (non scritto: i numeri per decidere) | dopo lo scalare, softmax 9 / 130 / 610 ms e `expert_act` 25 / 108 / 218 ms del prefill | stima: prefill 1.01× / 1.03× / 1.04×, decode +1-2%, circa 200 righe | — | **decide Marcello** (domanda 39): lo scalare ha preso quasi tutto |
-| 2026-09-19 | rimisura a macchina pulita di thread per fase e decode a contesto lungo (quattro `yes` dimenticati sotto le misure del 18-19/09, LEZIONI #84) | decode a 512, 8 contro 16 thread: 1.10×; RAM ~54 GB/s | 1.00-1.02× (non distinguibile a nessun contesto); RAM ~57 GB/s con 4-6 thread; a 512 il decode vuole 4 thread | A/A 2.5-4.6% | conclusione corretta: pochi thread sì, il «+10%» no; lo stimatore della larghezza va riscritto (domanda 31, §Rimisura a macchina pulita) |
-| 2026-09-19 | stimatore della larghezza del decode riscritto (domanda 31, LEZIONI #88): margine dal rumore misurato nelle passate stesse (non più un tetto fisso), scelta a coppie (mai il rumore di una terza larghezza), estensione fino a `TR_DECODE_TUNE_ROUNDS_MAX` sui due contendenti, nuova misura ad ogni classe di contesto e dopo `TR_DECODE_TUNE_REMEASURE_KEPT` passate mantenute con un cambio in sospeso, isteresi a due voti prima di cambiare scelta | — | — | — | test C verdi (`tests/test_phase.c`, `tools/mutate_tune.sh`); **da validare sul modello vero**, di notte a macchina tranquilla: nessun numero ancora |
+| 2026-09-19 | rimisura a macchina pulita di thread per fase e decode a contesto lungo (quattro `yes` dimenticati sotto le misure del 18-19/09, LESSONS #84) | decode a 512, 8 contro 16 thread: 1.10×; RAM ~54 GB/s | 1.00-1.02× (non distinguibile a nessun contesto); RAM ~57 GB/s con 4-6 thread; a 512 il decode vuole 4 thread | A/A 2.5-4.6% | conclusione corretta: pochi thread sì, il «+10%» no; lo stimatore della larghezza va riscritto (domanda 31, §Rimisura a macchina pulita) |
+| 2026-09-19 | stimatore della larghezza del decode riscritto (domanda 31, LESSONS #88): margine dal rumore misurato nelle passate stesse (non più un tetto fisso), scelta a coppie (mai il rumore di una terza larghezza), estensione fino a `TR_DECODE_TUNE_ROUNDS_MAX` sui due contendenti, nuova misura ad ogni classe di contesto e dopo `TR_DECODE_TUNE_REMEASURE_KEPT` passate mantenute con un cambio in sospeso, isteresi a due voti prima di cambiare scelta | — | — | — | test C verdi (`tests/test_phase.c`, `tools/mutate_tune.sh`); **da validare sul modello vero**, di notte a macchina tranquilla: nessun numero ancora |

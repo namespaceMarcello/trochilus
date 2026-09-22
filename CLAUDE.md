@@ -1,136 +1,140 @@
 <!-- preferenze: 39f397b3 -->
 # Trochilus
 
-Motore di inferenza per modelli MoE in C, senza dipendenze: gira su CPU di ogni tipo (dispatch
-dei kernel a runtime), GPU come moduli caricabili, esperti letti dal disco, risultati esatti al
-token contro transformers. Nasce prendendo il meglio di colibri (Apache-2.0) e ds4 (MIT).
+Inference engine for MoE models in C, with no dependencies: it runs on every kind of CPU (kernels
+dispatched at runtime), GPUs as loadable modules, experts read from disk, results exact to the
+token against transformers. Born by taking the best of colibri (Apache-2.0) and ds4 (MIT).
 
-C11 + intrinseci (e assembly dove misurato), Makefile, gcc/clang/MinGW-w64; strumenti in Python
-(`tools/.venv`: torch CPU + transformers) solo per conversione e oracoli.
+C11 + intrinsics (and assembly where measured), a Makefile, gcc/clang/MinGW-w64; the Python tools
+(`tools/.venv`: torch CPU + transformers) serve conversion and oracles only.
 
 ---
 
-## Come lavorare
+## How to work
 
-- A ogni avvio: `/caveman ultra`, poi `docs/STATUS.md`.
-- Agenti: **mai Fable**. Sonnet su brief chiusi (un pezzo con la sua interfaccia e il suo test),
-  Haiku per il meccanico; progettazione, interfacce e invarianti li fa l'orchestratore. Un
-  agente alla volta, o in parallelo solo su file disgiunti. Pochi agenti: l'usage è il limite.
-- **Fra agenti si parla inglese**, prompt e resoconti. Con Marcello in italiano.
-- Brief **conciso e completo**: obiettivo, vincoli, file da toccare, forma della risposta,
-  quando è finito. Il resoconto dell'agente: cosa ha fatto, file toccati, cosa resta aperto.
-- Resoconto a Marcello **in due punti**: cosa è stato implementato, come si prova. Il perché
-  va in `docs/STATUS.md`.
-- Logica e kernel: si sceglie, si costruisce, si consegna. Le domande si fanno prima, non a metà.
-- **Il commit lo chiede Marcello.** Si prepara tutto (test verdi, documenti) e ci si ferma.
-- Repo privato `namespaceMarcello/trochilus`: push e visibilità li decide Marcello.
+- At every session start: `/caveman ultra`, then `docs/STATUS.md`.
+- Agents: **never Fable**. Sonnet on closed briefs (one piece with its interface and its test),
+  Haiku for mechanical work; design, interfaces and invariants belong to the orchestrator. One
+  agent at a time, or in parallel only on disjoint files. Few agents: usage is the limit.
+- **Agents speak English to each other**, in briefs and in reports. With Marcello, Italian.
+- A brief is **short and complete**: goal, constraints, files to touch, shape of the answer, when
+  it is done. An agent's report: what it did, files touched, what is still open.
+- Report to Marcello in **two points**: what was implemented, how to try it. The why goes in
+  `docs/STATUS.md`.
+- Logic and kernels: choose, build, deliver. Questions are asked up front, not halfway through.
+- **Marcello asks for the commit.** Prepare everything (tests green, documents written) and stop.
+- Private repository `namespaceMarcello/trochilus`: pushes and visibility are Marcello's call.
 
-### Tieni tutto sotto controllo: il ciclo di ogni passo
+### Keep it all under control: the cycle of every step
 
-Obiettivo: a ogni richiesta il tasso di successo sale. Si misura in `docs/LESSONS.md`
-(colonna «Trovato da»): nessun errore deve arrivare a Marcello se un test poteva trovarlo prima.
+Goal: the success rate rises with every request. It is measured in `docs/LESSONS.md` (the "found
+by" column): no mistake should reach Marcello if a test could have caught it first.
 
-1. **Prima**: `docs/STATUS.md`, poi `grep` in `docs/LESSONS.md` sull'area che si tocca.
-2. **Errore o scoperta**, appena succede, anche piccola: una riga in `docs/LESSONS.md`.
-3. **Ogni errore diventa un controllo**: un test che lo riproduce (rosso prima del fix, verde
-   dopo), o un controllo in `make check`, un pin, un hook. Una frase in un documento è
-   prevenzione debole: si scrive *regola* e la lezione resta aperta.
-   **Un test si vede rosso almeno una volta, e dice quale ramo esercita**: rosso prima del fix,
-   o con una mutazione (`tools/mutate_*.sh`) quando il codice nasce insieme al test; in testa al
-   file sta scritto quale ramo prova, e un contatore (`TR_CHECK(n > 0)`) lo fa fallire se quel ramo
-   non è stato preso. Risultati uguali non dicono quale codice ha girato (LEZIONI #43, #50, #54, #78).
-4. **Ogni scenario nuovo entra nei test**: modello, famiglia, forma di tensore, piattaforma, uso
-   (prompt lungo, contesto pieno, file malformato) diventa un caso nella suite giusta: test C
-   in `tests/`, oracolo in `make oracle`, scenario di prestazioni in `bench/scenarios.json`.
-5. **Prima di dire "fatto"**: `make check` verde (build 0 warning, test, oracoli, sanitizer
-   dove disponibili). Un agente non chiude un passo: lo chiude la verifica dell'orchestratore.
-6. **Dopo un agente**: rileggere il resoconto contro il codice, `make check`, `docker ps` e
-   processi in background (LEZIONI #5).
-7. **Upstream**: portando o leggendo codice di colibri e ds4, ogni bug trovato va in
-   `docs/UPSTREAM.md` con la prova; PR o issue solo dopo il sì di Marcello.
-8. **Documenti**, nella tabella qui sotto.
+1. **Before**: `docs/STATUS.md`, then `grep` in `docs/LESSONS.md` for the area being touched.
+2. **A mistake or a discovery**, as soon as it happens, however small: one line in
+   `docs/LESSONS.md`.
+3. **Every mistake becomes a check**: a test that reproduces it (red before the fix, green after),
+   or a check in `make check`, a pin, a hook. A sentence in a document is weak prevention: write a
+   *rule*, or the lesson stays open.
+   **A test is seen red at least once, and it says which branch it exercises**: red before the fix,
+   or under a mutation (`tools/mutate_*.sh`) when the code is born together with the test; the head
+   of the file states which branch it covers, and a counter (`TR_CHECK(n > 0)`) fails it if that
+   branch was never taken. Equal results do not tell you which code ran (LESSONS #43, #50, #54,
+   #78).
+4. **Every new scenario enters the tests**: a model, a family, a tensor shape, a platform, a use
+   (long prompt, full context, malformed file) becomes a case in the right suite: C tests in
+   `tests/`, an oracle in `make oracle`, a performance scenario in `bench/scenarios.json`.
+5. **Before saying "done"**: `make check` green (0-warning build, tests, oracles, sanitizers where
+   available). An agent does not close a step: the orchestrator's verification does.
+6. **After an agent**: read the report against the code, `make check`, `docker ps` and background
+   processes (LESSONS #5).
+7. **Upstream**: when porting or reading code from colibri and ds4, every bug found goes in
+   `docs/UPSTREAM.md` with its proof; a PR or an issue only after Marcello says yes.
+8. **Documents**, per the table below.
 
-### Prima di ogni commit: documentare
-| Se è cambiato… | Scrivi in |
+### Before every commit: document
+| If this changed… | Write in |
 |---|---|
-| codice (ogni commit) | `docs/archive/DONE.md`: `### <data> — <titolo>`, cosa e come si prova |
-| un errore, una scoperta, un debito | `docs/LESSONS.md`, con la prevenzione e chi l'ha trovato |
-| codice portato da colibri o ds4 | `docs/ORIGINS.md` + intestazione del file |
-| decisione, debito, misura, prossimo passo | `docs/STATUS.md` (sostituisci, non appendere; tetto 40 KB) |
-| un passo chiuso, una decisione, una domanda nuova (con STATO) | `docs/status.json`, poi `tools/status_html.py` e ripubblica l'artifact (stesso URL) |
-| strati, principi, tappe | `docs/ARCHITECTURE.md` (si riscrive la riga, non si aggiunge) |
-| una misura o un tentativo di ottimizzazione (anche scartato) | `docs/MEASUREMENTS.md` |
+| code (every commit) | `docs/archive/DONE.md`: `### <date> — <title>`, what it is and how to try it |
+| a mistake, a discovery, a debt | `docs/LESSONS.md`, with the prevention and who found it |
+| code ported from colibri or ds4 | `docs/ORIGINS.md` + the file header |
+| a decision, a debt, a measurement, the next step | `docs/STATUS.md` (replace, do not append; 40 KB cap) |
+| a step closed, a decision, a new question (together with STATUS) | `docs/status.json`, then `tools/status_html.py`, and republish the artifact (same URL) |
+| layers, principles, milestones | `docs/ARCHITECTURE.md` (rewrite the line, do not add one) |
+| a measurement or an attempt at optimisation (even a rejected one) | `docs/MEASUREMENTS.md` |
 
 ---
 
-## Leggi prima di rispondere
+## Read before answering
 
-| Domanda su… | Apri |
+| Question about… | Open |
 |---|---|
-| principi, strati, esecuzione, tappe | `docs/ARCHITECTURE.md` |
-| a che punto siamo, decisioni, prossimo passo | `docs/STATUS.md` |
-| da dove viene un file, commit di riferimento | `docs/ORIGINS.md` |
-| numeri misurati, tentativi di ottimizzazione riusciti e scartati | `docs/MEASUREMENTS.md` |
-| domande aperte da misurare, dove scendere nel dettaglio | `docs/MEASUREMENTS.md` §Da misurare |
-| regole del codice che gira a ogni token | `docs/ARCHITECTURE.md` §Zona calda |
-| errori già fatti, scoperte, come si prevengono | `docs/LESSONS.md` |
-| bug trovati in colibri o ds4, segnalazioni agli autori | `docs/UPSTREAM.md` |
-| profilazione: livelli, strumenti, scenari | `docs/ARCHITECTURE.md` §Profilazione |
-| cosa è già stato fatto | `docs/archive/DONE.md` |
-| il comando per fare una cosa (banchi, misure, mutazioni, report) | `docs/COMMANDS.md` |
-| a che punto siamo, in figura (tappe, dipendenze, stato) | `docs/status.json` → `tools/status_html.py` → artifact `6mx3NS4KtQrBFPRLkAYupr`; si aggiorna insieme a `docs/STATUS.md` |
-| come colibri o ds4 fanno una cosa | `ref/colibri`, `ref/ds4` (worktree in sola lettura, commit in ORIGINI) |
+| principles, layers, execution, milestones | `docs/ARCHITECTURE.md` |
+| where we stand, decisions, the next step | `docs/STATUS.md` |
+| where a file comes from, the pinned commit | `docs/ORIGINS.md` |
+| measured numbers, optimisations that worked and that were rejected | `docs/MEASUREMENTS.md` |
+| open questions to measure, where to go into detail | `docs/MEASUREMENTS.md` §Da misurare |
+| the rules for code that runs on every token | `docs/ARCHITECTURE.md` §Hot path |
+| mistakes already made, discoveries, how they are prevented | `docs/LESSONS.md` |
+| bugs found in colibri or ds4, and what was reported to their authors | `docs/UPSTREAM.md` |
+| profiling: levels, tools, scenarios | `docs/ARCHITECTURE.md` §Profiling |
+| what has already been done | `docs/archive/DONE.md` |
+| the command to do something (benches, measurements, mutations, reports) | `docs/COMMANDS.md` |
+| where we stand, as a picture (milestones, dependencies, state) | `docs/status.json` → `tools/status_html.py` → artifact `6mx3NS4KtQrBFPRLkAYupr`; updated together with `docs/STATUS.md` |
+| how colibri or ds4 do something | `ref/colibri`, `ref/ds4` (read-only worktrees, commits in ORIGINS) |
 
 ---
 
-## Comandi
+## Commands
 
 ```bash
-make check               # il cancello: lint, build 0 warning, test, ASan, TSan, oracoli
-make                     # build/trochilus (nucleo, senza dipendenze)
-make test                # test C: kernel SIMD = scalare, GGUF malformati, pool, profiler
-make oracle              # modelli minuscoli: genera, converte, confronta con transformers
-build/trochilus run -m <f.gguf> -f prompt.txt -n 200    # testo in entrata, generazione greedy
-build/trochilus chat -m <file.gguf>                     # conversazione col template del modello
-make profile             # scenari col profiler, mediana di N, token identici
-tools/.venv/Scripts/python.exe tools/<script>.py        # su Linux/macOS: tools/.venv/bin/python
+make check               # the gate: lint, 0-warning build, tests, ASan, TSan, oracles
+make                     # build/trochilus (the core, no dependencies)
+make test                # C tests: SIMD kernels = scalar, malformed GGUF, pool, profiler
+make oracle              # tiny models: generate, convert, compare against transformers
+build/trochilus run -m <f.gguf> -f prompt.txt -n 200    # text in, greedy generation out
+build/trochilus chat -m <file.gguf>                     # a conversation with the model's template
+make profile             # profiler scenarios, median of N, identical tokens
+tools/.venv/Scripts/python.exe tools/<script>.py        # on Linux/macOS: tools/.venv/bin/python
 ```
 
-**Tutti gli altri comandi stanno in `docs/COMMANDS.md`**: oracoli per modello e piattaforma,
-banchi (`bench-disk`, `bench-mem`, `bench-attn`, `bench-expf`), le misure native con le loro
-guardie (`experts_budget.sh`, `prefill_overlap.sh`, `decode_context.sh`, `threads_phase.sh`,
-`ab_modes.sh`), le mutazioni, i report Python, la mappa del progetto.
+**Every other command is in `docs/COMMANDS.md`**: oracles per model and per platform, benches
+(`bench-disk`, `bench-mem`, `bench-attn`, `bench-expf`), the native measurements with their guards
+(`experts_budget.sh`, `prefill_overlap.sh`, `decode_context.sh`, `threads_phase.sh`,
+`ab_modes.sh`), the mutations, the Python reports, the map of the project.
 
-Prima di consegnare: `make check` verde. Su Windows la correttezza gira in Docker
-(`trochilus-dev:local`): Smart App Control blocca i binari appena compilati (LEZIONI #12).
-
----
-
-## Invarianti
-
-- **Sicurezza della macchina**: prima di caricare, il motore stima la memoria e rifiuta se
-  lascerebbe meno di 2 GB o del 10% di RAM libera. Nessun modello più grande della RAM prima
-  dello streaming (M1). Benchmark di al massimo 60 s per run, thread <= core fisici. Un download
-  grande si annuncia (dimensione, spazio libero verificato) prima di partire.
-- **Linguaggi**: C è la definizione (portabile, leggibile, riferimento bit a bit). I kernel caldi
-  si riscrivono in assembly uno alla volta; la versione assembly resta solo se il test la trova
-  identica al C e il benchmark la trova più veloce, e il C resta come fallback per le altre CPU.
-- Il nucleo non dipende da niente oltre libc e thread del sistema operativo.
-- Ogni variante di kernel (SIMD, assembly) è bit-identica allo scalare; il test lo verifica.
-- Zona calda (codice che gira a ogni token): niente allocazioni, stringhe, I/O; `tools/lint.py` e
-  `tests/test_hot.c` lo verificano. Ogni misura è una mediana di N run, mai una run sola.
-- **Misure native**: ogni script finisce ciò che ha lanciato (`tools/cleanup.lib`), niente parte con
-  orfani accesi (`tools/orphans.sh`), la macchina si carica solo con `tools/busy_machine.sh`, ogni
-  sessione dichiara il carico di fondo nel log e con un carico non basso le conclusioni non si tirano
-  (`docs/ARCHITECTURE.md` §Profilazione, LEZIONI #84-#88).
-- Un file derivato da colibri o ds4 dice nell'intestazione progetto, commit, percorso, modifica.
-- Commenti e nomi nel codice in inglese; documenti in `docs/` in italiano.
-- Prefisso `tr_` per i simboli pubblici; niente stato globale per modello (più modelli in un processo).
-- Modelli, fixture e binari non entrano in git (`.gitignore`).
+Before delivering: `make check` green. On Windows correctness runs in Docker
+(`trochilus-dev:local`): Smart App Control blocks freshly compiled binaries (LESSONS #12).
 
 ---
 
-## Manutenzione
+## Invariants
 
-Quando nasce un documento in `docs/`, aggiungi la sua riga alla tabella. Quello che è successo
-va in `docs/STATUS.md`, non qui.
+- **Safety of the machine**: before loading, the engine estimates memory and refuses if it would
+  leave less than 2 GB or 10% of RAM free. No model larger than RAM before streaming (M1). Benches
+  of at most 60 s per run, threads <= physical cores. A large download is announced (size, free
+  space verified) before it starts.
+- **Languages**: C is the definition (portable, readable, the bit-for-bit reference). Hot kernels
+  are rewritten in assembly one at a time; the assembly version stays only if the test finds it
+  identical to the C one and the benchmark finds it faster, and the C stays as the fallback for
+  every other CPU.
+- The core depends on nothing beyond libc and the operating system's threads.
+- Every kernel variant (SIMD, assembly) is bit-identical to the scalar one; a test verifies it.
+- Hot path (code that runs on every token): no allocation, no strings, no I/O; `tools/lint.py` and
+  `tests/test_hot.c` verify it. Every measurement is a median of N runs, never a single run.
+- **Native measurements**: every script finishes what it started (`tools/cleanup.lib`), nothing
+  starts with orphans still running (`tools/orphans.sh`), the machine is loaded only with
+  `tools/busy_machine.sh`, every session declares its background load in the log, and with a load
+  that is not low no conclusion is drawn (`docs/ARCHITECTURE.md` §Profiling, LESSONS #84-#88).
+- A file derived from colibri or ds4 states project, commit, path and modification in its header.
+- **Everything in the repository is written in English**: file names, code, comments, documents
+  under `docs/`. With Marcello the conversation stays in Italian.
+- Prefix `tr_` for public symbols; no global state per model (several models in one process).
+- Models, fixtures and binaries stay out of git (`.gitignore`).
+
+---
+
+## Maintenance
+
+When a document is born in `docs/`, add its row to the table. What happened goes in
+`docs/STATUS.md`, not here.

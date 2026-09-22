@@ -15,7 +15,7 @@ failures = []
 
 
 def fail(lesson, msg):
-    failures.append(f"[LEZIONI #{lesson}] {msg}")
+    failures.append(f"[LESSONS #{lesson}] {msg}")
 
 
 def check_docs_control_chars():
@@ -63,9 +63,9 @@ def check_lessons_table():
     for row in rows:
         cells = [c.strip() for c in re.split(r"(?<!\\)\|", row.strip().strip("|"))]  # "\|" is a literal pipe
         if len(cells) != 8:
-            fail("registro", f"LEZIONI row {cells[0]} has {len(cells)} columns, expected 8")
+            fail("registro", f"LESSONS row {cells[0]} has {len(cells)} columns, expected 8")
         if cells[0] != str(expected):
-            fail("registro", f"LEZIONI row numbered {cells[0]}, expected {expected}")
+            fail("registro", f"LESSONS row numbered {cells[0]}, expected {expected}")
         expected = int(cells[0]) + 1
 
 
@@ -107,7 +107,7 @@ def check_tests_no_tmpfile():
                 fail(3, f"{f.relative_to(ROOT)}:{i}: uses tmpfile(); write next to the test binary")
 
 
-# Hot zone (docs/ARCHITECTURE.md §Zona calda): code that runs for every token, between
+# Hot zone (docs/ARCHITECTURE.md §Hot path): code that runs for every token, between
 # /* hot: begin */ and /* hot: end */. A line may allow a name with /* hot-ok: name -- reason */.
 HOT_FILES = ["src/models/olmoe.c", "src/models/model.c", "src/kernels/kernels.c", "src/kernels/kernels_x86.c",
              "src/kernels/kernels_internal.h", "src/kernels/expf.c", "src/base/threads.c", "src/base/prof.h",

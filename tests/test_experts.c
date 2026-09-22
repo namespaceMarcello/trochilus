@@ -8,7 +8,7 @@
  * be told to fail the k-th call, for the failure-injection tests.
  *
  * Each test says which branch it exercises and counts that it was actually taken (CLAUDE.md,
- * LEZIONI #43 #50 #54 #78):
+ * LESSONS #43 #50 #54 #78):
  *   arithmetic   tr_experts_slot_bytes / tr_experts_min_slots, and tr_experts_create's budget
  *                gate: one byte short of the minimum refused (message names the MiB), the exact
  *                minimum accepted, non-positive shapes refused

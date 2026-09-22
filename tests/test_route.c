@@ -3,7 +3,7 @@
  * layer's own experts run?
  *
  * Each test says which branch it exercises and counts that the branch was actually taken
- * (CLAUDE.md, LEZIONI #43 #50 #54 #78):
+ * (CLAUDE.md, LESSONS #43 #50 #54 #78):
  *   pred_out   synth_zero_attn_out: attention never moves x, so layer L+1's router sees exactly
  *              layer L's output; pred_out's top n_used must equal chosen[L+1] every time. A
  *              negative control on the plain model must differ at least once, or the knob above

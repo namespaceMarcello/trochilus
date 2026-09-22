@@ -2,7 +2,7 @@
  * short one on a measured width, and no logit moves by a bit whatever the width.
  *
  * Each test says which branch of the rewrite it exercises, and counts that it was actually taken
- * (CLAUDE.md, LEZIONI #43 #50 #54 #78):
+ * (CLAUDE.md, LESSONS #43 #50 #54 #78):
  *   widths      tr_decode_tune_widths: narrowest first, a width under 4 threads dropped unless
  *               dropping it would leave nothing (the pool itself < 4)
  *   stats       tr_decode_tune_stats: center is the fastest pass, spread the noise around it --

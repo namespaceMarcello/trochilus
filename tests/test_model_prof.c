@@ -46,7 +46,7 @@ int main(int argc, char **argv) {
         TR_TEST_EXIT();
     }
 
-    /* disabled by default (docs/ARCHITECTURE.md §Profilazione) */
+    /* disabled by default (docs/ARCHITECTURE.md §Profiling) */
     tr_prof *prof = tr_session_prof(sess);
     TR_CHECK(prof != NULL);
     TR_CHECK(prof->enabled == 0);

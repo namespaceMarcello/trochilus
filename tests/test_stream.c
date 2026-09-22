@@ -10,7 +10,7 @@
  * be pointed at an exact read without depending on what the router actually chose.
  *
  * Each test says which branch it exercises and counts that it was actually taken (CLAUDE.md,
- * LEZIONI #43 #50 #54 #78):
+ * LESSONS #43 #50 #54 #78):
  *   content      a resident model's tr_experts_part(layer, expert, part) bytes match exactly the
  *                named GGUF tensor's own bytes at that expert's offset, read independently with
  *                tr_gguf_read_range straight off the file: a load-time mix-up (parts swapped, an
@@ -227,7 +227,7 @@ static void test_reference_one(const char *argv0, const synth_params *P, const c
             tr_pool *pool8 = tr_pool_create(8);
             run_and_compare(path, pool8, UINT64_MAX, MIN_SLOTS, tokens, N_PROMPT, ref, checked);
 
-            /* the min store really evicted, not just fit by luck (LEZIONI: same result never
+            /* the min store really evicted, not just fit by luck (LESSONS: same result never
              * proves which branch ran) */
             {
                 tr_model *m2 = load_budget(path, pool8, UINT64_MAX);

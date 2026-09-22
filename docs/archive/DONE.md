@@ -1,743 +1,805 @@
-# Fatto
+# Done
 
-Archivio, in coda. Una voce per commit o per passo chiuso: `### <data> — <titolo>`,
-cosa è stato implementato e come si prova.
+Archive, newest last. One entry per commit or closed step: `### <date> — <title>`, what was
+implemented and how to check it.
 
-### 2026-09-17 — Nascita del repo
-Repo locale `Desktop\trochilus` (branch `main`, LF). Licenza Apache-2.0 con `NOTICE` che
-attribuisce colibri (Apache-2.0) e ds4 (MIT, testo in `licenses/`). Sorgenti di riferimento
-fissati come worktree in `ref/` (ignorati da git): colibri `a90bed9`, ds4 `8db1d1d`.
-Hook che rifiuta i commit di codice senza voce qui.
+### 2026-09-17 — Repository birth
+Local repo `Desktop\trochilus` (branch `main`, LF). Apache-2.0 license with `NOTICE`
+crediting colibri (Apache-2.0) and ds4 (MIT, text in `licenses/`). Reference sources
+pinned as read-only worktrees in `ref/`: colibri `a90bed9`, ds4 `8db1d1d`. Hook that
+rejects code commits without an entry here.
 
-### 2026-09-17 — M0 passo 1: base, GGUF, convertitore
-`src/base/` (file con pread, memoria, tempo, log; pool di thread senza OpenMP; rilevamento CPU a
-runtime con controllo XGETBV), `src/format/gguf.c` (lettore GGUF v2/v3 che valida ogni misura
-contro il file), `tools/hf_to_gguf.py` e `tools/check_gguf.py` (gguf-py 0.19.0, OLMoE), comandi
-`trochilus cpu` e `trochilus inspect`. Prova: `make WERROR=1 test`, poi
-`build/trochilus cpu` e `build/trochilus inspect fixtures/tiny-olmoe/model-q8_0.gguf`.
+### 2026-09-17 — M0 step 1: base, GGUF, converter
+`src/base/` (files with pread, memory, time, log; thread pool without OpenMP; CPU
+detection at runtime with XGETBV check), `src/format/gguf.c` (GGUF v2/v3 reader that
+validates every dimension against the file), `tools/hf_to_gguf.py` and
+`tools/check_gguf.py` (gguf-py 0.19.0, OLMoE), commands `trochilus cpu` and
+`trochilus inspect`. Check: `make WERROR=1 test`, then `build/trochilus cpu` and
+`build/trochilus inspect fixtures/tiny-olmoe/model-q8_0.gguf`.
 
-### 2026-09-17 — Test di sicurezza del lettore GGUF
-`tests/test_gguf.c`: file valido letto campo per campo; lo stesso file troncato a ogni byte
-(mai aperto); 22 corruzioni mirate (magic, versione, conteggi enormi, stringhe con NUL, tipi e
-dimensioni false, offset disallineati, fuori file o che traboccano, nomi e chiavi duplicati), tutte
-rifiutate con messaggio; 3000 file mutati a caso, quelli aperti hanno tutti i tensori leggibili
-nei limiti. Pulito sotto AddressSanitizer + UBSan + leak check (gcc, Linux). Prova: `make test`.
+### 2026-09-17 — GGUF reader safety tests
+`tests/test_gguf.c`: valid file read field by field; same file truncated at every byte
+(never opens); 22 targeted corruptions (magic, version, huge counts, strings with NUL,
+wrong types and sizes, misaligned offsets, outside or overflowing file, duplicate names
+and keys), all rejected with a message; 3000 randomly mutated files, all that open have
+readable tensors within bounds. Clean under AddressSanitizer + UBSan + leak check (gcc,
+Linux). Check: `make test`.
 
-### 2026-09-17 — Microbenchmark dei kernel e prima misura
-`tests/bench_kernels.c`: per ogni tier disponibile e ogni kernel (dot_f32, dot_row f16/q8_0) su
-righe da 64 a 4096 elementi, mediana di N run e spread (rumore); più `tr_matmul` di una matrice
-da esperto OLMoE con 1 thread e con i core fisici. Base scalare registrata in `docs/MEASUREMENTS.md`.
-Prova: `gcc -std=c11 -O2 -ffp-contract=off tests/bench_kernels.c src/base/*.c src/format/*.c src/kernels/*.c -o build/bench/bench_kernels.exe && build/bench/bench_kernels.exe`.
+### 2026-09-17 — Kernel microbench and first measurement
+`tests/bench_kernels.c`: for each available tier and each kernel (dot_f32, dot_row
+f16/q8_0) on rows from 64 to 4096 elements, median of N runs and spread (noise); plus
+`tr_matmul` of an OLMoE expert matrix with 1 thread and physical cores. Scalar baseline
+recorded in `docs/MEASUREMENTS.md`. Check:
+`gcc -std=c11 -O2 -ffp-contract=off tests/bench_kernels.c src/base/*.c src/format/*.c src/kernels/*.c -o build/bench/bench_kernels.exe && build/bench/bench_kernels.exe`.
 
-### 2026-09-17 — Profiler del motore
-`src/base/prof.h/.c`: zone fisse per ogni fase del passaggio (embedding, proiezioni, norme, rope,
-scrittura KV, attenzione, router, esperti, lm_head, campionamento, letture dal disco, attese del
-pool), prefill e decode separati, byte di pesi toccati per token e banda di memoria effettiva.
-Vive nella sessione, costa un salto quando è spento, conta con RDTSC (TSC invariante, calibrato
-sul clock del sistema). Report a tabella e JSON. Prova: `make test` (`tests/test_prof.c`).
-Non ancora collegato al grafo OLMoE (lo sta scrivendo l'agente del passo 2).
+### 2026-09-17 — Engine profiler
+`src/base/prof.h/.c`: fixed zones for each phase (embedding, projections, norms, rope,
+KV write, attention, router, experts, lm_head, sampling, disk reads, pool waits),
+prefill and decode separate, weight bytes touched per token and effective memory bandwidth.
+Lives in the session, costs a jump when off, counts with RDTSC (invariant TSC, calibrated
+to system clock). Reports table and JSON. Check: `make test` (`tests/test_prof.c`).
+Not yet wired to the OLMoE graph (the step 2 agent is writing it).
 
-### 2026-09-17 — Ciclo di controllo
-`CLAUDE.md` §ciclo di controllo (7 punti: prima, errori, ogni errore diventa un controllo, ogni
-scenario entra nei test, `make check` prima di "fatto", verifica dopo un agente, documenti);
-`docs/LESSONS.md` con le prime 13 lezioni (causa, prevenzione, stato, trovato da); hook di commit
-che rifiuta `src/` cambiato senza test, oracolo o scenario (salvo `no-test: <motivo>`);
-`test_parallel_varying_chunks` in `tests/test_base.c` per le due race del pool (LEZIONI #4).
-Prova: hook provato su 5 casi (2 rifiuti, 3 accettati); `make test`.
+### 2026-09-17 — Control cycle
+`CLAUDE.md` §control cycle (7 points: before, errors, every error becomes a check, every
+scenario enters tests, `make check` before "done", verification after an agent, docs);
+`docs/LESSONS.md` with first 13 lessons (cause, prevention, state, found by); commit hook
+that rejects `src/` changes without test, oracle, or scenario (except `no-test: <reason>`);
+`test_parallel_varying_chunks` in `tests/test_base.c` for two pool races (LESSONS #4).
+Check: hook tested on 5 cases (2 rejections, 3 accepted); `make test`.
 
-### 2026-09-17 — Gradino 0: OLMoE minuscolo esatto, e il cancello `make check`
-Kernel scalari (`src/kernels/kernels.c`, contratto a 16 corsie), grafo OLMoE (`src/models/olmoe.c`),
-registro architetture e guardia della memoria (`src/models/model.c`), comandi `generate` e `logits`,
-`tools/oracle.py`. Oracolo contro transformers: f32 16/16 token (scarto logit 2.1e-7), f16 16/16
-(3.2e-4), q8_0 16/16 (8.2e-3). `make check`: lint (`tools/lint.py`: caratteri di controllo nei
-documenti, tabella dei tipi contro ggml, `tmpfile` nei test, tetti dei documenti, tabella lezioni),
-build Windows con 0 warning, poi in Docker `trochilus-dev` test gcc e clang, test sotto ASan+UBSan,
-oracolo. Il lint ha trovato iq1_s sbagliato nella tabella di ds4 (corretto). Prova: `make check`.
+### 2026-09-17 — Tier 0: tiny OLMoE exact, and the `make check` gate
+Scalar kernels (`src/kernels/kernels.c`, contracted to 16 lanes), OLMoE graph
+(`src/models/olmoe.c`), architecture register and memory guard (`src/models/model.c`),
+commands `generate` and `logits`, `tools/oracle.py`. Oracle against transformers: f32
+16/16 tokens (logit error 2.1e-7), f16 16/16 (3.2e-4), q8_0 16/16 (8.2e-3). `make
+check`: lint (`tools/lint.py`: control characters in docs, type table against ggml,
+`tmpfile` in tests, doc caps, lesson table), Windows build at 0 warnings, then in Docker
+`trochilus-dev` gcc and clang tests, tests under ASan+UBSan, oracle. Lint found wrong
+iq1_s in ds4 table (fixed). Check: `make check`.
 
-### 2026-09-17 — Profiler collegato a OLMoE, suite di scenari
-`tr_session_prof(tr_session*)` (unica aggiunta a `model.h`, con la voce `prof` in `tr_arch_vtable`):
-la sessione possiede un `tr_prof`, spento di default. `src/models/olmoe.c` cronometra ogni zona
-del passaggio in avanti (embedding, norme, proiezioni QKV, rope, scrittura KV, attenzione, router,
-i quattro passi dell'esperto, norma finale, lm_head) e conta i byte di pesi toccati per ogni matmul
-ed embedding; non ancora collegati POOL_WAIT e WEIGHT_READ. `trochilus generate` ha `--profile`
-(tabella su stderr), `--profile-json <file>` e `-p <n>` (prompt sintetico deterministico, niente
-tokenizer); prefill e decode separati, campionamento nella zona `sample`. `tools/profile_suite.py`
-(`make profile`) lancia `bench/scenarios.json` (modello minuscolo f32/q8_0) più volte, mediana e
-spread per fase e per zona, confronto con la misura precedente sulla stessa macchina (migliorato /
-peggiorato / rumore); `--smoke` (in `make check-linux`, dopo l'oracolo) verifica che `--profile`
-non cambi i token generati. `tests/test_model_prof.c`: un OLMoE minuscolo costruito a mano (niente
-fixture esterna) prova che il profiler è spento di default e che accenderlo non cambia i logit
-(bit a bit) rispetto a una sessione gemella senza profiler. Prova: `make check`, poi `make profile`.
+### 2026-09-17 — Profiler wired to OLMoE, scenario suite
+`tr_session_prof(tr_session*)` (sole addition to `model.h`, with `prof` entry in
+`tr_arch_vtable`): session owns a `tr_prof`, off by default. `src/models/olmoe.c`
+times each zone of forward pass (embedding, norms, QKV projections, rope, KV write,
+attention, router, four expert steps, final norm, lm_head) and counts weight bytes
+touched for each matmul and embedding; POOL_WAIT and WEIGHT_READ not yet wired.
+`trochilus generate` has `--profile` (table to stderr), `--profile-json <file>` and
+`-p <n>` (synthetic deterministic prompt, no tokenizer); prefill and decode separate,
+sampling in `sample` zone. `tools/profile_suite.py` (`make profile`) runs
+`bench/scenarios.json` (tiny f32/q8_0 model) multiple times, median and spread per
+phase and zone, comparison with previous measurement on same machine (improved /
+degraded / noise); `--smoke` (in `make check-linux`, after oracle) verifies that
+`--profile` does not change generated tokens. `tests/test_model_prof.c`: tiny OLMoE
+hand-built (no external fixture) proves profiler is off by default and turning it on
+does not change logits (bit for bit) versus twin session without profiler. Check:
+`make check`, then `make profile`.
 
-### 2026-09-17 — Flag -c, contesto pieno come errore, OLMoE-1B-7B scaricato
-`trochilus generate -c <token>` limita la cache KV (per profilare un modello vero con poca memoria);
-un contesto che si riempie prima della fine ora esce con codice 3 invece di 0 (trovato dal test
-nuovo del cancello). Hook contro le barre rovesciate nelle scritture da shell. Scaricato
-`models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf` (AllenAI, 7.36 GB, sha256 verificato). Prova:
+### 2026-09-17 — Flag -c, full context as error, OLMoE-1B-7B downloaded
+`trochilus generate -c <token>` limits KV cache (to profile real model with little memory);
+context that fills before the end now exits with code 3 instead of 0 (found by new gate
+test). Hook against backslashes in shell writes. Downloaded
+`models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf` (AllenAI, 7.36 GB, sha256 verified). Check:
 `make check`; `build/trochilus inspect models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf`.
 
-### 2026-09-17 — Kernel AVX2 e AVX-512 per dot_f32 e dot_row q8_0
-`src/kernels/kernels_x86.c`: varianti AVX2 e AVX-512 dei due kernel caldi, scelte all'avvio dalla
-CPU (AVX-512, poi AVX2, poi scalare; `TR_CPU_MAX` le limita), bit-identiche allo scalare. Parti comuni
-in `kernels_internal.h`; `tr_rmsnorm` usa il tier attivo. `test_kernels` confronta ogni tier con lo
-scalare su tutte le code e su valori speciali, e verifica di accorgersi di una variante sbagliata
-apposta. Kernel q8_0 10× più veloce su un thread; OLMoE-1B-7B Q8_0 da 6.9 a 21.1 token/s (8 thread),
-stessi token dello scalare (`docs/MEASUREMENTS.md`). `Makefile`: con gcc le istruzioni AVX allineate diventano
-non allineate (crash sotto ASan e su MinGW), e un flag cambiato ricompila tutto. Prova: `make check`,
-`make bench`, `build/trochilus generate -m models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf -p 32 -n 16 -c 128 -t 8 --profile`.
+### 2026-09-17 — AVX2 and AVX-512 kernels for dot_f32 and dot_row q8_0
+`src/kernels/kernels_x86.c`: AVX2 and AVX-512 variants of two hot kernels, chosen at
+startup by CPU (AVX-512, then AVX2, then scalar; `TR_CPU_MAX` limits them), bit-identical
+to scalar. Common parts in `kernels_internal.h`; `tr_rmsnorm` uses active tier.
+`test_kernels` compares every tier with scalar on all queues and special values, and
+verifies catching a deliberately wrong variant. q8_0 kernel 10× faster on one thread;
+OLMoE-1B-7B Q8_0 from 6.9 to 21.1 tok/s (8 threads), same tokens as scalar
+(`docs/MEASUREMENTS.md`). `Makefile`: with gcc aligned AVX instructions become
+misaligned (crash under ASan and on MinGW), and a changed flag recompiles everything.
+Check: `make check`, `make bench`,
+`build/trochilus generate -m models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf -p 32 -n 16 -c 128 -t 8 --profile`.
 
-### 2026-09-17 — Zona calda, pool con attesa attiva, misure ripetute
-Zona calda marcata nel codice (`/* hot: begin */`): `tools/lint.py` rifiuta allocazioni, stringhe,
-I/O e matematica per elemento, con un autotest del controllo; `tests/test_hot.c` conta le allocazioni
-mentre il modello genera (zero) e verifica logit identici con 1/2/3/8 thread. Pool di thread nuovo:
-uno slot per thread, attesa attiva 2 ms poi sonno (dispatch a 16 thread da 53 a 1.5 µs su Windows).
-Il cancello aggiunge ThreadSanitizer, `test_hot` 20 volte e la compilazione del benchmark.
-`profile_suite.py`: campo `context`, minimo e massimo, token identici fra run e fra thread;
-scenari del modello vero in `bench/scenarios-olmoe-1b-7b.json`. Prova: `make check`, `make bench`,
-`make profile SCENARIOS=bench/scenarios-olmoe-1b-7b.json`.
+### 2026-09-17 — Hot path, pool with spinning, repeated measurements
+Hot path marked in code (`/* hot: begin */`): `tools/lint.py` rejects allocations,
+strings, I/O and per-element math, with self-test of the check; `tests/test_hot.c`
+counts allocations while model generates (zero) and verifies identical logits with 1/2/3/8
+threads. New thread pool: one slot per thread, spin for 2 ms then sleep (dispatch at 16
+threads from 53 to 1.5 µs on Windows). Gate adds ThreadSanitizer, `test_hot` 20 times,
+and benchmark compilation. `profile_suite.py`: `context` field, min and max, identical
+tokens across runs and threads; real model scenarios in `bench/scenarios-olmoe-1b-7b.json`.
+Check: `make check`, `make bench`, `make profile SCENARIOS=bench/scenarios-olmoe-1b-7b.json`.
 
-### 2026-09-17 — Parte a thread singolo: rope da tabella, attivazioni e attenzione in parallelo
-Rope: tabella cos/sin per posizione costruita alla creazione della sessione (`tr_rope_table`), il
-forward non fa più trigonometria. Esperti a stadi (gate+up di tutti, poi le attivazioni di tutti come
-un solo lavoro parallelo `tr_swiglu(pool, ...)`, poi down, poi somma pesata). Attenzione: una testa
-per volta in `tr_attention_head` (somma pesata con il kernel nuovo `axpy_f32`, scalare + AVX2 +
-AVX-512), teste in parallelo con una riga di punteggi per thread. Logit del modello vero identici al
-bit a prima. Prova: `make check`; `trochilus logits` sugli stessi token con il binario di prima e di
-dopo, `cmp` dei file; `make profile SCENARIOS=bench/scenarios-olmoe-1b-7b.json`.
+### 2026-09-17 — Single-thread part: rope from table, activations and attention in parallel
+Rope: cos/sin table per position built at session creation (`tr_rope_table`), forward no
+longer does trigonometry. Experts staged (gate+up of all, then activations of all as one
+parallel job `tr_swiglu(pool, ...)`, then down, then weighted sum). Attention: one head
+at a time in `tr_attention_head` (weighted sum with new kernel `axpy_f32`, scalar + AVX2 +
+AVX-512), heads in parallel with one score row per thread. Real model logits identical to
+the bit before. Check: `make check`; `trochilus logits` on same tokens with binary before
+and after, `cmp` the files; `make profile SCENARIOS=bench/scenarios-olmoe-1b-7b.json`.
 
-### 2026-09-17 — Tokenizer BPE dai metadati GGUF, esatto contro transformers; `trochilus run` con testo
-`src/tokenizer/`: token, tipi e merge letti dal GGUF (il merge diventa coppia di id → rango e
-risultato), added token cercati leftmost-longest per primo byte, NFC e classi `\p{L}` `\p{N}` `\s`
-da tabelle generate sondando HF `tokenizers` 0.22.2 (`tools/gen_unicode_tables.py`), regole GPT-2
-rigiocate sui codepoint, BPE con coda di priorità (n log n). Famiglie ammesse solo con oracolo: oggi
-`olmo`. Comandi `trochilus tokenize` (anche a lotti, pezzi, decodifica) e `trochilus run` (testo in
-entrata, generazione greedy in uscita). Convertitore: vocabolario come `convert_hf_to_gguf.py` di
-llama.cpp e modalità `--vocab-only`. Windows: argomenti in UTF-8 (`wmain`), stdout binario.
-Lint: niente variabili statiche mutabili senza `global-ok`. Test con timeout.
-Prova: `make check` (test C `test_tokenizer` e `test_unicode`, `make oracle-tokenizer`: 20 745 testi
-con sweep di tutti i codepoint, 0 differenze su id, pezzi, testo normalizzato e decodifica; metadati
-del GGUF vero identici); `trochilus run -m models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf -f prompt.txt -n 120`.
+### 2026-09-17 — BPE tokenizer from GGUF metadata, exact against transformers; `trochilus run` with text
+`src/tokenizer/`: tokens, types, and merges read from GGUF (merge becomes id pair →
+rank and result), added tokens sought leftmost-longest per first byte, NFC and classes
+`\p{L}` `\p{N}` `\s` from tables generated by probing HF `tokenizers` 0.22.2
+(`tools/gen_unicode_tables.py`), GPT-2 rules played on codepoints, BPE with priority
+queue (n log n). Families allowed only with oracle: today `olmo`. Commands
+`trochilus tokenize` (also batch, pieces, decode) and `trochilus run` (text in, greedy
+generation out). Converter: vocabulary as `convert_hf_to_gguf.py` in llama.cpp and
+`--vocab-only` mode. Windows: arguments in UTF-8 (`wmain`), stdout binary. Lint: no
+mutable static variables without `global-ok`. Tests with timeout. Check: `make check`
+(C tests `test_tokenizer` and `test_unicode`, `make oracle-tokenizer`: 20,745 tests
+with sweep of all codepoints, 0 differences on ids, pieces, normalized text, and decode;
+real GGUF metadata identical); `trochilus run -m models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf -f prompt.txt -n 120`.
 
-### 2026-09-17 — `trochilus chat`: conversazione con il template del modello
-`src/tokenizer/chat.c`: il template di chat del GGUF si riconosce dai suoi byte esatti (lunghezza e
-FNV-1a) e si rende in C; un template sconosciuto si rifiuta (oggi: OLMoE-0125-Instruct).
-`tr_session_rewind` nel modello: a ogni turno la chat rende tutta la conversazione, tiene i token
-già in cache uguali e calcola solo il resto. Console Windows letta in UTF-16 (`tr_stdin_line`),
-caratteri spezzati fra due token stampati interi. Comandi `trochilus chat` e `chat-template`
-(per l'oracolo). Prova: `make check` (`test_session`: logit identici al bit dopo il rewind;
-`make oracle-tokenizer`: 600 conversazioni uguali ad `apply_chat_template`, testo e token;
-`make chat-check`: sul modello vero la seconda risposta della chat è identica a `run` sulla
-conversazione intera); a mano: `build/trochilus chat -m models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf`.
-Senza `-c`, se la RAM non basta per 4096 token la chat dimezza il contesto e lo scrive (LEZIONI #37).
+### 2026-09-17 — `trochilus chat`: conversation with model template
+`src/tokenizer/chat.c`: GGUF chat template recognized by its exact bytes (length and
+FNV-1a) and rendered in C; unknown template rejected (today: OLMoE-0125-Instruct).
+`tr_session_rewind` in model: each turn chat renders entire conversation, keeps already-
+cached tokens same, and computes only rest. Windows console read in UTF-16
+(`tr_stdin_line`), characters split across two tokens printed whole. Commands
+`trochilus chat` and `chat-template` (for oracle). Check: `make check` (`test_session`:
+logits identical to the bit after rewind; `make oracle-tokenizer`: 600 conversations
+equal to `apply_chat_template`, text and tokens; `make chat-check`: on real model second
+chat reply identical to `run` on entire conversation); by hand:
+`build/trochilus chat -m models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf`. Without `-c`, if
+RAM is short for 4096 tokens chat halves the context and prints it (LESSONS #37).
 
-### 2026-09-17 — Confronto con llama.cpp sul modello vero (strumenti)
-`ref/llama.cpp` (commit `b49650a`, solo riferimento) compilato nel container da
-`tools/build_llamacpp.sh`, con `tools/llamacpp_logits.c` (logit per posizione nello stesso formato di
-`trochilus logits`, generazione greedy). `tools/compare_llamacpp.py` confronta tokenizzazione, greedy
-e logit per posizione (parola migliore, KL, margini). Risultati in `docs/MEASUREMENTS.md`. Prova:
-`sh tools/build_llamacpp.sh` e `tools/compare_llamacpp.py ... --prompt bench/prompts/dante.txt` nel
-container. `make check` su Windows ora svuota alla fine la cache della VM di Docker.
+### 2026-09-17 — Comparison with llama.cpp on real model (tools)
+`ref/llama.cpp` (commit `b49650a`, reference only) compiled in container by
+`tools/build_llamacpp.sh`, with `tools/llamacpp_logits.c` (logits per position in same
+format as `trochilus logits`, greedy generation). `tools/compare_llamacpp.py` compares
+tokenization, greedy, and logits per position (best word, KL, margins). Results in
+`docs/MEASUREMENTS.md`. Check: `sh tools/build_llamacpp.sh` and
+`tools/compare_llamacpp.py ... --prompt bench/prompts/dante.txt` in container. `make
+check` on Windows now empties Docker VM cache at the end.
 
-### 2026-09-17 — Oracolo transformers sul modello vero tagliato a 2 layer
-`tools/make_olmoe_2layer_gguf.py` copia i primi 2 layer del GGUF vero (tensori byte per byte, solo
-`block_count` cambia); `tools/make_olmoe_2layer_ref.py` costruisce OLMoE in transformers con la
-configurazione del GGUF e i pesi dequantizzati, e scrive token greedy e logit per posizione di due
-prompt (27 e 1024 token). `tools/oracle.py` legge anche il formato a più prompt (`--logit-tol`).
-`make oracle-real` entra in `make check` (saltato senza il modello): token identici, logit entro
-1e-3 (misurato 2.4e-4). Prova: `make check`, oppure nel container
-`make BUILD=build/linux-gcc CC=gcc oracle-real`. Numeri in `docs/MEASUREMENTS.md`.
+### 2026-09-17 — Transformers oracle on real model cut to 2 layers
+`tools/make_olmoe_2layer_gguf.py` copies first 2 layers of real GGUF (tensors byte for
+byte, only `block_count` changes); `tools/make_olmoe_2layer_ref.py` builds OLMoE in
+transformers with GGUF config and dequantized weights, writes greedy tokens and logits
+per position of two prompts (27 and 1024 tokens). `tools/oracle.py` also reads multi-
+prompt format (`--logit-tol`). `make oracle-real` enters `make check` (skipped without
+model): identical tokens, logits within 1e-3 (measured 2.4e-4). Check: `make check`, or
+in container `make BUILD=build/linux-gcc CC=gcc oracle-real`. Numbers in
+`docs/MEASUREMENTS.md`.
 
-### 2026-09-17 — Confronto di velocità con llama.cpp e colibri
-`tools/speed_compare.py`: stessi thread e stesse lunghezze per Trochilus (`generate`), llama.cpp
-(`llama-bench`, decode alla stessa profondità di contesto) e colibri (`olmoe` sulla sua conversione
-int8), mediana di N run; con `--tok-file` anche la velocità dei tokenizer (Trochilus, `llama-tokenize`,
-HF `tokenizers`). `tools/build_llamacpp.sh` compila anche `llama-bench`. `trochilus generate` ora
-stampa token e valutazioni e divide per le valutazioni; `make check` lo verifica. Numeri in
-`docs/MEASUREMENTS.md`. Prova, nel container con i modelli nel volume `trochilus-models`:
+### 2026-09-17 — Speed comparison with llama.cpp and colibri
+`tools/speed_compare.py`: same threads and same lengths for Trochilus (`generate`),
+llama.cpp (`llama-bench`, decode at same context depth) and colibri (`olmoe` on its int8
+conversion), median of N runs; with `--tok-file` also tokenizer speed (Trochilus,
+`llama-tokenize`, HF `tokenizers`). `tools/build_llamacpp.sh` also compiles `llama-bench`.
+`trochilus generate` now prints tokens and evals and divides by evals; `make check`
+verifies it. Numbers in `docs/MEASUREMENTS.md`. Check, in container with models in
+`trochilus-models` volume:
 `tools/speed_compare.py --model /models/<gguf> --trochilus build/linux-gcc/trochilus --llama-bench
 ref/llama.cpp/build-trochilus/bin/llama-bench --threads 16,8 --prompt 32 --gen 32`.
 
-### 2026-09-17 — Prefill a blocchi in C esatto
-`tr_session_eval` corre in passate da al più `n_batch` token (default 512; `tr_session_create` prende
-`n_batch`, `-b` in `generate`/`run`/`chat`/`logits`). In una passata: K/V di tutti i token, attenzione
-per (testa, token); router per token e counting sort delle coppie (token, esperto) per esperto;
-`tr_matmul_grouped` (nuovo, `kernels.c`) per gate/up/down, e `tr_matmul` che visita i token a blocchi
-di 16 contro ogni riga di pesi; somma degli esperti per token in ordine di id; logit solo dell'ultimo
-token. Il decode è la passata da un token. Prompt 512 a 16 thread: 30 → 197 tok/s (col kernel qui
-sotto), decode invariato,
-logit identici al bit al binario di prima. Prova: `make check` (`tests/test_prefill.c`: 90 casi f32/Q8_0,
-n_batch, chiamate, thread, rewind; `test_kernels`: gruppi vuoti e righe spezzate fra thread;
-`tools/oracle.py`: `logits -b 3/64/tutto` al byte su tiny e OLMoE a 2 layer); velocità con
-`tools/speed_compare.py ... --prompt 512`.
+### 2026-09-17 — Batch prefill in exact C
+`tr_session_eval` runs in passes of at most `n_batch` tokens (default 512;
+`tr_session_create` takes `n_batch`, `-b` in `generate`/`run`/`chat`/`logits`). Per pass:
+K/V of all tokens, attention per (head, token); router per token and counting sort of
+(token, expert) pairs per expert; `tr_matmul_grouped` (new, `kernels.c`) for gate/up/down,
+and `tr_matmul` that visits tokens in blocks of 16 against each weight row; sum of experts
+per token in id order; logits of last token only. Decode is the pass from one token.
+512-token prompt at 16 threads: 30 → 197 tok/s (with kernel below), decode unchanged,
+logits identical to bit to binary before. Check: `make check` (`tests/test_prefill.c`: 90
+cases f32/Q8_0, n_batch, calls, threads, rewind; `test_kernels`: empty groups and rows
+split across threads; `tools/oracle.py`: `logits -b 3/64/all` to byte on tiny and OLMoE
+at 2 layers); speed with `tools/speed_compare.py ... --prompt 512`.
 
-### 2026-09-17 — Profilo del prefill, kernel a 4 token, confronti alternati
-`tools/profile_suite.py` riporta le zone anche in prefill e accetta `batch` in uno scenario;
-`bench/scenarios-olmoe-1b-7b.json` ha gli scenari `prefill512-t16/8/4/1`. Il profilo dice che il
-prefill sta al 90% nelle moltiplicazioni (attenzione 2%, seriale 8%), quindi kernel `dot_row_x4`
-(scalare, AVX2, AVX-512): una riga di pesi contro 4 token nei registri, un carico e una conversione
-per quattro prodotti, ognuno identico al bit al suo `dot_row`. `TR_MATMUL_TILE` si può cambiare da
-riga di compilazione. `tests/bench_kernels.c` misura `dot_row q8_0 x4` e `tr_matmul` con 64 token;
-`tests/test_kernels.c` confronta x4 con `dot_row` su ogni livello SIMD. Nuovo `tools/ab_speed.sh`:
-due binari alternati run per run, perché il portatile che si scalda falsa i confronti in sequenza
-(LEZIONI #46). Prova: `make check`, `make bench`, e
-`sh tools/ab_speed.sh models/<gguf> build/base/b/trochilus build/linux-gcc/trochilus` nel container.
+### 2026-09-17 — Prefill profile, 4-token kernel, alternating comparisons
+`tools/profile_suite.py` reports zones in prefill too and accepts `batch` in a scenario;
+`bench/scenarios-olmoe-1b-7b.json` has scenarios `prefill512-t16/8/4/1`. Profile shows
+prefill is 90% in multiplications (attention 2%, serial 8%), so kernel `dot_row_x4`
+(scalar, AVX2, AVX-512): one weight row against 4 tokens in registers, one load and one
+conversion per four products, each identical to the bit to its `dot_row`. `TR_MATMUL_TILE`
+can be changed from compile line. `tests/bench_kernels.c` measures `dot_row q8_0 x4` and
+`tr_matmul` with 64 tokens; `tests/test_kernels.c` compares x4 with `dot_row` on every
+SIMD tier. New `tools/ab_speed.sh`: two binaries alternated run by run, because laptop
+heating fakes sequential comparisons (LESSONS #46). Check: `make check`, `make bench`,
+and `sh tools/ab_speed.sh models/<gguf> build/base/b/trochilus build/linux-gcc/trochilus`
+in container.
 
-### 2026-09-17 — Perché il prefill non scalava: dove Windows mette i thread
-Misurato sul nativo (in Docker la topologia non è quella vera, LEZIONI #47): il clock sotto carico
-dal contatore di Windows e il prefill con l'affinità del processo fissata, casi alternati a ogni giro.
-Il prefill a 16 thread non era limitato dalla potenza (il clock scende del 6-8% da 1 a 16 thread) né
-dal CCD (8 thread divisi 4+4 sui due chiplet vanno il 7-9% meglio di 8 su uno solo): lo scheduler
-appoggiava due dei 16 thread sullo stesso core fisico. Un thread per core fisico vale +30%
-(134 → 174 tok/s a 2048 token di prompt) e da 8 a 16 core il prefill rende 2.02×. Chiuse le domande
-20 e 2 di `docs/MEASUREMENTS.md`, metà della 3; aperta la 22 (Linux, decode, macchina occupata).
-Prova: `docs/MEASUREMENTS.md` §Dove vanno i thread ha tabelle, metodo e numeri.
+### 2026-09-17 — Why prefill didn't scale: where Windows puts threads
+Measured on native (in Docker topology is not real, LESSONS #47): clock under load from
+Windows counter and prefill with process affinity pinned, cases alternated every round.
+16-thread prefill was not limited by power (clock drops 6-8% from 1 to 16 threads) nor by
+CCD (8 threads split 4+4 on two chiplets go 7-9% better than 8 on one alone): scheduler
+was putting two of the 16 threads on the same physical core. One thread per physical core
+is worth +30% (134 → 174 tok/s at 2048-token prompt) and 8 to 16 cores prefill yields
+2.02×. Closed questions 20 and 2 of `docs/MEASUREMENTS.md`, half of 3; opened 22 (Linux,
+decode, machine occupied). Check: `docs/MEASUREMENTS.md` §Where threads go has tables,
+method, and numbers.
 
-### 2026-09-17 — Decodifica speculativa dal prompt, esatta al bit
-`tr_session_eval_rows` tiene i logit delle ultime n posizioni di una passata invece che solo
-dell'ultima (`tr_session_logits_back`), e ogni riga è identica al bit ai logit che quel token dà da
-solo. Sopra ci stanno `src/gen/lookup.c` (l'n-gramma di coda cercato all'indietro nel contesto,
-proposta la continuazione della sua ultima occorrenza; da 4 a 2 token, niente stato, niente
-allocazioni) e `src/gen/greedy.c` (`tr_greedy_step`: emette il token già scelto, verifica 1 + k
-posizioni in una passata, tiene i token che il modello avrebbe scelto comunque e torna indietro con
-`tr_session_rewind` su quelli rifiutati). `generate` e `run` hanno `--spec <bozza>` e stampano
-quante bozze sono state accettate. Le fonti e cosa si è preso da ognuna: `docs/ORIGINS.md`
-§Speculazione sul prompt. Prova: `make check` (nuovo `tests/test_spec.c`: stessi token con bozza
-1..15, su due vocabolari perché con quello del modello nulla verrebbe mai rifiutato, LEZIONI #50;
-nuovo `make spec-check` sul modello vero tagliato a 2 layer: stesso testo con `--spec 0/1/4/8/15`),
-e `sh tools/ab_spec.sh <gguf> <binario> bench/prompts/code.txt 8` per la velocità a run alternate.
-Misurata sul modello intero (`docs/MEASUREMENTS.md` §Speculazione dal prompt): 1.42× riscrivendo un file
-già nel prompt (64% di bozze accettate), 0.62× scrivendo codice nuovo (13%), pareggio intorno al 15%.
-`--spec` resta spento di default fino alla bozza adattiva. `make` rifiuta ora di mescolare oggetti di
-due piattaforme nella stessa cartella (LEZIONI #52).
+### 2026-09-17 — Speculative decoding from prompt, bit-exact
+`tr_session_eval_rows` keeps logits of last n positions of a pass instead of only last
+(`tr_session_logits_back`), and each row is identical to bit to logits that token gives
+alone. Above are `src/gen/lookup.c` (n-gram of tail sought backward in context, proposes
+continuation of its last occurrence; 4 to 2 tokens, no state, no allocations) and
+`src/gen/greedy.c` (`tr_greedy_step`: emits already-chosen token, verifies 1 + k
+positions in one pass, keeps tokens model would choose anyway and rewinds with
+`tr_session_rewind` on rejected ones). `generate` and `run` have `--spec <draft>` and
+print how many drafts were accepted. Sources and what was taken from each: `docs/ORIGINS.md`
+§Speculative prompt. Check: `make check` (new `tests/test_spec.c`: same tokens with draft
+1..15, on two vocabularies because model vocabulary would never reject anything, LESSONS #50;
+new `make spec-check` on real model cut to 2 layers: same text with `--spec 0/1/4/8/15`),
+and `sh tools/ab_spec.sh <gguf> <binary> bench/prompts/code.txt 8` for speed at alternating
+runs. Measured on full model (`docs/MEASUREMENTS.md` §Speculative prompt): 1.42× rewriting
+file already in prompt (64% drafts accepted), 0.62× writing new code (13%), break-even
+around 15%. `--spec` stays off by default until adaptive draft. `make` now refuses to mix
+objects of two platforms in same folder (LESSONS #52).
 
-### 2026-09-18 — I thread del pool fissati ai core fisici
-`src/base/cpu.c` costruisce la lista dei posti (`tr_cpu_info.slot`, `n_slots`): un processore logico
-per core fisico prima di ogni fratello SMT, e i core presi a giro sulle cache di ultimo livello,
-perché 4+4 sui due chiplet batte 8 sullo stesso. Su Windows la topologia viene da
-`GetLogicalProcessorInformationEx` (core e cache L3), su Linux da `topology/` e `cache/index3/id`,
-su macOS non c'è (un thread non si può fissare: `n_slots` resta 0 e non si pinna niente). La lista
-rispetta una maschera già imposta al processo (`taskset`, `start /affinity`), e in quel caso anche il
-conteggio dei core scende a quelli usabili, così il pool non si dimensiona su core dove non girerà
-mai. `src/base/platform.c` aggiunge `tr_thread_pin` (Windows `SetThreadGroupAffinity`, che arriva
-oltre il primo gruppo di processori — llama.cpp no, UPSTREAM #3; Linux `sched_setaffinity`) e
-`tr_thread_affinity_restore`. In `src/base/threads.c` ogni worker si fissa al suo posto appena parte,
-il thread chiamante prende il posto 0 e torna dov'era quando il pool muore (un processo che crea pool
-di dimensioni diverse — i benchmark — non deve restare inchiodato al primo core). `TR_POOL_PIN`
-sceglie il modo: 0 niente, 1 un processore logico per thread, **2 il core fisico intero (default)**.
-Il modo conta: legare un thread a un processore costa il 17% sul decode, legarlo al suo core no
-(LEZIONI #58). Prova: `make check`, dove `tests/test_base.c` chiede al sistema
-operativo (`GetCurrentProcessorNumber`, `sched_getcpu`) su quale processore ha girato ogni chunk e
-pretende che sia il posto assegnato — con `TR_POOL_PIN=0` quel test è rosso. Velocità:
-`sh tools/ab_speed.sh <gguf> build/pin/on.sh build/pin/off.sh` e `docs/MEASUREMENTS.md` §Il pin dei thread.
-Fonti e cosa si è preso: `docs/ORIGINS.md` §Collocamento dei thread.
+### 2026-09-18 — Pool threads pinned to physical cores
+`src/base/cpu.c` builds slot list (`tr_cpu_info.slot`, `n_slots`): one logical processor
+per physical core before each SMT sibling, and cores taken in round-robin across last-level
+caches, because 4+4 on two chiplets beats 8 on one. On Windows topology comes from
+`GetLogicalProcessorInformationEx` (cores and L3 cache), on Linux from `topology/` and
+`cache/index3/id`, on macOS not available (thread cannot be pinned: `n_slots` stays 0 and
+nothing pins). List respects mask already imposed on process (`taskset`, `start /affinity`),
+and then core count drops to usable ones too, so pool does not size for cores it will never
+run on. `src/base/platform.c` adds `tr_thread_pin` (Windows `SetThreadGroupAffinity`,
+which reaches beyond first processor group — llama.cpp doesn't, UPSTREAM #3; Linux
+`sched_setaffinity`) and `tr_thread_affinity_restore`. In `src/base/threads.c` each worker
+pins itself to its slot as soon as it starts, calling thread takes slot 0 and returns where
+it was when pool dies (a process creating pools of different sizes — benchmarks — must not
+stay stuck on first core). `TR_POOL_PIN` chooses mode: 0 nothing, 1 one logical processor
+per thread, **2 entire physical core (default)**. Mode matters: pinning thread to processor
+costs 17% on decode, pinning to its core does not (LESSONS #58). Check: `make check`,
+where `tests/test_base.c` asks OS (`GetCurrentProcessorNumber`, `sched_getcpu`) which
+processor each chunk ran on and demands it is assigned slot — with `TR_POOL_PIN=0` that
+test is red. Speed: `sh tools/ab_speed.sh <gguf> build/pin/on.sh build/pin/off.sh` and
+`docs/MEASUREMENTS.md` §Thread pinning. Sources and what was taken: `docs/ORIGINS.md`
+§Thread placement.
 
-### 2026-09-18 — Bozza adattiva per `--spec`
-`src/gen/greedy.c` tiene `k_cur`: parte da `n_draft`, dopo un rifiuto parziale scende a quanto è
-stato davvero accettato, dopo una bozza accettata per intero risale di uno fino a `n_draft`, e dopo
-una bozza **tutta** sbagliata la speculazione si ferma per qualche passo, con pausa che raddoppia
-finché la sonda da un token continua a sbagliare (1, 3, 7, 15, al massimo 16). La pausa è la metà
-importante: su un MoE una riga in più costa 15-27 ms contro i ~35 di una passata, perché il token in
-bozza sceglie altri esperti e la passata legge anche i loro pesi, quindi il pareggio è al 60-75% di
-bozze accettate (`docs/MEASUREMENTS.md` §Bozza adattiva, LEZIONI #59). Risultato: 1.01× quando il modello
-inventa (era 0.60× con bozza fissa) e 1.15× quando ricopia un file già nel prompt (1.34× con bozza
-fissa, che resta disponibile con `--spec-fixed`). Una bozza vuota (il lookup non ha trovato nulla da
-proporre) non cambia niente. La politica si sceglie
-(`tr_draft_policy`): adattiva di default, `--spec-fixed` torna alla bozza fissa per le misure. La
-riga di statistiche stampa anche la bozza media per passata. I token restano identici a quelli senza
-speculazione, con ogni politica: è l'invariante di `tests/test_spec.c` e di `make spec-check`, che
-ora gira sul modello intero e pretende bozze accettate (LEZIONI #54). Nuovi test: `k_cur` scende sotto
-`n_draft` a ogni rifiuto vero e, partendo da 1, risale fino a `n_draft` su un contesto che si ripete
-(LEZIONI #55), e dopo una bozza tutta sbagliata il passo successivo non deve proporre niente —
-controllato a ogni passo, e la suite fallisce se in nessun caso una bozza è mai stata rifiutata del
-tutto, così il test non può passare per il motivo sbagliato. Prova: `make check`, e
-`sh tools/ab_spec.sh <gguf> <binario> bench/prompts/code.txt 8` per la velocità; numeri in
-`docs/MEASUREMENTS.md` §Bozza adattiva.
+### 2026-09-18 — Adaptive draft for `--spec`
+`src/gen/greedy.c` holds `k_cur`: starts at `n_draft`, after partial rejection drops to
+what was actually accepted, after draft fully accepted rises by one up to `n_draft`, and
+after draft **entirely** wrong speculation pauses for a few steps, with pause that doubles
+while probe from one token keeps being wrong (1, 3, 7, 15, max 16). Pause is the important
+half: on MoE one more row costs 15-27 ms vs ~35 of a pass, because draft token chooses
+other experts and pass also reads their weights, so break-even is at 60-75% drafts accepted
+(`docs/MEASUREMENTS.md` §Adaptive draft, LESSONS #59). Result: 1.01× when model invents
+(was 0.60× with fixed draft) and 1.15× when recopy file already in prompt (1.34× with fixed
+draft, which stays available with `--spec-fixed`). Empty draft (lookup found nothing to
+propose) changes nothing. Policy chosen (`tr_draft_policy`): adaptive by default,
+`--spec-fixed` returns to fixed draft for measurements. Stats line also prints average
+draft per pass. Tokens stay identical to those without speculation, with every policy: it
+is invariant of `tests/test_spec.c` and `make spec-check`, which now runs on full model
+and demands accepted drafts (LESSONS #54). New tests: `k_cur` drops below `n_draft` on
+every true rejection and, starting from 1, rises to `n_draft` on repeating context
+(LESSONS #55), and after entirely wrong draft next step must propose nothing — checked
+every step, and suite fails if no case ever fully rejected a draft, so test cannot pass
+for wrong reason. Check: `make check`, and `sh tools/ab_spec.sh <gguf> <binary> bench/prompts/code.txt 8`
+for speed; numbers in `docs/MEASUREMENTS.md` §Adaptive draft.
 
-### 2026-09-18 — Quanto darebbe la leva 2 (attivazioni int8 con VNNI): niente
-Domanda 21 chiusa con una misura, senza scrivere il kernel. `tests/bench_kernels.c` ha ora un
-candidato int8 × int8 con `_mm256_dpbusd_epi32` (stessa struttura di ggml) accanto ai nostri dot:
-sulla stessa riga fa 11.4 G elementi/s contro gli 11.3 del nostro dot float, mentre il nostro
-`dot_row_x4` (una riga di pesi contro 4 token) ne fa 30.6. Il candidato resta nel benchmark, non
-diventa un kernel: le attivazioni a 8 bit non sono lo stesso numero. Prova: `make bench`, righe
-`dot q8_0xq8_0` e `quantize x q8_0`; numeri e letture in `docs/MEASUREMENTS.md` §Attivazioni int8 con VNNI.
+### 2026-09-18 — What would lever 2 give (int8 activations with VNNI): nothing
+Question 21 closed with a measurement, without writing kernel. `tests/bench_kernels.c` now
+has int8 × int8 candidate with `_mm256_dpbusd_epi32` (same structure as ggml) alongside
+our dots: on same row does 11.4 G elements/s vs 11.3 of our float dot, while our `dot_row_x4`
+(one weight row vs 4 tokens) does 30.6. Candidate stays in benchmark, does not become
+kernel: 8-bit activations are not the same number. Check: `make bench`, rows `dot q8_0xq8_0`
+and `quantize x q8_0`; numbers and reads in `docs/MEASUREMENTS.md` §Int8 activations with VNNI.
 
-### 2026-09-17 — Una misura che non misura si ferma
-`tools/ab_speed.sh` e `tools/ab_spec.sh` si fermano alla prima run che non produce la riga dei tok/s
-e stampano le ultime righe di quella run: prima stampavano la tabella delle mediane su un file vuoto,
-e una misura muta sembrava una misura riuscita (LEZIONI #56).
+### 2026-09-17 — A measurement that doesn't measure stops
+`tools/ab_speed.sh` and `tools/ab_spec.sh` stop at first run that doesn't produce tok/s
+line and print last lines of that run: before they printed table of medians on empty file,
+and silent measurement looked like successful measurement (LESSONS #56).
 
-### 2026-09-18 — Revisione avversariale di tutto il repository
-Rilettura completa da parte di un altro modello (Fable 5.1): kernel, prefill, speculazione,
-tokenizer, pool, GGUF, piattaforma, riga di comando, strumenti e documenti. Esito: gli invarianti
-reggono; tre errori corretti, ognuno con un test rosso prima e verde dopo; una conclusione di misura
-rovesciata; due controlli e uno strumento nuovi (LEZIONI #60-#68, `docs/MEASUREMENTS.md` §Revisione).
-- `src/gen/greedy.c`: il tetto della pausa della bozza adattiva valeva sul valore vecchio, quindi
-  15 raddoppiava a 31. Prova: `build/.../tests/test_spec` (`test_adaptive_pause_is_capped`).
-- `src/base/threads.c`: l'affinità di prima del chiamante sta nel thread con un contatore dei pool
-  vivi (due pool distrutti nell'ordine di nascita lo lasciavano sul core 0), e un worker senza slot
-  riprende quell'affinità invece di ereditare il pin (Linux). Prova: `tests/test_base`
-  (`test_pool_caller_affinity_any_order`, `test_pool_oversubscribed`), anche sotto TSan.
-- `src/base/cpu.c`: un `TR_CPU_MAX` che non è un tier è un avviso sul log, non più un silenzio.
-- `make tier-check` (`tools/tier_check.sh`, dentro `check-linux`): il motore sotto `scalar` e
-  `avx2`, e i logit dei modelli minuscoli identici al byte fra tier, thread e `-b`.
-- `tests/bench_kernels.c`, sezione «one row, by»: int8 VNNI con la struttura del kernel a 4 token
-  (1.8-2.3× il nostro float) e float a 8 token (0.79× a n=2048), alternati. Prova: `make bench`.
-- `tools/ab_modes.sh`: confronto fra modi dello stesso binario con rotazione dell'ordine e
-  controllo A/A. Prova: `sh tools/ab_modes.sh 3 "a=<comando>" "a2=<stesso comando>"`.
-- Commenti corretti dove dicevano il contrario del codice: `lookup.h`, `threads.h`, `threads.c`.
+### 2026-09-18 — Adversarial review of entire repository
+Full re-read by another model (Fable 5.1): kernels, prefill, speculation, tokenizer, pool,
+GGUF, platform, command line, tools, and docs. Outcome: invariants hold; three errors fixed,
+each with red test before and green after; one measurement conclusion reversed; two checks
+and one tool new (LESSONS #60-#68, `docs/MEASUREMENTS.md` §Review).
+- `src/gen/greedy.c`: adaptive draft pause cap used old value, so 15 doubled to 31. Check:
+  `build/.../tests/test_spec` (`test_adaptive_pause_is_capped`).
+- `src/base/threads.c`: caller's prior affinity lives in thread with count of live pools
+  (two pools destroyed in birth order left it on core 0), and worker without slot resumes
+  that affinity instead of inheriting pin (Linux). Check: `tests/test_base`
+  (`test_pool_caller_affinity_any_order`, `test_pool_oversubscribed`), also under TSan.
+- `src/base/cpu.c`: a `TR_CPU_MAX` that is not a tier is a log warning, no longer silent.
+- `make tier-check` (`tools/tier_check.sh`, inside `check-linux`): engine under `scalar`
+  and `avx2`, and tiny model logits identical to byte across tiers, threads, and `-b`.
+- `tests/bench_kernels.c`, section "one row, by": int8 VNNI with 4-token kernel structure
+  (1.8-2.3× our float) and float at 8 tokens (0.79× at n=2048), alternated. Check:
+  `make bench`.
+- `tools/ab_modes.sh`: compare modes of same binary with order rotation and A/A check.
+  Check: `sh tools/ab_modes.sh 3 "a=<command>" "a2=<same command>"`.
+- Fixed comments that said opposite of code: `lookup.h`, `threads.h`, `threads.c`.
 
-### 2026-09-18 — Rimisura nativa con controllo A/A
-Nessun codice cambiato: `sh tools/remeasure.sh` (14 minuti, macchina ferma, 8 giri, ordine a
-rotazione, A/A) sulle tre conclusioni che stavano dentro lo spread, più le zone del profiler per la
-domanda 12. Caso peggiore di `--spec` **0.953×** (non 1.01×) e caso buono 1.175×; il −17% sul decode
-del pin al processore non si riproduce (la differenza fra i due pin è nel prefill, +9%); decode a 8
-thread 1.09-1.12× su 16. Una riga di bozza costa 13.7-17.6 ms su 31.3, per il 61-91% negli esperti.
-Numeri in `docs/MEASUREMENTS.md` §Revisione, decisioni in `docs/STATUS.md`, LEZIONI #58, #59, #66, #67.
-Prova: `sh tools/remeasure.sh`, poi `build/remeasure/` (ogni run e le mediane).
+### 2026-09-18 — Native remeasurement with A/A check
+No code changed: `sh tools/remeasure.sh` (14 minutes, machine stopped, 8 rounds, order
+rotation, A/A) on three conclusions that were within spread, plus profiler zones for
+question 12. Worst case `--spec` **0.953×** (not 1.01×) and best case 1.175×; −17%
+on decode of processor pin not reproduced (difference between two pins is in prefill,
++9%); decode at 8 threads 1.09-1.12× vs 16. One draft row costs 13.7-17.6 ms out of 31.3,
+for 61-91% in experts. Numbers in `docs/MEASUREMENTS.md` §Review, decisions in
+`docs/STATUS.md`, LESSONS #58, #59, #66, #67. Check: `sh tools/remeasure.sh`, then
+`build/remeasure/` (every run and medians).
 
-### 2026-09-18 — Thread per fase: il prompt su tutto il pool, il decode sulla larghezza che la sessione misura
-Domanda 26 chiusa. Misura (nativo, macchina ferma, 8 giri, A/A, contesti 512 e 2048): il prefill
-vuole 16 thread, il decode 8 (4 vince di poco a 512 e perde a 2048, 12 non rende). Il numero non è
-scritto nel motore: ogni sessione lo misura. Dopo contro prima: decode **1.085×** a 512,
-**1.02-1.03×** a 2048, prefill invariato, `--spec 8` caso peggiore 1.064×; token identici al bit.
-Numeri in `docs/MEASUREMENTS.md` §Thread per fase, decisione in `docs/STATUS.md`, LEZIONI #69-#72.
-- `src/base/threads.{h,c}`: `tr_pool_set_active(p, n)` e `tr_pool_active`: i `parallel_for`
-  seguenti usano i primi n thread (i primi n slot: core distinti sui due chiplet), gli altri
-  dormono. Prova: `tests/test_base` (`test_pool_active`: 5000 cambi di larghezza, anche sotto TSan).
-- `src/models/model.{h,c}`: ogni eval passa da `session_eval` (zona calda, ora sotto `tools/lint.py`):
-  passata lunga su tutto il pool; passata corta (fino a `TR_DECODE_ROWS` = 4 righe) sulla larghezza
-  del decode, che la sessione misura sulle prime 9 passate da un token (tutto il pool, metà, un
-  quarto; la più ampia entro l'1% dalla più veloce; di nuovo ogni 1024) o che
-  `tr_model_set_decode_threads` forza. `TR_DECODE_ROWS` nell'ambiente sposta il confine per le
-  misure (0: il motore di prima). Prova: `tests/test_phase` (le larghezze e la scelta su tempi
-  finti, la sequenza delle larghezze su una sessione vera, larghezza forzata 1..8 e oltre, ogni
-  logit identico a un thread solo, f32 e Q8_0; rosso prima, verde dopo, rimisura provata per
-  mutazione).
-- `src/app/main.c`: `--decode-threads <n>` in `generate`, `run`, `chat`, `logits`; dopo le righe di
-  velocità `threads: 16 prompt, 8 decode (measured)` (o `forced`); `decode_threads` nel JSON del
-  profilo. Prova: `build/trochilus generate -m <gguf> -p 64 -n 24` e lo stesso con
+### 2026-09-18 — Threads per phase: prompt on full pool, decode on width session measures
+Question 26 closed. Measure (native, machine stopped, 8 rounds, A/A, contexts 512 and 2048):
+prefill wants 16 threads, decode 8 (4 wins slightly at 512 and loses at 2048, 12 does not
+yield). Number not hardcoded in engine: each session measures it. After vs before: decode
+**1.085×** at 512, **1.02-1.03×** at 2048, prefill unchanged, `--spec 8` worst case 1.064×;
+tokens identical to bit. Numbers in `docs/MEASUREMENTS.md` §Threads per phase, decision in
+`docs/STATUS.md`, LESSONS #69-#72.
+- `src/base/threads.{h,c}`: `tr_pool_set_active(p, n)` and `tr_pool_active`: following
+  `parallel_for` uses first n threads (first n slots: distinct cores on two chiplets), others
+  sleep. Check: `tests/test_base` (`test_pool_active`: 5000 width changes, also under TSan).
+- `src/models/model.{h,c}`: every eval passes through `session_eval` (hot path, now under
+  `tools/lint.py`): long pass on full pool; short pass (up to `TR_DECODE_ROWS` = 4 rows) on
+  decode width, which session measures on first 9 single-token passes (full pool, half, quarter;
+  widest within 1% of fastest; again every 1024) or that `tr_model_set_decode_threads` forces.
+  `TR_DECODE_ROWS` in environment shifts the boundary for measurements (0: old engine). Check:
+  `tests/test_phase` (widths and choice on fake times, sequence of widths on real session,
+  forced width 1..8 and beyond, every logit identical to single thread, f32 and Q8_0; red
+  before, green after, remeasure tried by mutation).
+- `src/app/main.c`: `--decode-threads <n>` in `generate`, `run`, `chat`, `logits`; after
+  speed lines `threads: 16 prompt, 8 decode (measured)` (or `forced`); `decode_threads` in
+  profile JSON. Check: `build/trochilus generate -m <gguf> -p 64 -n 24` and same with
   `--decode-threads 8`.
-- `tools/tier_check.sh`: `test_phase` sotto `scalar` e `avx2`, e i logit identici al byte anche con
-  la larghezza misurata (5 thread) e con `--decode-threads 2`. Prova: `make tier-check`.
-- `tools/threads_phase.sh` (`sweep`, `change <binario prima>`, `after <binario prima>`): aspetta un
-  exe bloccato da Smart App Control invece di ricompilare, ferma e riavvia i container, aspetta 12
-  GiB liberi. `tools/ab_modes.sh` raccoglie la colonna `width` (la larghezza che ogni run si è
-  misurata). Prova: `sh tools/threads_phase.sh change build/trochilus-before.exe`.
-- Ogni `tools/*.sh` ha il corpo dentro `main()` chiamata dall'ultima riga: uno script modificato
-  mentre gira non si rompe più (LEZIONI #69); `tools/lint.py` lo pretende. `tools/remeasure.sh`
-  aspetta anche lui la memoria libera (LEZIONI #72). Prova: `make lint`.
+- `tools/tier_check.sh`: `test_phase` under `scalar` and `avx2`, and logits identical to byte
+  also with measured width (5 threads) and with `--decode-threads 2`. Check: `make tier-check`.
+- `tools/threads_phase.sh` (`sweep`, `change <binary before>`, `after <binary before>`): waits
+  for exe blocked by Smart App Control instead of recompiling, stops and restarts containers,
+  waits for 12 GiB free. `tools/ab_modes.sh` collects `width` column (width each run measured
+  itself). Check: `sh tools/threads_phase.sh change build/trochilus-before.exe`.
+- Every `tools/*.sh` has body inside `main()` called from last line: script modified while
+  running does not break anymore (LESSONS #69); `tools/lint.py` demands it.
+  `tools/remeasure.sh` also waits for free memory (LESSONS #72). Check: `make lint`.
 
-### 2026-09-19 — Decode a contesto lungo: la banda della RAM, e la KV con le posizioni di una testa in fila
+### 2026-09-19 — Decode at long context: RAM bandwidth, and KV with head positions in a row
 
-Punto 6 dei prossimi passi e domanda 4. Misurato prima (RAM ~54 GB/s; il decode perdeva col contesto
-perché la KV si leggeva a 32-36 GB/s, a salti), poi la leva esatta: decode 1.06-1.10× a contesto
-512, 1.12-1.14× a 2048, 1.15-1.18× a 4000, prefill 1.39-1.43× a 4000, logit identici al byte.
-Numeri in `docs/MEASUREMENTS.md` §Decode a contesto lungo.
+Point 6 of next steps and question 4. Measured first (RAM ~54 GB/s; decode lost with context
+because KV read at 32-36 GB/s, in jumps), then exact lever: decode 1.06-1.10× at context
+512, 1.12-1.14× at 2048, 1.15-1.18× at 4000, prefill 1.39-1.43× at 4000, logits identical
+to byte. Numbers in `docs/MEASUREMENTS.md` §Decode at long context.
 
-- `src/kv/kv.{h,c}` (strato nuovo): `tr_kv`, cache `[layer][testa KV][posizione][head_dim]`, K e V in
-  due blocchi; `tr_kv_bytes` per la guardia di memoria, `tr_kv_init`/`tr_kv_free`, `tr_kv_keys` e
-  `tr_kv_values` (posizione 0 di una testa; la posizione t sta `t * head_dim` float più avanti),
-  `tr_kv_write` (una passata di un layer, testa per testa; riscrive dopo un rewind). Zona calda sotto
-  `tools/lint.py`. Prova: `tests/test_kv.c` (layout, scritture in più passate, riscrittura, ultimo
-  elemento; nessun altro float toccato), rosso prima (non c'era) e verde dopo, e per mutazione
-  (`tools/mutate_kv.sh` nel container: 5 indici sbagliati su 5 visti, tre da `test_kv`, tutti
-  dall'oracolo).
-- `src/models/olmoe.c`: la sessione tiene un `tr_kv`; l'attenzione chiama `tr_attention_head` con
-  passo `head_dim` e scostamento 0 sulle chiavi e sui valori della sua testa KV (`h / group`): stesse
-  chiamate sugli stessi float. Prova: `make check` (test_prefill, test_spec, test_session, test_phase,
-  oracoli, `tier-check`, `spec-check`), e sul modello vero lo stadio `exact` qui sotto.
-- `src/base/prof.{h,c}`: byte letti **per zona** (`tr_prof_count(p, zona, pesi, disco)`,
-  `tr_prof_count_kv` per la KV letta dall'attenzione: ogni posizione, una volta per testa e per token),
-  `kv_bytes_read` per fase; la tabella stampa MiB per token e GB/s della zona, il JSON `bytes` per
-  zona e `kv_bytes` per fase. Gli esperti contano `gate_up` e `down` separati. Prova:
-  `tests/test_prof.c`, `tests/test_model_prof.c` (KV di una passata da 3 token e di un token a
-  posizione 3, pesi di `qkv_proj`, somma delle zone = totali della fase);
+- `src/kv/kv.{h,c}` (new layer): `tr_kv`, cache `[layer][KV head][position][head_dim]`, K and V in
+  two blocks; `tr_kv_bytes` for memory guard, `tr_kv_init`/`tr_kv_free`, `tr_kv_keys` and
+  `tr_kv_values` (position 0 of a head; position t is `t * head_dim` floats further),
+  `tr_kv_write` (one layer pass, head by head; rewrites after rewind). Hot path under
+  `tools/lint.py`. Check: `tests/test_kv.c` (layout, writes across multiple passes,
+  rewrite, last element; no other float touched), red before (not there) and green after,
+  and by mutation (`tools/mutate_kv.sh` in container: 5 wrong indices out of 5 found,
+  three from `test_kv`, all from oracle).
+- `src/models/olmoe.c`: session holds a `tr_kv`; attention calls `tr_attention_head` with
+  stride `head_dim` and offset 0 on keys and values of its KV head (`h / group`): same
+  calls on same floats. Check: `make check` (test_prefill, test_spec, test_session,
+  test_phase, oracles, `tier-check`, `spec-check`), and on real model the `exact` stage
+  below.
+- `src/base/prof.{h,c}`: bytes read **per zone** (`tr_prof_count(p, zone, weights, disk)`,
+  `tr_prof_count_kv` for KV read by attention: every position, once per head and per token),
+  `kv_bytes_read` per phase; table prints MiB per token and GB/s of zone, JSON `bytes` per
+  zone and `kv_bytes` per phase. Experts count `gate_up` and `down` separate. Check:
+  `tests/test_prof.c`, `tests/test_model_prof.c` (KV of 3-token pass and one token at
+  position 3, `qkv_proj` weights, sum of zones = phase totals);
   `build/trochilus generate -m <gguf> -p 512 -n 48 --profile`.
-- `tests/bench_mem.c`, `make bench-mem` (compilato con 0 warning in `make check`, nativo e Linux):
-  `ram` (letture in fila e sparse a blocchi da 2 MiB, 256 KiB, 4 KiB, 1-16 thread), `weights` (il
-  matmul del motore su matrici da esperto a caso), `kv <posizioni>` (un token di attenzione sui due
-  layout, kernel vero e sola lettura). Stampa data e ora di compilazione (LEZIONI #24). Ogni gruppo
-  sta sotto i 60 s.
-- `tools/profile_suite.py`: chiave `decode_threads` negli scenari; per zona ms per token, MiB per
-  token e GB/s; KV letta per token e traffico pesi + KV. `bench/scenarios-decode-context.json`:
-  contesto 32, 512, 2048, 4000, larghezza misurata e 8 forzati (16 forzati ai due contesti lunghi).
-  Prova: `make profile SCENARIOS=bench/scenarios-decode-context.json`.
-- `tools/decode_context.sh` (`measure`, `change <binario prima>`; `PROF_BEFORE=<binario>` profila
-  anche quello): ferma e riavvia i container, aspetta un exe bloccato e 12 GiB liberi; stadio `exact`
-  (logit al byte prima contro dopo su 600 posizioni, un token per passata e a passate da 64, e token
-  dopo un prompt da 4000: se differiscono non misura); i quattro contesti in **una** sessione di
-  `ab_modes.sh`, 16 modi in ordine di de Bruijn, ogni modo con la sua copia A/A; poi `bench_mem` e i
-  profili. `tools/decode_context_report.py speed | model | zones` fa le tabelle di MISURE dai file
-  delle run. Prova: `sh tools/decode_context.sh change build/trochilus-before.exe` (105 minuti).
-- `tools/ab_modes.sh`: `AB_GUARD`, un comando eseguito prima di ogni run; se fallisce la misura si
-  ferma (uscita 3). `decode_context.sh`, `threads_phase.sh` e `remeasure.sh` lo impostano a «nessun
-  container acceso» (LEZIONI #73). Prova: `AB_GUARD=false sh tools/ab_modes.sh 1 "a=true" "b=true"`.
+- `tests/bench_mem.c`, `make bench-mem` (compiled at 0 warnings in `make check`, native
+  and Linux): `ram` (sequential and scattered reads in 2 MiB, 256 KiB, 4 KiB blocks,
+  1-16 threads), `weights` (engine matmul on random expert matrices), `kv <positions>`
+  (one token of attention on both layouts, real kernel and read-only). Prints compile
+  date and time (LESSONS #24). Each group under 60 s.
+- `tools/profile_suite.py`: `decode_threads` key in scenarios; per zone ms per token, MiB
+  per token and GB/s; KV read per token and weight + KV traffic. `bench/scenarios-decode-context.json`:
+  context 32, 512, 2048, 4000, measured width and 8 forced (16 forced at two long contexts).
+  Check: `make profile SCENARIOS=bench/scenarios-decode-context.json`.
+- `tools/decode_context.sh` (`measure`, `change <binary before>`; `PROF_BEFORE=<binary>`
+  also profiles it): stops and restarts containers, waits for blocked exe and 12 GiB free;
+  `exact` stage (logits to byte before vs after on 600 positions, one token per pass and
+  passes of 64, and token after 4000-token prompt: if they differ no measure); four
+  contexts in **one** `ab_modes.sh` session, 16 modes in de Bruijn order, each mode with
+  its A/A copy; then `bench_mem` and profiles. `tools/decode_context_report.py speed | model | zones`
+  makes MEASUREMENTS tables from run files. Check: `sh tools/decode_context.sh change build/trochilus-before.exe`
+  (105 minutes).
+- `tools/ab_modes.sh`: `AB_GUARD`, a command executed before every run; if it fails
+  measurement stops (exit 3). `decode_context.sh`, `threads_phase.sh` and `remeasure.sh`
+  set it to "no containers on" (LESSONS #73). Check: `AB_GUARD=false sh tools/ab_modes.sh 1 "a=true" "b=true"`.
 
-### 2026-09-19 — Prefill su prompt lunghi: attenzione a gruppi, lavoro per token sul pool, righe F32 col kernel del tier
+### 2026-09-19 — Prefill on long prompts: grouped attention, work per token on pool, F32 rows with tier kernel
 
-Punto 4 dei prossimi passi, domande 7 e 30. Misurato prima (il softmax, cioè `expf` della libreria
-C, è il 51-72% dell'attenzione del prompt; la lettura ripetuta di chiavi e valori fra l'1% e il
-21-39% a 4000 token, secondo la run, e niente sotto; l'8% del prefill girava su un thread solo), poi
-le tre leve esatte. Numeri in
-`docs/MEASUREMENTS.md` §Prefill su prompt lunghi. Prefill **1.05-1.08× a 512, 1.07-1.08× a 2048,
-1.11-1.14× a 4000** (A/A 2.1%), decode non distinguibile (A/A 2.4%), logit identici al byte sul
-modello vero (600 posizioni un token per passata, passate da 64, prompt da 4000 a passate da 512 e
-da 100). `expf` nostro, la leva grande che resta, non è scritto: lo decide Marcello (domanda 37).
+Point 4 of next steps, questions 7 and 30. Measured first (softmax, i.e. C library `expf`,
+is 51-72% of prompt attention; repeated read of keys and values between 1% and 21-39% at
+4000 tokens, per run, nothing below; 8% of prefill ran on single thread), then three exact
+levers. Numbers in `docs/MEASUREMENTS.md` §Prefill on long prompts. Prefill **1.05-1.08×
+at 512, 1.07-1.08× at 2048, 1.11-1.14× at 4000** (A/A 2.1%), decode indistinguishable
+(A/A 2.4%), logits identical to byte on real model (600 positions one token per pass,
+passes of 64, 4000-token prompt at passes of 512 and 100). Our `expf`, the big lever
+remaining, not written: Marcello decides (question 37).
 
-- `src/kernels/kernels.{h,c}`, `kernels_x86.c`: `tr_attention_group` (l'attenzione di un gruppo di
-  token consecutivi di una testa: blocchi di `TR_ATTN_BLOCK` = 64 posizioni contro tutte le query
-  del gruppo, poi il softmax di ogni riga, poi i valori a blocchi; ogni uscita identica al bit a
-  `tr_attention_head`, che resta come definizione) e due kernel nuovi nella tabella, `dot_f32_x4`
-  (una query contro 4 chiavi, un accumulatore per chiave in un registro con nome) e `axpy_f32_x4` (4
-  valori sommati a un'uscita, in ordine, un carico e una scrittura dell'uscita per 4): scalare (la
-  definizione: 4 chiamate), AVX2, AVX-512 con le code a maschera. Le righe di pesi **F32** (il
-  router) usano i kernel del tier (`dot_row` = `dot_f32`, `dot_row_x4` = `dot_f32_x4`) invece del
-  ciclo scalare. Prova: `tests/test_kernels.c` (x4 contro scalare e contro 4 chiamate del proprio
-  tier, ogni lunghezza fino a 200 e code; 525 gruppi contro `tr_attention_head` query per query,
-  punteggi compresi, con sentinelle oltre l'uscita e oltre la riga di punteggi; ogni tier deve avere
-  kernel suoi), sotto ogni tier in `make tier-check`.
-- `src/models/olmoe.c`: l'attenzione corre a gruppi di `OLMOE_ATTN_QUERIES` = 16 token per testa (il
-  decode è un gruppo da uno: un solo percorso), con 16 righe di punteggi per worker a passo non
-  multiplo di 4 KiB; il lavoro di un token solo (embedding, norme, norme di q e k, RoPE, scrittura
-  della KV, somma del residuo, scelta del router con uno scratch per worker, righe copiate per gli
-  esperti, somma degli esperti) si divide sul pool per token, almeno `OLMOE_TOKENS_PER_CHUNK` = 8 a
-  pezzo: una passata corta resta sul thread che chiama. Il profiler conta i byte di KV per gruppo (le
-  posizioni che vede l'ultimo token del gruppo), non più per token. Prova: `tests/test_prefill.c`
-  (prompt da 141 token, contesto 160, passate fino a 141: 108 casi identici a un token per passata),
-  `tests/test_hot.c` (passate da 1, 4 e 20 token, anche sotto ThreadSanitizer), `tests/test_model_prof.c`
-  (byte di una passata da 3, da 20 e da 5 a posizione 20), `make check`.
-- `tools/mutate_prefill.sh` (nel container; con un argomento solo le mutazioni che lo contengono):
-  20 errori plausibili (17 nelle tre leve, 3 sul tier usato), 20 visti dai test; le due corse critiche le vede solo
-  ThreadSanitizer. Una mutazione non era vista (un punteggio calcolato oltre il contesto della query):
-  il test ora mette sentinelle dopo la riga (LEZIONI #80).
-- `tests/bench_attn.c`, `make bench-attn` (0 warning in `make check`, nativo e Linux): l'attenzione di
-  un prompt intero su un layer, una query alla volta (tutto, senza softmax, solo prodotti, solo
-  softmax, solo somma pesata), a gruppi con i kernel di oggi, a gruppi con x4, e il kernel del motore
-  (`grp full`); hash di tutte le uscite, i gruppi devono dare i bit di «una query alla volta»;
-  `--threads`, `--heads`, `--group`, `--block`, `--only`. `tests/bench_mem.c kv` chiama
-  `tr_attention_group` come il motore. `tests/bench_expf.c`, `make bench-expf` (nativo e nel
-  container: le due librerie C non sono lo stesso codice): costo di `expf` e confronto con
-  l'arrotondamento corretto su tutti i 2^32 float, 13 s a 16 thread.
-- `tools/prefill_context.sh` (`bench`, `measure`, `change <binario prima>`; `TROCHILUS=<binario>`
-  misura un motore che non è `build/trochilus.exe`, LEZIONI #81): come `decode_context.sh`, per il
-  prefill a 512, 2048 e 4000 in **una** sessione (ordine che mette ogni lunghezza dopo ogni altra,
-  copie A/A), stadio `exact` esteso a un prompt da 4000 a passate da 512 e da 100 su 16 thread,
-  `bench_attn`, profilo su `bench/scenarios-prefill-context.json` (512, 2048, 4000 a 16 thread e 512
-  a un thread: quanto di una zona non si divide). `tools/prefill_context_report.py attn | zones` fa le
-  tabelle; `tools/decode_context_report.py speed` legge anche le etichette `p512`. Prova: `sh
-  tools/prefill_context.sh change build/trochilus-before.exe`.
-- **Il tier viene usato** (LEZIONI #78, quarta volta di un verde che non vede il ramo):
-  `tests/test_tier_used.c`, in `make test` e sotto `TR_CPU_MAX=scalar` e `avx2` in `make tier-check`.
-  La tabella: ogni voce della zona calda di ogni tier è una funzione sua, per ogni tipo di peso che
-  il motore accetta. Il motore: un modello per tipo (F32, F16, Q8_0, router F32 accanto) gira con la
-  tabella attiva avvolta in contatori (`tr_kernels_set_active`, solo per i test, in
-  `kernels_internal.h`) e i prodotti contati per tipo sono esattamente righe × token. Rosso prima
-  (F16 scalare in ogni tier), verde dopo i **kernel F16** di AVX2 (F16C) e AVX-512 (`dot_row`,
-  `dot_row_x4`: conversione esatta, bit-identici, 49× sullo scalare in `make bench`);
-  `tests/synth_olmoe.h` scrive anche modelli F16 e col router F32 (`synth_f32_router`). Tre
-  mutazioni nuove in `tools/mutate_prefill.sh`: due le vede solo questo test. Regola generale in
-  `CLAUDE.md`. Prova: `make test`, `make tier-check`, `make bench`.
-- **`expf` nostro: preparato, non scritto** (decide Marcello; MISURE §Prefill su prompt lunghi, punto
-  7). `tests/bench_expf.c` prova un candidato dato alla compilazione (`-DTR_EXPF_CANDIDATE=<funzione>`)
-  su tutti i 2^32 float contro la libreria e contro il riferimento; senza candidato prova uno schizzo
-  scalare che vive solo nel banco (0 differenze da MinGW, 3.7 ns contro 30, 8 argomenti sulla strada
-  lenta); `--hard <file>` scrive i casi al confine e `tools/expf_hard_cases.py` li ricalcola a 200
-  bit con mpmath (369 casi, 0 errori del riferimento, sulle due piattaforme).
-  `tools/expf_quality.sh` (container, volume dei modelli) compila un motore di sola misura con ogni
-  `expf` arrotondato correttamente (`tools/cr_expf_emul.h`) e lo confronta col binario normale sul
-  modello vero (`tools/expf_quality.py`): KL media 3.9e-13, 0 token diversi su 1000. Il motore non
-  è stato toccato. Prova: `make bench-expf`; `sh tools/expf_quality.sh` nel container.
-- `tools/measure_guard.lib` e `tools/stay_awake.ps1`, usati da `prefill_context.sh`,
-  `decode_context.sh`, `threads_phase.sh` e `remeasure.sh` (LEZIONI #82): una misura alla volta
-  (`build/.measuring.lock` col pid; una seconda esce con 5, il lock di uno script morto si riprende)
-  e la macchina tenuta sveglia finché il lock esiste (una richiesta di alimentazione, nessuna
-  impostazione cambiata). Prova: due `sh tools/prefill_context.sh bench` insieme, il secondo si
-  rifiuta.
+- `src/kernels/kernels.{h,c}`, `kernels_x86.c`: `tr_attention_group` (attention of a group
+  of consecutive tokens of a head: blocks of `TR_ATTN_BLOCK` = 64 positions against all
+  group queries, then softmax of each row, then values in blocks; every output identical
+  to bit to `tr_attention_head`, which stays as definition) and two new kernels in table,
+  `dot_f32_x4` (one query against 4 keys, one accumulator per key in named register) and
+  `axpy_f32_x4` (4 values summed to one output, in order, one load and one output write
+  per 4): scalar (definition: 4 calls), AVX2, AVX-512 with masked queues. **F32** weight
+  rows (router) use tier kernels (`dot_row` = `dot_f32`, `dot_row_x4` = `dot_f32_x4`)
+  instead of scalar loop. Check: `tests/test_kernels.c` (x4 vs scalar and vs 4 calls of
+  own tier, every length up to 200 and queues; 525 groups vs `tr_attention_head` query
+  per query, scores included, with sentinels beyond output and beyond score row; every
+  tier must have its own kernels), under every tier in `make tier-check`.
+- `src/models/olmoe.c`: attention runs in groups of `OLMOE_ATTN_QUERIES` = 16 tokens per
+  head (decode is group of one: one path only), with 16 score rows per worker at stride
+  non-multiple of 4 KiB; work of one token alone (embedding, norms, q and k norms, RoPE,
+  KV write, residual sum, router choice with one scratch per worker, rows copied for
+  experts, expert sum) divides on pool per token, at least `OLMOE_TOKENS_PER_CHUNK` = 8
+  per piece: short pass stays on calling thread. Profiler counts KV bytes per group (the
+  positions seen by group's last token), no longer per token. Check: `tests/test_prefill.c`
+  (141-token prompt, context 160, passes up to 141: 108 cases identical to one token per
+  pass), `tests/test_hot.c` (passes of 1, 4, and 20 tokens, also under ThreadSanitizer),
+  `tests/test_model_prof.c` (bytes of 3-token pass, 20-token, and 5-token at position 20),
+  `make check`.
+- `tools/mutate_prefill.sh` (in container; with one argument only mutations containing it):
+  20 plausible errors (17 in three levers, 3 on tier used), 20 seen by tests; two critical
+  races seen only by ThreadSanitizer. One mutation was not seen (score computed beyond
+  query context): test now puts sentinels after the row (LESSONS #80).
+- `tests/bench_attn.c`, `make bench-attn` (0 warnings in `make check`, native and Linux):
+  attention of full prompt on one layer, one query at a time (all, no softmax, products
+  only, softmax only, weighted sum only), in groups with today's kernels, in groups with
+  x4, and engine kernel (`grp full`); hash of all outputs, groups must give bits of
+  "one query at a time"; `--threads`, `--heads`, `--group`, `--block`, `--only`.
+  `tests/bench_mem.c kv` calls `tr_attention_group` as engine. `tests/bench_expf.c`,
+  `make bench-expf` (native and in container: two C libraries are not same code): cost
+  of `expf` and comparison with correct rounding on all 2^32 floats, 13 s at 16 threads.
+- `tools/prefill_context.sh` (`bench`, `measure`, `change <binary before>`;
+  `TROCHILUS=<binary>` measures engine that is not `build/trochilus.exe`, LESSONS #81):
+  like `decode_context.sh`, for prefill at 512, 2048, 4000 in **one** session (order
+  puts each length after every other, A/A copies), `exact` stage extended to 4000-token
+  prompt at passes of 512 and 100 on 16 threads, `bench_attn`, profile on
+  `bench/scenarios-prefill-context.json` (512, 2048, 4000 at 16 threads and 512 at one
+  thread: how much of a zone does not divide). `tools/prefill_context_report.py attn | zones`
+  makes tables; `tools/decode_context_report.py speed` also reads `p512` labels. Check:
+  `sh tools/prefill_context.sh change build/trochilus-before.exe`.
+- **Tier is used** (LESSONS #78, fourth time of green that doesn't see branch):
+  `tests/test_tier_used.c`, in `make test` and under `TR_CPU_MAX=scalar` and `avx2` in
+  `make tier-check`. Table: every hot-path entry of every tier is its own function, for
+  every weight type engine accepts. Engine: one model per type (F32, F16, Q8_0, router
+  F32 beside) runs with active table wrapped in counters (`tr_kernels_set_active`, tests
+  only, in `kernels_internal.h`) and products counted per type are exactly rows × tokens.
+  Red before (F16 scalar in every tier), green after **F16 kernels** of AVX2 (F16C) and
+  AVX-512 (`dot_row`, `dot_row_x4`: exact conversion, bit-identical, 49× over scalar in
+  `make bench`); `tests/synth_olmoe.h` also writes F16 models and with F32 router
+  (`synth_f32_router`). Three new mutations in `tools/mutate_prefill.sh`: two seen only
+  by this test. General rule in `CLAUDE.md`. Check: `make test`, `make tier-check`,
+  `make bench`.
+- **Our `expf`: prepared, not written** (Marcello decides; MEASUREMENTS §Prefill on long
+  prompts, point 7). `tests/bench_expf.c` tries a candidate given at compile
+  (`-DTR_EXPF_CANDIDATE=<function>`) on all 2^32 floats against library and reference;
+  without candidate tries a sketch scalar that lives only in bench (0 differences from
+  MinGW, 3.7 ns vs 30, 8 arguments on slow path); `--hard <file>` writes boundary cases
+  and `tools/expf_hard_cases.py` recalculates them at 200 bits with mpmath (369 cases,
+  0 reference errors, on both platforms). `tools/expf_quality.sh` (container, models
+  volume) compiles measurement-only engine with every `expf` correctly rounded
+  (`tools/cr_expf_emul.h`) and compares it to normal binary on real model
+  (`tools/expf_quality.py`): average KL 3.9e-13, 0 different tokens in 1000. Engine
+  not touched. Check: `make bench-expf`; `sh tools/expf_quality.sh` in container.
+- `tools/measure_guard.lib` and `tools/stay_awake.ps1`, used by `prefill_context.sh`,
+  `decode_context.sh`, `threads_phase.sh` and `remeasure.sh` (LESSONS #82): one
+  measurement at a time (`build/.measuring.lock` with pid; second exits with 5, dead
+  script's lock is retaken) and machine kept awake while lock exists (power request, no
+  settings changed). Check: two `sh tools/prefill_context.sh bench` together, second
+  refuses.
 
-### 2026-09-19 — `tr_expf` scalare, la pulizia negli script, la rimisura a macchina pulita
+### 2026-09-19 — Scalar `tr_expf`, cleanup in scripts, remeasurement at clean machine
 
-- **`tr_expf`** (`src/kernels/expf.c`, `src/kernels/expf_table.h` generato da
-  `tools/gen_expf_table.py` con mpmath): exp(x) arrotondato correttamente a float su ogni float,
-  scalare, nessuna chiamata alla libreria C dentro. Tabella di 64 valori di 2^(j/64), ln2/64 in due
-  pezzi, polinomio di grado 5, test di arrotondamento a 2^-50, 8 eccezioni calcolate a 200 e a 400
-  bit (le ritrova `gen_expf_table.py --scan`, mirror numpy della strada veloce), NaN per un
-  arrotondamento non provato. `tr_softmax` e `tr_swiglu` la usano; `tr_expf_path` e
-  `tr_expf_exception` dicono ai test quale strada prende un argomento. Prova: `make bench-expf`
-  (tutti i 2^32 float contro il riferimento; su Windows anche contro l'`expf` di MinGW: 0 e 0),
-  `make test` (`tests/test_expf.c`: bordi, strada veloce a campione, ogni eccezione, softmax e SiLU
-  contro la definizione), `sh tools/mutate_expf.sh` nel container (17 mutazioni su 17 viste).
-- **Nel cancello**: `make check` gira `make bench-expf` con gcc e con clang; `tools/lint.py` rifiuta
-  `expf(` e `exp(` nella zona calda, confronta `expf_table.h` col suo generatore, pretende il trap di
-  pulizia in ogni `tools/*.sh` e rifiuta le pipe verso `tee` di ciò che può fallire; `clean-machine`
-  (`tools/orphans.sh`, `tools/test_cleanup.sh`) prima di tutto.
-- **Qualità e piattaforme**: `sh tools/expf_quality.sh` nel container (binario di prima, build di
-  emulazione dai sorgenti del commit di prima tirati fuori da git, binario nuovo: KL e token, e gli
-  stessi byte dell'emulazione o esce 1); `sh tools/platform_bits.sh` (logit di Windows e Linux al byte
-  su fixture e modello vero a 2 layer; le tabelle RoPE con `tests/dump_rope.c` e
-  `tools/rope_table_compare.py`, saltate se Smart App Control blocca lo strumento).
-- **La pulizia** (LEZIONI #84): `tools/cleanup.lib` in ogni script (discendenti uccisi dal trap EXIT,
-  anche l'albero nativo su Windows; INT e TERM diventano `exit 130`; `cleanup_run` per i passi lunghi,
-  perché una shell che aspetta un figlio in primo piano non serve i segnali); `tools/orphans.sh` e
-  `tools/orphans.ps1`; `tools/busy_machine.sh`; `tools/test_cleanup.sh`. Prova: `sh
-  tools/test_cleanup.sh`; un `yes` lasciato acceso e poi `sh tools/orphans.sh` o `make check`.
-- **La macchina interrogata** (LEZIONI #85): `tools/machine_still.sh` e `tools/cpu_busy.ps1` (processori
-  occupati, prima della sessione e prima di ogni run, in `MEASURE_AB_GUARD`), `tools/background_load.ps1`
-  e `measure_declare` (il carico di fondo e la quota di `System` nel log di ogni misura);
-  `prefill_context.sh` scrive da sé `binaries.sha256` e accetta `GEN_EXTRA` (decode a larghezza
-  forzata nei confronti prima/dopo). Prova: `sh tools/machine_still.sh 3.0 0 5` a macchina quieta e con
-  tre `yes` accesi da `sh tools/busy_machine.sh 3 sh tools/machine_still.sh 3.0 0 5`.
-- **La rimisura**: `threads_phase.sh widths` e `decode_context.sh widths` (decode forzato a 16 contro 8
-  thread ai quattro contesti), e `decode_context_report.py speed` che conta scelte e cambi di
-  larghezza. Prova: i comandi di MISURE §Rimisura a macchina pulita, a macchina lasciata sola.
+- **`tr_expf`** (`src/kernels/expf.c`, `src/kernels/expf_table.h` generated by
+  `tools/gen_expf_table.py` with mpmath): exp(x) correctly rounded to float on every
+  float, scalar, no C library calls inside. Table of 64 values of 2^(j/64), ln2/64 in
+  two pieces, degree-5 polynomial, rounding test at 2^-50, 8 exceptions calculated at
+  200 and 400 bits (found by `gen_expf_table.py --scan`, numpy mirror of fast path), NaN
+  for untested rounding. `tr_softmax` and `tr_swiglu` use it; `tr_expf_path` and
+  `tr_expf_exception` tell tests which path an argument takes. Check: `make bench-expf`
+  (all 2^32 floats vs reference; on Windows also vs MinGW's `expf`: 0 and 0), `make test`
+  (`tests/test_expf.c`: edges, fast path sampled, every exception, softmax and SiLU vs
+  definition), `sh tools/mutate_expf.sh` in container (17 mutations out of 17 found).
+- **In gate**: `make check` runs `make bench-expf` with gcc and clang; `tools/lint.py`
+  rejects `expf(` and `exp(` in hot path, compares `expf_table.h` to its generator,
+  demands cleanup trap in every `tools/*.sh` and rejects pipes to `tee` of what can fail;
+  `clean-machine` (`tools/orphans.sh`, `tools/test_cleanup.sh`) first of all.
+- **Quality and platforms**: `sh tools/expf_quality.sh` in container (binary before,
+  emulation build from before-commit sources pulled from git, binary after: KL and
+  tokens, and same bytes as emulation or exits 1); `sh tools/platform_bits.sh` (logits
+  of Windows and Linux to byte on fixture and 2-layer real model; RoPE tables with
+  `tests/dump_rope.c` and `tools/rope_table_compare.py`, skipped if Smart App Control
+  blocks tool).
+- **Cleanup** (LESSONS #84): `tools/cleanup.lib` in every script (descendants killed by
+  EXIT trap, also native tree on Windows; INT and TERM become `exit 130`;
+  `cleanup_run` for long steps, because shell waiting for foreground child doesn't serve
+  signals); `tools/orphans.sh` and `tools/orphans.ps1`; `tools/busy_machine.sh`;
+  `tools/test_cleanup.sh`. Check: `sh tools/test_cleanup.sh`; leave `yes` on then
+  `sh tools/orphans.sh` or `make check`.
+- **Machine interrogated** (LESSONS #85): `tools/machine_still.sh` and `tools/cpu_busy.ps1`
+  (busy processors, before session and before each run, in `MEASURE_AB_GUARD`),
+  `tools/background_load.ps1` and `measure_declare` (background load and `System`'s share
+  in every measurement log); `prefill_context.sh` writes `binaries.sha256` itself and
+  accepts `GEN_EXTRA` (decode at forced width in before/after comparisons). Check:
+  `sh tools/machine_still.sh 3.0 0 5` at quiet machine and with three `yes` on from
+  `sh tools/busy_machine.sh 3 sh tools/machine_still.sh 3.0 0 5`.
+- **Remeasurement**: `threads_phase.sh widths` and `decode_context.sh widths` (decode
+  forced at 16 vs 8 threads on four contexts), and `decode_context_report.py speed`
+  that counts choices and width changes. Check: commands in MEASUREMENTS §Remeasure at
+  clean machine, at machine left alone.
 
-### 2026-09-19 — Lo stimatore della larghezza del decode, riscritto
+### 2026-09-19 — Decode width estimator, rewritten
 
-- **Cosa**: la larghezza delle passate corte non la sceglie più «la più ampia entro l'1%» (tirava a
-  sorte: LEZIONI #88, domanda 31). `src/models/model.c`: `tr_decode_tune_widths` dà le larghezze
-  dalla più stretta e non scende sotto 4 thread; `tr_decode_tune_stats` dà di ogni larghezza il
-  centro (la passata più veloce) e il rumore (il distacco della seconda); `tr_decode_tune_pick`
-  tiene la più stretta entro il rumore della coppia (lei e la più veloce) e chiede altre passate
-  sulle due, fino a 6, quando decide il margine; `tr_decode_tune_debounce` cambia solo con due
-  misure concordi. La sessione rimisura a ogni raddoppio del contesto (da 32, ricalcolato dalla
-  posizione: un `rewind` lo abbassa) e dopo 128 passate se un cambio aspetta il secondo voto.
-  `tr_session_decode_history` tiene ciò che ogni misura ha deciso, e la riga `threads:` lo stampa:
-  `threads: 8 prompt, 4 decode (measured), choices 26:4 38:4(8) 76:8` (posizione:larghezza in uso,
-  fra parentesi la scelta che il debounce ha trattenuto). `tools/decode_context.sh long`: 1500 token
-  dopo un prompt di 1000, i cambi di ogni run contati da quella storia (`tools/long_switches.awk`).
-- **Come si prova**: `tests/test_phase.c` (in `make check`): le funzioni pure su tempi scritti a
-  mano, la sessione con un orologio finto (`tr_session_set_tune_clock`), ogni ramo col suo
-  contatore. Visto rosso: prima della riscrittura il caso piatto con l'attesa «la stretta»
-  (`0 != 2`); dopo, dieci mutazioni, nel container: `MSYS_NO_PATHCONV=1 docker run --rm -v
-  "$(pwd -W):/src" -w /src trochilus-dev:local sh tools/mutate_tune.sh` (mezz'ora; `-e ONLY=history`
-  per le due della storia). La riga: `build/trochilus generate -m fixtures/tiny-olmoe/model-f32.gguf
-  -p 20 -n 100 -t 8`. **Sul modello vero non è ancora misurato**: la validazione è il punto 0 di
-  `docs/STATUS.md`, di notte a macchina quieta.
+- **What**: width of short passes no longer chosen by "widest within 1%" (was random:
+  LESSONS #88, question 31). `src/models/model.c`: `tr_decode_tune_widths` gives widths
+  from narrowest and doesn't drop below 4 threads; `tr_decode_tune_stats` gives each width
+  its center (fastest pass) and noise (second's distance); `tr_decode_tune_pick` keeps
+  narrowest within noise of pair (it and fastest) and asks more passes on both, up to 6,
+  when it decides margin; `tr_decode_tune_debounce` changes only with two agreeing
+  measures. Session remeasures at every doubling of context (from 32, recalculated from
+  position: a `rewind` lowers it) and after 128 passes if a change waits for second vote.
+  `tr_session_decode_history` holds what each measure decided, and `threads:` line prints
+  it: `threads: 8 prompt, 4 decode (measured), choices 26:4 38:4(8) 76:8` (position:width in
+  use, in parens choice debounce held). `tools/decode_context.sh long`: 1500 tokens after
+  1000-token prompt, each run's changes counted from that history (`tools/long_switches.awk`).
+- **How to check it**: `tests/test_phase.c` (in `make check`): pure functions on hand-
+  written times, session with fake clock (`tr_session_set_tune_clock`), every branch with
+  its counter. Saw red: before rewrite flat case with wait "for narrowest" (`0 != 2`);
+  after, ten mutations, in container: `MSYS_NO_PATHCONV=1 docker run --rm -v
+  "$(pwd -W):/src" -w /src trochilus-dev:local sh tools/mutate_tune.sh` (half hour;
+  `-e ONLY=history` for two of history). Line: `build/trochilus generate -m fixtures/tiny-olmoe/model-f32.gguf
+  -p 20 -n 100 -t 8`. **On real model not yet measured**: validation is point 0 of
+  `docs/STATUS.md`, at night at quiet machine.
 
-### 2026-09-20 — M1, prima di scrivere codice: la traccia del routing e il banco del disco
+### 2026-09-20 — M1, before writing code: routing trace and disk bench
 
-- **Cosa**: `trochilus run --route-trace <file>` (`src/models/olmoe.c`, `model.h`: `tr_session_route_trace_begin`,
-  `tr_session_route_trace`) registra per token e layer gli esperti scelti e due previsioni del
-  layer dopo (`pred_in` prima degli esperti del layer, `pred_out` a layer finito); spenta non cambia
-  un byte e non tocca la zona calda. `tools/route_trace_report.py` ne ricava le domande 13-15
-  (previsione, cache LRU e pin, streaming per layer). `tests/bench_disk.c` / `make bench-disk`:
-  letture senza la cache del sistema, a blocchi grandi quanto una matrice di un esperto, 1-16
-  lettori (domanda 16). Prompt nuovo `bench/prompts/code-1000.txt` (904 token). Chiuse come «no» le
-  domande 5, 34, 39; aperte la 41 (il disco a un terzo della scheda) e la 42 (il primo layer).
-- **Come si prova**: `tests/test_route.c` in `make check` (previsioni esatte su due modelli
-  sintetici fatti apposta, traccia uguale per ogni forma delle passate, logit uguali con la traccia
-  accesa); cinque mutazioni rosse: `MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src
-  trochilus-dev:local sh tools/mutate_route.sh`; `tools/.venv/Scripts/python.exe
-  tools/route_trace_report.py --check` (in `make lint`). I numeri: nel container `build/linux-gcc/trochilus
-  run -m models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf -f bench/prompts/code-1000.txt -n 300 -t 8
-  --decode-threads 8 --route-trace build/route/code-1000.bin`, poi il report su quel file; `make
-  bench-disk` in nativo a macchina ferma. Risultati in `docs/MEASUREMENTS.md` §M1, prima di scrivere codice.
+- **What**: `trochilus run --route-trace <file>` (`src/models/olmoe.c`, `model.h`:
+  `tr_session_route_trace_begin`, `tr_session_route_trace`) records per token and layer
+  the experts chosen and two predictions of layer after (`pred_in` before layer experts,
+  `pred_out` after layer done); off changes not a byte and touches nothing hot. 
+  `tools/route_trace_report.py` derives questions 13-15 (prediction, LRU cache and pin,
+  streaming per layer). `tests/bench_disk.c` / `make bench-disk`: reads without system
+  cache, in blocks as big as expert matrix, 1-16 readers (question 16). New prompt
+  `bench/prompts/code-1000.txt` (904 tokens). Closed as "no" questions 5, 34, 39; opened
+  41 (disk a third of card) and 42 (first layer).
+- **How to check it**: `tests/test_route.c` in `make check` (predictions exact on two
+  synthetic models made for purpose, trace same for every pass shape, logits same with
+  trace on); five red mutations: `MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src"
+  -w /src trochilus-dev:local sh tools/mutate_route.sh`; `tools/.venv/Scripts/python.exe
+  tools/route_trace_report.py --check` (in `make lint`). Numbers: in container
+  `build/linux-gcc/trochilus run -m models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf -f
+  bench/prompts/code-1000.txt -n 300 -t 8 --decode-threads 8 --route-trace build/route/code-1000.bin`,
+  then report on that file; `make bench-disk` native at quiet machine. Results in
+  `docs/MEASUREMENTS.md` §M1, before writing code.
 
-### 2026-09-20 — M1, lotti 1 e 2: gli esperti passano per un archivio con un budget di RAM
+### 2026-09-20 — M1, batches 1 and 2: experts pass through store with RAM budget
 
-- **Cosa**: `src/memory/experts.{h,c}`: unità (layer, esperto) in slot allocati al caricamento,
-  indice diretto e lista LRU O(1), letture a richiesta sul thread che chiama, dimensioni delle parti
-  per layer. `src/models/olmoe.c`: il denso resta in RAM, gli esperti si chiedono all'archivio dopo
-  il router (`olmoe_refresh_experts`, fuori dalla zona calda), il GGUF resta aperto per la vita del
-  modello, un errore di lettura fa fallire la valutazione e rimette `pos` dov'era. Piano automatico
-  (`tr_expert_budget_plan`), `tr_model_load_budget`, `--expert-budget <MiB|min>` e
-  `TR_EXPERT_BUDGET_MIB`, riga `experts:` dopo `threads:`. Un solo percorso: col budget pieno
-  l'archivio si riempie al caricamento. `tools/lint.py` ora rifiuta i fine riga CRLF (LEZIONI #95).
-- **Come si prova**: `tests/test_experts.c` (contenuti al byte, LRU calcolata a mano, un layer
-  intero col minimo, residente, errori iniettati, 800 chiamate contro un modello di riferimento) e
-  `tests/test_stream.c` (logit identici al byte fra residente, minimo e intermedio, con e senza
-  pool; byte dell'archivio contro `tr_gguf_read_range`; errore di lettura a metà prompt; piano su
-  numeri finti), in `make check`, dove gli oracoli girano anche sotto `TR_EXPERT_BUDGET_MIB=min`;
-  mutazioni `tools/mutate_experts.sh` (10) e `tools/mutate_stream.sh` (5), tutte rosse. Modello vero
-  nel container: `trochilus logits` su 32 posizioni, residente contro `--expert-budget min` (72
-  unità su 1024): `cmp` identico. Nessuna misura di velocità ancora (lotto 3: letture dirette).
+- **What**: `src/memory/experts.{h,c}`: units (layer, expert) in slots allocated at load,
+  direct index and O(1) LRU list, reads on-demand on calling thread, part sizes per layer.
+  `src/models/olmoe.c`: dense stays in RAM, experts asked to store after router
+  (`olmoe_refresh_experts`, off hot path), GGUF stays open for model lifetime, read
+  error fails evaluation and puts `pos` back where it was. Auto plan
+  (`tr_expert_budget_plan`), `tr_model_load_budget`, `--expert-budget <MiB|min>` and
+  `TR_EXPERT_BUDGET_MIB`, `experts:` line after `threads:`. One path only: full budget
+  store fills at load. `tools/lint.py` now rejects CRLF line ends (LESSONS #95).
+- **How to check it**: `tests/test_experts.c` (contents to byte, LRU hand-calculated,
+  whole layer at minimum, resident, injected errors, 800 calls vs reference model) and
+  `tests/test_stream.c` (logits identical to byte across resident, minimum, intermediate,
+  with and without pool; store bytes vs `tr_gguf_read_range`; read error mid-prompt; plan
+  on fake numbers), in `make check`, where oracles also run under `TR_EXPERT_BUDGET_MIB=min`;
+  mutations `tools/mutate_experts.sh` (10) and `tools/mutate_stream.sh` (5), all red.
+  Real model in container: `trochilus logits` on 32 positions, resident vs
+  `--expert-budget min` (72 units of 1024): `cmp` identical. No speed measurement yet
+  (batch 3: direct reads).
 
-### 2026-09-20 — Domanda 44: il codice è un grafo piccolo e deterministico? Traccia versione 2 e maschera degli esperti
+### 2026-09-20 — Question 44: is code a small, deterministic graph? Trace v2 and expert mask
 
-- **Cosa**: la traccia del routing porta anche l'id di ogni token e il margine del router;
-  `tr_model_set_expert_mask` / `--expert-mask <file>` spegne esperti (sola misura: l'uscita non è
-  più del modello, e la riga `expert mask:` lo dice); `tools/route_graph_report.py` (copertura,
-  grafo statico, ripetizioni, tabella per id, margini, `--compare`, `--mask-from` anche a caso);
-  `tools/mask_quality.sh` (KL e token contro il modello intero); `tools/mutate_reports.py`; prompt
-  `bench/prompts/trace-{c2,py,sh,prose-it,prose-en}.txt`. Risultati in `docs/MEASUREMENTS.md`.
-- **Come si prova**: `tests/test_route.c` (id dei token, margini esatti contro lo stesso modello
-  con un esperto in più per token, maschera mai scelta e per layer, vuota e tolta = il modello);
-  `tools/.venv/Scripts/python.exe tools/route_graph_report.py --check` e `tools/mutate_reports.py`
-  (12 mutazioni rosse). Nel container: `trochilus run ... --route-trace`, poi il report sul file;
-  `sh tools/mask_quality.sh` da Git Bash. **Non ancora rifatti dopo queste modifiche**: `make check`
-  e `tools/mutate_route.sh` per intero (fermati per memoria il 20/09).
+- **What**: routing trace also carries id of each token and router margin;
+  `tr_model_set_expert_mask` / `--expert-mask <file>` turns off experts (measurement only:
+  output no longer of model, and `expert mask:` line says so); `tools/route_graph_report.py`
+  (coverage, static graph, repetitions, per-id table, margins, `--compare`, `--mask-from`
+  also random); `tools/mask_quality.sh` (KL and tokens vs whole model); `tools/mutate_reports.py`;
+  prompts `bench/prompts/trace-{c2,py,sh,prose-it,prose-en}.txt`. Results in
+  `docs/MEASUREMENTS.md`.
+- **How to check it**: `tests/test_route.c` (token ids, margins exact vs same model with
+  one more expert per token, mask never chosen and per-layer, empty and removed = model);
+  `tools/.venv/Scripts/python.exe tools/route_graph_report.py --check` and
+  `tools/mutate_reports.py` (12 red mutations). In container: `trochilus run ... --route-trace`,
+  then report on file; `sh tools/mask_quality.sh` from Git Bash. **Not yet redone after
+  these changes**: `make check` and `tools/mutate_route.sh` entirely (stopped for memory 20/09).
 
-### 2026-09-20 — M1 lotto 3: gli esperti si leggono senza la cache del sistema
+### 2026-09-20 — M1 batch 3: experts read without system cache
 
-- **Cosa**: `tr_file_open_direct` e `tr_file_alignment` in `src/base/platform.{h,c}`; l'archivio
-  legge allineato a 4096 senza copie (margine di un settore per parte nello slot, spostamento
-  registrato a ogni riempimento) e `tr_experts_stats` dice se è diretta; `olmoe_load` apre il
-  secondo handle, prova una lettura allineata di saggio e ricade sulla lettura normale se il file
-  system rifiuta; `TR_EXPERT_DIRECT=0` e `TR_MEM_AVAILABLE_MIB` per le misure; la riga `experts:`
-  dice `direct` o `buffered`. Nuovo per le misure: `tools/experts_budget.sh`,
-  `tools/experts_steady.awk`, i contatori dell'archivio in `tools/ab_modes.sh`.
-- **Come si prova**: `tests/test_experts.c` gira ogni suo caso con entrambi gli allineamenti e ha
-  il caso dei due esperti con resti diversi nello stesso slot; `tests/test_stream.c` confronta
-  diretta e normale al byte (residente e al minimo) e forza il ramo stretto del piano;
-  `tests/test_base.c` prova la lettura corta nell'ultimo settore. Quindici mutazioni rosse e la riga di controllo verde:
+- **What**: `tr_file_open_direct` and `tr_file_alignment` in `src/base/platform.{h,c}`; store
+  reads aligned to 4096 without copies (sector margin per side in slot, offset recorded
+  on each fill) and `tr_experts_stats` says if direct; `olmoe_load` opens second handle,
+  tries aligned probe read and falls back to normal if filesystem refuses; `TR_EXPERT_DIRECT=0`
+  and `TR_MEM_AVAILABLE_MIB` for measurements; `experts:` line says `direct` or `buffered`.
+  New for measurements: `tools/experts_budget.sh`, `tools/experts_steady.awk`, store
+  counters in `tools/ab_modes.sh`.
+- **How to check it**: `tests/test_experts.c` runs every case with both alignments and has
+  case of two experts with different remainders in same slot; `tests/test_stream.c`
+  compares direct and normal to byte (resident and minimum) and forces tight plan branch;
+  `tests/test_base.c` tries short read in last sector. Fifteen red mutations and control line green:
   `MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src trochilus-dev:local sh
-  tools/mutate_experts.sh`. Tutto in `make check`.
+  tools/mutate_experts.sh`. All in `make check`.
 
-### 2026-09-21 — M1 misurato (le quattro sessioni), domanda 44 chiusa, un controllo su MISURE
+### 2026-09-21 — M1 measured (four sessions), question 44 closed, one check on MEASUREMENTS
 
-Le misure di M1 sul modello vero, a macchina ferma: `experts_budget.sh measure | misses | long |
-direct` (`build/experts_budget/`) e `mask_quality.sh` sui tre testi che mancavano
-(`build/mask/quality.txt`). Numeri e conclusioni in `docs/MEASUREMENTS.md` §M1 misurato e §Il
-comportamento sul codice, decisioni in `docs/STATUS.md`. In breve: il costo di M1 è il **prompt**
-(ogni sessione rilegge il modello intero, ~4.3 s di disco), un token generato costa 0.03-0.6 unità,
-il decode a generazione lunga sta a 0.87-0.90× del modello residente, e la cache del sistema
-gonfierebbe il prefill di 2.42×. La simulazione della domanda 14 (22.4 unità per token) rispondeva
-a un'altra domanda: LEZIONI #98.
+M1 measurements on real model, machine stopped: `experts_budget.sh measure | misses | long | direct`
+(`build/experts_budget/`) and `mask_quality.sh` on three missing texts (`build/mask/quality.txt`).
+Numbers and conclusions in `docs/MEASUREMENTS.md` §M1 measured and §Behavior on code, decisions in
+`docs/STATUS.md`. In short: M1's cost is the **prompt** (each session re-reads whole model, ~4.3 s disk),
+one generated token costs 0.03-0.6 units, long-generation decode is 0.87-0.90× of resident model, and
+system cache would bloat prefill 2.42×. Question 14's simulation (22.4 units per token) answered another
+question: LESSONS #98.
 
-Nuovi: `tools/experts_budget.sh long` (200 contro 1000 token generati, contesto 1600) con
-`experts_steady.awk` parametrizzato (`-v short_n= -v gap=`); `tools/check_measurements.py`, agganciato a
-`lint` quindi a `make check`: una riga di MISURE che dà un numero da simulazione o da modello a
-tempo deve portare il tag «modello, non misura» (o «modello superato dalla misura» se è storia), e
-una domanda tagliata col primo tag non può essere barrata come chiusa.
+New: `tools/experts_budget.sh long` (200 vs 1000 generated tokens, context 1600) with `experts_steady.awk`
+parametrized (`-v short_n= -v gap=`); `tools/check_measurements.py`, hooked to `lint` so to `make check`:
+a MEASUREMENTS line giving a number from simulation or model-to-time must carry tag "model, not measure"
+(or "model beaten by measure" if history), and a question marked with first tag cannot be struck as closed.
 
-- **Come si prova**: `tools/.venv/Scripts/python.exe tools/check_measurements.py` (verde; togliere un tag
-  a una delle righe taggate di MISURE lo fa fallire, e barrare la domanda 43 lo fa fallire con
-  l'altra regola). Le misure si ripetono con gli stessi comandi: servono un'ora o due di macchina
-  ferma, e ogni sessione dichiara il carico di fondo nel log.
+- **How to check it**: `tools/.venv/Scripts/python.exe tools/check_measurements.py` (green; remove a tag
+  from one MEASUREMENTS tagged line fails it, and striking question 43 fails it with other rule).
+  Measurements repeat with same commands: take an hour or two of machine stopped, and each session
+  declares background load in log.
 
-### 2026-09-21 — Il prefill sotto budget legge il modello una volta per passata (domanda 47)
+### 2026-09-21 — Prefill under budget reads model once per pass (question 47)
 
-Nuovi `tools/prefill_overlap.sh` e `tools/prefill_overlap_report.py`: il prefill diviso nelle sue
-due metà (attesa del disco, dalla zona `weight_read`, e calcolo) a prompt 512 e 2048, con modello
-residente e a budget 50%, più il modo con una passata sola (`-b 2048`). Mediana di 5 giri più uno
-di riscaldamento, ordine a rotazione, macchina ferma, guardie delle altre misure native.
+New `tools/prefill_overlap.sh` and `tools/prefill_overlap_report.py`: prefill split into its
+two halves (disk wait, from `weight_read` zone, and compute) at prompt 512 and 2048, with
+resident model and 50% budget, plus mode with single pass (`-b 2048`). Median of 5 rounds
+plus one warmup, round-robin order, machine stopped, guards of other native measurements.
 
-Il conto ha trovato dell'altro: a 2048 token l'archivio legge 22 880 MiB, 3.5 volte la tabella
-degli esperti, una volta per passata da 512 token. Con una passata sola: 6 273 MiB e 11.27 s
-contro 23.51 (2.09×), calcolo invariato, ultima riga di logit identica al byte. Numeri e leve in
-`docs/MEASUREMENTS.md` §Il prefill legge il modello una volta per passata, priorità in `docs/STATUS.md`,
-lezione #99. Il codice del motore non è stato toccato.
+The count found something else: at 2048 tokens store reads 22,880 MiB, 3.5× the expert
+table, once per 512-token pass. With single pass: 6,273 MiB and 11.27 s vs 23.51 (2.09×),
+compute unchanged, last logit row identical to byte. Numbers and levers in
+`docs/MEASUREMENTS.md` §Prefill reads model once per pass, priority in `docs/STATUS.md`,
+lesson #99. Engine code not touched.
 
-- **Come si prova**: `TROCHILUS=<binario> sh tools/prefill_overlap.sh 5` (~20 minuti, macchina
-  ferma; risultati e profili in `build/prefill_overlap/`). L'esattezza fra le due forme:
-  `trochilus logits ... -b 512` e `-b 2048` sullo stesso prompt, l'ultima riga dei due file
-  confrontata con `cmp`.
+- **How to check it**: `TROCHILUS=<binary> sh tools/prefill_overlap.sh 5` (~20 minutes,
+  machine stopped; results and profiles in `build/prefill_overlap/`). Exactness between
+  two forms: `trochilus logits ... -b 512` and `-b 2048` on same prompt, last line of
+  both files compared with `cmp`.
 
-### 2026-09-21 — La mappa del progetto, il glossario, e il CLAUDE.md rimesso in misura
+### 2026-09-21 — Project map, glossary, and CLAUDE.md brought back into measure
 
-`docs/status.json` tiene lo stato del progetto come dato: le tappe M0-M6, un blocco per pezzo con
-stato (fatto / in corso / prossimo / aperto), cosa vuol dire in parole semplici, i numeri misurati
-con la data, le domande di MISURE collegate, i file, i comandi e le dipendenze. `tools/status_html.py`
-ne fa una pagina sola (colonne per tappa, frecce fra i blocchi, pannello al clic), pubblicata come
-artifact `6mx3NS4KtQrBFPRLkAYupr`. `docs/glossary.json` spiega da zero 38 parole chiave (LRU, KV,
-prefill, quantizzare, tier, oracolo, mutazione, KL...): nel pannello ogni parola riconosciuta
-diventa cliccabile e apre un fumetto con i termini imparentati.
+`docs/status.json` holds project state as data: stages M0-M6, one block per piece with state
+(done / in progress / next / open), what it means in simple words, measured numbers with date,
+linked MEASUREMENTS questions, files, commands and dependencies. `tools/status_html.py` makes
+one page (columns per stage, arrows between blocks, panel on click), published as artifact
+`6mx3NS4KtQrBFPRLkAYupr`. `docs/glossary.json` explains from scratch 38 keywords (LRU, KV,
+prefill, quantize, tier, oracle, mutation, KL...): in panel every recognized word becomes
+clickable and opens bubble with related terms.
 
-Il `CLAUDE.md` era fuori dai tetti (169 righe, 12.1 KB): i comandi interi sono passati a
-`docs/COMMANDS.md` senza cancellarne nessuno, nella mappa restano quelli di ogni giorno, ed è
-tornato a 136 righe / 8.5 KB, timbrato con l'impronta delle preferenze. Nella tabella «prima di
-ogni commit» c'è ora la riga che tiene viva la mappa: un passo chiuso o una decisione si scrivono
-anche in `docs/status.json`, e l'artifact si rigenera e si ripubblica sullo stesso URL.
+`CLAUDE.md` was over caps (169 lines, 12.1 KB): full commands passed to `docs/COMMANDS.md`
+without deleting any, map keeps daily ones, and returned to 136 lines / 8.5 KB, stamped with
+preferences' mark. In "before each commit" table is now the line that keeps map alive: closed
+step or decision also written in `docs/status.json`, and artifact regenerates and republishes
+at same URL.
 
-- **Come si prova**: `tools/.venv/Scripts/python.exe tools/status_html.py` scrive
-  `build/stato/index.html` (deve dire quanti blocchi sono fatti e quante voci di glossario);
-  `node ~/.claude/hooks/misura-claude-md.cjs CLAUDE.md` per i tetti della mappa.
+- **How to check it**: `tools/.venv/Scripts/python.exe tools/status_html.py` writes
+  `build/stato/index.html` (should say how many blocks are done and how many glossary entries);
+  `node ~/.claude/hooks/misura-claude-md.cjs CLAUDE.md` for map caps.
 
-### 2026-09-21 — Ordine per layer nel prefill: 1.89× sotto budget, esperti letti una volta per prompt
+### 2026-09-21 — Layer-major order in prefill: 1.89× under budget, experts read once per prompt
 
-Il corpo di un layer estratto in `forward_layer(m, s, L, tokens, n_tok, pos0, x)` e l'embedding e i
-logit nei loro `forward_embed` / `forward_logits`; `forward_pass` li chiama nello stesso ordine di
-prima, con `x = s->x`. Nuovo `forward_prompt_layer_major`: embedding di ogni blocco nella sua fetta
-di `s->x_all`, poi per ogni layer tutte le passate del prompt, poi i logit. `s->x_all` ([n_ctx]
-[n_embd]) è allocato alla creazione della sessione e solo quando l'archivio degli esperti è parziale
-(glielo chiede `tr_experts_get_stats`), contato nella guardia di memoria: nella zona calda non si
-alloca. `olmoe_eval` prende il percorso nuovo con `x_all != NULL && n > n_batch && trace == NULL`;
-a budget pieno, e con `--route-trace`, resta quello di prima.
+Layer body extracted into `forward_layer(m, s, L, tokens, n_tok, pos0, x)` and embedding
+and logits in their `forward_embed` / `forward_logits`; `forward_pass` calls them in
+same order as before, with `x = s->x`. New `forward_prompt_layer_major`: embedding of
+each block in its slice of `s->x_all`, then for each layer all prompt passes, then
+logits. `s->x_all` ([n_ctx][n_embd]) allocated at session creation and only when expert
+store is partial (asked by `tr_experts_get_stats`), counted in memory guard: nothing
+allocated on hot path. `olmoe_eval` takes new path with `x_all != NULL && n > n_batch && trace == NULL`;
+full budget and with `--route-trace`, stays as before.
 
-Misura (`sh tools/prefill_overlap.sh 5`, macchina ferma): a prompt 2048 e budget 50%, **6 273 MiB
-letti invece di 22 880 e 12.41 s invece di 23.51 (1.89×)**, calcolo non distinguibile. A 512 niente
-cambia. Numeri in `docs/MEASUREMENTS.md` §Il prefill legge il modello una volta per passata.
+Measure (`sh tools/prefill_overlap.sh 5`, machine stopped): at 2048-token prompt and 50%
+budget, **6,273 MiB read instead of 22,880 and 12.41 s instead of 23.51 (1.89×)**, compute
+indistinguishable. At 512 nothing changes. Numbers in `docs/MEASUREMENTS.md` §Prefill reads
+model once per pass.
 
-- **Come si prova**: `make check` (il caso `once_per_prompt` di `tests/test_stream.c` conta le unità
-  lette per un prompt di 36 token in passate da 12 e vuole al massimo `n_units + n_slots`; rosso
-  prima del fix con 33 su 16). Sul modello vero: `sh tools/prefill_overlap.sh 5`, risultati in
+- **How to check it**: `make check` (`once_per_prompt` case of `tests/test_stream.c`
+  counts units read for 36-token prompt in 12-token passes and wants max `n_units + n_slots`;
+  red before fix with 33 on 16). On real model: `sh tools/prefill_overlap.sh 5`, results in
   `build/prefill_overlap/report.txt`.
 
-### 2026-09-21 — Il costo fisso della generazione è l'archivio, non un warm-up (domanda 46)
+### 2026-09-21 — Generation's fixed cost is store, not warm-up (question 46)
 
-`sh tools/experts_budget.sh long` con dentro anche il **budget pieno** (200 contro 1000 token
-generati, contesto 1600, due giri, macchina ferma dopo aver chiuso una chat rimasta aperta): col
-modello residente il tempo per token non migliora da 200 a 1000 (34.64 → 33.48 tok/s, spread
-4-7%), sotto budget sì (29.21 → 30.79 al 50%, 26.53 → 29.84 al 25%). Il costo fisso di ~0.35 s e
-~0.84 s esiste solo quando si legge dal disco: è la LRU che si riassesta dopo il prompt, non i
-kernel che si scaldano né il contatore del decode. Numeri in `docs/MEASUREMENTS.md` §M1 misurato punto 3,
-domanda 46 ristretta a «dove va il resto» (i mancati spiegano ~115 ms su 840).
+`sh tools/experts_budget.sh long` with also **full budget** (200 vs 1000 generated tokens,
+context 1600, two rounds, machine stopped after closing open chat): with resident model
+time per token doesn't improve from 200 to 1000 (34.64 → 33.48 tok/s, spread 4-7%), under
+budget yes (29.21 → 30.79 at 50%, 26.53 → 29.84 at 25%). Fixed cost of ~0.35 s and ~0.84 s
+exists only when reading from disk: it is LRU resettling after prompt, not kernels warming
+nor decode counter. Numbers in `docs/MEASUREMENTS.md` §M1 measured point 3, question 46
+narrowed to "where the rest goes" (misses explain ~115 ms out of 840).
 
-- **Come si prova**: `sh tools/experts_budget.sh long` (~30 minuti, macchina ferma; prima
-  `sh tools/orphans.sh` deve essere pulito). Risultati in `build/experts_budget/steady-long.txt`.
+- **How to check it**: `sh tools/experts_budget.sh long` (~30 minutes, machine stopped;
+  first `sh tools/orphans.sh` must be clean). Results in `build/experts_budget/steady-long.txt`.
 
-### 2026-09-22 — `README.md` in inglese: dove siamo, cosa manca, di cosa ci vantiamo
+### 2026-09-22 — `README.md` in English: where we are, what's missing, what we boast of
 
-Primo documento del repo rivolto a chi non lavora qui dentro (i `docs/` restano in italiano).
-L'asse è quello chiesto da Marcello: **cosa abbiamo fatto, cosa faremo, dove arriviamo**, con in
-testa lo scopo — *democratizzare l'AI locale*: niente pagina dei requisiti minimi (lo scalare è la
-definizione, SIMD e GPU sono acceleratori), niente da installare, la macchina decide da sé, la RAM
-non decide che modelli puoi usare, e una macchina più piccola non dà una risposta peggiore (stessi
-token cambiando thread, `-b`, tier, budget).
+First document of repo for those not working here (docs/ stay in Italian). The axis is what
+Marcello asked: **what we did, what we will, where we reach**, with goal up front —
+*democratize local AI*: no minimum requirements page (scalar is definition, SIMD and GPU
+are accelerators), nothing to install, machine decides itself, RAM doesn't decide which
+models you use, and smaller machine doesn't give worse answer (same tokens changing threads,
+`-b`, tier, budget).
 
-Sezioni: perché; cosa abbiamo fatto (funzionante + numeri misurati + di cosa ci vantiamo, cinque
-voci ognuna con la prova accanto); cosa faremo (tappe M0-M6 con lo stato vero e i prossimi passi in
-ordine); dove vogliamo arrivare (quattro cose che non abbiamo: dimensione slegata dalla RAM, ogni
-GPU o nessuna, pesi piccoli senza perdite silenziose, sempre zero opzioni); cosa manca senza
-sconti; build; mappa dei `docs/`; **cosa leggiamo** (colibri, ds4, llama.cpp come fonti primarie
-con le idee prese una per una, più transformers/`tokenizers`/OLMoE; due soli file di codice
-portato); licenza.
+Sections: why; what we did (working + measured numbers + what we boast of, five items each
+with proof nearby); what we will (stages M0-M6 with true state and next steps in order);
+where we want to reach (four things we don't have: size unbound from RAM, any GPU or none,
+small weights without silent losses, always zero options); what's missing no excuses; build;
+map of `docs/`; **what we read** (colibri, ds4, llama.cpp as primary sources with ideas
+taken one by one, plus transformers/`tokenizers`/OLMoE; only two code files ported); license.
 
-**Fuori dal README, per scelta di Marcello** (2026-09-22): nessun confronto con altri motori e
-niente che dia il fianco — via i rapporti col tokenizer di HF e llama.cpp, via il confronto di
-velocità vecchio, via le righe su cosa i tre motori non provano e sulla policy AI di llama.cpp.
-I difetti trovati e le PR mandate a colibri e ds4 restano fuori: stanno in `docs/UPSTREAM.md`, il
-README non li nomina.
+**Out of README, Marcello's choice** (2026-09-22): no comparison with other engines and
+nothing that opens flank — out go reports with HF tokenizer and llama.cpp, out old speed
+comparison, out lines on what three engines don't try and on llama.cpp's AI policy. Found
+defects and PRs sent to colibri and ds4 stay out: they are in `docs/UPSTREAM.md`, README
+doesn't name them.
 
-I due documenti DeepSeek in `docs/` (report di terzi) entrano in `.gitignore`: non sono nostri e
-non devono finire in un repo che può diventare pubblico.
+Two DeepSeek documents in `docs/` (third-party reports) enter `.gitignore`: not ours and
+must not land in repo that can become public.
 
-- **Come si prova**: `cat README.md`; i numeri citati stanno in `docs/MEASUREMENTS.md` (§Prefill su
-  prompt lunghi, §Decode a contesto lungo, §M1 misurato, §Velocità — Trochilus contro llama.cpp)
-  e in `docs/STATUS.md`; `git check-ignore -v docs/DeepSeek_V41_Tech_Report.md` deve rispondere.
+- **How to check it**: `cat README.md`; numbers cited are in `docs/MEASUREMENTS.md`
+  (§Prefill on long prompts, §Decode at long context, §M1 measured, §Speed — Trochilus vs
+  llama.cpp) and in `docs/STATUS.md`; `git check-ignore -v docs/DeepSeek_V41_Tech_Report.md`
+  must answer.
 
-### 2026-09-22 — Logo tondo e intestazione del README
+### 2026-09-22 — Round logo and README header
 
-Il logo (uccello sulla testa del coccodrillo, `Desktop\logo trochilus.jpg`) ritagliato in un disco:
-il cerchio è dimensionato sulla **distanza massima dell'inchiostro dal centro**, non sul riquadro,
-altrimenti coda e muso restano fuori (il soggetto è disposto in diagonale). Reso a 2048 px e
-ridotto a 512 per un bordo pulito, trasparente fuori dal disco. Sta in `assets/logo.png`; le
-varianti con anello e con ritaglio stretto in `build/logo/`. Titolo del README centrato sotto il
-logo, con la nota che il logo è alla prima iterazione, e in testa la nota che anche il README lo è
-e verrà rifinito e sfoltito.
+Logo (bird on crocodile's head, `Desktop\logo trochilus.jpg`) cropped in a disk: circle
+sized to **maximum distance of ink from center**, not bounding box, else tail and snout stay
+out (subject arranged diagonally). Rendered at 2048 px and reduced to 512 for clean edge,
+transparent outside disk. In `assets/logo.png`; variants with ring and tight crop in
+`build/logo/`. README title centered below logo, with note logo is on first iteration, and
+at top note README too is and will be refined and thinned.
 
-- **Come si prova**: aprire `assets/logo.png`, e il README su GitHub.
+- **How to check it**: open `assets/logo.png`, and README on GitHub.
 
-### 2026-09-22 — English file names across the repository
+### 2026-09-22 — English file names across repository
 
-Marcello: no file in the repository carries an Italian name, and the contents follow in English.
-This step is the names and every reference to them; the contents are the next step.
+Marcello: no file in repository carries Italian name, and contents follow in English. This
+step is names and every reference to them; contents are next step.
 
 Renamed with `git mv`: `docs/ARCHITETTURA.md` → `ARCHITECTURE.md`, `STATO` → `STATUS`,
-`MISURE` → `MEASUREMENTS`, `LEZIONI` → `LESSONS`, `ORIGINI` → `ORIGINS`, `COMANDI` → `COMMANDS`,
+`MISURE` → `MEASUREMENTS`, `LESSONS` → `LESSONS`, `ORIGINI` → `ORIGINS`, `COMANDI` → `COMMANDS`,
 `docs/archivio/FATTO.md` → `docs/archive/DONE.md`, `stato.json` → `status.json`,
 `glossario.json` → `glossary.json`, `tools/check_misure.py` → `check_measurements.py`,
-`tools/stato_html.py` → `status_html.py`, and the two hooks
+`tools/stato_html.py` → `status_html.py`, and two hooks
 (`documenta-prima-del-commit.cjs` → `document-before-commit.cjs`,
 `niente-barre-in-scritture-shell.cjs` → `no-backslashes-in-shell-writes.cjs`).
 
-97 tracked files were rewritten to point at the new names: sources, tests, tools, `Makefile`,
-`CLAUDE.md`, `.claude/settings.json` and the hooks themselves. **`bench/prompts/` and
-`bench/results/` were deliberately left alone**: those bytes are the input and the output of a
+97 tracked files rewritten to point at new names: sources, tests, tools, `Makefile`,
+`CLAUDE.md`, `.claude/settings.json` and hooks themselves. **`bench/prompts/` and
+`bench/results/` deliberately left alone**: those bytes are input and output of a
 measurement, not a reference, and editing them would invalidate every comparison made with them.
 
-Two things the sweep taught us, both now in LESSONS: `pathlib.write_text` on Windows turns every
-`\n` into `\r\n` (97 files came back with CRLF, caught by lint), and the rename alone pushed
-`docs/STATUS.md` past its 40 KB cap, because the English names are longer than the Italian ones.
+Two things the sweep taught us, both now in LESSONS: `pathlib.write_text` on Windows turns
+every `\n` into `\r\n` (97 files came back with CRLF, caught by lint), and rename alone pushed
+`docs/STATUS.md` past its 40 KB cap, because English names are longer than Italian ones.
 
 - **How to check it**: `tools/.venv/Scripts/python.exe tools/lint.py` is green, and
-  `git grep -l 'STATO.md|LEZIONI.md|MISURE.md|docs/archivio'` matches only `bench/prompts/`.
+  `git grep -l 'STATO.md|LESSONS.md|MISURE.md|docs/archivio'` matches only `bench/prompts/`.
+
+### 2026-09-22 — The documents move to English (four done, two half done)
+
+Marcello: everything in the repository is written in English; with him the conversation stays in
+Italian. `CLAUDE.md` now carries that rule, in place of "documents in `docs/` in Italian".
+
+**Finished and verified**: `CLAUDE.md` (rewritten by hand), `ARCHITECTURE.md`, `ORIGINS.md`,
+`COMMANDS.md`, `STATUS.md`, `archive/DONE.md`, `UPSTREAM.md`. **Half done**: `LESSONS.md` and
+`MEASUREMENTS.md` — the headings of both are English, and in MEASUREMENTS these sections still
+have an Italian body: Open questions, Speculation from prompt, Adaptive draft, Kernel: one weight
+row vs 4 tokens, Speed levers, Adversarial review, Threads per phase, Decode at long context,
+Prefill on long prompts, Clean machine remeasure, `tr_expf`, M1 before writing code, M1 measured,
+Prefill reads model once per pass, Is code behavior a small graph, Attempts. Stopped there on
+purpose: the two Haiku agents were eating the usage.
+
+**A translation is verified, not believed** (LESSONS #100): the first agent reported "complete"
+and had translated the headings and one third of the bodies. The check compares the translated
+file with the one in git and fails on anything that is not prose: numbers (6770 → 6770 in
+MEASUREMENTS), table rows (618 → 618), fenced blocks, heading count, and it counts the Italian
+words still in the file. Everything committed here passed it; one wrong term found that way,
+`evicted hits` → `decayed hits` in ARCHITECTURE (it is a decaying score, not an eviction).
+
+Cross-references follow the headings: `§Zona calda` → `§Hot path`, `§Profilazione` → `§Profiling`,
+`§Esecuzione` → `§Execution` and the ORIGINS sections, rewritten in the Makefile, in the sources,
+in the tests and in the tools. `LEZIONI #n` → `LESSONS #n` everywhere. The `§` references that
+point at MEASUREMENTS sections are already English, because that file's headings were translated
+first.
+
+- **How to check it**: `tools/.venv/Scripts/python.exe tools/lint.py` is green;
+  `git grep -n 'LEZIONI'` matches only `bench/prompts/`, which is measurement input and is never
+  edited.
+- **What is left**: the Italian bodies of `LESSONS.md` and `MEASUREMENTS.md`, one section at a
+  time, and then the line in README that still calls the documents Italian.

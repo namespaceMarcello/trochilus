@@ -1,258 +1,262 @@
-# Architettura
+# Architecture
 
-Trochilus fa girare modelli MoE grandi su **qualsiasi** macchina e ne usa tutto: il bersaglio è
-il computer di una persona qualunque (16-32 GB di RAM, una GPU da 4-8 GB o nessuna, un SSD), non
-la workstation da 128 GB. VRAM, RAM e disco lavorano insieme; gli esperti che non stanno in
-memoria si leggono dal disco. Il risultato è esatto al token rispetto al riferimento. Il build
-predefinito non ha dipendenze.
+Trochilus runs large MoE models on **any** machine and uses every byte: the target is
+an ordinary person's computer (16–32 GB RAM, a 4–8 GB GPU or none, an SSD), not a
+128 GB workstation. VRAM, RAM, and disk work together; experts that do not fit in memory
+are read from disk. Results are exact to the token against the reference. The default build
+has no dependencies.
 
-Macchina di riferimento per le misure: portatile Ryzen 9 7940HX, 31 GB RAM, RTX 4070 Laptop 8 GB,
-NVMe 1 TB. Limite basso da tenere vivo: solo CPU, 16 GB, niente GPU.
+Reference machine for measurements: Ryzen 9 7940HX laptop, 31 GB RAM, RTX 4070 Laptop 8 GB,
+NVMe 1 TB. Low floor to keep alive: CPU only, 16 GB, no GPU.
 
-Prende da colibri (CPU vera, disco, test esatti) e da ds4 (GPU, formato, cache KV su disco).
-Da dove viene ogni file portato: `docs/ORIGINS.md`.
+Takes from colibri (true CPU, disk, exact tests) and ds4 (GPU, format, KV cache to disk).
+Where each ported file comes from: `docs/ORIGINS.md`.
 
-## Principi
+## Principles
 
-0. **Si adatta da solo.** All'avvio misura la macchina (core fisici, istruzioni della CPU, RAM
-   libera, VRAM, velocità del disco) e decide dove mettere cosa: pesi densi, esperti caldi, KV,
-   thread. Nessuna opzione obbligatoria; le opzioni servono solo a forzare una scelta.
-1. **La CPU è un motore, non un riferimento.** Ogni modello gira prima su CPU; la GPU accelera.
-2. **Un binario per tutte le CPU.** Kernel scelti a runtime (cpuid / hwcap), non con `-march`:
-   lo stesso eseguibile usa AVX-512 VNNI dove c'è e AVX2 o scalare dove no. Né colibri né ds4 lo fanno.
-3. **Lo scalare definisce i numeri.** Ogni variante SIMD o assembly somma nello stesso ordine
-   ed è **bit-identica** allo scalare, verificata da test. Una variante non identica non entra.
-4. **Zero dipendenze nel nucleo**: libc, thread del sistema operativo. Niente OpenMP (su macOS e
-   MinGW è una libreria in più), niente librerie di terzi. I backend GPU sono moduli caricati a
-   runtime: il nucleo parte anche dove CUDA o Metal non ci sono.
-5. **Il formato è GGUF v3** con i numeri di tipo standard di ggml e i nomi dei tensori di
-   llama.cpp: un file scaricato da Hugging Face si apre senza conversione.
-6. **Operazioni generiche, grafi per modello.** Il backend espone primitive senza nome di modello
-   (matmul quantizzata, rmsnorm, rope, attenzione, top-k, swiglu). Un'operazione fusa per un
-   modello è ammessa solo come accelerazione, con la composizione generica come fallback.
+0. **It adapts on its own.** On startup it measures the machine (physical cores, CPU
+   instructions, free RAM, VRAM, disk speed) and decides where to put what: dense weights,
+   hot experts, KV, threads. No mandatory option; options serve only to force a choice.
+1. **CPU is an engine, not a reference.** Every model runs first on CPU; GPU accelerates.
+2. **One binary for all CPUs.** Kernels chosen at runtime (cpuid / hwcap), not with `-march`:
+   the same executable uses AVX-512 VNNI where it exists and AVX2 or scalar elsewhere. Neither
+   colibri nor ds4 does this.
+3. **Scalar defines the numbers.** Every SIMD or assembly variant sums in the same order
+   and is **bit-identical** to scalar, verified by tests. A non-identical variant does not enter.
+4. **Zero dependencies in the core**: libc, system threads. No OpenMP (on macOS and MinGW it
+   is an extra library), no third-party libraries. GPU backends are modules loaded at runtime:
+   the core starts even where CUDA or Metal are absent.
+5. **The format is GGUF v3** with standard ggml type numbers and tensor names from llama.cpp:
+   a file downloaded from Hugging Face opens without conversion.
+6. **Generic operations, graphs per model.** The backend exposes primitives without model name
+   (quantized matmul, rmsnorm, rope, attention, top-k, swiglu). A fused operation for one model
+   is allowed only as acceleration, with generic composition as fallback.
 
-## C e assembly
+## C and assembly
 
-Il motore si scrive in C, e i punti dove il tempo si consuma davvero si portano in assembly.
-In un motore di inferenza quasi tutto il tempo sta in pochi kernel (prodotti scalari delle
-matrici quantizzate, attenzione, dequantizzazione); caricamento, tokenizer e orchestrazione non
-guadagnano niente dall'assembly e perderebbero la portabilità.
+The engine is written in C, and the points where time is really spent are ported to assembly.
+In an inference engine almost all time lives in a few kernels (dot products of quantized
+matrices, attention, dequantization); loading, tokenizer, and orchestration gain nothing from
+assembly and would lose portability.
 
-Il giro per ogni kernel:
-1. versione C scalare: definisce il risultato bit per bit;
-2. versione con intrinseci (AVX2, AVX-512, NEON): stessa aritmetica, test di identità;
-3. **versione assembly** per la CPU di riferimento (Zen 4, AVX-512 VNNI), scritta in GAS `.S` con
-   macro per le due convenzioni di chiamata (System V e Windows x64);
-4. microbenchmark delle tre: la più veloce entra nella tabella di dispatch per quella CPU.
+The cycle for each kernel:
+1. scalar C version: defines the result bit by bit;
+2. version with intrinsics (AVX2, AVX-512, NEON): same arithmetic, identity test;
+3. **assembly version** for the reference CPU (Zen 4, AVX-512 VNNI), written in GAS `.S` with
+   macros for the two calling conventions (System V and Windows x64);
+4. microbenchmark of the three: the fastest enters the dispatch table for that CPU.
 
-Il profiler decide l'ordine: si porta in assembly prima il kernel che pesa di più nella misura.
+The profiler decides the order: we port to assembly first the kernel that weighs most in
+the measurement.
 
-**Ogni ottimizzazione si prende, anche piccola**, a qualsiasi livello (algoritmo, memoria,
-istruzioni, assembly), a due condizioni verificate da strumenti, non a occhio:
-- **non fa danni**: i test la trovano bit-identica alla versione di prima;
-- **guadagna davvero**: il benchmark (mediana di almeno 5 run, macchina a regime) la trova più
-  veloce di più del rumore misurato su quel benchmark. Sotto il rumore non è un guadagno.
+**Every optimization is taken, however small**, at any level (algorithm, memory, instructions,
+assembly), under two conditions verified by tools, not by eye:
+- **it does no harm**: tests find it bit-identical to the previous version;
+- **it really gains**: the benchmark (median of at least 5 runs, machine at steady state) finds
+  it faster by more than the noise measured on that benchmark. Below the noise is not a gain.
 
-Ogni tentativo, riuscito o scartato, va in `docs/MEASUREMENTS.md` con il numero: uno scartato oggi
-non si riprova domani senza un motivo nuovo.
+Every attempt, successful or rejected, goes in `docs/MEASUREMENTS.md` with the number: one
+rejected today is not retried tomorrow without new reason.
 
-**Sotto l'assembly.** Il codice macchina scritto a mano non aggiunge niente all'assembly, che è già
-1:1. Quello che resta a quel livello è il **JIT**: generare codice macchina al caricamento del
-modello, con le dimensioni vere (lunghezza delle righe, blocchi, teste) scritte come costanti e le
-istruzioni scelte per la CPU esatta. Esperimento dopo l'assembly, con pagine mai scrivibili ed
-eseguibili insieme. Microcodice e firmware non si toccano; overclock e undervolt esclusi. Del
-sistema si usa solo ciò che è reversibile: priorità del processo, pagine grandi, piano energetico.
+**Below assembly.** Hand-written machine code adds nothing to assembly, which is already 1:1.
+What remains at that level is the **JIT**: generate machine code at model load time, with
+true dimensions (row lengths, blocks, heads) written as constants and instructions chosen
+for the exact CPU. Experiment after assembly, with pages never writable and executable
+together. Microcode and firmware are not touched; overclocking and undervolting are out. Of
+the system only what is reversible is used: process priority, huge pages, power plan.
 
-## Profilazione
+## Profiling
 
-I dati decidono dove si lavora. Tre livelli, dal più fine al più largo:
+Data decides where we work. Three levels, from finest to widest:
 
-| Livello | Strumento | Risponde a |
+| Level | Tool | Answers |
 |---|---|---|
-| kernel | `tests/bench_kernels.c` (`make bench`) | quanto è veloce un singolo kernel per tier, con il rumore |
-| memoria | `tests/bench_mem.c` (`make bench-mem`), `tests/bench_attn.c` (`make bench-attn`) | cosa dà la RAM della macchina, il tetto del decode: letture in fila e sparse a 1-16 thread, il matmul del motore su matrici da esperto a caso, un token di attenzione sulla KV; e l'attenzione di un prompt intero su un layer, smontata: prodotti, softmax e somma pesata da soli, una query alla volta contro un gruppo di query per blocco di chiavi, con controllo dei bit. I thread sono quelli del pool, pinnati come nel motore |
-| motore | profiler interno, `trochilus generate --profile` / `--profile-json <file>` | dove va il tempo di un token: per fase (embedding, proiezioni, norme, rope, attenzione, router, esperti, lm_head, campionamento), prefill e decode separati, attese del pool di thread, letture dal disco; **per ogni zona i byte letti (pesi e KV) e i GB/s**: una zona al tetto della RAM è limitata dalla memoria, una sotto da altro |
-| scenari | `tools/profile_suite.py` (`make profile`), scenari in `bench/scenarios.json` | come va un uso reale (prompt corto → risposta lunga; file lungo → risposta corta; contesto che cresce), mediana di N run con spread, confronto automatico con la misura precedente sulla stessa macchina: migliorato, peggiorato o rumore |
+| kernel | `tests/bench_kernels.c` (`make bench`) | how fast is a single kernel per tier, with noise |
+| memory | `tests/bench_mem.c` (`make bench-mem`), `tests/bench_attn.c` (`make bench-attn`) | what does the machine's RAM give, the decode cap: sequential and sparse reads at 1–16 threads, the engine's matmul on random expert matrices, one token of attention on KV; and the attention of a whole prompt on one layer, broken down: products, softmax and weighted sum alone, one query at a time against a group of queries per key block, with bit control. Threads are from the pool, pinned as in the engine |
+| engine | internal profiler, `trochilus generate --profile` / `--profile-json <file>` | where time goes for one token: per phase (embedding, projections, norms, rope, attention, router, experts, lm_head, sampling), prefill and decode separate, thread pool waits, disk reads; **per zone bytes read (weights and KV) and GB/s**: a zone at RAM ceiling is memory-bound, one below is bound by something else |
+| scenarios | `tools/profile_suite.py` (`make profile`), scenarios in `bench/scenarios.json` | how a real use fares (short prompt → long response; long file → short response; context that grows), median of N runs with spread, automatic comparison with the previous measurement on the same machine: improved, regressed, or noise |
 
-Il profiler non è globale (vive nella sessione), costa un solo salto condizionato quando è spento,
-e usa il contatore della CPU (RDTSC con TSC invariante, altrimenti il clock del sistema). I
-risultati della suite vanno in `bench/results/<data>-<commit>-<macchina>.json`; il riassunto e
-le decisioni che ne escono in `docs/MEASUREMENTS.md`.
+The profiler is not global (lives in the session), costs a single conditional jump when off,
+and uses the CPU counter (RDTSC with invariant TSC, else the system clock). Results of the
+suite go in `bench/results/<date>-<commit>-<machine>.json`; the summary and decisions that
+come from it in `docs/MEASUREMENTS.md`.
 
-Una misura nativa vale quanto la macchina su cui gira, e la macchina si interroga, non si presume
-(`docs/LESSONS.md` #84-#88: quattro processi dimenticati sotto due giorni di misure):
+A native measurement is worth as much as the machine it runs on, and the machine is questioned,
+not assumed (`docs/LESSONS.md` #84–#88: four forgotten processes under two days of measurements):
 
-| Regola | Controllo |
+| Rule | Control |
 |---|---|
-| ogni script finisce ciò che ha lanciato, e un segnale lo ferma subito | `tools/cleanup.lib` in ogni `tools/*.sh` (lo pretende `tools/lint.py`); `tools/test_cleanup.sh` in `make check`, rosso senza il trap a ogni esecuzione |
-| niente parte accanto a qualcosa che il progetto ha lasciato acceso | `tools/orphans.sh` in testa a `make check` e a ogni misura (`measure_begin`) |
-| la macchina si carica apposta in un modo solo | `tools/busy_machine.sh <n> <comando>`: i generatori di carico muoiono con lui |
-| la macchina è ferma prima della sessione e prima di ogni run | `measure_still` e `tools/machine_still.sh` in `AB_GUARD`: processori occupati e container; aspetta, poi si ferma e dice chi tiene la CPU |
-| ogni misura dichiara il carico di fondo; se non è basso le conclusioni non si tirano | `measure_declare` scrive nel log processori occupati e quota di `System` prima della prima run e dopo l'ultima |
-| un confronto ha il suo A/A, e una scelta si giudica dalla distribuzione, non dalla mediana | `tools/ab_modes.sh`; `tools/decode_context_report.py speed` stampa scelte e cambi di larghezza |
+| every script finishes what it launched, and a signal stops it right away | `tools/cleanup.lib` in every `tools/*.sh` (required by `tools/lint.py`); `tools/test_cleanup.sh` in `make check`, red without the trap at every run |
+| nothing starts next to something the project left on | `tools/orphans.sh` at head of `make check` and every measurement (`measure_begin`) |
+| the machine is loaded on purpose in one way only | `tools/busy_machine.sh <n> <command>`: load generators die with it |
+| the machine is still before the session and before every run | `measure_still` and `tools/machine_still.sh` in `AB_GUARD`: occupied processors and container; waits, then stops and says who is holding the CPU |
+| every measurement declares the background load; if it is not low conclusions are not drawn | `measure_declare` writes to log occupied processors and quota of `System` before the first run and after the last |
+| a comparison has its own A/A, and a choice is judged from distribution, not from median | `tools/ab_modes.sh`; `tools/decode_context_report.py speed` prints choices and width changes |
 
-## Zona calda
+## Hot path
 
-Il codice che gira a ogni token sta fra `/* hot: begin */` e `/* hot: end */` (modello, kernel,
-pool di thread, profiler). Il resto (caricamento, riga di comando, lettura dei file) è la zona
-fredda: gira una volta, e lì valgono chiarezza e difesa dai file malformati.
+The code that runs every token sits between `/* hot: begin */` and `/* hot: end */` (model,
+kernel, thread pool, profiler). The rest (loading, command line, reading files) is the
+cold zone: runs once, and clarity and defense against malformed files count there.
 
-Regole della zona calda, ognuna con il suo controllo:
+Rules of the hot path, each with its control:
 
-| Regola | Controllo |
+| Rule | Control |
 |---|---|
-| nessuna allocazione né rilascio di memoria | `tools/lint.py` sul sorgente; `tests/test_hot.c` conta le chiamate all'allocatore mentre il modello genera (devono essere zero) |
-| niente stringhe, stampe, file, variabili d'ambiente | `tools/lint.py` |
-| niente `pow`, `sin`, `cos`, `log` per elemento: si calcolano una volta in tabella | `tools/lint.py` |
-| niente `expf`/`exp` della libreria C: l'esponenziale è `tr_expf` (`src/kernels/expf.c`), arrotondato correttamente su ogni float, gli stessi bit su ogni piattaforma, nessuna chiamata alla libreria dentro | `tools/lint.py`; `make bench-expf` lo prova su tutti i 2^32 float, in `make check` con gcc e clang; `tests/test_expf.c`; `tools/mutate_expf.sh` |
-| stessi logit con ogni numero di thread e con il profiler acceso | `tests/test_hot.c` (pool da 1, 2, 3, 8 thread) |
-| ogni ottimizzazione misurata prima e dopo, tenuta solo sopra il rumore | riga in `docs/MEASUREMENTS.md` §Tentativi |
+| no memory allocation or release | `tools/lint.py` on source; `tests/test_hot.c` counts allocator calls while the model generates (must be zero) |
+| no strings, prints, files, environment variables | `tools/lint.py` |
+| no `pow`, `sin`, `cos`, `log` per element: computed once in table | `tools/lint.py` |
+| no `expf`/`exp` from C library: exponent is `tr_expf` (`src/kernels/expf.c`), rounded correctly on every float, same bits on every platform, no library call inside | `tools/lint.py`; `make bench-expf` proves it on all 2^32 floats, in `make check` with gcc and clang; `tests/test_expf.c`; `tools/mutate_expf.sh` |
+| same logits with any number of threads and with profiler on | `tests/test_hot.c` (pool of 1, 2, 3, 8 threads) |
+| every optimization measured before and after, kept only above noise | line in `docs/MEASUREMENTS.md` §Attempts |
 
-Un'eccezione si scrive sulla riga stessa, con il motivo: `/* hot-ok: pow -- motivo */`. Il lint
-la rifiuta quando la riga non usa più quel nome. I commenti non costano niente a runtime (stesso
-codice macchina con e senza, verificato): nella zona calda restano quelli che spiegano un vincolo.
+An exception is written on the same line, with reason: `/* hot-ok: pow -- reason */`. Lint
+rejects it when the line no longer uses that name. Comments cost nothing at runtime (same
+machine code with and without, verified): in the hot path only those explaining a constraint
+remain.
 
-## Sicurezza della macchina
+## Machine safety
 
-- Prima di caricare si stima la memoria necessaria; se resterebbe meno di 2 GB o del 10% di RAM
-  libera, il motore rifiuta e dice quanto manca. Mai swap.
-- Thread al massimo quanti i core fisici; i benchmark durano al più 60 s per run.
-- Nessun modello più grande della RAM finché lo streaming dal disco (M1) non è testato.
+- Before loading we estimate the memory needed; if less than 2 GB or less than 10% free RAM
+  would remain, the engine refuses and says how much is missing. Never swap.
+- Threads at most as many physical cores; benchmarks last at most 60 s per run.
+- No model larger than RAM while streaming from disk (M1) is not tested.
 
-## Strati
+## Layers
 
-| Cartella | Cosa fa | Da dove viene l'idea |
+| Folder | What it does | Where the idea came from |
 |---|---|---|
-| `src/base/` | piattaforma (file, `pread`, O_DIRECT, tempo, memoria allineata), pool di thread, rilevamento CPU | colibri `compat.h`, `omp_tune.h` (core fisici); ds4 pool `ds4_parallel_for` |
-| `src/format/` | lettore GGUF v3, tabella dei tipi, metadati | ds4 `parse_metadata` / `parse_tensors`, senza gli agganci per architettura |
-| `src/kernels/` | kernel CPU per tipo quantizzato: scalare + AVX2 + AVX-512 (+VNNI) + NEON, tabella di dispatch | colibri `quant.h`, `expert_ffn.h`; ds4 riferimenti K-quant |
-| `src/backend/` | interfaccia backend (tensori residenti sul dispositivo, grafo per token) e backend CPU | ds4 `ds4_gpu.h` (modello di esecuzione), ridotto alle primitive generiche |
-| `src/memory/` | archivio degli esperti (M1: RAM / disco; VRAM alla M3): unità (layer, esperto), slot allocati una volta, indice diretto e LRU O(1), letture a richiesta dal GGUF | idee: colibri `olmoe.c` (indice esperto → slot, esperto in un solo slot), ds4 streaming; scelte dalle nostre misure (`docs/MEASUREMENTS.md` §M1): LRU e non pin dall'uso, niente pool di I/O, niente precaricamento su dischi lenti; codice nuovo |
-| `src/kv/` | cache KV `[layer][testa][posizione]`: le posizioni di una testa in fila, perché l'attenzione le legga alla banda della RAM (`docs/MEASUREMENTS.md` §Decode a contesto lungo); poi riuso del prefisso, checkpoint su disco con punteggio a decadimento | layout: codice nuovo, dalle misure; idee per il resto: colibri `kv_prefix.h`, `kv_fp8.h`; ds4 `ds4_kvstore.c` |
-| `src/tokenizer/` | BPE byte-level dai metadati GGUF (famiglie di pretokenizer ammesse solo con oracolo), NFC e classi Unicode sondate da HF `tokenizers`, template di chat per architettura | idee: colibri `tok.h` (regex rigiocata in C), ds4 `vocab_load` (dal GGUF); codice nuovo |
-| `src/models/` | un grafo per famiglia, costruito dalle primitive | colibri `olmoe.c`, ds4 / colibri DeepSeek V4 |
-| `src/gen/` | come si sceglie il token dopo il modello: greedy, bozza dal prompt e verifica in una passata sola (poi campionamento e criteri di arresto) | idee: colibri `v4_ngram_draft`, llama.cpp `examples/lookup`; codice nuovo |
-| `src/app/` | CLI, poi server (API OpenAI e Anthropic) | entrambi |
-| `backends/cuda/`, `backends/metal/` | moduli GPU caricabili | ds4 `cuda/mmq` (ggml, MIT), `metal/*.metal` |
-| `tools/` | convertitore HF → GGUF, generatori dei modelli minuscoli (Python, fuori dal motore) | colibri `tools/make_*_tiny.py` |
-| `tests/` | test dei kernel (SIMD = scalare), oracoli minuscoli, microbenchmark | colibri |
+| `src/base/` | platform (files, `pread`, O_DIRECT, time, aligned memory), thread pool, CPU detection | colibri `compat.h`, `omp_tune.h` (physical cores); ds4 pool `ds4_parallel_for` |
+| `src/format/` | GGUF v3 reader, type table, metadata | ds4 `parse_metadata` / `parse_tensors`, without architecture hooks |
+| `src/kernels/` | CPU kernels per quantized type: scalar + AVX2 + AVX-512 (+VNNI) + NEON, dispatch table | colibri `quant.h`, `expert_ffn.h`; ds4 K-quant references |
+| `src/backend/` | backend interface (tensors on device, graph per token) and CPU backend | ds4 `ds4_gpu.h` (execution model), reduced to generic primitives |
+| `src/memory/` | expert store (M1: RAM / disk; VRAM at M3): units (layer, expert), slots allocated once, direct index and LRU O(1), reads on demand from GGUF | ideas: colibri `olmoe.c` (expert index → slot, expert in one slot), ds4 streaming; choices from our measurements (`docs/MEASUREMENTS.md` §M1): LRU not pin from use, no I/O pool, no preloading on slow disks; new code |
+| `src/kv/` | KV cache `[layer][head][position]`: a head's positions in row, so attention reads them at RAM bandwidth (`docs/MEASUREMENTS.md` §Decode at long context); then prefix reuse, checkpoint to disk with decay-weighted score | layout: new code, from measurements; ideas for the rest: colibri `kv_prefix.h`, `kv_fp8.h`; ds4 `ds4_kvstore.c` |
+| `src/tokenizer/` | byte-level BPE from GGUF metadata (pretokenizer families allowed only with oracle), NFC and Unicode classes probed from HF `tokenizers`, chat template per architecture | ideas: colibri `tok.h` (regex replayed in C), ds4 `vocab_load` (from GGUF); new code |
+| `src/models/` | one graph per family, built from primitives | colibri `olmoe.c`, ds4 / colibri DeepSeek V4 |
+| `src/gen/` | how the token is chosen after the model: greedy, draft from prompt and verify in one pass (then sampling and stop criteria) | ideas: colibri `v4_ngram_draft`, llama.cpp `examples/lookup`; new code |
+| `src/app/` | CLI, then server (OpenAI and Anthropic APIs) | both |
+| `backends/cuda/`, `backends/metal/` | loadable GPU modules | ds4 `cuda/mmq` (ggml, MIT), `metal/*.metal` |
+| `tools/` | HF → GGUF converter, tiny model generators (Python, outside the engine) | colibri `tools/make_*_tiny.py` |
+| `tests/` | kernel tests (SIMD = scalar), tiny oracles, microbenchmarks | colibri |
 
-## Esecuzione
+## Execution
 
-- **Pesi**: letti con `pread` in buffer propri, non `mmap`: la memoria residente resta sotto
-  controllo (colibri `st.h`, bug RSS di mmap). Denso: caricato all'avvio. Esperti: su richiesta.
-- **Esperti (M1)**: il denso (attenzione, norme, router, embedding) sta sempre in RAM; gli esperti
-  passano per l'archivio di `src/memory/`. Un'unità è un (layer, esperto) con le sue tre matrici in
-  uno slot solo; gli slot si allocano tutti al caricamento, quanti ne entrano nel **budget**. Dopo
-  il router il grafo chiede le unità del layer (`acquire`): quelle presenti si toccano (LRU), le
-  mancanti si leggono **subito e in fila, sul thread che chiama**, dal GGUF alle posizioni dei
-  tensori, sfrattando le meno usate di recente; le unità chieste dalla passata in corso non si
-  sfrattano. Si legge **senza la cache del sistema** (`tr_file_open_direct`), altrimenti il modello
-  finirebbe in RAM una seconda volta, proprio la memoria che il budget doveva risparmiare, e ogni
-  misura direbbe la banda della RAM invece di quella del disco. Il prezzo è l'allineamento a 4096:
-  l'inizio di una parte nel file non è allineato e il suo resto dipende da quale esperto è, quindi
-  lo slot tiene un margine di un settore per parte e la lettura allineata atterra lì dentro, senza
-  copie; dove la parte comincia dentro lo slot lo si registra a ogni riempimento. Se il file system
-  rifiuta (prova di apertura e una lettura allineata di saggio), si torna alla lettura normale e la
-  riga `experts:` lo dice. Un solo percorso: col budget che copre tutto, l'archivio si riempie al caricamento e
-  non manca mai niente, che è il motore di prima. Gli stessi byte negli stessi kernel: i logit
-  sono identici al byte con qualunque budget, e il test lo pretende. Perché così (`docs/MEASUREMENTS.md`
-  §M1): l'LRU batte il pin dall'uso a ogni capacità; il disco dà la stessa banda a uno e a otto
-  lettori, quindi niente thread di I/O finché non c'è qualcosa da sovrapporre; senza una previsione
-  non c'è niente da sovrapporre, e la previsione (il router del layer dopo, 92-95%) su un disco da
-  1.5 GB/s costa più di quel che rende. Thread di I/O e precaricamento arrivano insieme, come
-  opzione che il piano accende sui dischi veloci (domanda 43). Budget minimo: le unità di un
-  layer intero più quelle di un token, o il motore rifiuta. Un errore di lettura fa fallire la
-  valutazione e lascia la sessione com'era, mai il processo.
-- **Piano automatico (M1)**: al caricamento si misura la RAM disponibile e si toglie la riserva
-  (§Sicurezza), il denso e una sessione al contesto di default; quel che resta, fino a coprire
-  tutti gli esperti, è il budget. `--expert-budget <MiB>` lo forza, per test e misure.
-- **Passate**: una chiamata di valutazione corre in passate da al più `n_batch` token (512, `-b`); il
-  decode è una passata da un token, lo stesso codice. In una passata ogni numero è la stessa chiamata di
-  kernel che con un token solo (un elemento di matmul = un `dot_row`; norme, RoPE, router e somma degli
-  esperti per token; attenzione di un token sulle posizioni fino alla sua), quindi logit e cache sono
-  identici al bit per ogni `n_batch`. Gli esperti lavorano sulle coppie (token, esperto) ordinate per
-  esperto; le matrici si visitano a blocchi di token, e una riga di pesi va contro 4 token alla volta
-  nei registri (`dot_row_x4`: un carico e una conversione per quattro prodotti, ognuno identico al suo
-  `dot_row`). L'attenzione di una testa corre a **gruppi di 16 token** (`tr_attention_group`): un
-  blocco di 64 posizioni incontra tutte le query del gruppo mentre sta in cache, 4 posizioni per
-  carico della query (`dot_f32_x4`, `axpy_f32_x4`), così chiavi e valori si leggono una volta per
-  gruppo e non una per token; il decode è un gruppo da una query. Il lavoro che è di un token solo
-  (norme, RoPE, scrittura della KV, scelta del router, righe per gli esperti) si divide sul pool
-  per token, almeno 8 a pezzo: sotto, resta sul thread che chiama. Logit dell'ultimo token, o delle
-  ultime `n` posizioni quando servono a verificare una bozza (`tr_session_eval_rows`, al più
+- **Weights**: read with `pread` into own buffers, not `mmap`: resident memory stays under
+  control (colibri `st.h`, mmap RSS bug). Dense: loaded at startup. Experts: on demand.
+- **Experts (M1)**: the dense (attention, norms, router, embedding) always stay in RAM; experts
+  pass through the store from `src/memory/`. A unit is a (layer, expert) with its three matrices
+  in one slot only; slots are allocated all at load, as many fit in the **budget**. After the
+  router the graph asks for units of the layer (`acquire`): present ones are touched (LRU),
+  missing ones are read **right away and in sequence, on the calling thread**, from GGUF at tensor
+  positions, evicting the least recently used; units asked by the current pass are not evicted.
+  Read **without the system cache** (`tr_file_open_direct`), else the model would end in RAM
+  a second time, the very memory the budget was to save, and every measurement would report
+  RAM bandwidth instead of disk bandwidth. The price is alignment to 4096: the start of a
+  part in the file is not aligned and its remainder depends on which expert, so the slot holds
+  a margin of one sector per part and the aligned read lands inside without copies; where the
+  part starts inside the slot is recorded at every fill. If the filesystem refuses (open trial
+  and an aligned test read), we fall back to normal read and the `experts:` line says so.
+  One path only: with the budget covering all, the store fills at load and never misses,
+  which is the old engine. Same bytes in same kernels: logits are byte-identical with any
+  budget, and the test demands it. Why this way (`docs/MEASUREMENTS.md` §M1): LRU beats
+  pin from use at any capacity; disk gives the same bandwidth to one and eight readers, so
+  no I/O thread until there is something to overlap; without prediction there is nothing to
+  overlap, and prediction (the router of the next layer, 92–95%) on a 1.5 GB/s disk costs
+  more than it pays. I/O threads and preloading come together, as option that the plan
+  switches on for fast disks (question 43). Minimum budget: units of one whole layer plus
+  those of one token, or the engine refuses. A read error makes evaluation return -1 and
+  leaves the session as it was, never closes the process.
+- **Auto plan (M1)**: at load we measure available RAM and subtract the reserve
+  (§Machine safety), the dense, and one session at default context; what is left, up to
+  covering all experts, is the budget. `--expert-budget <MiB>` forces it, for tests and
+  measurements.
+- **Passes**: one eval call runs in passes of at most `n_batch` tokens (512, `-b`); decode
+  is one pass of one token, same code. In one pass every number is the same kernel call as
+  with one token only (one matmul element = one `dot_row`; norms, RoPE, router, and expert
+  sum per token; one token's attention on positions up to it), so logits and cache are
+  bit-identical for every `n_batch`. Experts work on (token, expert) pairs ordered by expert;
+  matrices are visited in token blocks, and one weight row goes against 4 tokens at a time
+  in registers (`dot_row_x4`: one load and one conversion for four products, each identical
+  to its `dot_row`). One head's attention runs at **groups of 16 tokens** (`tr_attention_group`):
+  a block of 64 positions meets all queries of the group while in cache, 4 positions per
+  query load (`dot_f32_x4`, `axpy_f32_x4`), so keys and values are read once per group and
+  not once per token; decode is a group of one query. Work that is one token only (norms,
+  RoPE, KV write, router choice, rows for experts) divides on the pool per token, at least
+  8 per piece: below, stays on the calling thread. Logits of the last token, or of the last
+  `n` positions when needed to verify a draft (`tr_session_eval_rows`, at most
   `TR_LOGIT_ROWS_MAX`).
-- **Speculazione dal prompt** (`src/gen/`): la bozza è la continuazione dell'ultima occorrenza
-  dell'n-gramma di coda nel contesto; una passata sola verifica 1 + k posizioni e si tengono solo i
-  token che il modello avrebbe scelto comunque, gli altri spariscono con `tr_session_rewind`. Poiché
-  ogni riga di una passata è identica al bit alla passata da un token, i token generati sono gli
-  stessi con e senza speculazione: è velocità, mai un risultato diverso.
-- **Thread**: pool persistente dimensionato sui **core fisici** (colibri: +2.3x su Zen 3 contro i
-  core logici), `parallel_for` su intervalli di righe. Contarli non basta: se non si fissano ai core,
-  Windows ne appoggia due sullo stesso core fisico e il prefill perde il 30% (`docs/MEASUREMENTS.md`
-  §Dove vanno i thread). **Thread per fase**: una passata lunga (il prompt) è limitata dal calcolo e
-  usa tutto il pool; una passata corta (decode, bozza corta: fino a 4 righe) è limitata dalla lettura
-  dei pesi e usa i primi n slot del pool. n non è una costante: ogni sessione lo **misura** sulle sue
-  prime passate da un token (tutto il pool, metà, un quarto, mai sotto 4 thread), tiene la più
-  stretta entro il rumore misurato in quelle stesse passate, rimisura a ogni raddoppio del contesto
-  e cambia solo dopo due misure concordi; `--decode-threads` lo forza. La larghezza cambia
-  la velocità, mai un logit (`docs/MEASUREMENTS.md` §Thread per fase).
-- **GPU**: tutto il token in un solo lotto di comandi, tensori che restano sul dispositivo (ds4).
-- **KV**: in memoria per sessione; riuso del prefisso per id di token; checkpoint su disco con
-  punteggio `(hit decaduti + 1) × token / byte` (ds4).
+- **Draft from prompt** (`src/gen/`): the draft is the continuation of the last occurrence
+  of the tail n-gram in the context; one pass verifies 1 + k positions and keeps only tokens
+  the model would have chosen anyway, the rest vanish with `tr_session_rewind`. Since each
+  row of a pass is bit-identical to the one-token pass, generated tokens are the same with
+  and without drafting: it is speed, never a different result.
+- **Threads**: pool persistent, sized on **physical cores** (colibri: +2.3x on Zen 3 versus
+  logical cores), `parallel_for` on row ranges. Counting is not enough: if not pinned to
+  cores, Windows places two on the same physical core and prefill loses 30% (`docs/MEASUREMENTS.md`
+  §Where do threads go). **Threads per phase**: a long pass (the prompt) is bound by compute
+  and uses the whole pool; a short pass (decode, short draft: up to 4 rows) is bound by weight
+  reads and uses the first n slots of the pool. n is not a constant: every session **measures**
+  it on its first one-token passes (whole pool, half, quarter, never below 4 threads), keeps
+  the tightest within measured noise on those same passes, remeasures every doubling of context,
+  and changes only after two concordant measurements; `--decode-threads` forces it. Width
+  changes speed, never a logit (`docs/MEASUREMENTS.md` §Threads per phase).
+- **GPU**: all of one token in a single command batch, tensors stay on device (ds4).
+- **KV**: in memory per session; prefix reuse by token id; checkpoint to disk with
+  score `(decayed hits + 1) × tokens / bytes` (ds4).
 
-## Correttezza
+## Correctness
 
-| Livello | Cosa confronta | Dove |
+| Level | What it compares | Where |
 |---|---|---|
-| kernel | ogni variante SIMD/asm contro lo scalare, bit per bit, su input casuali | `tests/test_kernels.c` |
-| tier | il motore intero sotto ogni tier (`TR_CPU_MAX`): test del modello, e logit identici al byte fra tier, thread e `-b` | `make tier-check` (`tools/tier_check.sh`) |
-| il tier viene usato | numeri uguali non dicono quale codice ha girato: ogni voce calda di ogni tier è una funzione sua, per ogni tipo di peso; e nel motore i prodotti contati sulla tabella attiva, tipo per tipo, sono esattamente righe × token | `tests/test_tier_used.c`, anche sotto ogni tier in `make tier-check` |
-| modello minuscolo | token greedy **identici** a transformers (f32, f16); logit entro tolleranza per posizione; q8_0 solo riportato, perché il riferimento non è quantizzato | `tools/make_tiny_olmoe.py` → `tools/oracle.py` (`make oracle`) |
-| modello vero | OLMoE vero tagliato a 2 layer contro transformers sugli stessi pesi Q8_0 dequantizzati: token identici, logit entro 1e-3 | `make oracle-real` (saltato senza il modello) |
-| ottimizzazione esatta | logit del modello vero prima e dopo, identici al bit, con più numeri di thread | `trochilus logits` + `cmp`, a mano |
-| prefill a blocchi | logit e cache con molti token per passata identici al bit a un token per passata: `n_batch`, divisione in chiamate, thread, f32/Q8_0, rewind | `tests/test_prefill.c`; `tools/oracle.py` (`logits -b 3/64/tutto` al byte) su tiny e OLMoE a 2 layer |
-| thread per fase | ogni logit identico al bit a un thread solo con la larghezza misurata e con ogni larghezza forzata; il pool ristretto usa solo i primi n worker; la scelta fra le larghezze su tempi finti | `tests/test_phase.c`, `tests/test_base.c` (`test_pool_active`), `make tier-check` (`--decode-threads`) |
+| kernel | every SIMD/asm variant against scalar, bit by bit, on random input | `tests/test_kernels.c` |
+| tier | the whole engine under every tier (`TR_CPU_MAX`): model test, and logits byte-identical across tiers, threads, `-b` | `make tier-check` (`tools/tier_check.sh`) |
+| tier is used | same numbers do not say which code ran: every hot entry of every tier is its own function, per weight type; and in the engine products counted on the active table, type by type, are exactly rows × tokens | `tests/test_tier_used.c`, also under every tier in `make tier-check` |
+| tiny model | greedy tokens **identical** to transformers (f32, f16); logits within tolerance per position; q8_0 report only, because reference is not quantized | `tools/make_tiny_olmoe.py` → `tools/oracle.py` (`make oracle`) |
+| real model | true OLMoE cut to 2 layers against transformers on same Q8_0 weights dequantized: identical tokens, logits within 1e-3 | `make oracle-real` (skipped without the model) |
+| exact optimization | logits of true model before and after, byte-identical, with multiple thread counts | `trochilus logits` + `cmp`, by hand |
+| prefill in blocks | logits and cache with many tokens per pass identical bit-for-bit to one token per pass: `n_batch`, split calls, threads, f32/Q8_0, rewind | `tests/test_prefill.c`; `tools/oracle.py` (`logits -b 3/64/whole` to byte) on tiny and OLMoE 2-layer |
+| threads per phase | every logit byte-identical to one thread only with measured width and every forced width; the narrowed pool uses only the first n workers; choice among widths on fake times | `tests/test_phase.c`, `tests/test_base.c` (`test_pool_active`), `make tier-check` (`--decode-threads`) |
 
-## Scala dei modelli
+## Model scale
 
-Si parte piccoli e si sale solo quando il gradino sotto è **esatto e misurato**. A ogni gradino
-si misurano token/s (prefill e decode), RAM, primo token, e lo stesso modello su **llama.cpp** e
-**colibri** sulla stessa macchina: è l'unico modo di sapere quanto vale davvero Trochilus.
+We start small and climb only when the rung below is **exact and measured**. At each rung
+we measure tokens/s (prefill and decode), RAM, first token, and the same model on **llama.cpp**
+and **colibri** on the same machine: it is the only way to know what Trochilus is really worth.
 
-| Gradino | Modello | Dimensione | Cosa mette alla prova |
+| Rung | Model | Size | What it tests |
 |---|---|---|---|
-| 0 | OLMoE minuscolo, pesi casuali | 1 MB | correttezza contro transformers |
-| 1 | OLMoE-1B-7B | ~7 GB Q8_0, ~4 GB Q4 | kernel CPU, thread, tokenizer: tutto in RAM |
-| 2 | Qwen3-Coder-30B-A3B | ~17 GB Q4 | un MoE per il codice che sta ancora in 31 GB; prompt lunghi, file riletti |
-| 3 | un MoE più grande della RAM | > 31 GB | esperti dal disco, piano VRAM + RAM + SSD |
-| 4 | DeepSeek V4 Flash | centinaia di GB | il bersaglio di colibri e ds4, su una macchina normale |
+| 0 | OLMoE tiny, random weights | 1 MB | correctness against transformers |
+| 1 | OLMoE-1B-7B | ~7 GB Q8_0, ~4 GB Q4 | CPU kernels, threads, tokenizer: all in RAM |
+| 2 | Qwen3-Coder-30B-A3B | ~17 GB Q4 | a MoE for code that still fits in 31 GB; long prompts, files reread |
+| 3 | a MoE larger than RAM | > 31 GB | experts from disk, VRAM + RAM + SSD plan |
+| 4 | DeepSeek V4 Flash | hundreds of GB | the target of colibri and ds4, on an ordinary machine |
 
-## Orizzonte (dopo la M2)
+## Horizon (after M2)
 
-Il limite di velocità in generazione è il movimento dei dati: token/s ≈ banda della memoria ÷
-byte letti per token. Le direzioni che attaccano quella divisione, da provare una alla volta con
-la regola «non fa danni + guadagna davvero»:
+The speed limit in generation is data movement: tokens/s ≈ memory bandwidth ÷ bytes read
+per token. The directions that attack that division, one at a time, under the rule
+«does no harm + really gains»:
 
-| Direzione | Cosa fa | Attacca |
+| Direction | What it does | Attacks |
 |---|---|---|
-| decodifica speculativa | un modello piccolo (o il testo già nel prompt) propone più token, il grande li verifica in un passaggio | più token per ogni lettura dei pesi |
-| modelli a diffusione | modelli addestrati a comporre tutta la risposta insieme e raffinarla in pochi passaggi (per il codice: DiffuCoder, Dream-Coder) | un passaggio per molti token; è un'altra famiglia di modelli, va supportata a parte |
-| previsione degli esperti | carica gli esperti che serviranno prima che il router li scelga | letture dal disco in attesa |
-| disposizione per frequenza | esperti caldi in VRAM, tiepidi in RAM, freddi su SSD, in ordine di lettura | distanza dei dati |
-| sparsità delle attivazioni | salta i neuroni che resteranno quasi a zero, previsti in anticipo | byte letti per token |
-| pesi a pochi bit (2 bit, ternari) | meno byte per peso; con -1/0/+1 le moltiplicazioni diventano somme | byte letti per token |
-| JIT | codice macchina generato al caricamento con le dimensioni del modello come costanti | lavoro della CPU |
-| superottimizzazione | ricerca automatica della sequenza di istruzioni più veloce per i kernel minuscoli | lavoro della CPU |
+| speculative decode | a small model (or text already in prompt) proposes more tokens, the large one verifies them in one pass | more tokens per weight read |
+| diffusion models | models trained to compose the whole response together and refine it in few passes (for code: DiffuCoder, Dream-Coder) | one pass for many tokens; a different family, supported separately |
+| expert prediction | loads experts that will be needed before the router picks them | disk reads in wait |
+| arrangement by frequency | hot experts in VRAM, warm in RAM, cold on SSD, in read order | data distance |
+| activation sparsity | skips neurons that will stay near zero, predicted early | bytes read per token |
+| weights at few bits (2-bit, ternary) | fewer bytes per weight; with -1/0/+1 multiplies become sums | bytes read per token |
+| JIT | machine code generated at model load with model dimensions as constants | CPU work |
+| superoptimization | automatic search for the fastest instruction sequence for tiny kernels | CPU work |
 
-## Tappe
+## Milestones
 
-| Tappa | Contenuto | Fatta quando |
+| Milestone | Contents | Done when |
 |---|---|---|
-| **M0** | base, GGUF, convertitore (F32/F16/Q8_0), backend CPU scalare + AVX2 + AVX-512 con dispatch, grafo OLMoE, greedy, CLI | oracolo minuscolo esatto su Windows e Linux; OLMoE-1B-7B vero risponde |
-| M1 | esperti dal disco con budget di RAM: archivio a slot, LRU O(1), letture a richiesta; **piano automatico** (misura la RAM, sceglie il budget); poi, su dischi veloci, thread di I/O e precaricamento | budget piccolo forzato → logit identici al byte; nessuna opzione necessaria |
-| M2 | K-quant (Q4_K, Q6_K, Q2_K, IQ2_XXS) su CPU, laboratorio assembly | kernel bit-identici, microbenchmark |
-| M3 | modulo CUDA (mmq di ggml via ds4), esperti caldi in VRAM, piano VRAM + RAM + disco | stessi token della CPU; un modello più grande della RAM gira sul PC di riferimento |
-| M4 | DeepSeek V4 Flash | oracolo minuscolo esatto; gira sul PC di riferimento |
-| M5 | checkpoint KV su disco, server, decodifica speculativa | — |
-| M6 | moduli Vulkan (GPU AMD/Intel, integrate; colibri ha `backend_vulkan.c`) e Metal | stessi token della CPU |
+| **M0** | base, GGUF, converter (F32/F16/Q8_0), CPU backend scalar + AVX2 + AVX-512 with dispatch, OLMoE graph, greedy, CLI | tiny oracle exact on Windows and Linux; true OLMoE-1B-7B answers |
+| M1 | experts from disk with RAM budget: slot-based store, LRU O(1), reads on demand; **auto plan** (measures RAM, picks budget); then, on fast disks, I/O threads and preloading | small forced budget → byte-identical logits; no option necessary |
+| M2 | K-quant (Q4_K, Q6_K, Q2_K, IQ2_XXS) on CPU, assembly workshop | bit-identical kernels, microbenchmarks |
+| M3 | CUDA module (mmq from ggml via ds4), hot experts in VRAM, VRAM + RAM + disk plan | same tokens as CPU; a model larger than RAM runs on reference PC |
+| M4 | DeepSeek V4 Flash | tiny oracle exact; runs on reference PC |
+| M5 | KV checkpoint to disk, server, speculative decode | — |
+| M6 | Vulkan modules (AMD/Intel GPU, integrated; colibri has `backend_vulkan.c`) and Metal | same tokens as CPU |
