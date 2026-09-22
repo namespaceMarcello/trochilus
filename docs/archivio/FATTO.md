@@ -690,13 +690,13 @@ ordine); dove vogliamo arrivare (quattro cose che non abbiamo: dimensione slegat
 GPU o nessuna, pesi piccoli senza perdite silenziose, sempre zero opzioni); cosa manca senza
 sconti; build; mappa dei `docs/`; **cosa leggiamo** (colibri, ds4, llama.cpp come fonti primarie
 con le idee prese una per una, più transformers/`tokenizers`/OLMoE; due soli file di codice
-portato) e le due PR che abbiamo mandato indietro; licenza.
+portato); licenza.
 
 **Fuori dal README, per scelta di Marcello** (2026-09-22): nessun confronto con altri motori e
 niente che dia il fianco — via i rapporti col tokenizer di HF e llama.cpp, via il confronto di
 velocità vecchio, via le righe su cosa i tre motori non provano e sulla policy AI di llama.cpp.
-I difetti trovati restano in `docs/UPSTREAM.md`: nel README si dice solo che ciò che si trova
-torna indietro, coi due link.
+I difetti trovati e le PR mandate a colibri e ds4 restano fuori: stanno in `docs/UPSTREAM.md`, il
+README non li nomina.
 
 I due documenti DeepSeek in `docs/` (report di terzi) entrano in `.gitignore`: non sono nostri e
 non devono finire in un repo che può diventare pubblico.

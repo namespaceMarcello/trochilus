@@ -213,10 +213,6 @@ Only two files carry code that came from elsewhere: the GGUF type table in `src/
 requires. Everything else is ours — which is exactly why the list above matters, because the ideas
 were not.
 
-Reading a codebase that closely also turns something up now and then, and when it does we send it
-back: [antirez/ds4#1095](https://github.com/antirez/ds4/pull/1095) and
-[JustVugg/colibri#1624](https://github.com/JustVugg/colibri/pull/1624).
-
 ## License
 
 Apache-2.0 — see `LICENSE`, and `NOTICE` for third-party material.
