@@ -1,5 +1,5 @@
 /* bench_expf.c — tr_expf against the C library's expf and against the correctly rounded value,
- * on EVERY float: the proof of src/kernels/expf.c (docs/MISURE.md "Prefill su prompt lunghi" and
+ * on EVERY float: the proof of src/kernels/expf.c (docs/MEASUREMENTS.md "Prefill su prompt lunghi" and
  * question 37).
  *
  * The softmax of the attention and of the router, and the SiLU of the experts, take one
@@ -32,7 +32,7 @@
  *   --slow <file>   the arguments tr_expf cannot settle with its fast path, for
  *                   tools/gen_expf_table.py --slow
  *
- * One run, well under 60 s on 16 threads (docs/ARCHITETTURA.md, safety of the machine). */
+ * One run, well under 60 s on 16 threads (docs/ARCHITECTURE.md, safety of the machine). */
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>

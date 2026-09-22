@@ -4,7 +4,7 @@
  * against scalar, and a tier whose table silently falls back to scalar's function gives the same
  * numbers many times slower: for two days the F32 weight rows (the router's matrix of every
  * GGUF) and the F16 ones ran on the scalar loop in every tier, and every test was green
- * (docs/LEZIONI.md #78; the fourth green check that did not see its branch, after #43, #50, #54).
+ * (docs/LESSONS.md #78; the fourth green check that did not see its branch, after #43, #50, #54).
  * Identical logits between tiers say the tiers agree, not that a tier is used. Two halves:
  *
  *   the table    for every tier this CPU has, every entry the hot zone goes through is a function

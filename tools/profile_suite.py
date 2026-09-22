@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""profile_suite.py — scenario profiling suite (docs/ARCHITETTURA.md §Profilazione).
+"""profile_suite.py — scenario profiling suite (docs/ARCHITECTURE.md §Profilazione).
 
 Runs `trochilus generate -p <prompt_tokens> -n <gen_tokens> --profile-json <tmp>`
 for each scenario in bench/scenarios.json, several times (median + spread), and
@@ -28,7 +28,7 @@ import time
 from datetime import datetime
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SAFETY_TIMEOUT_S = 60          # docs/ARCHITETTURA.md: at most 60 s per scenario run
+SAFETY_TIMEOUT_S = 60          # docs/ARCHITECTURE.md: at most 60 s per scenario run
 SAC_RETRY_INTERVAL_S = 15
 SAC_RETRY_BUDGET_S = 5 * 60    # Windows Smart App Control can block a fresh binary (LEZIONI #12)
 

@@ -10,7 +10,7 @@
  * never depends on what this file returns. Nothing here allocates.
  *
  * Idea from llama.cpp (examples/lookup, common/ngram-cache) and colibri (v4_ngram_draft),
- * see docs/ORIGINI.md; the code is new. */
+ * see docs/ORIGINS.md; the code is new. */
 #ifndef TR_LOOKUP_H
 #define TR_LOOKUP_H
 

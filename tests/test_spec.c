@@ -243,7 +243,7 @@ static void test_adaptive_grows_on_repeat(tr_model *model, const int32_t *prompt
 }
 
 /* The pause after a draft where nothing was accepted: that step must be followed by steps that
- * draft nothing at all (a wrong draft costs more than half a pass, docs/MISURE.md). Checked on
+ * draft nothing at all (a wrong draft costs more than half a pass, docs/MEASUREMENTS.md). Checked on
  * every step of a real run, and the test fails if no such rejection ever happened, so it cannot
  * pass for the wrong reason (LEZIONI #43, #50, #55). */
 static int64_t test_adaptive_pauses_after_a_wrong_draft(tr_model *model, const int32_t *prompt) {
@@ -299,7 +299,7 @@ static int64_t test_adaptive_pauses_after_a_wrong_draft(tr_model *model, const i
  * the tail was once followed by a token the model will not choose (its real choice comes from a
  * shadow session fed the same tokens). The session never sees that history, so the tokens are
  * still the model's own; what is measured is how many steps pass between two drafts
- * (docs/LEZIONI.md #60: the cap let 15 double to 31 before it applied). */
+ * (docs/LESSONS.md #60: the cap let 15 double to 31 before it applied). */
 static void test_adaptive_pause_is_capped(tr_model *model, const int32_t *prompt) {
     enum { MAX_STEPS = 200, N_PAUSES = 6 };
     static const int64_t want[N_PAUSES] = {1, 3, 7, 15, 16, 16};

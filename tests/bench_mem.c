@@ -1,10 +1,10 @@
 /* bench_mem.c — what the RAM of this machine gives, and what the two big readers of a decode
- * token get out of it (docs/MISURE.md question 4 and "Decode a contesto lungo").
+ * token get out of it (docs/MEASUREMENTS.md question 4 and "Decode a contesto lungo").
  *
  * A decode token reads ~1.2 GB of weights plus the KV cache of its whole context, far more
  * than any cache level holds: its ceiling is the bandwidth of the RAM, and the profiler's
  * bytes per zone (src/base/prof.h) are to be held against the numbers printed here.
- * Three groups, each one run well under 60 s (docs/ARCHITETTURA.md, safety of the machine):
+ * Three groups, each one run well under 60 s (docs/ARCHITECTURE.md, safety of the machine):
  *
  *   bench_mem ram          plain reads (64-bit sums: no arithmetic worth the name) of 2 GiB:
  *                            seq      every thread walks its own contiguous share
@@ -438,7 +438,7 @@ int main(int argc, char **argv) {
     tr_kernels_init();
     char cpu_line[512], err[256];
     tr_cpu_describe(tr_cpu(), cpu_line, sizeof cpu_line);
-    /* which build this is: a stale benchmark measures the code of another day (docs/LEZIONI.md #24) */
+    /* which build this is: a stale benchmark measures the code of another day (docs/LESSONS.md #24) */
     printf("bench_mem %s, built %s %s, kernels %s, median of %d\n%s\n", group, __DATE__, __TIME__,
            tr_kernels_get()->tier, n_runs, cpu_line);
     if (tr_mem_guard((uint64_t)2 * GIB + 64 * MIB, err, sizeof err) != 0) {

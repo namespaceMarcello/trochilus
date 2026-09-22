@@ -1,6 +1,6 @@
 #!/bin/sh
 # mask_quality.sh — does the model's output on code need only the experts code uses most?
-# (docs/MISURE.md domanda 44, the functional test.) Experts are switched off with --expert-mask, a
+# (docs/MEASUREMENTS.md domanda 44, the functional test.) Experts are switched off with --expert-mask, a
 # measurement-only mode: by usage in ONE trace of code (the most used 75, 50, 25% of the units
 # stay), and, as a control, the same number drawn at random. Then, on texts the mask has never
 # seen (other code, and prose), the logits of every position against the whole model: mean KL
@@ -10,11 +10,11 @@
 #
 # Needs build/route/code-1000.bin (trochilus run --route-trace on bench/prompts/code-1000.txt)
 # and the Linux build of the engine (build/linux-gcc/trochilus); the engine runs in the container
-# with the models volume (Smart App Control blocks a fresh Windows exe, docs/LEZIONI.md #12), the
+# with the models volume (Smart App Control blocks a fresh Windows exe, docs/LESSONS.md #12), the
 # masks and the comparison run here with the project's Python. Counts and KL, no stopwatch: the
 # machine does not have to be still. About 25 minutes. Results in build/mask/quality.txt.
 set -e
-# The body is one function, called on the last line (docs/LEZIONI.md #69).
+# The body is one function, called on the last line (docs/LESSONS.md #69).
 main() {
 . tools/cleanup.lib
 trap cleanup_children EXIT

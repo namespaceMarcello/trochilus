@@ -222,7 +222,7 @@ static int parse_expert_budget(const char *s, uint64_t *out) {
     return 0;
 }
 
-/* --expert-mask <file>, MEASUREMENT ONLY (docs/MISURE.md domanda 44): one "layer expert" per line,
+/* --expert-mask <file>, MEASUREMENT ONLY (docs/MEASUREMENTS.md domanda 44): one "layer expert" per line,
  * the experts switched off (tools/route_graph_report.py --mask-from writes such a file). The output
  * is then not the model's own, and the line on stderr says so. 0 on success. */
 static int apply_expert_mask(tr_model *model, const char *path) {
@@ -826,7 +826,7 @@ static int cmd_tokenize(int argc, char **argv) {
     return rc;
 }
 
-/* ---- route trace (docs/MISURE.md domande 13-15) ------------------------------------------- */
+/* ---- route trace (docs/MEASUREMENTS.md domande 13-15) ------------------------------------------- */
 
 /* Little-endian: 8 bytes "TRROUTE2"; int64 x 8 (n_tokens, n_prompt, n_layers, n_expert, n_used,
  * n_pred, expert_bytes, layer_bytes); then chosen, pred_in, pred_out as uint16 arrays of the
@@ -886,7 +886,7 @@ static int cmd_run(int argc, char **argv) {
                         "automatic)\n"
                         "                     [--spec-fixed]  (fixed draft length instead of adaptive, for "
                         "measurement)\n"
-                        "                     [--route-trace <file>]  (docs/MISURE.md domande 13-15: routing of "
+                        "                     [--route-trace <file>]  (docs/MEASUREMENTS.md domande 13-15: routing of "
                         "every token)\n"
                         "                     [--expert-mask <file>]  (measurement only: experts switched off)\n"
                         "                     [--no-parse-special]\n");

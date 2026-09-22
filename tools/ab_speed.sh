@@ -1,5 +1,5 @@
 #!/bin/sh
-# ab_speed.sh — two binaries on the same prompt, runs alternated (docs/LEZIONI.md #46).
+# ab_speed.sh — two binaries on the same prompt, runs alternated (docs/LESSONS.md #46).
 #
 # A sweep that measures all of A and then all of B is not a comparison: this laptop loses
 # 10-25% as it heats up, which is more than most changes are worth. Here the runs go round
@@ -13,7 +13,7 @@
 #       sh tools/ab_speed.sh models/<file>.gguf build/base/b/trochilus build/linux-gcc/trochilus
 set -e
 # The body is one function, called on the last line: the shell parses all of it before it runs
-# any, so editing this file while it runs cannot change a run under way (docs/LEZIONI.md #69).
+# any, so editing this file while it runs cannot change a run under way (docs/LESSONS.md #69).
 main() {
 . tools/cleanup.lib
 trap cleanup_children EXIT
@@ -41,7 +41,7 @@ while [ $R -le "$ROUNDS" ]; do
                 s/^generate: .* evaluations in .* (\([0-9.]*\) tok.s)/$WHO t$T decode $R \1/p")
       # A run that measured nothing (the engine refused to load, the binary is blocked, a flag is
       # wrong) must stop the comparison: printing the medians of the runs that did work would be a
-      # table with a hole in it that nobody sees (docs/LEZIONI.md #56).
+      # table with a hole in it that nobody sees (docs/LESSONS.md #56).
       if [ -z "$LINES" ]; then
         echo "ab_speed: $WHO t$T round $R produced no tok/s line, stopping. The run said:" >&2
         printf '%s\n' "$ERR" | tail -3 >&2

@@ -1,6 +1,6 @@
 #!/bin/sh
 # mutate_route.sh — does tests/test_route.c see a wrong routing trace (src/models/olmoe.c,
-# docs/MISURE.md domande 13-15)? A test never seen red proves nothing (docs/LEZIONI.md #43): each
+# docs/MEASUREMENTS.md domande 13-15)? A test never seen red proves nothing (docs/LESSONS.md #43): each
 # mutation is applied to a copy of the tree, the copy is built and test_route is run. Linux
 # container, from the repo root:
 #
@@ -9,7 +9,7 @@
 # One line per mutation: which tests went red. "no mutation" must be green, every other line must
 # be RED. ONLY=<word> runs "no mutation" and the mutations with that word in the name.
 set -e
-# The body is one function, called on the last line (docs/LEZIONI.md #69).
+# The body is one function, called on the last line (docs/LESSONS.md #69).
 main() {
 . tools/cleanup.lib
 trap cleanup_children EXIT

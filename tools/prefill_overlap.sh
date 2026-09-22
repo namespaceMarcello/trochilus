@@ -1,6 +1,6 @@
 #!/bin/sh
 # prefill_overlap.sh — how much of the prefill is the engine WAITING for the disk, and what
-# overlapping that wait with the compute could give (docs/MISURE.md §M1 misurato, domanda 47).
+# overlapping that wait with the compute could give (docs/MEASUREMENTS.md §M1 misurato, domanda 47).
 #
 # Under a partial budget the prompt reads the whole expert table once: the bytes are necessary
 # (past ~40 tokens every expert is used). What is not necessary is waiting for them in line with
@@ -22,10 +22,10 @@
 #
 # Same rules as the other native measurements: the containers of the other projects are stopped
 # and started again at the end, a binary Smart App Control blocks is waited for and never rebuilt
-# (TROCHILUS=<binary> to use a second copy, docs/LEZIONI.md #12, #81), the machine must be still
+# (TROCHILUS=<binary> to use a second copy, docs/LESSONS.md #12, #81), the machine must be still
 # (AB_GUARD, LEZIONI #73) and stays awake for the duration (LEZIONI #82). About 20 minutes.
 set -e
-# The body is one function, called on the last line (docs/LEZIONI.md #69).
+# The body is one function, called on the last line (docs/LESSONS.md #69).
 main() {
 R=${1:-5}
 B=${TROCHILUS:-build/trochilus.exe}
@@ -67,7 +67,7 @@ AB_GUARD=$MEASURE_AB_GUARD
 export AB_GUARD
 still() { sh -c "$AB_GUARD" || { echo "prefill_overlap: the machine is not still $1, stopping"; exit 3; }; }
 
-# the model takes 7 GiB and the memory guard wants 3 more free (docs/LEZIONI.md #72)
+# the model takes 7 GiB and the memory guard wants 3 more free (docs/LESSONS.md #72)
 TRY=0
 while :; do
   AVAIL=$($B cpu 2>&1 | sed -n 's/^ram: .* total, \([0-9]*\)\.[0-9]* GiB available.*/\1/p')

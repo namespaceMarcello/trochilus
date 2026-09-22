@@ -1,5 +1,5 @@
 #!/bin/sh
-# expf_quality.sh — what tr_expf changed on Linux, measured on the real model (docs/MISURE.md
+# expf_quality.sh — what tr_expf changed on Linux, measured on the real model (docs/MEASUREMENTS.md
 # question 37). glibc's expf is not the correctly rounded value for 170 648 floats
 # (tests/bench_expf.c), tr_expf is for every float: on Linux the engine's numbers moved, by one
 # unit of the last place in one exponential out of 25 000. Three binaries:
@@ -24,7 +24,7 @@
 # About 10 minutes. On Windows there is nothing to measure: MinGW's expf is the correctly rounded
 # value everywhere, and the stage `exact` of tools/prefill_context.sh asks for the same bytes.
 set -e
-# The body is one function, called on the last line (docs/LEZIONI.md #69).
+# The body is one function, called on the last line (docs/LESSONS.md #69).
 main() {
 . tools/cleanup.lib
 trap cleanup_children EXIT
@@ -71,7 +71,7 @@ for W in before emul after; do
   $BIN logits -m $M --tokens "$ALL" --out /tmp/logits-$W.bin -t 16 > /dev/null 2>&1
 done
 # to a file and then shown: through a pipe into tee a failed comparison would end with 0
-# (docs/LEZIONI.md #90)
+# (docs/LESSONS.md #90)
 {
   echo "##### after (tr_expf) against before (glibc's expf)"
   $PYBIN tools/expf_quality.py /tmp/logits-before.bin /tmp/logits-after.bin $OUT/tokens-before.txt $OUT/tokens-after.txt

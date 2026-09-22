@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""speed_compare.py — Trochilus against llama.cpp and colibri on the same model (docs/STATO.md, M0 step 5).
+"""speed_compare.py — Trochilus against llama.cpp and colibri on the same model (docs/STATUS.md, M0 step 5).
 
 For each thread count, each engine processes the same prompt length and generates the same number of
 tokens; every figure is the median of --runs runs (one warm-up run discarded), with min and max.
@@ -36,7 +36,7 @@ import time
 from datetime import datetime
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SAFETY_TIMEOUT_S = 60       # docs/ARCHITETTURA.md: at most 60 s per benchmark run
+SAFETY_TIMEOUT_S = 60       # docs/ARCHITECTURE.md: at most 60 s per benchmark run
 MIN_AVAILABLE_GB = 9.0      # a 7 GB model plus the 2 GB margin of the machine-safety invariant
 
 
@@ -60,7 +60,7 @@ def check_memory():
 
 
 def drop_caches():
-    """Gives the page cache of the previous engine back (docs/LEZIONI.md #38); needs --privileged."""
+    """Gives the page cache of the previous engine back (docs/LESSONS.md #38); needs --privileged."""
     try:
         os.sync()
         with open("/proc/sys/vm/drop_caches", "w") as f:

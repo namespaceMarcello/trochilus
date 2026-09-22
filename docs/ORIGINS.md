@@ -108,7 +108,7 @@ passata da un token (`tests/test_prefill.c`, `tests/test_spec.c`): nessuna delle
 
 `src/memory/experts.{h,c}` è codice nuovo (nessuna riga portata), scritto dopo aver letto
 `ref/colibri/c/olmoe.c` (`LCache`, `Slot`, `expert_get`, `pilot_worker`) e con le misure delle
-domande 13-16 davanti (`docs/MISURE.md` §M1). Tre difetti trovati in quella lettura stanno in
+domande 13-16 davanti (`docs/MEASUREMENTS.md` §M1). Tre difetti trovati in quella lettura stanno in
 `docs/UPSTREAM.md` #7-#9.
 
 | Scelta | colibri | Trochilus | Perché |

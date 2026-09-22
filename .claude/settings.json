@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"C:/Users/marce/Desktop/trochilus/.claude/hooks/documenta-prima-del-commit.cjs\"",
+            "command": "node \"C:/Users/marce/Desktop/trochilus/.claude/hooks/document-before-commit.cjs\"",
             "if": "Bash(git commit:*)",
             "timeout": 10,
             "statusMessage": "Controllo che il lavoro sia documentato..."
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"C:/Users/marce/Desktop/trochilus/.claude/hooks/niente-barre-in-scritture-shell.cjs\"",
+            "command": "node \"C:/Users/marce/Desktop/trochilus/.claude/hooks/no-backslashes-in-shell-writes.cjs\"",
             "timeout": 10,
             "statusMessage": "Controllo barre rovesciate nelle scritture da shell..."
           }

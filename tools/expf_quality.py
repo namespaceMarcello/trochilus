@@ -9,7 +9,7 @@ greedily from the same prompt. Prints, over the positions: how many rows are the
 the first that is not), the largest difference between two logits, the mean and the largest
 KL(A || B), how many positions choose another token; and, with the token files, how many
 generated tokens are the same before the first difference.
-Used by tools/expf_quality.sh (docs/MISURE.md question 37) and tools/platform_bits.sh.
+Used by tools/expf_quality.sh (docs/MEASUREMENTS.md question 37) and tools/platform_bits.sh.
 """
 import sys
 

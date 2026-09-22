@@ -8,10 +8,10 @@
 #      thread count and -b.
 # A cap that did not take effect (a typo in TR_CPU_MAX is ignored by design) would turn all of
 # this into the best tier tested three times: the first check is that the cap really capped
-# (docs/LEZIONI.md #64).
+# (docs/LESSONS.md #64).
 set -e
 # The body is one function, called on the last line: the shell parses all of it before it runs
-# any, so editing this file while it runs cannot change a run under way (docs/LEZIONI.md #69).
+# any, so editing this file while it runs cannot change a run under way (docs/LESSONS.md #69).
 main() {
 . tools/cleanup.lib
 trap cleanup_children EXIT

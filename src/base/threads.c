@@ -195,7 +195,7 @@ tr_pool *tr_pool_create(int n_threads) {
      * undoes the affinity they inherit from the pinned caller).
      * TR_POOL_PIN: 0 no pin, 1 one logical processor per thread, 2 (the default) the whole
      * physical core, which keeps one thread per core but lets the scheduler pick the sibling
-     * (docs/MISURE.md §Il pin dei thread). */
+     * (docs/MEASUREMENTS.md §Il pin dei thread). */
     const char *pin_env = getenv("TR_POOL_PIN");
     int pin_mode = pin_env != NULL ? atoi(pin_env) : 2;
     if (cpu->n_slots <= 0) pin_mode = 0;

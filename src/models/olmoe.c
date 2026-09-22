@@ -41,7 +41,7 @@ typedef struct {
 } olmoe_layer;
 
 /* Owns the buffers behind a session's tr_route_trace, defined near tr_session_route_trace_begin
- * below (docs/MISURE.md domande 13-15). Opaque here: forward_pass only ever sees s->trace != NULL. */
+ * below (docs/MEASUREMENTS.md domande 13-15). Opaque here: forward_pass only ever sees s->trace != NULL. */
 typedef struct olmoe_route_trace olmoe_route_trace;
 
 typedef struct {
@@ -62,7 +62,7 @@ typedef struct {
                           * (buffered), unless experts_file is not NULL */
     tr_file *experts_file; /* NULL: experts read through gguf's own buffered handle; else a second,
                             * unbuffered handle on the same path this model owns and closes (Step C,
-                            * docs/ARCHITETTURA.md): tr_experts then reads with tr_file_alignment */
+                            * docs/ARCHITECTURE.md): tr_experts then reads with tr_file_alignment */
     tr_experts *experts; /* shared store for every layer's gate/up/down experts (Esperti M1) */
     unsigned char *expert_off; /* [n_layers][n_expert], 1: never chosen (tr_model_set_expert_mask,
                                 * measurement only); NULL: every expert can be chosen */
@@ -76,7 +76,7 @@ typedef struct {
 #define OLMOE_DEFAULT_BATCH 512
 /* Consecutive tokens of a head whose attention runs as one group (tr_attention_group): the keys
  * and the values come from memory once per group. Measured at 4, 16 and 64 on a prompt of 4000:
- * the same speed (docs/MISURE.md "Prefill su prompt lunghi"); 16 rows of scores stay in L2. */
+ * the same speed (docs/MEASUREMENTS.md "Prefill su prompt lunghi"); 16 rows of scores stay in L2. */
 #define OLMOE_ATTN_QUERIES 16
 /* The work of a pass that belongs to one token alone (norms, RoPE, the write into the cache, the
  * router's choice, the rows copied for the experts) is split over the pool by token, at least
@@ -117,9 +117,9 @@ typedef struct {
     int64_t score_stride; /* floats from a row of scores to the next: n_ctx and some (score_row_stride) */
     int64_t n_workers;
 
-    olmoe_route_trace *trace; /* NULL: tracing off (docs/MISURE.md domande 13-15) */
+    olmoe_route_trace *trace; /* NULL: tracing off (docs/MEASUREMENTS.md domande 13-15) */
 
-    /* [n_ctx][n_embd]: the whole prompt's hidden state, layer by layer (docs/MISURE.md "Il
+    /* [n_ctx][n_embd]: the whole prompt's hidden state, layer by layer (docs/MEASUREMENTS.md "Il
      * prefill legge il modello una volta per passata"). NULL when the expert store is fully
      * resident (nothing to save a re-read for); non-NULL only makes forward_prompt_layer_major
      * reachable, it does not force it (olmoe_eval still needs n > n_batch). */
@@ -416,12 +416,12 @@ static void *olmoe_load(const char *path, tr_gguf *g, tr_pool *pool, uint64_t ex
         all_experts_bytes += t->n_bytes;
     }
 
-    /* Step C (docs/ARCHITETTURA.md): read the experts without the operating system's page cache
+    /* Step C (docs/ARCHITECTURE.md): read the experts without the operating system's page cache
      * when the platform and filesystem allow it, so the budget planned below is not spent twice
-     * (docs/MISURE.md M1 point 4: a resident store's own copy plus the OS's page cache copy of the
+     * (docs/MEASUREMENTS.md M1 point 4: a resident store's own copy plus the OS's page cache copy of the
      * same bytes). TR_EXPERT_DIRECT=0 forces the buffered path outright, for the measurement that
      * compares the two. A resident store does not need this, but takes the same path anyway --
-     * one path either way (docs/ARCHITETTURA.md). */
+     * one path either way (docs/ARCHITECTURE.md). */
     uint64_t read_align = 1;
     void *experts_read_ctx = (void *)tr_gguf_file(g);
     {
@@ -446,7 +446,7 @@ static void *olmoe_load(const char *path, tr_gguf *g, tr_pool *pool, uint64_t ex
         }
     }
 
-    /* Safety of the machine, and the expert budget (docs/ARCHITETTURA.md Esperti M1). Every
+    /* Safety of the machine, and the expert budget (docs/ARCHITECTURE.md Esperti M1). Every
      * tensor in an OLMoE GGUF file is a model weight, so the sum over the whole directory minus
      * the expert tensors just sized above is the (exact) dense total. slot_bytes pads every
      * layer's parts to the biggest layer's needs, so resident_bytes (every unit, padded) is what
@@ -760,7 +760,7 @@ static void *olmoe_session_create(void *model, int64_t n_ctx, int64_t n_batch, c
     uint64_t scratch_bytes = scratch_f32 * sizeof(float) + scratch_i64 * sizeof(int64_t) +
                              (uint64_t)(n_workers * m->n_expert);
 
-    /* Layer-major prefill (docs/MISURE.md "Il prefill legge il modello una volta per passata")
+    /* Layer-major prefill (docs/MEASUREMENTS.md "Il prefill legge il modello una volta per passata")
      * only pays for itself, and only helps, when the store cannot hold the whole table: ask it
      * (tr_experts_get_stats), never guess from the budget the caller passed. Resident stores
      * (n_slots >= n_units) keep x_all NULL, so olmoe_eval takes today's pass-major loop. */
@@ -840,7 +840,7 @@ static void clamp_inplace(float *x, int64_t n, float c) {
 }
 
 /* Bytes of a matmul weight actually touched for one token: every output row,
- * each row_bytes(type, cols) long (docs/ARCHITETTURA.md §Profilazione). */
+ * each row_bytes(type, cols) long (docs/ARCHITECTURE.md §Profilazione). */
 static uint64_t mat_bytes(const tr_mat *w) {
     return (uint64_t)w->rows * (uint64_t)tr_row_bytes(w->type, w->cols);
 }
@@ -1001,7 +1001,7 @@ static void mix_body(void *ctx_, int64_t begin, int64_t end, int worker) {
  * scratch of n_expert bytes, set here: cleared, or a copy of `off` (NULL: none), the experts
  * switched off for a measurement (tr_model_set_expert_mask), which are then never chosen.
  * Shared by route_token (which sorts its own selection
- * by id afterward) and the route trace's predictions (kept best-first, docs/MISURE.md domande
+ * by id afterward) and the route trace's predictions (kept best-first, docs/MEASUREMENTS.md domande
  * 13-15: tr_session_route_trace_begin below, after the hot zone). */
 static void top_experts(const float *router, int64_t n_expert, const unsigned char *off, unsigned char *taken,
                         int64_t k, int64_t *ids, float *vals) {
@@ -1083,13 +1083,13 @@ static void gather_body(void *ctx_, int64_t begin, int64_t end, int worker) {
                (size_t)c->n_embd * sizeof(float));
 }
 
-/* Defined below, after the hot zone (docs/MISURE.md domande 13-15): records layer L's routing
+/* Defined below, after the hot zone (docs/MEASUREMENTS.md domande 13-15): records layer L's routing
  * of this block's tokens into s->trace, called once per (layer, block) under one `if` in
  * forward_layer. x: this layer's hidden state for the block (s->x in pass-major, a slice of
  * s->x_all in layer-major). */
 static void route_trace_record(olmoe_session *s, int64_t L, const int32_t *tokens, int64_t n_tok, const float *x);
 
-/* Defined below, after the hot zone (docs/ARCHITETTURA.md Esperti M1): acquires layer L's
+/* Defined below, after the hot zone (docs/ARCHITECTURE.md Esperti M1): acquires layer L's
  * non-empty experts from the shared store (reading the missing ones from disk) and refreshes
  * every expert's tr_mat.data for this layer, called once per layer from forward_layer. Allocates
  * nothing: it only touches s->acquire_ids, sized at session create. -1 on a failed read. */
@@ -1355,7 +1355,7 @@ static int forward_pass(olmoe_model *m, olmoe_session *s, const int32_t *tokens,
     return 0;
 }
 
-/* The whole prompt (n > n_batch), layer by layer instead of pass by pass (docs/MISURE.md "Il
+/* The whole prompt (n > n_batch), layer by layer instead of pass by pass (docs/MEASUREMENTS.md "Il
  * prefill legge il modello una volta per passata"): every block is embedded into its own slice
  * of s->x_all, then for each layer every block runs forward_layer in turn before the next layer
  * starts, so olmoe_refresh_experts sees every block's need for that layer before moving on --
@@ -1438,7 +1438,7 @@ static int olmoe_eval(void *session, const int32_t *tokens, int64_t n, int64_t n
 }
 /* hot: end */
 
-/* Outside the hot zone (docs/ARCHITETTURA.md Esperti M1): allocates nothing, using only
+/* Outside the hot zone (docs/ARCHITECTURE.md Esperti M1): allocates nothing, using only
  * s->acquire_ids (sized at session create). Called once per layer from forward_pass. */
 static int olmoe_refresh_experts(olmoe_model *m, olmoe_session *s, int64_t L) {
     olmoe_layer *layer = &m->layers[L];
@@ -1503,7 +1503,7 @@ static tr_prof *olmoe_prof(void *session) {
     return &s->prof;
 }
 
-/* ---- routing trace (docs/MISURE.md domande 13-15) -------------------------------------------
+/* ---- routing trace (docs/MEASUREMENTS.md domande 13-15) -------------------------------------------
  * Outside the hot zone: route_trace_record (called from inside it, under one `if`) allocates
  * nothing and only touches the scratch begun here. */
 

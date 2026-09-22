@@ -64,7 +64,7 @@ Working today, end to end:
 
 Ryzen 9 7940HX (16 physical cores), 31 GB RAM, NVMe ~1.5 GB/s, Windows 11, native build, quiet
 machine, OLMoE-1B-7B Q8_0 resident in RAM. Every number is the median of N runs with its spread
-recorded; the full tables and the method are in `docs/MISURE.md`.
+recorded; the full tables and the method are in `docs/MEASUREMENTS.md`.
 
 | Context | Prefill (tok/s) | Decode (tok/s) |
 |---|---|---|
@@ -79,7 +79,7 @@ and 0.90x / 0.87x of the resident engine over 1000 tokens — **once generation 
 barely matters; what costs is the first prompt**, which reads the whole model once.
 
 Where the speed came from. Each step was measured with alternating runs and an A/A control, and
-the ones that did not pay are written down too, in `docs/MISURE.md`, with their numbers:
+the ones that did not pay are written down too, in `docs/MEASUREMENTS.md`, with their numbers:
 
 | Change | Effect |
 |---|---|
@@ -114,7 +114,7 @@ cost us a good optimization, which is how we know. Every session carries an A/A 
 declared background load, and a difference smaller than the worst A/A of that session is written
 down as "not distinguishable".
 
-**Every mistake becomes an automatic check.** `docs/LEZIONI.md` is the log: each entry names how
+**Every mistake becomes an automatic check.** `docs/LESSONS.md` is the log: each entry names how
 it was found and the test, lint rule or gate check that now prevents it from coming back. The hot
 path — the code that runs on every token — is enforced by `tools/lint.py` and `tests/test_hot.c`:
 no allocation, no strings, no I/O.
@@ -193,18 +193,18 @@ The engineering log lives in `docs/`, in Italian:
 
 | Document | Content |
 |---|---|
-| `docs/ARCHITETTURA.md` | principles, layers, execution, the correctness ladder, milestones |
-| `docs/STATO.md` | where the project stands, the decisions taken, the next step |
-| `docs/MISURE.md` | every measurement, including the optimisations that were rejected |
-| `docs/LEZIONI.md` | every mistake and discovery, with the check that now prevents it |
-| `docs/ORIGINI.md` | where each borrowed idea or file comes from, commit by commit |
-| `docs/COMANDI.md` | the commands: benchmarks, measurements, mutations, reports |
+| `docs/ARCHITECTURE.md` | principles, layers, execution, the correctness ladder, milestones |
+| `docs/STATUS.md` | where the project stands, the decisions taken, the next step |
+| `docs/MEASUREMENTS.md` | every measurement, including the optimisations that were rejected |
+| `docs/LESSONS.md` | every mistake and discovery, with the check that now prevents it |
+| `docs/ORIGINS.md` | where each borrowed idea or file comes from, commit by commit |
+| `docs/COMMANDS.md` | the commands: benchmarks, measurements, mutations, reports |
 
 ## What we read
 
 Trochilus is written from scratch, but almost nothing in it was invented here. Three engines are
 pinned at a commit in `ref/` and read as primary sources; every idea taken from one of them is
-recorded in `docs/ORIGINI.md` with the file and function it came from, so that whoever improves
+recorded in `docs/ORIGINS.md` with the file and function it came from, so that whoever improves
 that piece next knows where to look first.
 
 | Project | Some of what we learned from it |

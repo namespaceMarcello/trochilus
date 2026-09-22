@@ -1,7 +1,7 @@
 # stay_awake.ps1 <flag file> [max minutes] -- keeps Windows awake while a measurement runs.
 #
 # After hours without input Windows goes to modern standby and suspends every process: a
-# measurement stops half way and goes on hours later on another machine (docs/LEZIONI.md #82).
+# measurement stops half way and goes on hours later on another machine (docs/LESSONS.md #82).
 # This holds a power request (ES_SYSTEM_REQUIRED) for as long as the flag file exists, and lets
 # it go when the measurement removes the file, or after max minutes if the measurement died.
 # It changes no setting of the machine. Started by tools/measure_guard.lib.

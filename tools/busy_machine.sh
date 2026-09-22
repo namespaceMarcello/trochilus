@@ -7,9 +7,9 @@
 #
 # On 2026-09-17 the same test was four `yes > /dev/null &` typed by hand: the shell that started
 # them went away, they stayed, and ran at 100% for 37 hours under two days of measurements
-# (docs/LEZIONI.md #84). Here they are children of this script, killed from its EXIT trap
+# (docs/LESSONS.md #84). Here they are children of this script, killed from its EXIT trap
 # whatever ends it (tools/cleanup.lib), and the script fails if one is left.
-# The body is one function, called on the last line (docs/LEZIONI.md #69).
+# The body is one function, called on the last line (docs/LESSONS.md #69).
 main() {
 . tools/cleanup.lib
 N=$1

@@ -2,7 +2,7 @@
 """Convert a Hugging Face transformers checkpoint to a standard GGUF v3 file.
 
 Purpose:
-  Trochilus reads plain GGUF v3 with llama.cpp tensor naming (see docs/ARCHITETTURA.md,
+  Trochilus reads plain GGUF v3 with llama.cpp tensor naming (see docs/ARCHITECTURE.md,
   principle 5): this tool produces that file from an HF `transformers` checkpoint
   directory, so the C engine never has to understand HF's on-disk layout.
 

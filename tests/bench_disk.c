@@ -1,4 +1,4 @@
-/* bench_disk.c — what the disk of this machine gives to a reader of experts (docs/MISURE.md
+/* bench_disk.c — what the disk of this machine gives to a reader of experts (docs/MEASUREMENTS.md
  * question 16, the ground of milestone M1: experts read from the disk when they are needed).
  *
  * An expert that is not in RAM is three matrices somewhere in a file of several GB, wanted now,
@@ -17,7 +17,7 @@
  * Before any number: the direct reader and tr_file_pread return the same bytes at the same
  * positions, or the benchmark stops (a fast reader of the wrong bytes measures nothing).
  * Every line is the median of N runs (default 5) after one warm-up, with min, max and spread
- * (max - min) / median. The whole program stops launching runs after 50 s (docs/ARCHITETTURA.md,
+ * (max - min) / median. The whole program stops launching runs after 50 s (docs/ARCHITECTURE.md,
  * safety of the machine: a benchmark run stays under 60 s) and says so. Reads only. */
 #if defined(__linux__) && !defined(_GNU_SOURCE)
 #define _GNU_SOURCE /* O_DIRECT */
@@ -120,7 +120,7 @@ static int raw_read(raw_file *f, int reader, void *buf, size_t n, uint64_t offse
 #endif
 }
 
-/* ---- Step F (docs/LEZIONI.md #94): tr_file_pread creates and destroys a Windows event on every
+/* ---- Step F (docs/LESSONS.md #94): tr_file_pread creates and destroys a Windows event on every
  * call (platform.c); measured against the same read through one event kept alive across every
  * call, on a small block the OS already has cached, so the event's own cost is what shows up, not
  * the disk's. POSIX pread(2) has no per-call kernel object, so there is nothing to measure there. */
@@ -183,7 +183,7 @@ static double bench_pread_reused_event(const char *path, void *buf, uint64_t off
     return per_call;
 }
 
-/* ~14 us is 1% of a 2 MiB read at this disk's own measured speed (docs/MISURE.md): only above
+/* ~14 us is 1% of a 2 MiB read at this disk's own measured speed (docs/MEASUREMENTS.md): only above
  * that bar would the per-call event be worth removing from tr_file_pread's hot path. */
 #define EVENT_OVERHEAD_BAR_SEC 14e-6
 

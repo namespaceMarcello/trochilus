@@ -2,7 +2,7 @@
 """gen_expf_table.py — writes src/kernels/expf_table.h, every constant of tr_expf (src/kernels/expf.c).
 
 tr_expf is exp(x) correctly rounded to float on all 2^32 floats, with no C library call inside
-(docs/MISURE.md question 37). Its numbers come from here, computed with mpmath at 200 bits and
+(docs/MEASUREMENTS.md question 37). Its numbers come from here, computed with mpmath at 200 bits and
 rounded with integer arithmetic, never from a C library (whose exp2 is not the same on two
 platforms):
 

@@ -1,6 +1,6 @@
 # Stato
 
-Sostituisci, non appendere. Tetto 40 KB. Lo storico sta in `archivio/FATTO.md`.
+Sostituisci, non appendere. Tetto 40 KB. Lo storico sta in `archivio/DONE.md`.
 
 ## Decisioni
 
@@ -30,11 +30,11 @@ Sostituisci, non appendere. Tetto 40 KB. Lo storico sta in `archivio/FATTO.md`.
 - 2026-09-17 — **Zona calda** (Marcello: prestazioni fino all'ultima goccia): il codice che gira a
   ogni token ha regole controllate da lint e test (niente allocazioni, stringhe, I/O, matematica per
   elemento; logit identici con ogni numero di thread). Commenti e numero di righe non cambiano il
-  codice macchina (verificato): non sono una leva di velocità. Regole in `docs/ARCHITETTURA.md`.
+  codice macchina (verificato): non sono una leva di velocità. Regole in `docs/ARCHITECTURE.md`.
 - 2026-09-17 — **Mai un numero da una run sola** (Marcello): mediana di N con minimo, massimo e
   spread; token identici in ogni run; i test con thread girano più volte e sotto ThreadSanitizer.
 - 2026-09-17 — Pool di thread con attesa attiva (2 ms di `pause`, poi sonno), uno slot per thread:
-  il dispatch da 53 µs a 1.5 µs a 16 thread su Windows (`docs/MISURE.md`).
+  il dispatch da 53 µs a 1.5 µs a 16 thread su Windows (`docs/MEASUREMENTS.md`).
 - 2026-09-17 — Rope da tabella per sessione, esperti a stadi (attivazioni di tutti in un solo lavoro
   parallelo), attenzione per testa: decode 26.3 → 32.8 tok/s a 16 thread, logit identici al bit.
   Ogni ottimizzazione esatta si prova così: `trochilus logits` sugli stessi token col binario di
@@ -59,23 +59,23 @@ Sostituisci, non appendere. Tetto 40 KB. Lo storico sta in `archivio/FATTO.md`.
 - 2026-09-17 — **Confronto colibri/ds4 per componente** (Marcello, LEZIONI #29), con poco usage: una
   cartella per volta (kernel, grafo OLMoE, GGUF, pool; piattaforma solo se serve), mappa delle funzioni
   con Haiku, un Sonnet per cartella su righe mirate (≤ 30 righe di resoconto), verifica mia solo dei
-  punti segnalati, stop dopo ogni cartella. Risultato: una riga per cartella in `docs/ORIGINI.md`; le
+  punti segnalati, stop dopo ogni cartella. Risultato: una riga per cartella in `docs/ORIGINS.md`; le
   correzioni dopo, con test; bug di colibri/ds4 in `docs/UPSTREAM.md` con la prova.
 - 2026-09-17 — **Correttezza sul modello vero**: llama.cpp non basta come riferimento esatto (attivazioni
-  a 8 bit, KV f16: KL media 9e-3, `docs/MISURE.md`). Si fa l'oracolo con transformers sugli stessi pesi
+  a 8 bit, KV f16: KL media 9e-3, `docs/MEASUREMENTS.md`). Si fa l'oracolo con transformers sugli stessi pesi
   reali tagliati a 2 layer; Marcello: non deve fermare gli sviluppi, lo fa un agente Sonnet in
   parallelo (serve ~5 GB di RAM libera: niente chat aperte) e poi entra in `make check`.
 - 2026-09-17 — Idee DeepSpeed (offload su SSD) valutate: streaming per **esperti**, non per layer; KV
   su disco come checkpoint dei file già letti, non per i token vecchi con attenzione piena. Si decide
-  con le misure 13-17 di `docs/MISURE.md` §Da misurare; ordine proposto: 13-16 dopo i passi 1-2 qui
+  con le misure 13-17 di `docs/MEASUREMENTS.md` §Da misurare; ordine proposto: 13-16 dopo i passi 1-2 qui
   sotto, 17 con il lavoro sulla KV (in attesa del sì di Marcello sull'ordine).
 - 2026-09-17 — **llama.cpp terza fonte** (Marcello): da llama.cpp/ggml (MIT) si portano solo i pezzi
   dove le misure dicono che vince (prefill a blocchi, attivazioni int8/VNNI come opzione), con il metodo
-  di colibri/ds4 (intestazione, `docs/ORIGINI.md`, bit-identità, benchmark). Non si portano grafo ggml,
+  di colibri/ds4 (intestazione, `docs/ORIGINS.md`, bit-identità, benchmark). Non si portano grafo ggml,
   allocatore, backend, C++. `sgemm.cpp` di llamafile è C++ con intrinseci, non assembly: per i pesi
   Q8_0 vuole attivazioni Q8_0 (non esatte), e il percorso float usa FMA (non bit-identico allo scalare).
 
-- 2026-09-17 — **Prefill a blocchi in C esatto** (passo 1): mappa delle tre fonti in `docs/ORIGINI.md`.
+- 2026-09-17 — **Prefill a blocchi in C esatto** (passo 1): mappa delle tre fonti in `docs/ORIGINS.md`.
   Presi: passate da 512 token (llama.cpp), coppie (token, esperto) ordinate per esperto (ds4), attenzione
   del lotto per (testa, token) dopo aver scritto tutti i K/V (colibri), logit solo dell'ultimo token
   (tutte). Scartati: attivazioni int8 nel lotto (llama.cpp, ds4: non esatte) e la somma di ds4 per riga su
@@ -91,7 +91,7 @@ Sostituisci, non appendere. Tetto 40 KB. Lo storico sta in `archivio/FATTO.md`.
   guadagno (LEZIONI #46: una buona ottimizzazione era stata scartata così).
 
 - 2026-09-17 — **Il prefill non scalava per colpa del collocamento dei thread**, non della potenza né
-  del CCD (domanda 20, `docs/MISURE.md` §Dove vanno i thread). Il clock scende del 6-8% da 1 a 16
+  del CCD (domanda 20, `docs/MEASUREMENTS.md` §Dove vanno i thread). Il clock scende del 6-8% da 1 a 16
   thread, e 8 thread divisi 4+4 sui due chiplet vanno meglio di 8 su uno solo: è Windows che appoggia
   due dei 16 thread sullo stesso core fisico. Un thread per core fisico: **+30%** sul prefill, e da 8
   a 16 core **2.02×**. Le prove di collocamento si fanno native: dentro Docker la topologia non è
@@ -112,7 +112,7 @@ Sostituisci, non appendere. Tetto 40 KB. Lo storico sta in `archivio/FATTO.md`.
 - 2026-09-18 — **I thread del pool si fissano al core fisico, non al processore logico** (domande 22,
   27 e 3). Uno per core, i core presi a giro sui due chiplet, i fratelli SMT solo se i thread sono più
   dei core; ogni thread è libero fra i due fratelli del **suo** core. Rimisurato con controllo A/A
-  (8 giri, `docs/MISURE.md` §Revisione): a 16 thread prefill **1.27×** su nessun pin e **+9%** sul
+  (8 giri, `docs/MEASUREMENTS.md` §Revisione): a 16 thread prefill **1.27×** su nessun pin e **+9%** sul
   pin al processore, che è anche instabile (spread 25% contro 5%); sul decode il pin al core non è
   distinguibile dagli altri due (soglia 2.2%). Il «−17% sul decode» del pin al processore, da cui
   era nata la scelta, **non si riproduce** (−3.4% contro nessun pin): la scelta resta, per il
@@ -120,7 +120,7 @@ Sostituisci, non appendere. Tetto 40 KB. Lo storico sta in `archivio/FATTO.md`.
   occupata (+19% sul prefill, 3 giri). Su macOS non si pinna (non si può) e una maschera già imposta
   al processo viene rispettata. `TR_POOL_PIN=0/1/2` per i confronti.
 - 2026-09-18 — **Su un MoE una riga di bozza in più non è quasi gratis**: misurata per zona, nativa
-  (`docs/MISURE.md` §Revisione), costa **17.6 ms** se è la sola e **13.7 ms** l'una se sono otto,
+  (`docs/MEASUREMENTS.md` §Revisione), costa **17.6 ms** se è la sola e **13.7 ms** l'una se sono otto,
   contro i 31.3 di una passata. Il costo sta negli esperti (91% e 61%): la riga in bozza fa leggere
   2.3-4.7 esperti nuovi per layer su 8 e il tempo segue quei MiB; le moltiplicazioni dense sono
   gratis per la prima riga in più. Il pareggio della speculazione è al **44-56%** di bozze
@@ -143,7 +143,7 @@ Sostituisci, non appendere. Tetto 40 KB. Lo storico sta in `archivio/FATTO.md`.
   esatta «8 token nei registri» invece non rende (0.79× a n=2048). Ma l'int8 non è bit-identico:
   romperebbe «prefill a blocchi = token per token» e può esistere solo come modo dichiarato.
 - 2026-09-18, **rimisurato a macchina pulita il 2026-09-19** — **Thread per fase, e il numero lo
-  misura il motore** (domanda 26, `docs/MISURE.md` §Thread per fase e §Rimisura a macchina pulita).
+  misura il motore** (domanda 26, `docs/MEASUREMENTS.md` §Thread per fase e §Rimisura a macchina pulita).
   Il prefill vuole tutto il pool (16 contro 8 thread: 1.49-1.57×). Il decode vuole **pochi** thread,
   4 a contesto corto e 8 a contesto lungo, perché la RAM tocca il tetto (57 GB/s) con 4-6 lettori e
   oltre cala; 16 non vince mai ma da 8 **non è distinguibile** (1.00-1.09×, soglia 4.6%). I numeri
@@ -160,7 +160,7 @@ Sostituisci, non appendere. Tetto 40 KB. Lo storico sta in `archivio/FATTO.md`.
   passate). La riga `threads:` stampa la storia delle scelte. Resta la validazione sul modello vero
   (primo dei prossimi passi).
 - 2026-09-19 — **La KV tiene in fila le posizioni di una testa** (`src/kv/`, primo pezzo dello strato
-  KV; `docs/MISURE.md` §Decode a contesto lungo). La RAM di questa macchina dà **~57 GB/s** in
+  KV; `docs/MEASUREMENTS.md` §Decode a contesto lungo). La RAM di questa macchina dà **~57 GB/s** in
   lettura con 4-6 thread e oltre cala (domanda 4, rimisurata a macchina pulita: i «~54» di questa
   sezione avevano sotto quattro core presi, LEZIONI #84; non 41, che era la velocità del motore del
   17/09). Le moltiplicazioni sui pesi
@@ -175,7 +175,7 @@ Sostituisci, non appendere. Tetto 40 KB. Lo storico sta in `archivio/FATTO.md`.
   solo leggendo meno byte**, cioè con leve non esatte (KV a 16 o 8 bit, domanda 36), che decide
   Marcello.
 - 2026-09-19 — **Prefill su prompt lunghi: tre leve esatte, e il pezzo grosso che resta è `expf`**
-  (`docs/MISURE.md` §Prefill su prompt lunghi). L'ipotesi «l'attenzione del prompt è lettura ripetuta
+  (`docs/MEASUREMENTS.md` §Prefill su prompt lunghi). L'ipotesi «l'attenzione del prompt è lettura ripetuta
   di chiavi e valori» era vera a metà: smontata nel banco (`make bench-attn`), la zona è per il
   51-72% **softmax**, cioè `expf` della libreria C (30 ns a chiamata con MinGW, 2.3 con glibc), per
   il 27-37% prodotti e somma pesata, e la lettura ripetuta pesa solo a 4000 token, dallo 0 al 39%
@@ -189,7 +189,7 @@ Sostituisci, non appendere. Tetto 40 KB. Lo storico sta in `archivio/FATTO.md`.
   a 512, 1.07-1.08× a 2048, 1.11-1.14× a 4000** (A/A 2.1%), decode non distinguibile, logit identici
   al byte sul modello vero anche su un prompt da 4000.
 - 2026-09-19 — **`tr_expf`: l'esponenziale è nostro, scalare, arrotondato correttamente** (decisione
-  di Marcello; `docs/MISURE.md` §`tr_expf`; il SIMD no, in questo passo). `src/kernels/expf.c`: tabella
+  di Marcello; `docs/MEASUREMENTS.md` §`tr_expf`; il SIMD no, in questo passo). `src/kernels/expf.c`: tabella
   di 64 valori da mpmath, polinomio, test di arrotondamento, 8 eccezioni calcolate a 200 bit, nessuna
   chiamata alla libreria C dentro; un arrotondamento non provato uscirebbe come NaN. **La prova è
   esaustiva e sta nel cancello**: tutti i 4 278 190 082 float contro il riferimento, con gcc e con
@@ -272,22 +272,19 @@ Sostituisci, non appendere. Tetto 40 KB. Lo storico sta in `archivio/FATTO.md`.
 
 ## Prossimi passi
 
-I passi del 17 e del 18/09 (prefill a blocchi, `--spec`, pin dei thread, bozza adattiva, revisione
-avversariale, rimisura con A/A, thread per fase) stanno in `docs/archivio/FATTO.md`, i loro numeri
-in `docs/MISURE.md`.
+I passi del 17-19/09 (prefill a blocchi, `--spec`, pin dei thread, bozza adattiva, revisione
+avversariale, rimisura con A/A, thread per fase; decode a contesto lungo e KV per testa, prefill su
+prompt lunghi, `tr_expf` scalare, pulizia negli script) stanno in `docs/archive/DONE.md`, i loro
+numeri in `docs/MEASUREMENTS.md`; chiuse le domande 4, 7, 18, 29, 30, 37, 40, aperte la 34, 35, 36,
+38, 39.
 
-I passi del 19/09 (decode a contesto lungo e la KV per testa, prefill su prompt lunghi,
-`tr_expf` scalare, la pulizia negli script e la rimisura a macchina pulita) stanno in
-`docs/archivio/FATTO.md`, i loro numeri in `docs/MISURE.md`; chiuse le domande 4, 7, 18, 29, 30,
-37, 40, aperte la 34, 35, 36, 38, 39.
-
-Fatto il 2026-09-19 sera e il 20 (`docs/MISURE.md` §M1, prima di scrivere codice; LEZIONI #91-#94):
+Fatto il 2026-09-19 sera e il 20 (`docs/MEASUREMENTS.md` §M1, prima di scrivere codice; LEZIONI #91-#94):
 lo stimatore della larghezza riscritto, e il primo pezzo di M1 — la traccia del routing e il banco
 del disco (misure 13-16). Chiuse le domande 13-16 e, come «no», la 5, la 34 e la 39; aperte la 41,
 la 42 e la 43. Le attese per token di quelle simulazioni le ha poi smentite la misura (domanda 14,
 LEZIONI #98).
 
-**M1 in corso** (progetto in `docs/ARCHITETTURA.md` §Esecuzione «Esperti (M1)», dai numeri sopra):
+**M1 in corso** (progetto in `docs/ARCHITECTURE.md` §Esecuzione «Esperti (M1)», dai numeri sopra):
 archivio a slot allocati al caricamento, indice e LRU O(1), non il pin dall'uso (LEZIONI #93);
 **letture a richiesta sul thread che chiama, senza thread di I/O e senza precaricamento** (con un
 disco da 1.5 GB/s il disco è il collo: k=8 neutro, k=12 −40% nel modello a tempo; l'11-15% solo su un
@@ -302,7 +299,7 @@ lo stato di fabbrica dei PC bersaglio, M1 si progetta su ~1.5 GB/s.
   sistema** (`tr_file_open_direct`, allineamento a 4096, `TR_EXPERT_DIRECT=0` per forzarlo).
   Test: `tests/test_experts.c`, `tests/test_stream.c`, oracoli sotto `min`, modello vero `cmp` al
   byte; 23 mutazioni rosse.
-- **Misurato la notte del 2026-09-20** (`docs/MISURE.md` §M1 misurato; macchina ferma, carico di
+- **Misurato la notte del 2026-09-20** (`docs/MEASUREMENTS.md` §M1 misurato; macchina ferma, carico di
   fondo 1.0-1.4 processori su 16, larghezza del decode forzata a 8, A/A su ogni modo):
   `experts_budget.sh measure | misses | long | direct`, risultati in `build/experts_budget/`.
   **M1 funziona: il costo è il prompt.**
@@ -315,7 +312,7 @@ lo stato di fabbrica dei PC bersaglio, M1 si progetta su ~1.5 GB/s.
     tabella, una per passata (domanda 47 qui sotto);
   - un token generato costa **0.3 unità al 50%** subito dopo il prompt e **0.03** lontano: la
     simulazione della domanda 14 (22.4) rispondeva a un'altra domanda — il motore entra nel decode
-    con la LRU riempita dal prompt (LEZIONI #98, controllo `tools/check_misure.py` in `make check`);
+    con la LRU riempita dal prompt (LEZIONI #98, controllo `tools/check_measurements.py` in `make check`);
   - la lettura diretta contro la cache del sistema, stesso budget e stessi byte: prefill 81.4
     contro 197.0 (**2.42×**), decode 24.2 contro 32.6. La guardia che rifiuta di misurare senza
     `direct` era giusta: senza, ogni numero di M1 sarebbe gonfiato di 2.4× sul prompt.
@@ -327,7 +324,7 @@ lo stato di fabbrica dei PC bersaglio, M1 si progetta su ~1.5 GB/s.
   da 200 a 1000 token, dentro lo spread) e c'è sotto budget (~0.35 s al 50%, ~0.84 s al 25%).
   È l'archivio che si riassesta dopo il prompt, non i kernel che si scaldano: la fase di
   preparazione (48) non lo può nascondere. I mancati ne spiegano ~115 ms su 840.
-- **Misurato il 2026-09-21, domanda 47** (`docs/MISURE.md` §Il prefill legge il modello una volta
+- **Misurato il 2026-09-21, domanda 47** (`docs/MEASUREMENTS.md` §Il prefill legge il modello una volta
   per passata; `sh tools/prefill_overlap.sh`): il prompt si elabora a blocchi di 512 token e ogni
   passata percorre tutti i layer, quindi sotto budget **rilegge la tabella intera a ogni passata**.
   A 2048 token: 22 880 MiB invece di 6 528 e 23.51 s; con una passata sola (`-b 2048`) 6 273 MiB e
@@ -355,9 +352,9 @@ lo stato di fabbrica dei PC bersaglio, M1 si progetta su ~1.5 GB/s.
      esperti, e costa un formato nostro. In fondo.
 - **Poi**: le domande 42 (il layer 0), 43 (da che disco in su il precaricamento rende), 46 (il
   costo fisso del decode). Tre matrici in una lettura sola: **no**, in GGUF i tre tensori sono
-  separati (docs/ORIGINI.md §L'archivio degli esperti).
+  separati (docs/ORIGINS.md §L'archivio degli esperti).
 
-- **Domanda 44, fatta quasi tutta** (2026-09-20, `docs/MISURE.md` §Il comportamento sul codice…): sul
+- **Domanda 44, fatta quasi tutta** (2026-09-20, `docs/MEASUREMENTS.md` §Il comportamento sul codice…): sul
   codice OLMoE-1B-7B **non** è un grafo piccolo (il 25% delle unità copre il 68-73%), **non** è una
   tabella per token (9-16% al layer 0), **non** è statico (54-65% contro l'82-86% del router vivo),
   **non** è comprimibile spegnendo esperti (93.9% dei token col 50% spento, sul testo stesso della

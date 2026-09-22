@@ -1,4 +1,4 @@
-# orphans.ps1 <repo path> -- processes this project started and nobody ended (docs/LEZIONI.md #84).
+# orphans.ps1 <repo path> -- processes this project started and nobody ended (docs/LESSONS.md #84).
 #
 # One line per process: pid, start, what it is. Nothing printed means nothing is left. What counts:
 #   - any `yes` (the load generator of a busy-machine test: tools/busy_machine.sh starts them and

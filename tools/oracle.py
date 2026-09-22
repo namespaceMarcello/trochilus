@@ -113,7 +113,7 @@ BATCH_SIZES = (3, 64)
 
 
 def check_batches(binary, model, full_ids, per_token_path, vocab, label=""):
-    """Prefill in blocks (docs/STATO.md): `logits -b k` must write, for the last token of
+    """Prefill in blocks (docs/STATUS.md): `logits -b k` must write, for the last token of
     each pass, the very bytes that one token per pass gives at that position. Exact by
     design, so any difference fails whatever --expect says. Returns True if all match."""
     with open(per_token_path, "rb") as f:

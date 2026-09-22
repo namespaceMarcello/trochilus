@@ -26,14 +26,14 @@ process.stdin.on('end', () => {
     )
     process.exit(2)
   }
-  if (staged.includes('docs/archivio/FATTO.md')) process.exit(0)
+  if (staged.includes('docs/archive/DONE.md')) process.exit(0)
   console.error(
     'Questo commit tocca il codice ma non documenta niente.\n' +
-    'Aggiungi in coda a docs/archivio/FATTO.md una voce di 2-5 righe:\n' +
+    'Aggiungi in coda a docs/archive/DONE.md una voce di 2-5 righe:\n' +
     '  ### <data> — <titolo>\n  cosa e\' stato implementato, e come si prova.\n' +
-    'Aggiorna docs/STATO.md SOLO se e\' cambiata una decisione, un debito o un\n' +
+    'Aggiorna docs/STATUS.md SOLO se e\' cambiata una decisione, un debito o un\n' +
     'prossimo passo (cancella la voce fatta, non aggiungerne una accanto).\n' +
-    'Se hai portato codice da colibri o ds4, aggiorna docs/ORIGINI.md.\n' +
+    'Se hai portato codice da colibri o ds4, aggiorna docs/ORIGINS.md.\n' +
     'Poi metti in stage e rifai il commit.\n' +
     'File nel commit: ' + staged.join(', ')
   )

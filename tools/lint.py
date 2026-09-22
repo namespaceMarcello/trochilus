@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Project lint: the lessons in docs/LEZIONI.md that a script can check.
+"""Project lint: the lessons in docs/LESSONS.md that a script can check.
 
 Each check names the lesson it enforces. Exit 1 on any failure.
 
@@ -45,19 +45,19 @@ def check_line_endings():
 
 
 def check_doc_limits():
-    """struttura-repo: CLAUDE.md is a map (<= 200 lines), STATO.md does not grow (<= 40 KB)."""
+    """struttura-repo: CLAUDE.md is a map (<= 200 lines), STATUS.md does not grow (<= 40 KB)."""
     claude = ROOT / "CLAUDE.md"
     n = claude.read_text(encoding="utf-8").count("\n")
     if n > 200:
         fail("struttura", f"CLAUDE.md has {n} lines (limit 200)")
-    stato = ROOT / "docs" / "STATO.md"
+    stato = ROOT / "docs" / "STATUS.md"
     if stato.stat().st_size > 40_000:
-        fail("struttura", f"docs/STATO.md is {stato.stat().st_size} bytes (limit 40 KB)")
+        fail("struttura", f"docs/STATUS.md is {stato.stat().st_size} bytes (limit 40 KB)")
 
 
 def check_lessons_table():
     """The lessons table stays machine-readable: 8 columns, consecutive numbers."""
-    rows = [l for l in (ROOT / "docs" / "LEZIONI.md").read_text(encoding="utf-8").splitlines()
+    rows = [l for l in (ROOT / "docs" / "LESSONS.md").read_text(encoding="utf-8").splitlines()
             if re.match(r"^\| \d+ \|", l)]
     expected = 1
     for row in rows:
@@ -107,7 +107,7 @@ def check_tests_no_tmpfile():
                 fail(3, f"{f.relative_to(ROOT)}:{i}: uses tmpfile(); write next to the test binary")
 
 
-# Hot zone (docs/ARCHITETTURA.md §Zona calda): code that runs for every token, between
+# Hot zone (docs/ARCHITECTURE.md §Zona calda): code that runs for every token, between
 # /* hot: begin */ and /* hot: end */. A line may allow a name with /* hot-ok: name -- reason */.
 HOT_FILES = ["src/models/olmoe.c", "src/models/model.c", "src/kernels/kernels.c", "src/kernels/kernels_x86.c",
              "src/kernels/kernels_internal.h", "src/kernels/expf.c", "src/base/threads.c", "src/base/prof.h",
@@ -119,7 +119,7 @@ HOT_RULES = [
                                  r"fopen|fread|fwrite|getenv|tr_log|tr_file_\w+|tr_gguf_\w+)\s*\(")),
     ("letterale stringa", re.compile(r'(")(?:[^"\\]|\\.)*"')),
     ("matematica da tabellare", re.compile(r"\b(pow|powf|cos|cosf|sin|sinf|tan|tanf|log|logf|log2|log10)\s*\(")),
-    # the library's exponential: 30 ns a call with MinGW, and other bits with glibc (docs/MISURE.md question 37)
+    # the library's exponential: 30 ns a call with MinGW, and other bits with glibc (docs/MEASUREMENTS.md question 37)
     ("esponenziale della libreria C (si usa tr_expf)", re.compile(r"\b(expf|exp|exp2f|exp2|expm1f|expm1)\s*\(")),
 ]
 HOT_BEGIN, HOT_END = "/* hot: begin */", "/* hot: end */"
@@ -192,7 +192,7 @@ def check_hot_zones():
     for rel in HOT_FILES:
         path = ROOT / rel
         for line, msg in hot_problems(path.read_text(encoding="utf-8")):
-            failures.append(f"[zona calda, docs/ARCHITETTURA.md] {rel}:{line}: {msg}")
+            failures.append(f"[zona calda, docs/ARCHITECTURE.md] {rel}:{line}: {msg}")
 
 
 # No global state per model (CLAUDE.md): a mutable static variable in src/ is shared by every

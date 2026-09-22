@@ -1,4 +1,4 @@
-/* test_hot.c — the hot zone contract (docs/ARCHITETTURA.md §Zona calda) on a model big
+/* test_hot.c — the hot zone contract (docs/ARCHITECTURE.md §Zona calda) on a model big
  * enough for the pool to split real work:
  *   - generating tokens performs zero memory allocations and frees (counted by linking
  *     the engine's allocator calls through --wrap, see the Makefile);

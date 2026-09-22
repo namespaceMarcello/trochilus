@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Trochilus against llama.cpp on the same GGUF and prompt (docs/STATO.md, correctness on a real model).
+"""Trochilus against llama.cpp on the same GGUF and prompt (docs/STATUS.md, correctness on a real model).
 
 Both engines get the same token ids. The script compares:
   1. tokenization of the prompt file (Trochilus `tokenize` against llama.cpp `llama-tokenize`);

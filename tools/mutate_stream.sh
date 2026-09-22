@@ -1,7 +1,7 @@
 #!/bin/sh
 # mutate_stream.sh — does tests/test_stream.c see a wrong streaming engine (src/models/olmoe.c:
 # expert pointer refresh, load-time offsets, acquire's own selection, failure handling)? A test
-# never seen red proves nothing (docs/LEZIONI.md #43): each mutation is applied to a copy of the
+# never seen red proves nothing (docs/LESSONS.md #43): each mutation is applied to a copy of the
 # tree, the copy is built and test_stream is run. Linux container, from the repo root:
 #
 #   MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src trochilus-dev:local sh tools/mutate_stream.sh
@@ -10,7 +10,7 @@
 # green, every other line must be RED. ONLY=<word> runs "no mutation" and the mutations with that
 # word in the name.
 set -e
-# The body is one function, called on the last line (docs/LEZIONI.md #69).
+# The body is one function, called on the last line (docs/LESSONS.md #69).
 main() {
 . tools/cleanup.lib
 trap cleanup_children EXIT

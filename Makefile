@@ -10,7 +10,7 @@
 #   make bench-mem  what the RAM gives: plain reads, the engine's matmul, attention on two KV layouts
 #   make bench-attn the attention of a whole prompt on one layer, taken apart, with the bits checked
 #   make bench-expf tr_expf on all the 2^32 floats against the correctly rounded exp and the C library's
-#   make lint       docs and tables against the lessons in docs/LEZIONI.md
+#   make lint       docs and tables against the lessons in docs/LESSONS.md
 #   make WERROR=1   warnings are errors
 # Extra flags without losing the defaults: EXTRA_CFLAGS, EXTRA_LDFLAGS.
 
@@ -27,7 +27,7 @@ endif
 
 # gcc stores AVX registers into stack arrays with aligned moves, trusting a 32/64-byte stack
 # alignment that MinGW (gcc bug 54412) and ASan's fake stack do not give: the GNU assembler
-# rewrites them as unaligned moves, same speed on current CPUs (docs/LEZIONI.md #19).
+# rewrites them as unaligned moves, same speed on current CPUs (docs/LESSONS.md #19).
 # clang uses its own assembler and aligns correctly.
 ifeq ($(findstring clang,$(shell $(CC) --version 2>/dev/null)),)
 CFLAGS  += -Wa,-muse-unaligned-vector-move
@@ -59,7 +59,7 @@ all: $(BUILD)/trochilus$(EXE)
 
 # Objects of two platforms must never share a BUILD directory: a build in the container with
 # the default BUILD silently overwrites the native ones and the next link mixes them
-# (docs/LEZIONI.md #52). The stamp says who owns the directory.
+# (docs/LESSONS.md #52). The stamp says who owns the directory.
 PLATFORM_TAG := $(if $(filter Windows_NT,$(OS)),windows,$(shell uname -s 2>/dev/null))-$(CC)
 platform-guard:
 	@mkdir -p $(BUILD)
@@ -72,11 +72,11 @@ $(BUILD)/trochilus$(EXE): $(CORE_OBJ) $(APP_OBJ)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDLIBS)
 
 ifeq ($(OS),Windows_NT)
-# wmain: Windows passes the command line as UTF-16, main.c converts it to UTF-8 (docs/LEZIONI.md #13)
+# wmain: Windows passes the command line as UTF-16, main.c converts it to UTF-8 (docs/LESSONS.md #13)
 $(BUILD)/trochilus$(EXE): LDLIBS += -municode
 endif
 
-# Makefile as a prerequisite: a changed flag recompiles everything (docs/LEZIONI.md #21)
+# Makefile as a prerequisite: a changed flag recompiles everything (docs/LESSONS.md #21)
 $(BUILD)/%.o: %.c Makefile | platform-guard
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -97,7 +97,7 @@ HOT_WRAP := malloc calloc realloc free posix_memalign
 endif
 $(BUILD)/tests/test_hot$(EXE): LDLIBS += $(foreach s,$(HOT_WRAP),-Wl,--wrap=$(s))
 
-# a test that loops forever fails instead of hanging the gate (docs/LEZIONI.md #35); no timeout(1): no limit
+# a test that loops forever fails instead of hanging the gate (docs/LESSONS.md #35); no timeout(1): no limit
 TEST_RUN := $(shell command -v timeout >/dev/null 2>&1 && echo timeout 300)
 test: $(TEST_BIN)
 	@set -e; for t in $(TEST_BIN); do echo "== $$t"; $(TEST_RUN) ./$$t; done; echo "== all C tests passed"
@@ -105,7 +105,7 @@ test: $(TEST_BIN)
 bench: $(BENCH_BIN)
 	./$(BENCH_BIN)
 
-# Each group is one run, under 60 s (docs/ARCHITETTURA.md, safety). Native, on a still machine.
+# Each group is one run, under 60 s (docs/ARCHITECTURE.md, safety). Native, on a still machine.
 bench-mem: $(MEM_BIN)
 	./$(MEM_BIN) ram
 	./$(MEM_BIN) weights
@@ -113,7 +113,7 @@ bench-mem: $(MEM_BIN)
 	./$(MEM_BIN) kv 2048
 	./$(MEM_BIN) kv 4000
 
-# What the disk gives to a reader of experts (docs/MISURE.md question 16): blocks as big as an
+# What the disk gives to a reader of experts (docs/MEASUREMENTS.md question 16): blocks as big as an
 # expert matrix at random positions of DISK_FILE, without the system's cache. Under 60 s, reads only.
 DISK_FILE ?= models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf
 bench-disk: $(DISK_BIN)
@@ -137,7 +137,7 @@ bench-expf: $(EXPF_BIN)
 	./$(EXPF_BIN) $(EXPF_CHECK)
 
 # Scenarios with the engine profiler (bench/scenarios.json), compared with the
-# previous run on this machine. See docs/ARCHITETTURA.md §Profilazione.
+# previous run on this machine. See docs/ARCHITECTURE.md §Profilazione.
 # SCENARIOS=bench/scenarios-olmoe-1b-7b.json for the real model (skipped if not downloaded)
 SCENARIOS ?= bench/scenarios.json
 profile: $(BUILD)/trochilus$(EXE)
@@ -146,7 +146,7 @@ profile: $(BUILD)/trochilus$(EXE)
 lint:
 	$(PY) tools/lint.py
 	$(PY) tools/route_trace_report.py --check
-	$(PY) tools/check_misure.py
+	$(PY) tools/check_measurements.py
 
 # Tiny OLMoE: transformers reference -> GGUF -> engine, greedy tokens must match exactly.
 FIX := fixtures/tiny-olmoe
@@ -166,7 +166,7 @@ oracle: $(BUILD)/trochilus$(EXE) $(FIX)/model-f32.gguf $(FIX)/model-f16.gguf $(F
 
 # Every kernel tier end to end, not only the best one this CPU has (tools/tier_check.sh): the model
 # tests under TR_CPU_MAX=scalar and avx2, and the logits of the tiny fixtures identical, byte for
-# byte, across tiers, thread counts and -b (docs/LEZIONI.md #64).
+# byte, across tiers, thread counts and -b (docs/LESSONS.md #64).
 tier-check: $(BUILD)/trochilus$(EXE) $(TEST_BIN) $(FIX)/model-f32.gguf $(FIX)/model-f16.gguf $(FIX)/model-q8_0.gguf
 	sh tools/tier_check.sh $(BUILD) $(FIX)
 
@@ -207,7 +207,7 @@ oracle-real: $(BUILD)/trochilus$(EXE)
 # Speculation on the prompt must not move a single token: the same prompt with --spec 0 and with
 # every draft size gives the same text. It runs on the whole real model: the 2-layer cut writes
 # text that repeats nothing, so the drafter never fires there and the check would prove nothing
-# (docs/LEZIONI.md #54). The prompt holds the file the model is asked to write again, which is
+# (docs/LESSONS.md #54). The prompt holds the file the model is asked to write again, which is
 # where the drafter hits. Skipped without the real model.
 spec-check: $(BUILD)/trochilus$(EXE)
 	@if [ ! -f $(REAL_MODEL) ]; then echo "spec-check: SKIPPED, $(REAL_MODEL) not found"; else \
@@ -225,12 +225,12 @@ spec-check: $(BUILD)/trochilus$(EXE)
 	fi
 
 # The gate. Correctness runs in Linux (Docker image trochilus-dev, tools/docker/Dockerfile) so that
-# Windows Smart App Control, which blocks freshly built executables for minutes (docs/LEZIONI.md #12),
+# Windows Smart App Control, which blocks freshly built executables for minutes (docs/LESSONS.md #12),
 # cannot make it flaky; on Windows the native build is still compiled with 0 warnings.
 DOCKER_IMG := trochilus-dev:local
 # Before anything else: nothing this project started is still running, or the gate does not
 # start (four forgotten load generators ran at 100% under two days of measurements, and a build
-# beside a measurement spoils it: docs/LEZIONI.md #84, #57); and a script that is told to stop
+# beside a measurement spoils it: docs/LESSONS.md #84, #57); and a script that is told to stop
 # takes its children with it (tools/cleanup.lib), seen failing without the trap at every run.
 clean-machine:
 	sh tools/orphans.sh
@@ -239,11 +239,11 @@ ifeq ($(OS),Windows_NT)
 check: clean-machine lint
 	$(MAKE) WERROR=1 all $(TEST_BIN) $(BENCH_BIN) $(MEM_BIN) $(ATTN_BIN) $(EXPF_BIN) $(DISK_BIN) $(BUILD)/tests/dump_rope$(EXE)
 	@# the models volume, when it exists, replaces models/ read over the Windows bind mount:
-	@# the real-model checks load the same file from ext4 instead of 9p (docs/LEZIONI.md #41)
+	@# the real-model checks load the same file from ext4 instead of 9p (docs/LESSONS.md #41)
 	MSYS_NO_PATHCONV=1 docker run --rm --security-opt seccomp=unconfined -v "$(CURDIR):/src" \
 		$$(docker volume inspect trochilus-models > /dev/null 2>&1 && echo "-v trochilus-models:/src/models") \
 		-w /src $(DOCKER_IMG) make check-linux
-	@# give the Docker VM's file cache back to Windows (docs/LEZIONI.md #38)
+	@# give the Docker VM's file cache back to Windows (docs/LESSONS.md #38)
 	MSYS_NO_PATHCONV=1 docker run --rm --privileged $(DOCKER_IMG) sh -c "sync; echo 3 > /proc/sys/vm/drop_caches"
 	sh tools/check_argv_utf8.sh $(BUILD)/trochilus$(EXE) $(TOKFIX)/vocab.gguf
 	@echo "== check passed (native Windows build: 0 warnings; tests, ASan and oracles: Linux)"
@@ -290,7 +290,7 @@ check-linux:
 	build/linux-gcc/trochilus generate -m $(FIX)/model-f32.gguf -p 6 -n 4 -c 16 > /dev/null
 	! build/linux-gcc/trochilus generate -m $(FIX)/model-f32.gguf -p 6 -n 4 -c 8 > /dev/null 2>&1
 	@echo "== context flag ok"
-	@# decode speed counts evaluations, not tokens: 4 tokens are 3 evaluations (docs/LEZIONI.md #40;
+	@# decode speed counts evaluations, not tokens: 4 tokens are 3 evaluations (docs/LESSONS.md #40;
 	@# tools/speed_compare.py reads this line)
 	build/linux-gcc/trochilus generate -m $(FIX)/model-f32.gguf -p 6 -n 4 2>&1 >/dev/null | grep -q "generate: 4 tokens, 3 evaluations in"
 	@echo "== speed line ok"

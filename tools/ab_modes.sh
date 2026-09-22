@@ -1,5 +1,5 @@
 #!/bin/sh
-# ab_modes.sh — two or more ways of running the engine, runs alternated (docs/LEZIONI.md #46).
+# ab_modes.sh — two or more ways of running the engine, runs alternated (docs/LESSONS.md #46).
 #
 # tools/ab_speed.sh compares two binaries; this compares MODES of one: an environment variable
 # (TR_POOL_PIN=1 against 2), a flag (-t 8 against -t 16, --spec 8 against --spec 0). Each mode is
@@ -9,7 +9,7 @@
 #     B always runs on the machine A has just warmed, and that does not cancel out;
 #   - a mode given twice under two labels is an A/A control: the difference between two
 #     identical modes is the floor under which no difference between two real ones means
-#     anything (docs/LEZIONI.md #66).
+#     anything (docs/LESSONS.md #66).
 #
 #   tools/ab_modes.sh <rounds> "label=command" "label=command" [...]
 #
@@ -22,11 +22,11 @@
 #
 # AB_GUARD, when set, is a shell command run before every run: if it fails the machine is no
 # longer the one the comparison started on, and the comparison stops there instead of mixing
-# runs of two machines (docs/LEZIONI.md #73: another session started its containers again
+# runs of two machines (docs/LESSONS.md #73: another session started its containers again
 # seven minutes into a measurement). Example: AB_GUARD='[ -z "$(docker ps -q)" ]'.
 set -e
 # The body is one function, called on the last line: the shell parses all of it before it runs
-# any, so editing this file while it runs cannot change a run under way (docs/LEZIONI.md #69).
+# any, so editing this file while it runs cannot change a run under way (docs/LESSONS.md #69).
 main() {
 . tools/cleanup.lib
 trap cleanup_children EXIT

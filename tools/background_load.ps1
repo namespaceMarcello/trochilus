@@ -2,7 +2,7 @@
 #
 # A native measurement runs on top of whatever else the machine does, and that is part of the
 # number: every measuring script writes this line in its log before its first run and after its
-# last (docs/LEZIONI.md #85: on this machine the kernel's System process alone holds 0.8 of a
+# last (docs/LESSONS.md #85: on this machine the kernel's System process alone holds 0.8 of a
 # core with everything stopped). Total: logical processors busy on average over the window, from
 # the raw idle counter. Then the processes that used the most, in cores, from the raw per-process
 # counters: they include the protected ones (System, the antivirus, the WSL virtual machine),

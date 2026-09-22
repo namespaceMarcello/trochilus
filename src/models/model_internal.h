@@ -10,13 +10,13 @@
 #include "model.h" /* TR_DECODE_TUNE_WIDTHS, TR_DECODE_TUNE_ROUNDS_MAX: the tuner's shape */
 #include "../memory/experts.h" /* tr_experts: tr_model_experts, tests only */
 
-/* Safety of the machine (docs/ARCHITETTURA.md): refuses if `available - needed`
+/* Safety of the machine (docs/ARCHITECTURE.md): refuses if `available - needed`
  * would leave less than max(2 GiB, 10% of total RAM). 0 on success, -1 with a
  * message in err on refusal. If tr_mem_info cannot query the OS, allows the
  * allocation (nothing to check against) and logs a warning. */
 int tr_mem_guard(uint64_t needed_bytes, char *err, size_t err_len);
 
-/* The automatic expert budget (docs/ARCHITETTURA.md Esperti M1, tr_model_load_budget): resident
+/* The automatic expert budget (docs/ARCHITECTURE.md Esperti M1, tr_model_load_budget): resident
  * (*budget = all_experts) when dense + all_experts passes the same rule tr_mem_guard checks
  * (available - needed >= reserve, reserve = max(2 GiB, total / 10)); otherwise *budget is what
  * available leaves after reserve, dense and session_allowance, capped to all_experts. -1 (budget

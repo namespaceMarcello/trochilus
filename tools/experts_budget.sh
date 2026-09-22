@@ -1,8 +1,8 @@
 #!/bin/sh
 # experts_budget.sh — what M1 costs: the engine's speed with 25, 50, 75 and 100% of the experts in
-# RAM, the rest read from the disk when a token asks for them (docs/ARCHITETTURA.md §Esecuzione
-# Esperti M1, docs/MISURE.md §M1). Native Windows, still machine, rotating order, A/A control
-# (tools/ab_modes.sh, docs/LEZIONI.md #66). Run from the repo root in Git Bash. Results in
+# RAM, the rest read from the disk when a token asks for them (docs/ARCHITECTURE.md §Esecuzione
+# Esperti M1, docs/MEASUREMENTS.md §M1). Native Windows, still machine, rotating order, A/A control
+# (tools/ab_modes.sh, docs/LESSONS.md #66). Run from the repo root in Git Bash. Results in
 # build/experts_budget/.
 #
 #   sh tools/experts_budget.sh measure [rounds]
@@ -28,17 +28,17 @@
 #       much the cache flatters a measurement, and what it costs when the model does not fit.
 #
 # The decode width is FORCED to 8 everywhere (--decode-threads 8): the estimator that would
-# measure it is not validated yet (punto 0 di docs/STATO.md), and a measurement must not rest on
+# measure it is not validated yet (punto 0 di docs/STATUS.md), and a measurement must not rest on
 # it. The containers of the other projects are stopped for the duration and started again at the
 # end, also on failure; if somebody starts one meanwhile the session stops at the next run
-# instead of going on with a busy machine (AB_GUARD, docs/LEZIONI.md #73).
+# instead of going on with a busy machine (AB_GUARD, docs/LESSONS.md #73).
 #
 # Before any speed: the store must really be reading from the disk. A run whose `experts:` line
 # says `buffered` would measure the RAM of the page cache (12-26 GB/s) and not the disk
-# (~1.5 GB/s, docs/MISURE.md §M1 point 4), so the script refuses to start.
+# (~1.5 GB/s, docs/MEASUREMENTS.md §M1 point 4), so the script refuses to start.
 set -e
 # The body is one function, called on the last line: the shell parses all of it before it runs
-# any, so editing this file while it runs cannot change a run under way (docs/LEZIONI.md #69).
+# any, so editing this file while it runs cannot change a run under way (docs/LESSONS.md #69).
 main() {
 WHAT=$1
 B=build/trochilus.exe
@@ -72,7 +72,7 @@ wait_runs() {
     sleep 60
   done
 }
-# one measurement at a time, and the machine stays awake while it lasts (docs/LEZIONI.md #82)
+# one measurement at a time, and the machine stays awake while it lasts (docs/LESSONS.md #82)
 . tools/measure_guard.lib
 measure_begin experts_budget
 trap measure_end EXIT
@@ -83,7 +83,7 @@ RUNNING=$(docker ps -q 2>/dev/null || true)
 restart() { measure_end; if [ -n "$RUNNING" ]; then docker start $RUNNING > /dev/null 2>&1 || true; echo "containers started again"; fi; }
 trap restart EXIT
 if [ -n "$RUNNING" ]; then
-  # the VM's file cache goes back to Windows first (docs/LEZIONI.md #38), then everything stops
+  # the VM's file cache goes back to Windows first (docs/LESSONS.md #38), then everything stops
   MSYS_NO_PATHCONV=1 docker run --rm --privileged trochilus-dev:local sh -c "sync; echo 3 > /proc/sys/vm/drop_caches" || true
   docker stop $RUNNING > /dev/null
   echo "containers stopped: $(echo $RUNNING | wc -w)"
@@ -93,7 +93,7 @@ export AB_GUARD
 still() { sh -c "$AB_GUARD" || { echo "experts_budget: the machine is not still $1 (a container, or a busy CPU), stopping"; exit 3; }; }
 
 # The model takes 7 GiB and the memory guard wants 3 more left free; Windows needs minutes to
-# take back what the VM has released (docs/LEZIONI.md #72). Up to 15 minutes, a look every 30 s.
+# take back what the VM has released (docs/LESSONS.md #72). Up to 15 minutes, a look every 30 s.
 TRY=0
 while :; do
   AVAIL=$($B cpu 2>&1 | sed -n 's/^ram: .* total, \([0-9]*\)\.[0-9]* GiB available.*/\1/p')

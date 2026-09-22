@@ -12,7 +12,7 @@ C11 + intrinseci (e assembly dove misurato), Makefile, gcc/clang/MinGW-w64; stru
 
 ## Come lavorare
 
-- A ogni avvio: `/caveman ultra`, poi `docs/STATO.md`.
+- A ogni avvio: `/caveman ultra`, poi `docs/STATUS.md`.
 - Agenti: **mai Fable**. Sonnet su brief chiusi (un pezzo con la sua interfaccia e il suo test),
   Haiku per il meccanico; progettazione, interfacce e invarianti li fa l'orchestratore. Un
   agente alla volta, o in parallelo solo su file disgiunti. Pochi agenti: l'usage è il limite.
@@ -20,18 +20,18 @@ C11 + intrinseci (e assembly dove misurato), Makefile, gcc/clang/MinGW-w64; stru
 - Brief **conciso e completo**: obiettivo, vincoli, file da toccare, forma della risposta,
   quando è finito. Il resoconto dell'agente: cosa ha fatto, file toccati, cosa resta aperto.
 - Resoconto a Marcello **in due punti**: cosa è stato implementato, come si prova. Il perché
-  va in `docs/STATO.md`.
+  va in `docs/STATUS.md`.
 - Logica e kernel: si sceglie, si costruisce, si consegna. Le domande si fanno prima, non a metà.
 - **Il commit lo chiede Marcello.** Si prepara tutto (test verdi, documenti) e ci si ferma.
 - Repo privato `namespaceMarcello/trochilus`: push e visibilità li decide Marcello.
 
 ### Tieni tutto sotto controllo: il ciclo di ogni passo
 
-Obiettivo: a ogni richiesta il tasso di successo sale. Si misura in `docs/LEZIONI.md`
+Obiettivo: a ogni richiesta il tasso di successo sale. Si misura in `docs/LESSONS.md`
 (colonna «Trovato da»): nessun errore deve arrivare a Marcello se un test poteva trovarlo prima.
 
-1. **Prima**: `docs/STATO.md`, poi `grep` in `docs/LEZIONI.md` sull'area che si tocca.
-2. **Errore o scoperta**, appena succede, anche piccola: una riga in `docs/LEZIONI.md`.
+1. **Prima**: `docs/STATUS.md`, poi `grep` in `docs/LESSONS.md` sull'area che si tocca.
+2. **Errore o scoperta**, appena succede, anche piccola: una riga in `docs/LESSONS.md`.
 3. **Ogni errore diventa un controllo**: un test che lo riproduce (rosso prima del fix, verde
    dopo), o un controllo in `make check`, un pin, un hook. Una frase in un documento è
    prevenzione debole: si scrive *regola* e la lezione resta aperta.
@@ -53,13 +53,13 @@ Obiettivo: a ogni richiesta il tasso di successo sale. Si misura in `docs/LEZION
 ### Prima di ogni commit: documentare
 | Se è cambiato… | Scrivi in |
 |---|---|
-| codice (ogni commit) | `docs/archivio/FATTO.md`: `### <data> — <titolo>`, cosa e come si prova |
-| un errore, una scoperta, un debito | `docs/LEZIONI.md`, con la prevenzione e chi l'ha trovato |
-| codice portato da colibri o ds4 | `docs/ORIGINI.md` + intestazione del file |
-| decisione, debito, misura, prossimo passo | `docs/STATO.md` (sostituisci, non appendere; tetto 40 KB) |
-| un passo chiuso, una decisione, una domanda nuova (con STATO) | `docs/stato.json`, poi `tools/stato_html.py` e ripubblica l'artifact (stesso URL) |
-| strati, principi, tappe | `docs/ARCHITETTURA.md` (si riscrive la riga, non si aggiunge) |
-| una misura o un tentativo di ottimizzazione (anche scartato) | `docs/MISURE.md` |
+| codice (ogni commit) | `docs/archive/DONE.md`: `### <data> — <titolo>`, cosa e come si prova |
+| un errore, una scoperta, un debito | `docs/LESSONS.md`, con la prevenzione e chi l'ha trovato |
+| codice portato da colibri o ds4 | `docs/ORIGINS.md` + intestazione del file |
+| decisione, debito, misura, prossimo passo | `docs/STATUS.md` (sostituisci, non appendere; tetto 40 KB) |
+| un passo chiuso, una decisione, una domanda nuova (con STATO) | `docs/status.json`, poi `tools/status_html.py` e ripubblica l'artifact (stesso URL) |
+| strati, principi, tappe | `docs/ARCHITECTURE.md` (si riscrive la riga, non si aggiunge) |
+| una misura o un tentativo di ottimizzazione (anche scartato) | `docs/MEASUREMENTS.md` |
 
 ---
 
@@ -67,18 +67,18 @@ Obiettivo: a ogni richiesta il tasso di successo sale. Si misura in `docs/LEZION
 
 | Domanda su… | Apri |
 |---|---|
-| principi, strati, esecuzione, tappe | `docs/ARCHITETTURA.md` |
-| a che punto siamo, decisioni, prossimo passo | `docs/STATO.md` |
-| da dove viene un file, commit di riferimento | `docs/ORIGINI.md` |
-| numeri misurati, tentativi di ottimizzazione riusciti e scartati | `docs/MISURE.md` |
-| domande aperte da misurare, dove scendere nel dettaglio | `docs/MISURE.md` §Da misurare |
-| regole del codice che gira a ogni token | `docs/ARCHITETTURA.md` §Zona calda |
-| errori già fatti, scoperte, come si prevengono | `docs/LEZIONI.md` |
+| principi, strati, esecuzione, tappe | `docs/ARCHITECTURE.md` |
+| a che punto siamo, decisioni, prossimo passo | `docs/STATUS.md` |
+| da dove viene un file, commit di riferimento | `docs/ORIGINS.md` |
+| numeri misurati, tentativi di ottimizzazione riusciti e scartati | `docs/MEASUREMENTS.md` |
+| domande aperte da misurare, dove scendere nel dettaglio | `docs/MEASUREMENTS.md` §Da misurare |
+| regole del codice che gira a ogni token | `docs/ARCHITECTURE.md` §Zona calda |
+| errori già fatti, scoperte, come si prevengono | `docs/LESSONS.md` |
 | bug trovati in colibri o ds4, segnalazioni agli autori | `docs/UPSTREAM.md` |
-| profilazione: livelli, strumenti, scenari | `docs/ARCHITETTURA.md` §Profilazione |
-| cosa è già stato fatto | `docs/archivio/FATTO.md` |
-| il comando per fare una cosa (banchi, misure, mutazioni, report) | `docs/COMANDI.md` |
-| a che punto siamo, in figura (tappe, dipendenze, stato) | `docs/stato.json` → `tools/stato_html.py` → artifact `6mx3NS4KtQrBFPRLkAYupr`; si aggiorna insieme a `docs/STATO.md` |
+| profilazione: livelli, strumenti, scenari | `docs/ARCHITECTURE.md` §Profilazione |
+| cosa è già stato fatto | `docs/archive/DONE.md` |
+| il comando per fare una cosa (banchi, misure, mutazioni, report) | `docs/COMMANDS.md` |
+| a che punto siamo, in figura (tappe, dipendenze, stato) | `docs/status.json` → `tools/status_html.py` → artifact `6mx3NS4KtQrBFPRLkAYupr`; si aggiorna insieme a `docs/STATUS.md` |
 | come colibri o ds4 fanno una cosa | `ref/colibri`, `ref/ds4` (worktree in sola lettura, commit in ORIGINI) |
 
 ---
@@ -96,7 +96,7 @@ make profile             # scenari col profiler, mediana di N, token identici
 tools/.venv/Scripts/python.exe tools/<script>.py        # su Linux/macOS: tools/.venv/bin/python
 ```
 
-**Tutti gli altri comandi stanno in `docs/COMANDI.md`**: oracoli per modello e piattaforma,
+**Tutti gli altri comandi stanno in `docs/COMMANDS.md`**: oracoli per modello e piattaforma,
 banchi (`bench-disk`, `bench-mem`, `bench-attn`, `bench-expf`), le misure native con le loro
 guardie (`experts_budget.sh`, `prefill_overlap.sh`, `decode_context.sh`, `threads_phase.sh`,
 `ab_modes.sh`), le mutazioni, i report Python, la mappa del progetto.
@@ -122,7 +122,7 @@ Prima di consegnare: `make check` verde. Su Windows la correttezza gira in Docke
 - **Misure native**: ogni script finisce ciò che ha lanciato (`tools/cleanup.lib`), niente parte con
   orfani accesi (`tools/orphans.sh`), la macchina si carica solo con `tools/busy_machine.sh`, ogni
   sessione dichiara il carico di fondo nel log e con un carico non basso le conclusioni non si tirano
-  (`docs/ARCHITETTURA.md` §Profilazione, LEZIONI #84-#88).
+  (`docs/ARCHITECTURE.md` §Profilazione, LEZIONI #84-#88).
 - Un file derivato da colibri o ds4 dice nell'intestazione progetto, commit, percorso, modifica.
 - Commenti e nomi nel codice in inglese; documenti in `docs/` in italiano.
 - Prefisso `tr_` per i simboli pubblici; niente stato globale per modello (più modelli in un processo).
@@ -133,4 +133,4 @@ Prima di consegnare: `make check` verde. Su Windows la correttezza gira in Docke
 ## Manutenzione
 
 Quando nasce un documento in `docs/`, aggiungi la sua riga alla tabella. Quello che è successo
-va in `docs/STATO.md`, non qui.
+va in `docs/STATUS.md`, non qui.

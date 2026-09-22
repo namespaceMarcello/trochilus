@@ -1,4 +1,4 @@
-/* cr_expf_emul.h — for a MEASUREMENT build only, never for the engine (docs/MISURE.md question 37).
+/* cr_expf_emul.h — for a MEASUREMENT build only, never for the engine (docs/MEASUREMENTS.md question 37).
  *
  * Included in front of the source files that call expf (tools/expf_quality.sh finds them; in
  * front of every file it would come before their _GNU_SOURCE), it turns each expf of the engine

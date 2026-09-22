@@ -312,7 +312,7 @@ static void count_diffs(const tr_kernels *K, const tr_kernels *S, unsigned seed,
 
 /* Wrong only in rounding: the scalar arithmetic with lanes 0 and 8 swapped before the
  * tree. count_diffs must see it, or the comparison is too weak to prove anything
- * (docs/LEZIONI.md #20: too many infinities once hid exactly this). */
+ * (docs/LESSONS.md #20: too many infinities once hid exactly this). */
 static float wrong_dot_f32(const float *a, const float *b, int64_t n) {
     float lane[TR_LANES] = {0};
     for (int64_t k = 0; k < n; k++) lane[k % TR_LANES] += a[k] * b[k];

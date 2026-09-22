@@ -99,7 +99,7 @@ static void test_file(void) {
 }
 
 /* ---- tr_file_open_direct: unbuffered reads, and the short-read-at-EOF rule (platform.h Step A,
- * docs/ARCHITETTURA.md Esperti M1). Skips with a message, rather than failing, when this
+ * docs/ARCHITECTURE.md Esperti M1). Skips with a message, rather than failing, when this
  * filesystem cannot actually serve an aligned read on it (docker bind mounts, in particular) --
  * proven with a trial read, not merely a successful open, since some filesystems accept
  * FILE_FLAG_NO_BUFFERING/O_DIRECT at open and then cannot service a read on it. */
@@ -447,7 +447,7 @@ static void test_parallel_repeated(tr_pool *p) {
     }
 }
 
-/* Regression for two dispatch races found on 2026-09-17 (docs/LEZIONI.md): a worker
+/* Regression for two dispatch races found on 2026-09-17 (docs/LESSONS.md): a worker
  * that starts after the first job, and a worker left on a stale generation, both only
  * showed up when the number of chunks changes from one call to the next. 20000 calls
  * with n cycling through 1..64 on fresh pools of several sizes, each must cover every
@@ -514,7 +514,7 @@ static void test_pool_active(void) {
 
 /* Every slot names a different logical processor, and the first physical_cores of them
  * come before any SMT sibling: that ordering is what makes the pin worth its 30%
- * (docs/MISURE.md "Dove vanno i thread"). */
+ * (docs/MEASUREMENTS.md "Dove vanno i thread"). */
 static void test_cpu_slots(void) {
     const tr_cpu_info *c = tr_cpu();
     TR_CHECK(c->n_slots >= 0 && c->n_slots <= TR_CPU_MAX_SLOTS);
@@ -622,7 +622,7 @@ static int same_mask(const thread_mask *a, const thread_mask *b) {
 /* Two pools alive at once: whatever the order they are destroyed in, the calling thread ends
  * where it started, and stays on its slot while one of them is still alive. Each pool used to
  * save "where the caller was" for itself, so the second saved the first one's pin and, destroyed
- * last, left the caller on one core for the rest of the process (docs/LEZIONI.md #61). */
+ * last, left the caller on one core for the rest of the process (docs/LESSONS.md #61). */
 static void test_pool_caller_affinity_any_order(void) {
     thread_mask before = current_mask();
     if (!before.ok || tr_cpu()->n_slots == 0) return; /* platform without placement */
@@ -701,7 +701,7 @@ static int oversubscribed_child(void) {
 
 /* More threads than processors: the threads without a slot are left to the scheduler. On Linux
  * a new thread inherits its creator's affinity, and the creator had just pinned itself to slot
- * 0: they all piled up on the caller's core (docs/LEZIONI.md #62). */
+ * 0: they all piled up on the caller's core (docs/LESSONS.md #62). */
 static void test_pool_oversubscribed(const char *argv0) {
 #if defined(__linux__)
     char cmd[1024];

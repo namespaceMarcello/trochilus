@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """decode_context_report.py — what tools/decode_context.sh measured, as the tables of
-docs/MISURE.md §Decode a contesto lungo.
+docs/MEASUREMENTS.md §Decode a contesto lungo.
 
     decode_context_report.py speed <ab_modes output> [...]
         per context: median (min-max) of every mode, the ratio to the first mode of that context
@@ -8,7 +8,7 @@ docs/MISURE.md §Decode a contesto lungo.
     decode_context_report.py model <ab_modes output> <label> [...]
         ms per token of the modes "<label>-<context>" against the context: the line through them
         (ms at context zero, ms per 1000 tokens of context, the bandwidth the KV cache is read at)
-        beside the hypothesis of docs/STATO.md, tok/s = band / (weights + KV per token x context).
+        beside the hypothesis of docs/STATUS.md, tok/s = band / (weights + KV per token x context).
     decode_context_report.py zones <profile_suite results json> [...]
         decode zones of every scenario: ms per token, MiB read per token, GB/s in the zone.
 

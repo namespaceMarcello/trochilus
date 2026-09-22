@@ -1,7 +1,7 @@
 # Misure
 
 Ogni tentativo di ottimizzazione, riuscito o scartato, con il suo numero. Regola
-(`docs/ARCHITETTURA.md` §C e assembly): un guadagno conta solo se sposta la mediana più dello
+(`docs/ARCHITECTURE.md` §C e assembly): un guadagno conta solo se sposta la mediana più dello
 spread misurato sulla stessa riga. Si sostituiscono le tabelle di base quando cambiano; i
 tentativi si aggiungono in coda.
 

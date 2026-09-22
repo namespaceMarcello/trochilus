@@ -1,6 +1,6 @@
 #!/bin/sh
 # mutate_expf.sh — do the checks see a wrong tr_expf? A test never seen red proves nothing
-# (docs/LEZIONI.md #43): each mutation is applied to a copy of the tree, the copy is built and
+# (docs/LESSONS.md #43): each mutation is applied to a copy of the tree, the copy is built and
 # the checks that should notice are run. Linux container, from the repo root:
 #
 #   MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src trochilus-dev:local sh tools/mutate_expf.sh
@@ -10,7 +10,7 @@
 # script writes) and lint (the hot zone). "no mutation" must be all green, every other line must
 # have at least one RED. About 10 minutes.
 set -e
-# The body is one function, called on the last line (docs/LEZIONI.md #69).
+# The body is one function, called on the last line (docs/LESSONS.md #69).
 main() {
 . tools/cleanup.lib
 trap cleanup_children EXIT

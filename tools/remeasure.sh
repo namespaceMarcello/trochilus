@@ -1,15 +1,15 @@
 #!/bin/sh
-# remeasure.sh — the conclusions of docs/STATO.md that sit inside their own spread, measured again
-# (docs/LEZIONI.md #66): native Windows, still machine, 8 rounds, rotating order, A/A control.
+# remeasure.sh — the conclusions of docs/STATUS.md that sit inside their own spread, measured again
+# (docs/LESSONS.md #66): native Windows, still machine, 8 rounds, rotating order, A/A control.
 # Run from the repo root in Git Bash; about 15 minutes. Results in build/remeasure/.
 #
 # The containers of the other projects are stopped for the duration and started again at the end,
-# also when the script fails or is interrupted (docs/STATO.md: measurements want a still machine).
+# also when the script fails or is interrupted (docs/STATUS.md: measurements want a still machine).
 #
 #   sh tools/remeasure.sh [rounds]
 set -e
 # The body is one function, called on the last line: the shell parses all of it before it runs
-# any, so editing this file while it runs cannot change a run under way (docs/LEZIONI.md #69).
+# any, so editing this file while it runs cannot change a run under way (docs/LESSONS.md #69).
 main() {
 R=${1:-8}
 B=build/trochilus.exe
@@ -19,7 +19,7 @@ OUT=build/remeasure
 mkdir -p $OUT
 [ -f $B ] && [ -f $M ] || { echo "remeasure: $B or $M is missing"; exit 1; }
 
-# one measurement at a time, and the machine stays awake while it lasts (docs/LEZIONI.md #82)
+# one measurement at a time, and the machine stays awake while it lasts (docs/LESSONS.md #82)
 . tools/measure_guard.lib
 measure_begin remeasure
 RUNNING=$(docker ps -q 2>/dev/null || true)
@@ -27,18 +27,18 @@ restart() { measure_end; if [ -n "$RUNNING" ]; then docker start $RUNNING > /dev
 trap restart EXIT
 trap 'exit 130' INT TERM
 if [ -n "$RUNNING" ]; then
-  # the VM's file cache goes back to Windows first (docs/LEZIONI.md #38), then everything stops
+  # the VM's file cache goes back to Windows first (docs/LESSONS.md #38), then everything stops
   MSYS_NO_PATHCONV=1 docker run --rm --privileged trochilus-dev:local sh -c "sync; echo 3 > /proc/sys/vm/drop_caches" || true
   docker stop $RUNNING > /dev/null
   echo "containers stopped: $(echo $RUNNING | wc -w)"
 fi
 # from here on a running container, or a CPU busy with other work, means somebody else is using
-# the machine: ab_modes.sh stops at the next run instead of going on (docs/LEZIONI.md #73, #84)
+# the machine: ab_modes.sh stops at the next run instead of going on (docs/LESSONS.md #73, #84)
 AB_GUARD=$MEASURE_AB_GUARD
 export AB_GUARD
 
 # The model takes 7 GiB and the memory guard wants 3 more left free; after a `make check` Windows
-# needs minutes to take back what the VM has released (docs/LEZIONI.md #72). Up to 15 minutes.
+# needs minutes to take back what the VM has released (docs/LESSONS.md #72). Up to 15 minutes.
 TRY=0
 while :; do
   AVAIL=$($B cpu 2>&1 | sed -n 's/^ram: .* total, \([0-9]*\)\.[0-9]* GiB available.*/\1/p')
@@ -87,7 +87,7 @@ for round in 1 2 3; do
     $B generate -m $M --tokens "$IDS" -n 200 -t 16 --spec $mode --profile-json $OUT/5-zones-$tag-$round.json > /dev/null 2>&1
   done
 done
-# to a file and then shown: through a pipe into tee a failed report would end with 0 (docs/LEZIONI.md #90)
+# to a file and then shown: through a pipe into tee a failed report would end with 0 (docs/LESSONS.md #90)
 $PY - $OUT > $OUT/5-zones.txt <<'EOF'
 import json, statistics, sys
 out = sys.argv[1]

@@ -1,7 +1,7 @@
 #!/bin/sh
 # mutate_tune.sh — does tests/test_phase.c see a wrong choice in threads per phase (the tuner
-# rewritten for docs/LEZIONI.md #88: pairwise margin, extension, milestone and kept-pass
-# re-measurement, debounce)? A test never seen red proves nothing (docs/LEZIONI.md #43): each
+# rewritten for docs/LESSONS.md #88: pairwise margin, extension, milestone and kept-pass
+# re-measurement, debounce)? A test never seen red proves nothing (docs/LESSONS.md #43): each
 # mutation is applied to a copy of the tree, the copy is built and test_phase is run. Linux
 # container, from the repo root:
 #
@@ -11,7 +11,7 @@
 # be RED. About 30 minutes; ONLY=<word> runs "no mutation" and the mutations with that word in
 # the name (-e ONLY=history: 10 minutes).
 set -e
-# The body is one function, called on the last line (docs/LEZIONI.md #69).
+# The body is one function, called on the last line (docs/LESSONS.md #69).
 main() {
 . tools/cleanup.lib
 trap cleanup_children EXIT

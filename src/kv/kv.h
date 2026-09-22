@@ -6,7 +6,7 @@
  * ([layer][position][kv head]) a head reads head_dim floats out of every n_head_kv * head_dim:
  * a new page at every position and a prefetcher that sees nothing to follow. Measured on one
  * decode token's attention, 8 threads: 28-35 GB/s that way, 46-47 GB/s this way, of the 54 the
- * RAM gives (tests/bench_mem.c, docs/MISURE.md "Decode a contesto lungo").
+ * RAM gives (tests/bench_mem.c, docs/MEASUREMENTS.md "Decode a contesto lungo").
  *
  * The layout decides where a number lives, never its value: attention makes the same kernel
  * calls on the same floats in the same order, so the logits do not change by a bit. */

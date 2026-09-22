@@ -8,7 +8,7 @@ esplicito di Marcello, seguendo la skill `oss-contributo` nel fork di quel proge
 
 Decisione 2026-09-17: nessuna PR per ora, le segnalazioni si accumulano e si decide dopo.
 2026-09-19: Marcello chiede di seguirle con la skill. Si portano fino a *PR pronta*; per aprire
-serve comunque il suo sì. Lo stato fine di ognuna sta nello `STATO.md` del fork.
+serve comunque il suo sì. Lo stato fine di ognuna sta nello `STATUS.md` del fork.
 
 Stati: *trovato* → *verificato* (prova riprodotta, non già segnalato) → *PR pronta* (fix + gate
 verde nel fork) → *aperta #n* → *chiusa* (mergiata o rifiutata, con il motivo).

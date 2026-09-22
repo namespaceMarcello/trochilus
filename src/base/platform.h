@@ -1,7 +1,7 @@
 /* platform.h — the only place that knows which operating system it runs on.
  *
  * Files are read with positional reads into caller buffers, never mapped: a
- * mapping keeps the whole model resident (see docs/ARCHITETTURA.md). Every
+ * mapping keeps the whole model resident (see docs/ARCHITECTURE.md). Every
  * function here is safe to call from any thread unless stated otherwise. */
 #ifndef TR_PLATFORM_H
 #define TR_PLATFORM_H

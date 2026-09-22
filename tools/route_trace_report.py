@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""route_trace_report.py — docs/MISURE.md domande 13-15, from a trace written by
+"""route_trace_report.py — docs/MEASUREMENTS.md domande 13-15, from a trace written by
 `trochilus run ... --route-trace <file>` (src/models/model.h: tr_route_trace).
 
 Usage:
@@ -37,7 +37,7 @@ MAGIC = b"TRROUTE1"
 MAGIC2 = b"TRROUTE2"  # the same, then token ids and router margins (tools/route_graph_report.py)
 HEADER_FIELDS = ("n_tokens", "n_prompt", "n_layers", "n_expert", "n_used", "n_pred",
                   "expert_bytes", "layer_bytes")
-K_VALUES = (8, 12, 16)          # docs/MISURE.md domanda 13
+K_VALUES = (8, 12, 16)          # docs/MEASUREMENTS.md domanda 13
 CACHE_FRACTIONS = (0.25, 0.50, 0.75)  # domande 14-15
 MIB = 1024.0 * 1024.0
 

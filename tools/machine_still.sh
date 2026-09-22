@@ -1,6 +1,6 @@
 #!/bin/sh
 # machine_still.sh — is the machine still? A speed measured beside somebody else's work is a
-# number about two programs (docs/LEZIONI.md #84: four forgotten `yes` processes at 100% for 37
+# number about two programs (docs/LESSONS.md #84: four forgotten `yes` processes at 100% for 37
 # hours under two days of "still machine" measurements; #73: the work of another window shows in
 # no container). Counts the logical processors busy over a window (tools/cpu_busy.ps1 on
 # Windows, /proc/stat elsewhere) and waits until they are at most the limit.
@@ -14,7 +14,7 @@
 # The limit is this machine's: with the containers stopped it idles at 1.8 logical processors
 # busy over 10 s (the kernel's System process alone holds 0.8, then browser, Defender, the
 # terminals), between 0.8 and 3.3 over 2 s; a process running flat out is 1.0 more, a build 16.
-# The body is one function, called on the last line (docs/LEZIONI.md #69).
+# The body is one function, called on the last line (docs/LESSONS.md #69).
 main() {
 . tools/cleanup.lib
 trap cleanup_children EXIT

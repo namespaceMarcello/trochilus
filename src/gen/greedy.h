@@ -8,7 +8,7 @@
  * same tokens, in the same order, as with n_draft = 0. Speculation is a speed knob, never a
  * result. Nothing here allocates.
  *
- * How many tokens to draft each step is itself tunable (docs/MISURE.md question 25):
+ * How many tokens to draft each step is itself tunable (docs/MEASUREMENTS.md question 25):
  * TR_DRAFT_FIXED always asks for n_draft (still capped by room left in the context);
  * TR_DRAFT_ADAPTIVE tracks k_cur, which starts at n_draft, shrinks to the number actually
  * accepted after a partial rejection, and grows by one after a step where the whole draft was

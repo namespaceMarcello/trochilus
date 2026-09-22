@@ -15,7 +15,7 @@ process.stdin.on('end', () => {
   if (!escape.test(cmd)) process.exit(0)
   console.error(
     'Questo comando scrive un file da shell/Python e contiene barre rovesciate (es. barra+n).\n' +
-    'Passando dalla shell diventano caratteri di controllo e il file si rovina (docs/LEZIONI.md #14).\n' +
+    'Passando dalla shell diventano caratteri di controllo e il file si rovina (docs/LESSONS.md #14).\n' +
     'Scrivi quel testo con lo strumento Write o Edit. Per sostituzioni senza barre rovesciate va bene Python.'
   )
   process.exit(2)

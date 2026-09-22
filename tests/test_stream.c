@@ -1,6 +1,6 @@
 /* test_stream.c — the OLMoE engine takes its experts from the shared store (src/memory/experts.h)
  * instead of holding every one of them resident, and gives byte-identical logits whatever the
- * budget (docs/ARCHITETTURA.md Esperti M1, lot 2).
+ * budget (docs/ARCHITECTURE.md Esperti M1, lot 2).
  *
  * Every check forces its budget explicitly (never automatic: automatic depends on the machine's
  * free RAM, and this suite must give the same answer everywhere). Synthetic models from
@@ -35,7 +35,7 @@
  *                read must be at most n_units + n_slots, not passes x n_units
  *   rewind       rewind to 0 and re-evaluate the same tokens under the min store: identical
  *                logits (the store has no notion of position)
- *   direct       a real model loaded with the direct path (docs/ARCHITETTURA.md Esperti M1, Step
+ *   direct       a real model loaded with the direct path (docs/ARCHITECTURE.md Esperti M1, Step
  *                C) gives logits byte-identical to TR_EXPERT_DIRECT=0's buffered path, resident
  *                and at --expert-budget min; skipped, with a message, if tr_file_open_direct
  *                cannot actually read this filesystem
@@ -483,7 +483,7 @@ static void test_failure(const char *argv0) {
 /* ---- once_per_prompt: a prompt longer than n_batch reads every unit ONCE, not once per
  * internal pass. The prompt runs in passes of n_batch tokens and each pass walked every layer,
  * so under a store too small to hold the model each pass read the whole table again (3.5x the
- * bytes on the real model at 2048 tokens: docs/MISURE.md domanda 47, docs/LEZIONI.md #99). The
+ * bytes on the real model at 2048 tokens: docs/MEASUREMENTS.md domanda 47, docs/LESSONS.md #99). The
  * layer-major order of the prefill -- every pass of one layer, then the next layer -- reads each
  * unit once per prompt instead. Exercises that order; without it the count is passes x units. */
 static void test_once_per_prompt(const char *argv0) {
@@ -550,7 +550,7 @@ static void test_rewind(const char *argv0) {
     remove(path);
 }
 
-/* ---- direct: the unbuffered path (docs/ARCHITETTURA.md Esperti M1, Step C) gives the same
+/* ---- direct: the unbuffered path (docs/ARCHITECTURE.md Esperti M1, Step C) gives the same
  * logits as the buffered one, if this filesystem can actually serve it ---- */
 
 static void test_direct(const char *argv0) {
@@ -657,7 +657,7 @@ static void test_direct(const char *argv0) {
     remove(path);
 }
 
-/* ---- mem_available: TR_MEM_AVAILABLE_MIB (docs/ARCHITETTURA.md Esperti M1, Step D) ---- */
+/* ---- mem_available: TR_MEM_AVAILABLE_MIB (docs/ARCHITECTURE.md Esperti M1, Step D) ---- */
 
 /* Big enough that its expert weights alone (F32, not Q8_0: at this size Q8_0's per-byte cost in
  * synth_olmoe.h would dominate the test) clear the automatic plan's fixed 512 MiB session floor

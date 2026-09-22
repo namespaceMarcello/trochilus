@@ -1,6 +1,6 @@
 #!/bin/sh
-# decode_context.sh — the decode as the context grows (docs/MISURE.md §Decode a contesto lungo):
-# native Windows, still machine, rotating order, A/A control (tools/ab_modes.sh, docs/LEZIONI.md
+# decode_context.sh — the decode as the context grows (docs/MEASUREMENTS.md §Decode a contesto lungo):
+# native Windows, still machine, rotating order, A/A control (tools/ab_modes.sh, docs/LESSONS.md
 # #66). Run from the repo root in Git Bash. Results in build/decode_context/.
 #
 #   sh tools/decode_context.sh measure [rounds]
@@ -14,12 +14,12 @@
 #   sh tools/decode_context.sh widths [rounds]
 #       speed-d16: the decode forced on 16 threads against forced on 8, at the four contexts,
 #       each with its A/A copy: does the decode want half the pool at every context, or was that
-#       a fact of a machine with four cores taken (docs/LEZIONI.md #84)? About 40 minutes.
+#       a fact of a machine with four cores taken (docs/LESSONS.md #84)? About 40 minutes.
 #       speed-d4: the decode forced on 4 threads against forced on 8, at the four contexts, each
 #       with its A/A copy: the truth the estimator is checked against from 2048 up, where 4 and 8
-#       sit within the noise of three passes (docs/MISURE.md domanda 31). About 40 minutes more.
+#       sit within the noise of three passes (docs/MEASUREMENTS.md domanda 31). About 40 minutes more.
 #   sh tools/decode_context.sh long [runs]
-#       the estimator on a run that crosses two context classes (docs/MISURE.md domanda 31): 1500
+#       the estimator on a run that crosses two context classes (docs/MEASUREMENTS.md domanda 31): 1500
 #       tokens after a prompt of 1000 go through 1024 and 2048, so the session measures again
 #       twice and the debounce has something to hold. One line per run in long.txt: tok/s and the
 #       history of the choices the `threads:` line prints; then the switches of every run. About
@@ -40,11 +40,11 @@
 # The containers of the other projects are stopped for the duration and started again at the end,
 # also when the script fails or is interrupted; if somebody starts one in the meantime the
 # measurement stops at the next run instead of going on with a busy machine (AB_GUARD,
-# docs/LEZIONI.md #73). A binary Smart App Control still blocks (docs/LEZIONI.md #12) is waited
+# docs/LESSONS.md #73). A binary Smart App Control still blocks (docs/LESSONS.md #12) is waited
 # for, never rebuilt: a rebuild starts the wait again.
 set -e
 # The body is one function, called on the last line: the shell parses all of it before it runs
-# any, so editing this file while it runs cannot change a run under way (docs/LEZIONI.md #69).
+# any, so editing this file while it runs cannot change a run under way (docs/LESSONS.md #69).
 main() {
 WHAT=$1
 B=build/trochilus.exe
@@ -77,7 +77,7 @@ wait_runs() {
     sleep 60
   done
 }
-# one measurement at a time, and the machine stays awake while it lasts (docs/LEZIONI.md #82)
+# one measurement at a time, and the machine stays awake while it lasts (docs/LESSONS.md #82)
 . tools/measure_guard.lib
 measure_begin decode_context
 trap measure_end EXIT
@@ -91,7 +91,7 @@ RUNNING=$(docker ps -q 2>/dev/null || true)
 restart() { measure_end; if [ -n "$RUNNING" ]; then docker start $RUNNING > /dev/null 2>&1 || true; echo "containers started again"; fi; }
 trap restart EXIT
 if [ -n "$RUNNING" ]; then
-  # the VM's file cache goes back to Windows first (docs/LEZIONI.md #38), then everything stops
+  # the VM's file cache goes back to Windows first (docs/LESSONS.md #38), then everything stops
   MSYS_NO_PATHCONV=1 docker run --rm --privileged trochilus-dev:local sh -c "sync; echo 3 > /proc/sys/vm/drop_caches" || true
   docker stop $RUNNING > /dev/null
   echo "containers stopped: $(echo $RUNNING | wc -w)"
@@ -103,7 +103,7 @@ export AB_GUARD
 still() { sh -c "$AB_GUARD" || { echo "decode_context: the machine is not still $1 (a container, or a busy CPU), stopping"; exit 3; }; }
 
 # The model takes 7 GiB and the memory guard wants 3 more left free; Windows needs minutes to
-# take back what the VM has released (docs/LEZIONI.md #72). Up to 15 minutes, a look every 30 s.
+# take back what the VM has released (docs/LESSONS.md #72). Up to 15 minutes, a look every 30 s.
 TRY=0
 while :; do
   AVAIL=$($B cpu 2>&1 | sed -n 's/^ram: .* total, \([0-9]*\)\.[0-9]* GiB available.*/\1/p')
@@ -198,7 +198,7 @@ long_runs() {
     cleanup_run $B generate -m $M -p 1000 -n 1500 -c 2600 -t 16 > /dev/null 2> $OUT/long-run.txt
     SPEED=$(sed -n 's/^generate: .* in .* (\([0-9.]*\) tok.s)/\1/p' $OUT/long-run.txt)
     CHOICES=$(sed -n 's/^threads: .* choices \(.*\)$/\1/p' $OUT/long-run.txt)
-    # a run that says nothing must stop the session, not leave a hole (docs/LEZIONI.md #56)
+    # a run that says nothing must stop the session, not leave a hole (docs/LESSONS.md #56)
     [ -n "$SPEED" ] && [ -n "$CHOICES" ] || { echo "decode_context: long run $I gave no speed or no choices:"; tail -3 $OUT/long-run.txt; exit 1; }
     echo "run $I decode $SPEED tok/s choices $CHOICES" >> $OUT/long.txt
     I=$((I + 1))

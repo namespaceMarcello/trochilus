@@ -1,4 +1,4 @@
-/* expf.c — tr_expf: exp(x) correctly rounded to float, on every float (docs/MISURE.md question 37).
+/* expf.c — tr_expf: exp(x) correctly rounded to float, on every float (docs/MEASUREMENTS.md question 37).
  *
  * The softmax of the attention and of the router, and the SiLU of the experts, take one
  * exponential per element. The C library's expf was the one kernel of the hot zone the engine

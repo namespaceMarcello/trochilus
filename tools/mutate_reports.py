@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """mutate_reports.py — do the `--check` of the routing reports see a wrong formula? A check never
-seen red proves nothing (docs/LEZIONI.md #43): each mutation is applied to a copy of the script in
+seen red proves nothing (docs/LESSONS.md #43): each mutation is applied to a copy of the script in
 a temporary directory, the copy's `--check` is run, and it must fail. A few seconds, no container:
 
     tools/.venv/Scripts/python.exe tools/mutate_reports.py

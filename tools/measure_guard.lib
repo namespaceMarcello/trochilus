@@ -1,6 +1,6 @@
 # measure_guard.lib -- functions sourced by the scripts that measure on a still machine
 # (prefill_context.sh, decode_context.sh, threads_phase.sh, remeasure.sh). What a long
-# measurement needs and nobody gave it (docs/LEZIONI.md #82, #84):
+# measurement needs and nobody gave it (docs/LESSONS.md #82, #84):
 #
 #   measure_begin <name>   nothing this project started is still running (tools/orphans.sh: a
 #                          forgotten load generator, an engine, another script), or it refuses
@@ -49,7 +49,7 @@ measure_end() {
 }
 
 # What "the machine is still" means before every run (AB_GUARD of tools/ab_modes.sh): no
-# container running (docs/LEZIONI.md #73) and the CPU not busy with somebody else's work (#84).
+# container running (docs/LESSONS.md #73) and the CPU not busy with somebody else's work (#84).
 MEASURE_AB_GUARD='[ -z "$(docker ps -q 2>/dev/null)" ] && sh tools/machine_still.sh 3.5 600 2'
 
 # measure_still <name>: a longer look (10 s), and a wait of up to 15 minutes for whoever is using
@@ -60,7 +60,7 @@ measure_still() {
 
 # measure_declare <when>: a native measurement says what else the machine was doing, before its
 # first run and after its last: total busy logical processors and who holds them, over 20 s
-# (tools/background_load.ps1; docs/LEZIONI.md #85: on this machine the kernel's System process
+# (tools/background_load.ps1; docs/LESSONS.md #85: on this machine the kernel's System process
 # alone holds 0.8 of a core with everything stopped, and every number here has it underneath).
 measure_declare() {
   if command -v powershell.exe > /dev/null 2>&1; then

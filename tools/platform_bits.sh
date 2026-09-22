@@ -17,7 +17,7 @@
 #
 # A measurement, not a gate: it changes nothing and always ends with 0 unless a step fails.
 set -e
-# The body is one function, called on the last line (docs/LEZIONI.md #69).
+# The body is one function, called on the last line (docs/LESSONS.md #69).
 main() {
 . tools/cleanup.lib
 trap cleanup_children EXIT
@@ -29,7 +29,7 @@ LIN=build/linux-gcc/trochilus
 PY=tools/.venv/Scripts/python.exe
 REAL=fixtures/olmoe-2layer/model.gguf
 # DUMP_ROPE=<binary>: a second copy of the tool built elsewhere (make BUILD=build/after2
-# build/after2/tests/dump_rope.exe) when Smart App Control still blocks the first (docs/LEZIONI.md #81)
+# build/after2/tests/dump_rope.exe) when Smart App Control still blocks the first (docs/LESSONS.md #81)
 DUMP=${DUMP_ROPE:-build/tests/dump_rope.exe}
 mkdir -p $OUT
 make $WIN build/tests/dump_rope.exe > /dev/null
@@ -68,7 +68,7 @@ body() {
   one tiny-q8_0 fixtures/tiny-olmoe/model-q8_0.gguf 128 120
   if [ -f $REAL ]; then one real-2layer $REAL 50304 $N; else echo "##### real-2layer: SKIPPED, $REAL not found"; fi
   # the tables last: a tool built a minute ago may be one Smart App Control still blocks (exit 126
-  # from Git Bash, docs/LEZIONI.md #12); the logits above do not need it
+  # from Git Bash, docs/LESSONS.md #12); the logits above do not need it
   RC=0
   $DUMP > /dev/null 2>&1 || RC=$?
   if [ "$RC" = 126 ]; then

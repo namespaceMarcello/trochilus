@@ -1,5 +1,5 @@
 /* test_experts.c — the expert store (src/memory/experts.h): which (layer, expert) units are in
- * RAM under a budget, and the door to disk for the rest (docs/ARCHITETTURA.md "Esecuzione",
+ * RAM under a budget, and the door to disk for the rest (docs/ARCHITECTURE.md "Esecuzione",
  * Esperti (M1)).
  *
  * A fake reader replaces the GGUF file: every byte of every part of every unit is a pure

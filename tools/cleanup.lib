@@ -1,4 +1,4 @@
-# cleanup.lib -- every script kills what it started (docs/LEZIONI.md #84).
+# cleanup.lib -- every script kills what it started (docs/LESSONS.md #84).
 #
 # On 2026-09-17 a busy-machine test left four `yes` processes behind; they ran at 100% for 37
 # hours under every native measurement of two days. The cause was not a missing guard on the
@@ -13,7 +13,7 @@
 #                                     A shell that waits for a foreground child does not run its
 #                                     traps until the child ends: a measuring script told to stop
 #                                     went on for the twenty minutes of its ab_modes session
-#                                     (docs/LEZIONI.md #82). `wait` is interrupted at once.
+#                                     (docs/LESSONS.md #82). `wait` is interrupted at once.
 #   cleanup_children                  kills every descendant of this script, deepest included:
 #                                     the engine under `sh -c` under ab_modes.sh, the keep-awake
 #                                     helper, a load generator.

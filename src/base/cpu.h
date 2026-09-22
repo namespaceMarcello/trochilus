@@ -44,7 +44,7 @@ typedef struct {
      * after every core already has a thread. Restricted to the processors this process
      * is allowed to run on, so an outer `taskset` / `start /affinity` still decides.
      * n_slots is 0 when the topology is unknown or the platform has no affinity: then
-     * nothing is pinned and the scheduler places the threads (docs/MISURE.md
+     * nothing is pinned and the scheduler places the threads (docs/MEASUREMENTS.md
      * "Dove vanno i thread"). */
     int n_slots;
     tr_cpu_slot slot[TR_CPU_MAX_SLOTS];

@@ -1,6 +1,6 @@
 #!/bin/sh
-# prefill_context.sh — the prefill as the prompt grows (docs/MISURE.md §Prefill su prompt lunghi):
-# native Windows, still machine, rotating order, A/A control (tools/ab_modes.sh, docs/LEZIONI.md
+# prefill_context.sh — the prefill as the prompt grows (docs/MEASUREMENTS.md §Prefill su prompt lunghi):
+# native Windows, still machine, rotating order, A/A control (tools/ab_modes.sh, docs/LESSONS.md
 # #66). Run from the repo root in Git Bash. Results in build/prefill_context/.
 #
 #   sh tools/prefill_context.sh bench
@@ -27,15 +27,15 @@
 #
 # The containers of the other projects are stopped for the duration and started again at the end,
 # also when the script fails or is interrupted; if somebody starts one in the meantime the
-# measurement stops at the next run (AB_GUARD, docs/LEZIONI.md #73). A binary Smart App Control
-# still blocks (docs/LEZIONI.md #12) is waited for, never rebuilt: a rebuild starts the wait again.
+# measurement stops at the next run (AB_GUARD, docs/LESSONS.md #73). A binary Smart App Control
+# still blocks (docs/LESSONS.md #12) is waited for, never rebuilt: a rebuild starts the wait again.
 # When the wait goes past half an hour, a second copy built somewhere else may run at once
 # (make BUILD=build/after2 build/after2/trochilus.exe, then TROCHILUS=build/after2/trochilus.exe
-# sh tools/prefill_context.sh ...; docs/LEZIONI.md #81). One measurement at a time, and the machine
-# is kept awake while it lasts (tools/measure_guard.lib, docs/LEZIONI.md #82).
+# sh tools/prefill_context.sh ...; docs/LESSONS.md #81). One measurement at a time, and the machine
+# is kept awake while it lasts (tools/measure_guard.lib, docs/LESSONS.md #82).
 set -e
 # The body is one function, called on the last line: the shell parses all of it before it runs
-# any, so editing this file while it runs cannot change a run under way (docs/LEZIONI.md #69).
+# any, so editing this file while it runs cannot change a run under way (docs/LESSONS.md #69).
 main() {
 WHAT=$1
 # TROCHILUS=<binary>: the engine to measure, when it is not the one make builds
@@ -70,7 +70,7 @@ wait_runs() {
     sleep 60
   done
 }
-# one measurement at a time, and the machine stays awake while it lasts (docs/LEZIONI.md #82)
+# one measurement at a time, and the machine stays awake while it lasts (docs/LESSONS.md #82)
 . tools/measure_guard.lib
 measure_begin prefill_context
 trap measure_end EXIT
@@ -80,14 +80,14 @@ wait_runs $ATTNB
 [ -z "$BEFORE" ] || wait_runs $BEFORE cpu
 [ -z "$PROF_BEFORE" ] || wait_runs $PROF_BEFORE cpu
 # which binaries these numbers belong to: a name like trochilus-before.exe is reused from one
-# session to the next, a hash is not (docs/LEZIONI.md #81, #86)
+# session to the next, a hash is not (docs/LESSONS.md #81, #86)
 sha256sum $B $ATTNB $BEFORE $PROF_BEFORE > $OUT/binaries.sha256 2> /dev/null || true
 
 RUNNING=$(docker ps -q 2>/dev/null || true)
 restart() { measure_end; if [ -n "$RUNNING" ]; then docker start $RUNNING > /dev/null 2>&1 || true; echo "containers started again"; fi; }
 trap restart EXIT
 if [ -n "$RUNNING" ]; then
-  # the VM's file cache goes back to Windows first (docs/LEZIONI.md #38), then everything stops
+  # the VM's file cache goes back to Windows first (docs/LESSONS.md #38), then everything stops
   MSYS_NO_PATHCONV=1 docker run --rm --privileged trochilus-dev:local sh -c "sync; echo 3 > /proc/sys/vm/drop_caches" || true
   docker stop $RUNNING > /dev/null
   echo "containers stopped: $(echo $RUNNING | wc -w)"
@@ -99,7 +99,7 @@ export AB_GUARD
 still() { sh -c "$AB_GUARD" || { echo "prefill_context: the machine is not still $1 (a container, or a busy CPU), stopping"; exit 3; }; }
 
 # The model takes 7 GiB and the memory guard wants 3 more left free; Windows needs minutes to
-# take back what the VM has released (docs/LEZIONI.md #72). Up to 15 minutes, a look every 30 s.
+# take back what the VM has released (docs/LESSONS.md #72). Up to 15 minutes, a look every 30 s.
 TRY=0
 while [ "$WHAT" != bench ]; do
   AVAIL=$($B cpu 2>&1 | sed -n 's/^ram: .* total, \([0-9]*\)\.[0-9]* GiB available.*/\1/p')
@@ -114,7 +114,7 @@ measure_declare "before the first run"
 
 # $1: binary, $2: prompt length, $3: context. GEN_EXTRA: further arguments of every run, for
 # instance "--decode-threads 8": the width of the decode is measured by each session for itself
-# and changes from run to run (docs/MISURE.md question 31); forcing it on both binaries keeps
+# and changes from run to run (docs/MEASUREMENTS.md question 31); forcing it on both binaries keeps
 # that choice out of a before/after comparison of the 48 tokens after the prompt.
 gen() { echo "$1 generate -m $M -p $2 -n 48 -c $3 -t 16 $GEN_EXTRA"; }
 

@@ -1,5 +1,5 @@
 /* bench_attn.c — the attention of a whole prompt on one layer, the way the prefill runs it, taken
- * apart (docs/MISURE.md question 7 and "Prefill su prompt lunghi").
+ * apart (docs/MEASUREMENTS.md question 7 and "Prefill su prompt lunghi").
  *
  * The prefill runs a prompt in passes of 512 tokens. In a pass every (head, token) is one item:
  * token i at position pos0 + i multiplies its query with the keys of positions 0..pos0+i, takes
@@ -34,7 +34,7 @@
  * spread; "ns" is thread time per (query, position) pair; "bits" is a hash of every output of
  * the prompt, and blk, blkx and grp must print the hash of the matching "one" line (--group and
  * --block size blk and blkx; grp takes --group, its block is TR_ATTN_BLOCK). One run stays
- * well under 60 s (docs/ARCHITETTURA.md, safety of the machine). */
+ * well under 60 s (docs/ARCHITECTURE.md, safety of the machine). */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -149,7 +149,7 @@ static void wsum_plain(const tr_kernels *k, float *out, const float *values, int
 
 #if HAVE_X86
 /* One query against 4 keys: one load of the query per 4 products, an accumulator per key in a
- * named register (docs/LEZIONI.md #45). Each score is bit for bit avx512_dot_f32's. */
+ * named register (docs/LESSONS.md #45). Each score is bit for bit avx512_dot_f32's. */
 __attribute__((target("avx512f")))
 static void dots_x4(const tr_kernels *k, const float *q, const float *keys, int64_t t0, int64_t t1, float *scores) {
     int64_t t = t0;
@@ -351,7 +351,7 @@ int main(int argc, char **argv) {
     tr_kernels_init();
     char cpu_line[512], err[256];
     tr_cpu_describe(tr_cpu(), cpu_line, sizeof cpu_line);
-    /* which build this is: a stale benchmark measures the code of another day (docs/LEZIONI.md #24) */
+    /* which build this is: a stale benchmark measures the code of another day (docs/LESSONS.md #24) */
     printf("bench_attn %d, built %s %s, kernels %s, median of %d, group %d, block %d\n%s\n", (int)n_pos, __DATE__,
            __TIME__, tr_kernels_get()->tier, n_runs, (int)group, (int)block, cpu_line);
     if (tr_mem_guard((uint64_t)256 * MIB, err, sizeof err) != 0) {

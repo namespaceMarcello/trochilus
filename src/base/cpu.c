@@ -232,7 +232,7 @@ static void core_add_cpu(core_desc *co, unsigned group, unsigned lcpu) {
 /* Fills c->slot from the cores, best placement first: one logical processor per physical
  * core before any second sibling (two threads on one core measured 30% slower than one
  * per core), and the cores taken round robin over the last-level caches (4+4 over the two
- * chiplets of a 7940HX beat 8 on one by 7-9%). Both numbers: docs/MISURE.md. */
+ * chiplets of a 7940HX beat 8 on one by 7-9%). Both numbers: docs/MEASUREMENTS.md. */
 static void order_slots(tr_cpu_info *c, const core_desc *cores, int n_cores) {
     c->n_slots = 0;
     if (n_cores <= 0) return;

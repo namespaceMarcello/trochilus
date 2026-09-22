@@ -1,5 +1,5 @@
 #!/bin/sh
-# ab_spec.sh — what speculation on the prompt is worth, runs alternated (docs/LEZIONI.md #46).
+# ab_spec.sh — what speculation on the prompt is worth, runs alternated (docs/LESSONS.md #46).
 #
 # The same binary and the same text prompt, once with --spec 0 and once with --spec <draft>,
 # round robin so that a machine warming up costs both the same. Round 0 is dropped as warm-up.
@@ -14,7 +14,7 @@
 #       bench/prompts/code.txt 8 16 200 5
 set -e
 # The body is one function, called on the last line: the shell parses all of it before it runs
-# any, so editing this file while it runs cannot change a run under way (docs/LEZIONI.md #69).
+# any, so editing this file while it runs cannot change a run under way (docs/LESSONS.md #69).
 main() {
 . tools/cleanup.lib
 trap cleanup_children EXIT
@@ -41,7 +41,7 @@ while [ $R -le "$ROUNDS" ]; do
       "$BIN" run -m "$MODEL" -f "$PROMPT" -n "$GEN" -t "$T" --spec "$K" 2>"$OUT.err" >"$TXT"
       LINE=$(sed -n "s/^generate: [0-9]* tokens in .* (\([0-9.]*\) tok.s)/spec$K t$T $R \1/p" "$OUT.err")
       # No tok/s line means the run never generated: stop instead of printing medians with a hole
-      # in them (docs/LEZIONI.md #56).
+      # in them (docs/LESSONS.md #56).
       if [ -z "$LINE" ]; then
         echo "ab_spec: --spec $K, t$T, round $R produced no tok/s line, stopping. The run said:" >&2
         tail -3 "$OUT.err" >&2

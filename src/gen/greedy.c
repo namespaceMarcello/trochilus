@@ -87,7 +87,7 @@ int64_t tr_greedy_step(tr_greedy *g, int32_t *out) {
      * probe is wrong again (1, 3, 7, 15, capped at 16). The pause is the important half: an extra
      * row of a pass costs 15-22 ms against the 34 ms of the pass itself, because the drafted
      * token usually routes to other experts and the pass reads their weights too, so a draft
-     * pays only above roughly half accepted (docs/MISURE.md §Speculazione dal prompt). A step
+     * pays only above roughly half accepted (docs/MEASUREMENTS.md §Speculazione dal prompt). A step
      * where the lookup proposed nothing although it was allowed to (k == 0 with want > 0) leaves
      * everything as it was: nothing was risked. */
     if (g->policy == TR_DRAFT_ADAPTIVE) {

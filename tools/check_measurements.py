@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""check_misure.py -- a number from a model is not a measurement (docs/LEZIONI.md #98).
+"""check_measurements.py -- a number from a model is not a measurement (docs/LESSONS.md #98).
 
 Domanda 14 predicted 22.4 misses and 143 MiB per generated token with half the model in RAM;
 the measurement found 0.3 and 1.8 on the same budget, because the simulation ran over a long
@@ -7,7 +7,7 @@ generation while the engine's cache is warm from the prompt. The question had be
 through -- closed -- on the strength of the simulation alone, and the engine's design rested
 on it for a day.
 
-Two rules over docs/MISURE.md, so the same thing cannot close a question again:
+Two rules over docs/MEASUREMENTS.md, so the same thing cannot close a question again:
 
   A. a line that says a number comes from a simulation or a time model carries one of the two
      tags, so a reader cannot mistake it for something measured:
@@ -16,13 +16,13 @@ Two rules over docs/MISURE.md, so the same thing cannot close a question again:
   B. a question row tagged «modello, non misura» stays OPEN -- no ~~strikethrough~~ -- until a
      measured number takes its place. The other tag is history, so it may sit in a closed row.
 
-Run: tools/.venv/Scripts/python.exe tools/check_misure.py   (in `make check`)
+Run: tools/.venv/Scripts/python.exe tools/check_measurements.py   (in `make check`)
 """
 import re
 import sys
 from pathlib import Path
 
-DOC = Path(__file__).resolve().parent.parent / "docs" / "MISURE.md"
+DOC = Path(__file__).resolve().parent.parent / "docs" / "MEASUREMENTS.md"
 TAG = "modello, non misura"
 OLD_TAG = "modello superato dalla misura"
 # the words that announce a number nobody measured
@@ -55,7 +55,7 @@ def main() -> int:
             print("  " + b, file=sys.stderr)
         print(
             "\n  A model's number is a hypothesis: it is tagged, and its question stays in\n"
-            "  the open-questions section until it is measured (docs/LEZIONI.md #98).",
+            "  the open-questions section until it is measured (docs/LESSONS.md #98).",
             file=sys.stderr,
         )
         return 1

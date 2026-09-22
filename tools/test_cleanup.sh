@@ -1,6 +1,6 @@
 #!/bin/sh
 # test_cleanup.sh — does a script that is told to stop take its children with it?
-# (tools/cleanup.lib, docs/LEZIONI.md #84 and #82)
+# (tools/cleanup.lib, docs/LESSONS.md #84 and #82)
 #
 #   sh tools/test_cleanup.sh        from the repo root; part of `make check`, a few seconds
 #
@@ -13,7 +13,7 @@
 #                      is seen red at every run, not once (then the leftover is removed by force).
 # The native program is ping on Windows (always there, and Smart App Control knows it) and sleep
 # elsewhere; the count on its command line is how each victim's child is told from anything else.
-# The body is one function, called on the last line (docs/LEZIONI.md #69).
+# The body is one function, called on the last line (docs/LESSONS.md #69).
 main() {
 . tools/cleanup.lib
 trap cleanup_children EXIT

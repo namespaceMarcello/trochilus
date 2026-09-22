@@ -26,7 +26,7 @@ nei limiti. Pulito sotto AddressSanitizer + UBSan + leak check (gcc, Linux). Pro
 ### 2026-09-17 — Microbenchmark dei kernel e prima misura
 `tests/bench_kernels.c`: per ogni tier disponibile e ogni kernel (dot_f32, dot_row f16/q8_0) su
 righe da 64 a 4096 elementi, mediana di N run e spread (rumore); più `tr_matmul` di una matrice
-da esperto OLMoE con 1 thread e con i core fisici. Base scalare registrata in `docs/MISURE.md`.
+da esperto OLMoE con 1 thread e con i core fisici. Base scalare registrata in `docs/MEASUREMENTS.md`.
 Prova: `gcc -std=c11 -O2 -ffp-contract=off tests/bench_kernels.c src/base/*.c src/format/*.c src/kernels/*.c -o build/bench/bench_kernels.exe && build/bench/bench_kernels.exe`.
 
 ### 2026-09-17 — Profiler del motore
@@ -40,7 +40,7 @@ Non ancora collegato al grafo OLMoE (lo sta scrivendo l'agente del passo 2).
 ### 2026-09-17 — Ciclo di controllo
 `CLAUDE.md` §ciclo di controllo (7 punti: prima, errori, ogni errore diventa un controllo, ogni
 scenario entra nei test, `make check` prima di "fatto", verifica dopo un agente, documenti);
-`docs/LEZIONI.md` con le prime 13 lezioni (causa, prevenzione, stato, trovato da); hook di commit
+`docs/LESSONS.md` con le prime 13 lezioni (causa, prevenzione, stato, trovato da); hook di commit
 che rifiuta `src/` cambiato senza test, oracolo o scenario (salvo `no-test: <motivo>`);
 `test_parallel_varying_chunks` in `tests/test_base.c` per le due race del pool (LEZIONI #4).
 Prova: hook provato su 5 casi (2 rifiuti, 3 accettati); `make test`.
@@ -82,7 +82,7 @@ CPU (AVX-512, poi AVX2, poi scalare; `TR_CPU_MAX` le limita), bit-identiche allo
 in `kernels_internal.h`; `tr_rmsnorm` usa il tier attivo. `test_kernels` confronta ogni tier con lo
 scalare su tutte le code e su valori speciali, e verifica di accorgersi di una variante sbagliata
 apposta. Kernel q8_0 10× più veloce su un thread; OLMoE-1B-7B Q8_0 da 6.9 a 21.1 token/s (8 thread),
-stessi token dello scalare (`docs/MISURE.md`). `Makefile`: con gcc le istruzioni AVX allineate diventano
+stessi token dello scalare (`docs/MEASUREMENTS.md`). `Makefile`: con gcc le istruzioni AVX allineate diventano
 non allineate (crash sotto ASan e su MinGW), e un flag cambiato ricompila tutto. Prova: `make check`,
 `make bench`, `build/trochilus generate -m models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf -p 32 -n 16 -c 128 -t 8 --profile`.
 
@@ -134,7 +134,7 @@ Senza `-c`, se la RAM non basta per 4096 token la chat dimezza il contesto e lo 
 `ref/llama.cpp` (commit `b49650a`, solo riferimento) compilato nel container da
 `tools/build_llamacpp.sh`, con `tools/llamacpp_logits.c` (logit per posizione nello stesso formato di
 `trochilus logits`, generazione greedy). `tools/compare_llamacpp.py` confronta tokenizzazione, greedy
-e logit per posizione (parola migliore, KL, margini). Risultati in `docs/MISURE.md`. Prova:
+e logit per posizione (parola migliore, KL, margini). Risultati in `docs/MEASUREMENTS.md`. Prova:
 `sh tools/build_llamacpp.sh` e `tools/compare_llamacpp.py ... --prompt bench/prompts/dante.txt` nel
 container. `make check` su Windows ora svuota alla fine la cache della VM di Docker.
 
@@ -145,7 +145,7 @@ configurazione del GGUF e i pesi dequantizzati, e scrive token greedy e logit pe
 prompt (27 e 1024 token). `tools/oracle.py` legge anche il formato a più prompt (`--logit-tol`).
 `make oracle-real` entra in `make check` (saltato senza il modello): token identici, logit entro
 1e-3 (misurato 2.4e-4). Prova: `make check`, oppure nel container
-`make BUILD=build/linux-gcc CC=gcc oracle-real`. Numeri in `docs/MISURE.md`.
+`make BUILD=build/linux-gcc CC=gcc oracle-real`. Numeri in `docs/MEASUREMENTS.md`.
 
 ### 2026-09-17 — Confronto di velocità con llama.cpp e colibri
 `tools/speed_compare.py`: stessi thread e stesse lunghezze per Trochilus (`generate`), llama.cpp
@@ -153,7 +153,7 @@ prompt (27 e 1024 token). `tools/oracle.py` legge anche il formato a più prompt
 int8), mediana di N run; con `--tok-file` anche la velocità dei tokenizer (Trochilus, `llama-tokenize`,
 HF `tokenizers`). `tools/build_llamacpp.sh` compila anche `llama-bench`. `trochilus generate` ora
 stampa token e valutazioni e divide per le valutazioni; `make check` lo verifica. Numeri in
-`docs/MISURE.md`. Prova, nel container con i modelli nel volume `trochilus-models`:
+`docs/MEASUREMENTS.md`. Prova, nel container con i modelli nel volume `trochilus-models`:
 `tools/speed_compare.py --model /models/<gguf> --trochilus build/linux-gcc/trochilus --llama-bench
 ref/llama.cpp/build-trochilus/bin/llama-bench --threads 16,8 --prompt 32 --gen 32`.
 
@@ -189,8 +189,8 @@ Il prefill a 16 thread non era limitato dalla potenza (il clock scende del 6-8% 
 dal CCD (8 thread divisi 4+4 sui due chiplet vanno il 7-9% meglio di 8 su uno solo): lo scheduler
 appoggiava due dei 16 thread sullo stesso core fisico. Un thread per core fisico vale +30%
 (134 → 174 tok/s a 2048 token di prompt) e da 8 a 16 core il prefill rende 2.02×. Chiuse le domande
-20 e 2 di `docs/MISURE.md`, metà della 3; aperta la 22 (Linux, decode, macchina occupata).
-Prova: `docs/MISURE.md` §Dove vanno i thread ha tabelle, metodo e numeri.
+20 e 2 di `docs/MEASUREMENTS.md`, metà della 3; aperta la 22 (Linux, decode, macchina occupata).
+Prova: `docs/MEASUREMENTS.md` §Dove vanno i thread ha tabelle, metodo e numeri.
 
 ### 2026-09-17 — Decodifica speculativa dal prompt, esatta al bit
 `tr_session_eval_rows` tiene i logit delle ultime n posizioni di una passata invece che solo
@@ -200,12 +200,12 @@ proposta la continuazione della sua ultima occorrenza; da 4 a 2 token, niente st
 allocazioni) e `src/gen/greedy.c` (`tr_greedy_step`: emette il token già scelto, verifica 1 + k
 posizioni in una passata, tiene i token che il modello avrebbe scelto comunque e torna indietro con
 `tr_session_rewind` su quelli rifiutati). `generate` e `run` hanno `--spec <bozza>` e stampano
-quante bozze sono state accettate. Le fonti e cosa si è preso da ognuna: `docs/ORIGINI.md`
+quante bozze sono state accettate. Le fonti e cosa si è preso da ognuna: `docs/ORIGINS.md`
 §Speculazione sul prompt. Prova: `make check` (nuovo `tests/test_spec.c`: stessi token con bozza
 1..15, su due vocabolari perché con quello del modello nulla verrebbe mai rifiutato, LEZIONI #50;
 nuovo `make spec-check` sul modello vero tagliato a 2 layer: stesso testo con `--spec 0/1/4/8/15`),
 e `sh tools/ab_spec.sh <gguf> <binario> bench/prompts/code.txt 8` per la velocità a run alternate.
-Misurata sul modello intero (`docs/MISURE.md` §Speculazione dal prompt): 1.42× riscrivendo un file
+Misurata sul modello intero (`docs/MEASUREMENTS.md` §Speculazione dal prompt): 1.42× riscrivendo un file
 già nel prompt (64% di bozze accettate), 0.62× scrivendo codice nuovo (13%), pareggio intorno al 15%.
 `--spec` resta spento di default fino alla bozza adattiva. `make` rifiuta ora di mescolare oggetti di
 due piattaforme nella stessa cartella (LEZIONI #52).
@@ -228,8 +228,8 @@ Il modo conta: legare un thread a un processore costa il 17% sul decode, legarlo
 (LEZIONI #58). Prova: `make check`, dove `tests/test_base.c` chiede al sistema
 operativo (`GetCurrentProcessorNumber`, `sched_getcpu`) su quale processore ha girato ogni chunk e
 pretende che sia il posto assegnato — con `TR_POOL_PIN=0` quel test è rosso. Velocità:
-`sh tools/ab_speed.sh <gguf> build/pin/on.sh build/pin/off.sh` e `docs/MISURE.md` §Il pin dei thread.
-Fonti e cosa si è preso: `docs/ORIGINI.md` §Collocamento dei thread.
+`sh tools/ab_speed.sh <gguf> build/pin/on.sh build/pin/off.sh` e `docs/MEASUREMENTS.md` §Il pin dei thread.
+Fonti e cosa si è preso: `docs/ORIGINS.md` §Collocamento dei thread.
 
 ### 2026-09-18 — Bozza adattiva per `--spec`
 `src/gen/greedy.c` tiene `k_cur`: parte da `n_draft`, dopo un rifiuto parziale scende a quanto è
@@ -238,7 +238,7 @@ una bozza **tutta** sbagliata la speculazione si ferma per qualche passo, con pa
 finché la sonda da un token continua a sbagliare (1, 3, 7, 15, al massimo 16). La pausa è la metà
 importante: su un MoE una riga in più costa 15-27 ms contro i ~35 di una passata, perché il token in
 bozza sceglie altri esperti e la passata legge anche i loro pesi, quindi il pareggio è al 60-75% di
-bozze accettate (`docs/MISURE.md` §Bozza adattiva, LEZIONI #59). Risultato: 1.01× quando il modello
+bozze accettate (`docs/MEASUREMENTS.md` §Bozza adattiva, LEZIONI #59). Risultato: 1.01× quando il modello
 inventa (era 0.60× con bozza fissa) e 1.15× quando ricopia un file già nel prompt (1.34× con bozza
 fissa, che resta disponibile con `--spec-fixed`). Una bozza vuota (il lookup non ha trovato nulla da
 proporre) non cambia niente. La politica si sceglie
@@ -251,7 +251,7 @@ ora gira sul modello intero e pretende bozze accettate (LEZIONI #54). Nuovi test
 controllato a ogni passo, e la suite fallisce se in nessun caso una bozza è mai stata rifiutata del
 tutto, così il test non può passare per il motivo sbagliato. Prova: `make check`, e
 `sh tools/ab_spec.sh <gguf> <binario> bench/prompts/code.txt 8` per la velocità; numeri in
-`docs/MISURE.md` §Bozza adattiva.
+`docs/MEASUREMENTS.md` §Bozza adattiva.
 
 ### 2026-09-18 — Quanto darebbe la leva 2 (attivazioni int8 con VNNI): niente
 Domanda 21 chiusa con una misura, senza scrivere il kernel. `tests/bench_kernels.c` ha ora un
@@ -259,7 +259,7 @@ candidato int8 × int8 con `_mm256_dpbusd_epi32` (stessa struttura di ggml) acca
 sulla stessa riga fa 11.4 G elementi/s contro gli 11.3 del nostro dot float, mentre il nostro
 `dot_row_x4` (una riga di pesi contro 4 token) ne fa 30.6. Il candidato resta nel benchmark, non
 diventa un kernel: le attivazioni a 8 bit non sono lo stesso numero. Prova: `make bench`, righe
-`dot q8_0xq8_0` e `quantize x q8_0`; numeri e letture in `docs/MISURE.md` §Attivazioni int8 con VNNI.
+`dot q8_0xq8_0` e `quantize x q8_0`; numeri e letture in `docs/MEASUREMENTS.md` §Attivazioni int8 con VNNI.
 
 ### 2026-09-17 — Una misura che non misura si ferma
 `tools/ab_speed.sh` e `tools/ab_spec.sh` si fermano alla prima run che non produce la riga dei tok/s
@@ -270,7 +270,7 @@ e una misura muta sembrava una misura riuscita (LEZIONI #56).
 Rilettura completa da parte di un altro modello (Fable 5.1): kernel, prefill, speculazione,
 tokenizer, pool, GGUF, piattaforma, riga di comando, strumenti e documenti. Esito: gli invarianti
 reggono; tre errori corretti, ognuno con un test rosso prima e verde dopo; una conclusione di misura
-rovesciata; due controlli e uno strumento nuovi (LEZIONI #60-#68, `docs/MISURE.md` §Revisione).
+rovesciata; due controlli e uno strumento nuovi (LEZIONI #60-#68, `docs/MEASUREMENTS.md` §Revisione).
 - `src/gen/greedy.c`: il tetto della pausa della bozza adattiva valeva sul valore vecchio, quindi
   15 raddoppiava a 31. Prova: `build/.../tests/test_spec` (`test_adaptive_pause_is_capped`).
 - `src/base/threads.c`: l'affinità di prima del chiamante sta nel thread con un contatore dei pool
@@ -292,7 +292,7 @@ rotazione, A/A) sulle tre conclusioni che stavano dentro lo spread, più le zone
 domanda 12. Caso peggiore di `--spec` **0.953×** (non 1.01×) e caso buono 1.175×; il −17% sul decode
 del pin al processore non si riproduce (la differenza fra i due pin è nel prefill, +9%); decode a 8
 thread 1.09-1.12× su 16. Una riga di bozza costa 13.7-17.6 ms su 31.3, per il 61-91% negli esperti.
-Numeri in `docs/MISURE.md` §Revisione, decisioni in `docs/STATO.md`, LEZIONI #58, #59, #66, #67.
+Numeri in `docs/MEASUREMENTS.md` §Revisione, decisioni in `docs/STATUS.md`, LEZIONI #58, #59, #66, #67.
 Prova: `sh tools/remeasure.sh`, poi `build/remeasure/` (ogni run e le mediane).
 
 ### 2026-09-18 — Thread per fase: il prompt su tutto il pool, il decode sulla larghezza che la sessione misura
@@ -300,7 +300,7 @@ Domanda 26 chiusa. Misura (nativo, macchina ferma, 8 giri, A/A, contesti 512 e 2
 vuole 16 thread, il decode 8 (4 vince di poco a 512 e perde a 2048, 12 non rende). Il numero non è
 scritto nel motore: ogni sessione lo misura. Dopo contro prima: decode **1.085×** a 512,
 **1.02-1.03×** a 2048, prefill invariato, `--spec 8` caso peggiore 1.064×; token identici al bit.
-Numeri in `docs/MISURE.md` §Thread per fase, decisione in `docs/STATO.md`, LEZIONI #69-#72.
+Numeri in `docs/MEASUREMENTS.md` §Thread per fase, decisione in `docs/STATUS.md`, LEZIONI #69-#72.
 - `src/base/threads.{h,c}`: `tr_pool_set_active(p, n)` e `tr_pool_active`: i `parallel_for`
   seguenti usano i primi n thread (i primi n slot: core distinti sui due chiplet), gli altri
   dormono. Prova: `tests/test_base` (`test_pool_active`: 5000 cambi di larghezza, anche sotto TSan).
@@ -332,7 +332,7 @@ Numeri in `docs/MISURE.md` §Thread per fase, decisione in `docs/STATO.md`, LEZI
 Punto 6 dei prossimi passi e domanda 4. Misurato prima (RAM ~54 GB/s; il decode perdeva col contesto
 perché la KV si leggeva a 32-36 GB/s, a salti), poi la leva esatta: decode 1.06-1.10× a contesto
 512, 1.12-1.14× a 2048, 1.15-1.18× a 4000, prefill 1.39-1.43× a 4000, logit identici al byte.
-Numeri in `docs/MISURE.md` §Decode a contesto lungo.
+Numeri in `docs/MEASUREMENTS.md` §Decode a contesto lungo.
 
 - `src/kv/kv.{h,c}` (strato nuovo): `tr_kv`, cache `[layer][testa KV][posizione][head_dim]`, K e V in
   due blocchi; `tr_kv_bytes` per la guardia di memoria, `tr_kv_init`/`tr_kv_free`, `tr_kv_keys` e
@@ -379,7 +379,7 @@ Punto 4 dei prossimi passi, domande 7 e 30. Misurato prima (il softmax, cioè `e
 C, è il 51-72% dell'attenzione del prompt; la lettura ripetuta di chiavi e valori fra l'1% e il
 21-39% a 4000 token, secondo la run, e niente sotto; l'8% del prefill girava su un thread solo), poi
 le tre leve esatte. Numeri in
-`docs/MISURE.md` §Prefill su prompt lunghi. Prefill **1.05-1.08× a 512, 1.07-1.08× a 2048,
+`docs/MEASUREMENTS.md` §Prefill su prompt lunghi. Prefill **1.05-1.08× a 512, 1.07-1.08× a 2048,
 1.11-1.14× a 4000** (A/A 2.1%), decode non distinguibile (A/A 2.4%), logit identici al byte sul
 modello vero (600 posizioni un token per passata, passate da 64, prompt da 4000 a passate da 512 e
 da 100). `expf` nostro, la leva grande che resta, non è scritto: lo decide Marcello (domanda 37).
@@ -511,7 +511,7 @@ da 100). `expf` nostro, la leva grande che resta, non è scritto: lo decide Marc
   "$(pwd -W):/src" -w /src trochilus-dev:local sh tools/mutate_tune.sh` (mezz'ora; `-e ONLY=history`
   per le due della storia). La riga: `build/trochilus generate -m fixtures/tiny-olmoe/model-f32.gguf
   -p 20 -n 100 -t 8`. **Sul modello vero non è ancora misurato**: la validazione è il punto 0 di
-  `docs/STATO.md`, di notte a macchina quieta.
+  `docs/STATUS.md`, di notte a macchina quieta.
 
 ### 2026-09-20 — M1, prima di scrivere codice: la traccia del routing e il banco del disco
 
@@ -530,7 +530,7 @@ da 100). `expf` nostro, la leva grande che resta, non è scritto: lo decide Marc
   tools/route_trace_report.py --check` (in `make lint`). I numeri: nel container `build/linux-gcc/trochilus
   run -m models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf -f bench/prompts/code-1000.txt -n 300 -t 8
   --decode-threads 8 --route-trace build/route/code-1000.bin`, poi il report su quel file; `make
-  bench-disk` in nativo a macchina ferma. Risultati in `docs/MISURE.md` §M1, prima di scrivere codice.
+  bench-disk` in nativo a macchina ferma. Risultati in `docs/MEASUREMENTS.md` §M1, prima di scrivere codice.
 
 ### 2026-09-20 — M1, lotti 1 e 2: gli esperti passano per un archivio con un budget di RAM
 
@@ -558,7 +558,7 @@ da 100). `expf` nostro, la leva grande che resta, non è scritto: lo decide Marc
   più del modello, e la riga `expert mask:` lo dice); `tools/route_graph_report.py` (copertura,
   grafo statico, ripetizioni, tabella per id, margini, `--compare`, `--mask-from` anche a caso);
   `tools/mask_quality.sh` (KL e token contro il modello intero); `tools/mutate_reports.py`; prompt
-  `bench/prompts/trace-{c2,py,sh,prose-it,prose-en}.txt`. Risultati in `docs/MISURE.md`.
+  `bench/prompts/trace-{c2,py,sh,prose-it,prose-en}.txt`. Risultati in `docs/MEASUREMENTS.md`.
 - **Come si prova**: `tests/test_route.c` (id dei token, margini esatti contro lo stesso modello
   con un esperto in più per token, maschera mai scelta e per layer, vuota e tolta = il modello);
   `tools/.venv/Scripts/python.exe tools/route_graph_report.py --check` e `tools/mutate_reports.py`
@@ -586,20 +586,20 @@ da 100). `expf` nostro, la leva grande che resta, non è scritto: lo decide Marc
 
 Le misure di M1 sul modello vero, a macchina ferma: `experts_budget.sh measure | misses | long |
 direct` (`build/experts_budget/`) e `mask_quality.sh` sui tre testi che mancavano
-(`build/mask/quality.txt`). Numeri e conclusioni in `docs/MISURE.md` §M1 misurato e §Il
-comportamento sul codice, decisioni in `docs/STATO.md`. In breve: il costo di M1 è il **prompt**
+(`build/mask/quality.txt`). Numeri e conclusioni in `docs/MEASUREMENTS.md` §M1 misurato e §Il
+comportamento sul codice, decisioni in `docs/STATUS.md`. In breve: il costo di M1 è il **prompt**
 (ogni sessione rilegge il modello intero, ~4.3 s di disco), un token generato costa 0.03-0.6 unità,
 il decode a generazione lunga sta a 0.87-0.90× del modello residente, e la cache del sistema
 gonfierebbe il prefill di 2.42×. La simulazione della domanda 14 (22.4 unità per token) rispondeva
 a un'altra domanda: LEZIONI #98.
 
 Nuovi: `tools/experts_budget.sh long` (200 contro 1000 token generati, contesto 1600) con
-`experts_steady.awk` parametrizzato (`-v short_n= -v gap=`); `tools/check_misure.py`, agganciato a
+`experts_steady.awk` parametrizzato (`-v short_n= -v gap=`); `tools/check_measurements.py`, agganciato a
 `lint` quindi a `make check`: una riga di MISURE che dà un numero da simulazione o da modello a
 tempo deve portare il tag «modello, non misura» (o «modello superato dalla misura» se è storia), e
 una domanda tagliata col primo tag non può essere barrata come chiusa.
 
-- **Come si prova**: `tools/.venv/Scripts/python.exe tools/check_misure.py` (verde; togliere un tag
+- **Come si prova**: `tools/.venv/Scripts/python.exe tools/check_measurements.py` (verde; togliere un tag
   a una delle righe taggate di MISURE lo fa fallire, e barrare la domanda 43 lo fa fallire con
   l'altra regola). Le misure si ripetono con gli stessi comandi: servono un'ora o due di macchina
   ferma, e ogni sessione dichiara il carico di fondo nel log.
@@ -614,7 +614,7 @@ di riscaldamento, ordine a rotazione, macchina ferma, guardie delle altre misure
 Il conto ha trovato dell'altro: a 2048 token l'archivio legge 22 880 MiB, 3.5 volte la tabella
 degli esperti, una volta per passata da 512 token. Con una passata sola: 6 273 MiB e 11.27 s
 contro 23.51 (2.09×), calcolo invariato, ultima riga di logit identica al byte. Numeri e leve in
-`docs/MISURE.md` §Il prefill legge il modello una volta per passata, priorità in `docs/STATO.md`,
+`docs/MEASUREMENTS.md` §Il prefill legge il modello una volta per passata, priorità in `docs/STATUS.md`,
 lezione #99. Il codice del motore non è stato toccato.
 
 - **Come si prova**: `TROCHILUS=<binario> sh tools/prefill_overlap.sh 5` (~20 minuti, macchina
@@ -624,21 +624,21 @@ lezione #99. Il codice del motore non è stato toccato.
 
 ### 2026-09-21 — La mappa del progetto, il glossario, e il CLAUDE.md rimesso in misura
 
-`docs/stato.json` tiene lo stato del progetto come dato: le tappe M0-M6, un blocco per pezzo con
+`docs/status.json` tiene lo stato del progetto come dato: le tappe M0-M6, un blocco per pezzo con
 stato (fatto / in corso / prossimo / aperto), cosa vuol dire in parole semplici, i numeri misurati
-con la data, le domande di MISURE collegate, i file, i comandi e le dipendenze. `tools/stato_html.py`
+con la data, le domande di MISURE collegate, i file, i comandi e le dipendenze. `tools/status_html.py`
 ne fa una pagina sola (colonne per tappa, frecce fra i blocchi, pannello al clic), pubblicata come
-artifact `6mx3NS4KtQrBFPRLkAYupr`. `docs/glossario.json` spiega da zero 38 parole chiave (LRU, KV,
+artifact `6mx3NS4KtQrBFPRLkAYupr`. `docs/glossary.json` spiega da zero 38 parole chiave (LRU, KV,
 prefill, quantizzare, tier, oracolo, mutazione, KL...): nel pannello ogni parola riconosciuta
 diventa cliccabile e apre un fumetto con i termini imparentati.
 
 Il `CLAUDE.md` era fuori dai tetti (169 righe, 12.1 KB): i comandi interi sono passati a
-`docs/COMANDI.md` senza cancellarne nessuno, nella mappa restano quelli di ogni giorno, ed è
+`docs/COMMANDS.md` senza cancellarne nessuno, nella mappa restano quelli di ogni giorno, ed è
 tornato a 136 righe / 8.5 KB, timbrato con l'impronta delle preferenze. Nella tabella «prima di
 ogni commit» c'è ora la riga che tiene viva la mappa: un passo chiuso o una decisione si scrivono
-anche in `docs/stato.json`, e l'artifact si rigenera e si ripubblica sullo stesso URL.
+anche in `docs/status.json`, e l'artifact si rigenera e si ripubblica sullo stesso URL.
 
-- **Come si prova**: `tools/.venv/Scripts/python.exe tools/stato_html.py` scrive
+- **Come si prova**: `tools/.venv/Scripts/python.exe tools/status_html.py` scrive
   `build/stato/index.html` (deve dire quanti blocchi sono fatti e quante voci di glossario);
   `node ~/.claude/hooks/misura-claude-md.cjs CLAUDE.md` per i tetti della mappa.
 
@@ -655,7 +655,7 @@ a budget pieno, e con `--route-trace`, resta quello di prima.
 
 Misura (`sh tools/prefill_overlap.sh 5`, macchina ferma): a prompt 2048 e budget 50%, **6 273 MiB
 letti invece di 22 880 e 12.41 s invece di 23.51 (1.89×)**, calcolo non distinguibile. A 512 niente
-cambia. Numeri in `docs/MISURE.md` §Il prefill legge il modello una volta per passata.
+cambia. Numeri in `docs/MEASUREMENTS.md` §Il prefill legge il modello una volta per passata.
 
 - **Come si prova**: `make check` (il caso `once_per_prompt` di `tests/test_stream.c` conta le unità
   lette per un prompt di 36 token in passate da 12 e vuole al massimo `n_units + n_slots`; rosso
@@ -669,7 +669,7 @@ generati, contesto 1600, due giri, macchina ferma dopo aver chiuso una chat rima
 modello residente il tempo per token non migliora da 200 a 1000 (34.64 → 33.48 tok/s, spread
 4-7%), sotto budget sì (29.21 → 30.79 al 50%, 26.53 → 29.84 al 25%). Il costo fisso di ~0.35 s e
 ~0.84 s esiste solo quando si legge dal disco: è la LRU che si riassesta dopo il prompt, non i
-kernel che si scaldano né il contatore del decode. Numeri in `docs/MISURE.md` §M1 misurato punto 3,
+kernel che si scaldano né il contatore del decode. Numeri in `docs/MEASUREMENTS.md` §M1 misurato punto 3,
 domanda 46 ristretta a «dove va il resto» (i mancati spiegano ~115 ms su 840).
 
 - **Come si prova**: `sh tools/experts_budget.sh long` (~30 minuti, macchina ferma; prima
@@ -701,9 +701,9 @@ README non li nomina.
 I due documenti DeepSeek in `docs/` (report di terzi) entrano in `.gitignore`: non sono nostri e
 non devono finire in un repo che può diventare pubblico.
 
-- **Come si prova**: `cat README.md`; i numeri citati stanno in `docs/MISURE.md` (§Prefill su
+- **Come si prova**: `cat README.md`; i numeri citati stanno in `docs/MEASUREMENTS.md` (§Prefill su
   prompt lunghi, §Decode a contesto lungo, §M1 misurato, §Velocità — Trochilus contro llama.cpp)
-  e in `docs/STATO.md`; `git check-ignore -v docs/DeepSeek_V41_Tech_Report.md` deve rispondere.
+  e in `docs/STATUS.md`; `git check-ignore -v docs/DeepSeek_V41_Tech_Report.md` deve rispondere.
 
 ### 2026-09-22 — Logo tondo e intestazione del README
 
@@ -716,3 +716,28 @@ logo, con la nota che il logo è alla prima iterazione, e in testa la nota che a
 e verrà rifinito e sfoltito.
 
 - **Come si prova**: aprire `assets/logo.png`, e il README su GitHub.
+
+### 2026-09-22 — English file names across the repository
+
+Marcello: no file in the repository carries an Italian name, and the contents follow in English.
+This step is the names and every reference to them; the contents are the next step.
+
+Renamed with `git mv`: `docs/ARCHITETTURA.md` → `ARCHITECTURE.md`, `STATO` → `STATUS`,
+`MISURE` → `MEASUREMENTS`, `LEZIONI` → `LESSONS`, `ORIGINI` → `ORIGINS`, `COMANDI` → `COMMANDS`,
+`docs/archivio/FATTO.md` → `docs/archive/DONE.md`, `stato.json` → `status.json`,
+`glossario.json` → `glossary.json`, `tools/check_misure.py` → `check_measurements.py`,
+`tools/stato_html.py` → `status_html.py`, and the two hooks
+(`documenta-prima-del-commit.cjs` → `document-before-commit.cjs`,
+`niente-barre-in-scritture-shell.cjs` → `no-backslashes-in-shell-writes.cjs`).
+
+97 tracked files were rewritten to point at the new names: sources, tests, tools, `Makefile`,
+`CLAUDE.md`, `.claude/settings.json` and the hooks themselves. **`bench/prompts/` and
+`bench/results/` were deliberately left alone**: those bytes are the input and the output of a
+measurement, not a reference, and editing them would invalidate every comparison made with them.
+
+Two things the sweep taught us, both now in LESSONS: `pathlib.write_text` on Windows turns every
+`\n` into `\r\n` (97 files came back with CRLF, caught by lint), and the rename alone pushed
+`docs/STATUS.md` past its 40 KB cap, because the English names are longer than the Italian ones.
+
+- **How to check it**: `tools/.venv/Scripts/python.exe tools/lint.py` is green, and
+  `git grep -l 'STATO.md|LEZIONI.md|MISURE.md|docs/archivio'` matches only `bench/prompts/`.

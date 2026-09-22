@@ -1,6 +1,6 @@
 /* experts.c — the expert store: RAM-resident units backed by on-demand reads from disk, one
  * doubly linked LRU list holding every slot (free slots at the cold end) and an O(1) unit -> slot
- * index (see experts.h for the contract; docs/ARCHITETTURA.md "Esecuzione" Esperti (M1)). */
+ * index (see experts.h for the contract; docs/ARCHITECTURE.md "Esecuzione" Esperti (M1)). */
 #include "experts.h"
 
 #include <stdio.h>

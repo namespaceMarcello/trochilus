@@ -1,6 +1,6 @@
 # cpu_busy.ps1 [seconds] [-Top] -- how many logical processors are busy, machine wide.
 #
-# A measurement "on a still machine" has to ask the machine (docs/LEZIONI.md #84: four forgotten
+# A measurement "on a still machine" has to ask the machine (docs/LESSONS.md #84: four forgotten
 # `yes` processes ran at 100% for 37 hours under every native measurement of two days, and no
 # script looked). Prints one number: the logical processors busy on average over the window, from
 # two raw samples of the idle counter (class and property names are not localized, unlike the

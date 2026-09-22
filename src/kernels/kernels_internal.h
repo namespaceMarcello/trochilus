@@ -75,7 +75,7 @@ const tr_kernels *tr_kernels_x86_tier(const char *tier);
 /* Tests only: makes k the active table; NULL goes back to the tier tr_kernels_init chooses.
  * The engine reads the active table at every matmul and every attention, so a test can wrap a
  * tier's kernels with counters and see which ones a model really runs
- * (tests/test_tier_used.c, docs/LEZIONI.md #78). Never while a forward pass is running. */
+ * (tests/test_tier_used.c, docs/LESSONS.md #78). Never while a forward pass is running. */
 void tr_kernels_set_active(const tr_kernels *k);
 
 #endif

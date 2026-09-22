@@ -1,11 +1,11 @@
 #!/bin/sh
-# Builds llama.cpp (ref/llama.cpp, commit in docs/ORIGINI.md) for the CPU and the reference
+# Builds llama.cpp (ref/llama.cpp, commit in docs/ORIGINS.md) for the CPU and the reference
 # program tools/llamacpp_logits.c against it. Runs in the trochilus-dev container:
 #   MSYS_NO_PATHCONV=1 docker run --rm -v "$PWD:/src" -w /src trochilus-dev:local sh tools/build_llamacpp.sh
 # Output: ref/llama.cpp/build-trochilus/bin/{llamacpp_logits,llama-tokenize,llama-bench}
 set -e
 # The body is one function, called on the last line: the shell parses all of it before it runs
-# any, so editing this file while it runs cannot change a run under way (docs/LEZIONI.md #69).
+# any, so editing this file while it runs cannot change a run under way (docs/LESSONS.md #69).
 main() {
 . tools/cleanup.lib
 trap cleanup_children EXIT

@@ -10,7 +10,7 @@ Macchina di riferimento per le misure: portatile Ryzen 9 7940HX, 31 GB RAM, RTX 
 NVMe 1 TB. Limite basso da tenere vivo: solo CPU, 16 GB, niente GPU.
 
 Prende da colibri (CPU vera, disco, test esatti) e da ds4 (GPU, formato, cache KV su disco).
-Da dove viene ogni file portato: `docs/ORIGINI.md`.
+Da dove viene ogni file portato: `docs/ORIGINS.md`.
 
 ## Principi
 
@@ -53,7 +53,7 @@ istruzioni, assembly), a due condizioni verificate da strumenti, non a occhio:
 - **guadagna davvero**: il benchmark (mediana di almeno 5 run, macchina a regime) la trova più
   veloce di più del rumore misurato su quel benchmark. Sotto il rumore non è un guadagno.
 
-Ogni tentativo, riuscito o scartato, va in `docs/MISURE.md` con il numero: uno scartato oggi
+Ogni tentativo, riuscito o scartato, va in `docs/MEASUREMENTS.md` con il numero: uno scartato oggi
 non si riprova domani senza un motivo nuovo.
 
 **Sotto l'assembly.** Il codice macchina scritto a mano non aggiunge niente all'assembly, che è già
@@ -77,10 +77,10 @@ I dati decidono dove si lavora. Tre livelli, dal più fine al più largo:
 Il profiler non è globale (vive nella sessione), costa un solo salto condizionato quando è spento,
 e usa il contatore della CPU (RDTSC con TSC invariante, altrimenti il clock del sistema). I
 risultati della suite vanno in `bench/results/<data>-<commit>-<macchina>.json`; il riassunto e
-le decisioni che ne escono in `docs/MISURE.md`.
+le decisioni che ne escono in `docs/MEASUREMENTS.md`.
 
 Una misura nativa vale quanto la macchina su cui gira, e la macchina si interroga, non si presume
-(`docs/LEZIONI.md` #84-#88: quattro processi dimenticati sotto due giorni di misure):
+(`docs/LESSONS.md` #84-#88: quattro processi dimenticati sotto due giorni di misure):
 
 | Regola | Controllo |
 |---|---|
@@ -106,7 +106,7 @@ Regole della zona calda, ognuna con il suo controllo:
 | niente `pow`, `sin`, `cos`, `log` per elemento: si calcolano una volta in tabella | `tools/lint.py` |
 | niente `expf`/`exp` della libreria C: l'esponenziale è `tr_expf` (`src/kernels/expf.c`), arrotondato correttamente su ogni float, gli stessi bit su ogni piattaforma, nessuna chiamata alla libreria dentro | `tools/lint.py`; `make bench-expf` lo prova su tutti i 2^32 float, in `make check` con gcc e clang; `tests/test_expf.c`; `tools/mutate_expf.sh` |
 | stessi logit con ogni numero di thread e con il profiler acceso | `tests/test_hot.c` (pool da 1, 2, 3, 8 thread) |
-| ogni ottimizzazione misurata prima e dopo, tenuta solo sopra il rumore | riga in `docs/MISURE.md` §Tentativi |
+| ogni ottimizzazione misurata prima e dopo, tenuta solo sopra il rumore | riga in `docs/MEASUREMENTS.md` §Tentativi |
 
 Un'eccezione si scrive sulla riga stessa, con il motivo: `/* hot-ok: pow -- motivo */`. Il lint
 la rifiuta quando la riga non usa più quel nome. I commenti non costano niente a runtime (stesso
@@ -127,8 +127,8 @@ codice macchina con e senza, verificato): nella zona calda restano quelli che sp
 | `src/format/` | lettore GGUF v3, tabella dei tipi, metadati | ds4 `parse_metadata` / `parse_tensors`, senza gli agganci per architettura |
 | `src/kernels/` | kernel CPU per tipo quantizzato: scalare + AVX2 + AVX-512 (+VNNI) + NEON, tabella di dispatch | colibri `quant.h`, `expert_ffn.h`; ds4 riferimenti K-quant |
 | `src/backend/` | interfaccia backend (tensori residenti sul dispositivo, grafo per token) e backend CPU | ds4 `ds4_gpu.h` (modello di esecuzione), ridotto alle primitive generiche |
-| `src/memory/` | archivio degli esperti (M1: RAM / disco; VRAM alla M3): unità (layer, esperto), slot allocati una volta, indice diretto e LRU O(1), letture a richiesta dal GGUF | idee: colibri `olmoe.c` (indice esperto → slot, esperto in un solo slot), ds4 streaming; scelte dalle nostre misure (`docs/MISURE.md` §M1): LRU e non pin dall'uso, niente pool di I/O, niente precaricamento su dischi lenti; codice nuovo |
-| `src/kv/` | cache KV `[layer][testa][posizione]`: le posizioni di una testa in fila, perché l'attenzione le legga alla banda della RAM (`docs/MISURE.md` §Decode a contesto lungo); poi riuso del prefisso, checkpoint su disco con punteggio a decadimento | layout: codice nuovo, dalle misure; idee per il resto: colibri `kv_prefix.h`, `kv_fp8.h`; ds4 `ds4_kvstore.c` |
+| `src/memory/` | archivio degli esperti (M1: RAM / disco; VRAM alla M3): unità (layer, esperto), slot allocati una volta, indice diretto e LRU O(1), letture a richiesta dal GGUF | idee: colibri `olmoe.c` (indice esperto → slot, esperto in un solo slot), ds4 streaming; scelte dalle nostre misure (`docs/MEASUREMENTS.md` §M1): LRU e non pin dall'uso, niente pool di I/O, niente precaricamento su dischi lenti; codice nuovo |
+| `src/kv/` | cache KV `[layer][testa][posizione]`: le posizioni di una testa in fila, perché l'attenzione le legga alla banda della RAM (`docs/MEASUREMENTS.md` §Decode a contesto lungo); poi riuso del prefisso, checkpoint su disco con punteggio a decadimento | layout: codice nuovo, dalle misure; idee per il resto: colibri `kv_prefix.h`, `kv_fp8.h`; ds4 `ds4_kvstore.c` |
 | `src/tokenizer/` | BPE byte-level dai metadati GGUF (famiglie di pretokenizer ammesse solo con oracolo), NFC e classi Unicode sondate da HF `tokenizers`, template di chat per architettura | idee: colibri `tok.h` (regex rigiocata in C), ds4 `vocab_load` (dal GGUF); codice nuovo |
 | `src/models/` | un grafo per famiglia, costruito dalle primitive | colibri `olmoe.c`, ds4 / colibri DeepSeek V4 |
 | `src/gen/` | come si sceglie il token dopo il modello: greedy, bozza dal prompt e verifica in una passata sola (poi campionamento e criteri di arresto) | idee: colibri `v4_ngram_draft`, llama.cpp `examples/lookup`; codice nuovo |
@@ -156,7 +156,7 @@ codice macchina con e senza, verificato): nella zona calda restano quelli che sp
   rifiuta (prova di apertura e una lettura allineata di saggio), si torna alla lettura normale e la
   riga `experts:` lo dice. Un solo percorso: col budget che copre tutto, l'archivio si riempie al caricamento e
   non manca mai niente, che è il motore di prima. Gli stessi byte negli stessi kernel: i logit
-  sono identici al byte con qualunque budget, e il test lo pretende. Perché così (`docs/MISURE.md`
+  sono identici al byte con qualunque budget, e il test lo pretende. Perché così (`docs/MEASUREMENTS.md`
   §M1): l'LRU batte il pin dall'uso a ogni capacità; il disco dà la stessa banda a uno e a otto
   lettori, quindi niente thread di I/O finché non c'è qualcosa da sovrapporre; senza una previsione
   non c'è niente da sovrapporre, e la previsione (il router del layer dopo, 92-95%) su un disco da
@@ -189,14 +189,14 @@ codice macchina con e senza, verificato): nella zona calda restano quelli che sp
   stessi con e senza speculazione: è velocità, mai un risultato diverso.
 - **Thread**: pool persistente dimensionato sui **core fisici** (colibri: +2.3x su Zen 3 contro i
   core logici), `parallel_for` su intervalli di righe. Contarli non basta: se non si fissano ai core,
-  Windows ne appoggia due sullo stesso core fisico e il prefill perde il 30% (`docs/MISURE.md`
+  Windows ne appoggia due sullo stesso core fisico e il prefill perde il 30% (`docs/MEASUREMENTS.md`
   §Dove vanno i thread). **Thread per fase**: una passata lunga (il prompt) è limitata dal calcolo e
   usa tutto il pool; una passata corta (decode, bozza corta: fino a 4 righe) è limitata dalla lettura
   dei pesi e usa i primi n slot del pool. n non è una costante: ogni sessione lo **misura** sulle sue
   prime passate da un token (tutto il pool, metà, un quarto, mai sotto 4 thread), tiene la più
   stretta entro il rumore misurato in quelle stesse passate, rimisura a ogni raddoppio del contesto
   e cambia solo dopo due misure concordi; `--decode-threads` lo forza. La larghezza cambia
-  la velocità, mai un logit (`docs/MISURE.md` §Thread per fase).
+  la velocità, mai un logit (`docs/MEASUREMENTS.md` §Thread per fase).
 - **GPU**: tutto il token in un solo lotto di comandi, tensori che restano sul dispositivo (ds4).
 - **KV**: in memoria per sessione; riuso del prefisso per id di token; checkpoint su disco con
   punteggio `(hit decaduti + 1) × token / byte` (ds4).

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""route_graph_report.py — docs/MISURE.md domanda 44: is the model's behaviour on code a small,
+"""route_graph_report.py — docs/MEASUREMENTS.md domanda 44: is the model's behaviour on code a small,
 deterministic graph? From traces written by `trochilus run ... --route-trace <file>`
 (tools/route_trace_report.py reads the format; version 2 adds token ids and router margins).
 

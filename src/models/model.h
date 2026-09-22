@@ -6,7 +6,7 @@
  * Each architecture ("olmoe", ...) implements tr_arch_vtable in src/models/<arch>.c
  * and is listed in src/models/model.c.
  *
- * Not quite immutable any more (docs/ARCHITETTURA.md Esperti M1): an architecture with a shared
+ * Not quite immutable any more (docs/ARCHITECTURE.md Esperti M1): an architecture with a shared
  * expert store (src/memory/experts.h) refreshes which units are resident on every forward pass,
  * under a budget smaller than every expert. Like the pool, this makes one evaluation at a time
  * per model the rule -- already true today, since sessions of the same model already share it. */
@@ -50,7 +50,7 @@ typedef struct tr_session tr_session;
  * exercised without a machine actually short on RAM; the memory guard that refuses an unsafe load
  * still queries the real machine, so safety never depends on it. TR_EXPERT_DIRECT=0 forces the
  * expert store to read through the ordinary buffered handle instead of trying an unbuffered one
- * first (docs/ARCHITETTURA.md Esperti M1, Step C), for the measurement that compares the two. */
+ * first (docs/ARCHITECTURE.md Esperti M1, Step C), for the measurement that compares the two. */
 tr_model *tr_model_load_budget(const char *path, tr_pool *pool, uint64_t expert_budget, char *err, size_t err_len);
 tr_model *tr_model_load(const char *path, tr_pool *pool, char *err, size_t err_len);
 void tr_model_free(tr_model *m);
@@ -58,7 +58,7 @@ const tr_model_info *tr_model_get_info(const tr_model *m);
 /* Snapshot of the shared expert store's counters (src/memory/experts.h); -1 if this model's
  * architecture keeps no such store. */
 int tr_model_expert_stats(const tr_model *m, tr_experts_stats *out);
-/* MEASUREMENT ONLY (docs/MISURE.md domanda 44): switches experts off. off is [n_layers][n_expert],
+/* MEASUREMENT ONLY (docs/MEASUREMENTS.md domanda 44): switches experts off. off is [n_layers][n_expert],
  * 1 = this expert is never chosen by its layer's router, which then takes the best of the
  * others; the softmax still runs over all of them. The output is no longer the model's own. NULL
  * clears the mask. -1 (nothing changes) if a layer would be left with fewer experts than a token
@@ -98,11 +98,11 @@ int64_t tr_session_max_logit_rows(const tr_session *s);
  * position n exactly as if only those n tokens had been evaluated. The logits are
  * not valid again until the next eval. -1 if n is out of range (nothing changes). */
 int tr_session_rewind(tr_session *s, int64_t n);
-/* The session's own profiler (docs/ARCHITETTURA.md §Profilazione), disabled by
+/* The session's own profiler (docs/ARCHITECTURE.md §Profilazione), disabled by
  * default: set ->enabled and ->phase to turn it on. Never NULL. */
 tr_prof *tr_session_prof(tr_session *s);
 
-/* ---- routing trace (docs/MISURE.md domande 13-15: does the next layer's router already know
+/* ---- routing trace (docs/MEASUREMENTS.md domande 13-15: does the next layer's router already know
  * what it will choose, and how much of the model would still need to come from disk) ----
  * Off by default and free when off: nothing changes until tr_session_route_trace_begin is
  * called. Once begun, every forward pass records its tokens' routing in evaluation order until
@@ -139,12 +139,12 @@ int tr_session_route_trace_begin(tr_session *s, int64_t max_tokens);
 /* NULL if tr_session_route_trace_begin was never called on this session. */
 const tr_route_trace *tr_session_route_trace(const tr_session *s);
 
-/* ---- threads per phase (docs/MISURE.md "Thread per fase") ----
+/* ---- threads per phase (docs/MEASUREMENTS.md "Thread per fase") ----
  * A long pass (a prompt) is bound by compute and runs on the whole pool. A short pass, of at
  * most TR_DECODE_ROWS tokens (decoding, a short draft to verify), is bound by reading the
  * weights: once the memory bus is full more threads only add waiting, and how many fill it is
  * a fact of the machine, not of the model. So it is measured, not configured, and the margin is
- * the noise measured in the passes themselves, never a constant (docs/LEZIONI.md #88: a fixed
+ * the noise measured in the passes themselves, never a constant (docs/LESSONS.md #88: a fixed
  * 1% was tuned on a machine contaminated by stray load and picked a different width on a quiet
  * one). The widths probed are the whole pool, half and a quarter (tr_pool_set_active: the first
  * slots, distinct cores), dropping any under 4 threads, narrowest first.
@@ -198,7 +198,7 @@ typedef struct {
     const char *arch;
     /* takes ownership of g, also on failure; expert_budget: see tr_model_load_budget. path: the
      * same file g was opened from, kept only so an architecture with a shared expert store can
-     * open a second, unbuffered handle on it (docs/ARCHITETTURA.md Esperti M1, Step C) -- not
+     * open a second, unbuffered handle on it (docs/ARCHITECTURE.md Esperti M1, Step C) -- not
      * retained beyond this call. */
     void *(*load)(const char *path, tr_gguf *g, tr_pool *pool, uint64_t expert_budget, char *err, size_t err_len);
     void (*free)(void *model);

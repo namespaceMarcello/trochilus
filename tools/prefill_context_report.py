@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """prefill_context_report.py — what tools/prefill_context.sh measured, as the tables of
-docs/MISURE.md §Prefill su prompt lunghi.
+docs/MEASUREMENTS.md §Prefill su prompt lunghi.
 
     prefill_context_report.py attn <bench_attn output> [...]
         per prompt length and thread count: ms of one layer's attention for every variant, and

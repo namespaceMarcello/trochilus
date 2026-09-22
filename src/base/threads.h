@@ -26,14 +26,14 @@ typedef void (*tr_range_fn)(void *ctx, int64_t begin, int64_t end, int worker);
  * own (tr_cpu()->slot, best placement first; free between the SMT siblings of that core, or
  * tied to the one logical processor with TR_POOL_PIN=1): left to itself Windows puts two of
  * 16 threads on one physical core and leaves cores idle, which costs 30% of the prefill
- * (docs/MISURE.md "Dove vanno i thread"). Threads beyond the last slot are not pinned. The
+ * (docs/MEASUREMENTS.md "Dove vanno i thread"). Threads beyond the last slot are not pinned. The
  * calling thread is put back where it was when the last live pool it created is destroyed,
  * in any order, provided tr_pool_destroy runs on the thread that called tr_pool_create.
  * Pinning is skipped where the platform or the topology does not allow it, and TR_POOL_PIN=0
  * turns it off for A/B measurements.
  *
  * Two pools alive at once take the same slots, first core first: used at the same time they
- * share cores and leave others idle (docs/LEZIONI.md #63, open). */
+ * share cores and leave others idle (docs/LESSONS.md #63, open). */
 tr_pool *tr_pool_create(int n_threads);
 void tr_pool_destroy(tr_pool *p);
 int tr_pool_size(const tr_pool *p);
@@ -42,7 +42,7 @@ int tr_pool_size(const tr_pool *p);
  * the first n slots of tr_cpu(), so on distinct physical cores spread over the last-level
  * caches. n outside [1, tr_pool_size] means all of them, which is how a pool starts. The
  * threads left out get no work and go to sleep. Work bound by memory bandwidth wants fewer
- * threads than work bound by compute (docs/MISURE.md "Thread per fase"); by the determinism
+ * threads than work bound by compute (docs/MEASUREMENTS.md "Thread per fase"); by the determinism
  * contract above the width changes the speed of a result, never the result. Called by the
  * thread that calls tr_parallel_for, between two calls and never from inside a body. */
 void tr_pool_set_active(tr_pool *p, int n);
@@ -53,7 +53,7 @@ int tr_pool_active(const tr_pool *p);
  * every chunk and returns when all are done. A call made from inside a body
  * runs serially on the calling thread, with the worker id of the body it was made
  * from: that id belongs to the outer pool, so a body may only nest calls on its own
- * pool (on another pool the id can exceed that pool's size, docs/LEZIONI.md #63).
+ * pool (on another pool the id can exceed that pool's size, docs/LESSONS.md #63).
  * p == NULL runs serially. Not reentrant from two unrelated threads on the same
  * pool: one job at a time per pool. */
 void tr_parallel_for(tr_pool *p, int64_t n, int64_t min_chunk, tr_range_fn fn, void *ctx);

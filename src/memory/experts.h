@@ -1,5 +1,5 @@
 /* experts.h — the expert store: which experts are in RAM, and the door to the disk for the
- * others (milestone M1, docs/ARCHITETTURA.md "Esecuzione", docs/MISURE.md "M1, prima di scrivere
+ * others (milestone M1, docs/ARCHITECTURE.md "Esecuzione", docs/MEASUREMENTS.md "M1, prima di scrivere
  * codice").
  *
  * A unit is one expert of one layer: its TR_EXPERT_PARTS matrices (gate, up, down), bytes exactly
@@ -13,7 +13,7 @@
  * and nothing is ever missing or evicted, which is the engine before M1. The same bytes reach the
  * same kernels whatever the budget, so no logit depends on it (tests/test_experts.c).
  *
- * Why this shape and not the one the sources have (measured, docs/MISURE.md): an LRU reads less
+ * Why this shape and not the one the sources have (measured, docs/MEASUREMENTS.md): an LRU reads less
  * than a pin learned from usage at every capacity; one reader gets the whole bandwidth of the
  * disk, eight get no more, so there is no I/O thread until there is something to overlap; and the
  * only thing to overlap would be a prefetch, which on a 1.5 GB/s disk costs more reads than it

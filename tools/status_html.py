@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""stato_html.py -- la mappa del progetto, da docs/stato.json a una pagina sola.
+"""status_html.py -- la mappa del progetto, da docs/status.json a una pagina sola.
 
-Il dato sta nel repo (docs/stato.json): tappe, blocchi, stato di ognuno, i numeri misurati con
-la data, le domande di docs/MISURE.md collegate, i file e i comandi. Questo script ne fa una
+Il dato sta nel repo (docs/status.json): tappe, blocchi, stato di ognuno, i numeri misurati con
+la data, le domande di docs/MEASUREMENTS.md collegate, i file e i comandi. Questo script ne fa una
 pagina autosufficiente in build/stato/index.html, che si pubblica come artifact.
 
-    tools/.venv/Scripts/python.exe tools/stato_html.py [--out build/stato/index.html]
+    tools/.venv/Scripts/python.exe tools/status_html.py [--out build/stato/index.html]
 
-Quando cambia docs/STATO.md cambia anche docs/stato.json: il generatore non inventa niente.
+Quando cambia docs/STATUS.md cambia anche docs/status.json: il generatore non inventa niente.
 """
 import argparse
 import json
@@ -15,8 +15,8 @@ import pathlib
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-DATA = ROOT / "docs" / "stato.json"
-GLOSSARIO = ROOT / "docs" / "glossario.json"
+DATA = ROOT / "docs" / "status.json"
+GLOSSARIO = ROOT / "docs" / "glossary.json"
 
 PAGE = """<title>Mappa di Trochilus</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -303,7 +303,7 @@ PAGE = """<title>Mappa di Trochilus</title>
   <footer class="fine">
     Un blocco alla volta: clicca per sapere cosa vuol dire, i numeri che abbiamo misurato e le
     domande aperte collegate. Le frecce dicono cosa aspetta cosa. La verità sta nel repo:
-    <code>docs/stato.json</code>, generata da <code>tools/stato_html.py</code>.
+    <code>docs/status.json</code>, generata da <code>tools/status_html.py</code>.
   </footer>
 </div>
 

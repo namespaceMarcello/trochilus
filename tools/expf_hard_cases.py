@@ -12,7 +12,7 @@ arithmetic, subnormals included, and compares.
     expf_hard_cases.py <file> [<file> ...]
 
 No difference: on those 2^32 arguments the reference IS the correctly rounded value, so a library
-whose expf agrees with it everywhere (MinGW-w64: docs/MISURE.md question 37) rounds correctly
+whose expf agrees with it everywhere (MinGW-w64: docs/MEASUREMENTS.md question 37) rounds correctly
 everywhere, and "zero differences from the library" for an expf of ours is a proof.
 """
 import struct

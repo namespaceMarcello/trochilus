@@ -1,6 +1,6 @@
 #!/bin/sh
-# threads_phase.sh — how many threads each phase wants (docs/MISURE.md §Thread per fase): native
-# Windows, still machine, rotating order, A/A control (tools/ab_modes.sh, docs/LEZIONI.md #66).
+# threads_phase.sh — how many threads each phase wants (docs/MEASUREMENTS.md §Thread per fase): native
+# Windows, still machine, rotating order, A/A control (tools/ab_modes.sh, docs/LESSONS.md #66).
 # Run from the repo root in Git Bash. Results in build/threads_phase/.
 #
 #   sh tools/threads_phase.sh sweep [rounds]
@@ -23,10 +23,10 @@
 #
 # The containers of the other projects are stopped for the duration and started again at the end,
 # also when the script fails or is interrupted. A binary Smart App Control still blocks
-# (docs/LEZIONI.md #12) is waited for, never rebuilt: a rebuild starts the wait again.
+# (docs/LESSONS.md #12) is waited for, never rebuilt: a rebuild starts the wait again.
 set -e
 # The body is one function, called on the last line: the shell parses all of it before it runs
-# any, so editing this file while it runs cannot change a run under way (docs/LEZIONI.md #69).
+# any, so editing this file while it runs cannot change a run under way (docs/LESSONS.md #69).
 main() {
 WHAT=$1
 B=build/trochilus.exe
@@ -50,7 +50,7 @@ wait_runs() {
     sleep 60
   done
 }
-# one measurement at a time, and the machine stays awake while it lasts (docs/LEZIONI.md #82)
+# one measurement at a time, and the machine stays awake while it lasts (docs/LESSONS.md #82)
 . tools/measure_guard.lib
 measure_begin threads_phase
 trap measure_end EXIT
@@ -62,19 +62,19 @@ RUNNING=$(docker ps -q 2>/dev/null || true)
 restart() { measure_end; if [ -n "$RUNNING" ]; then docker start $RUNNING > /dev/null 2>&1 || true; echo "containers started again"; fi; }
 trap restart EXIT
 if [ -n "$RUNNING" ]; then
-  # the VM's file cache goes back to Windows first (docs/LEZIONI.md #38), then everything stops
+  # the VM's file cache goes back to Windows first (docs/LESSONS.md #38), then everything stops
   MSYS_NO_PATHCONV=1 docker run --rm --privileged trochilus-dev:local sh -c "sync; echo 3 > /proc/sys/vm/drop_caches" || true
   docker stop $RUNNING > /dev/null
   echo "containers stopped: $(echo $RUNNING | wc -w)"
 fi
 # from here on a running container, or a CPU busy with other work, means somebody else is using
-# the machine: ab_modes.sh stops at the next run instead of going on (docs/LEZIONI.md #73, #84)
+# the machine: ab_modes.sh stops at the next run instead of going on (docs/LESSONS.md #73, #84)
 AB_GUARD=$MEASURE_AB_GUARD
 export AB_GUARD
 
 # The model takes 7 GiB and the memory guard wants 3 more left free. After a `make check` Windows
 # needs minutes to take back what the VM has released: a measurement started at once stops at its
-# first run with "not enough memory" (docs/LEZIONI.md #72). Up to 15 minutes, one look every 30 s.
+# first run with "not enough memory" (docs/LESSONS.md #72). Up to 15 minutes, one look every 30 s.
 TRY=0
 while :; do
   AVAIL=$($B cpu 2>&1 | sed -n 's/^ram: .* total, \([0-9]*\)\.[0-9]* GiB available.*/\1/p')

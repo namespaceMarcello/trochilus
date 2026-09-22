@@ -1,5 +1,5 @@
 {
-  "nota": "Le parole che ricorrono nella mappa del progetto, spiegate da zero. Ogni voce: alias da riconoscere nel testo, titolo, spiegazione, e i termini collegati. Le usa tools/stato_html.py.",
+  "nota": "Le parole che ricorrono nella mappa del progetto, spiegate da zero. Ogni voce: alias da riconoscere nel testo, titolo, spiegazione, e i termini collegati. Le usa tools/status_html.py.",
   "voci": [
     {
       "id": "token",

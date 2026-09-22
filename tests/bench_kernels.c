@@ -5,7 +5,7 @@
  *   - the reported value is the median; `spread` is (max - min) / median of those runs,
  *     the noise floor of that line on this machine at this moment;
  *   - an optimization counts only if it moves the median by more than the spread.
- * The whole benchmark stays well under 60 seconds (docs/ARCHITETTURA.md, safety).
+ * The whole benchmark stays well under 60 seconds (docs/ARCHITECTURE.md, safety).
  *
  *   bench_kernels [--runs N] [--ms M] [--threads T]
  *
@@ -65,7 +65,7 @@ static void fill_row(tr_type type, uint8_t *row, int64_t n) {
     }
 }
 
-/* ---- candidate: int8 x int8 with VNNI (docs/MISURE.md question 21) --------
+/* ---- candidate: int8 x int8 with VNNI (docs/MEASUREMENTS.md question 21) --------
  *
  * Not a kernel and not a tier: a measurement. Quantizing the activations to int8 is a
  * different number from the float dot, so this can never be one of our bit-identical
@@ -137,7 +137,7 @@ static float dot_q8_q8_vnni(const uint8_t *row, const int8_t *xq, const float *x
     return _mm_cvtss_f32(s) - corr;
 }
 
-/* ---- question 21, second take (docs/LEZIONI.md #65) ------------------------------------
+/* ---- question 21, second take (docs/LESSONS.md #65) ------------------------------------
  * The candidate above is one row against ONE token, with a scalar half->float and a scalar
  * correction chain inside the loop, and it was compared with our one-token float dot: +1-8%,
  * "lever 2 is not worth writing". But the kernel the prefill really runs is one row against
@@ -380,7 +380,7 @@ static void measure_quant(const float *x, int64_t n, int8_t *q, float *d, int ru
 
 /* The four kernels of the second take on one weight row, run ALTERNATELY (a b c d a b c d ...):
  * a comparison measured one kernel after the other moves with the temperature of the core
- * (docs/LEZIONI.md #46). ns are per input row, so the lines compare directly. */
+ * (docs/LESSONS.md #46). ns are per input row, so the lines compare directly. */
 enum { CAND_X4_FLOAT = 0, CAND_VNNI256_X4, CAND_VNNI512_X4, CAND_X8_FLOAT, CAND_COUNT };
 
 typedef struct {
