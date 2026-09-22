@@ -19,6 +19,8 @@
 .claude/worktrees/
 __pycache__/
 /tools/.venv/
+# documenti di terze parti (report DeepSeek): non sono nostri, fuori da git
+/docs/DeepSeek*
 # risultati di profilazione da un albero sporco (i risultati puliti restano in git come storico)
 /bench/results/*-dirty-*
 /bench/results/speed-*

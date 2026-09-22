@@ -674,3 +674,22 @@ domanda 46 ristretta a «dove va il resto» (i mancati spiegano ~115 ms su 840).
 
 - **Come si prova**: `sh tools/experts_budget.sh long` (~30 minuti, macchina ferma; prima
   `sh tools/orphans.sh` deve essere pulito). Risultati in `build/experts_budget/steady-long.txt`.
+
+### 2026-09-22 — `README.md` in inglese: dove siamo, cosa manca, di cosa ci vantiamo
+
+Primo documento del repo rivolto a chi non lavora qui dentro (i `docs/` restano in italiano).
+Dice in ordine: cos'è il motore e per quale macchina, cosa funziona oggi, i numeri misurati
+(prefill 306-315 / 303-308 / 276 tok/s e decode 38.9 / 35.5 / 27.5 / 20.9 a contesto
+32/512/2048/4000, M1 sotto budget, tokenizer 13× HF), le cinque cose di cui ci vantiamo con la
+prova accanto (esattezza come invariante provato, `tr_expf` esaustivo, speculazione bit-identica,
+un binario per ogni CPU, il metodo di misura e le ottimizzazioni scartate scritte), la tabella
+delle tappe M0-M6 con lo stato vero, **cosa manca** senza sconti (una sola famiglia, niente GPU,
+niente K-quant, NEON non scritto, solo greedy, il confronto con llama.cpp vecchio di un
+prefill 10× fa), l'obiettivo, build e comandi, la mappa dei `docs/` e la provenienza con NOTICE.
+
+I due documenti DeepSeek in `docs/` (report di terzi) entrano in `.gitignore`: non sono nostri e
+non devono finire in un repo che può diventare pubblico.
+
+- **Come si prova**: `cat README.md`; i numeri citati stanno in `docs/MISURE.md` (§Prefill su
+  prompt lunghi, §Decode a contesto lungo, §M1 misurato, §Velocità — Trochilus contro llama.cpp)
+  e in `docs/STATO.md`; `git check-ignore -v docs/DeepSeek_V41_Tech_Report.md` deve rispondere.
