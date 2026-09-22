@@ -704,3 +704,15 @@ non devono finire in un repo che può diventare pubblico.
 - **Come si prova**: `cat README.md`; i numeri citati stanno in `docs/MISURE.md` (§Prefill su
   prompt lunghi, §Decode a contesto lungo, §M1 misurato, §Velocità — Trochilus contro llama.cpp)
   e in `docs/STATO.md`; `git check-ignore -v docs/DeepSeek_V41_Tech_Report.md` deve rispondere.
+
+### 2026-09-22 — Logo tondo e intestazione del README
+
+Il logo (uccello sulla testa del coccodrillo, `Desktop\logo trochilus.jpg`) ritagliato in un disco:
+il cerchio è dimensionato sulla **distanza massima dell'inchiostro dal centro**, non sul riquadro,
+altrimenti coda e muso restano fuori (il soggetto è disposto in diagonale). Reso a 2048 px e
+ridotto a 512 per un bordo pulito, trasparente fuori dal disco. Sta in `assets/logo.png`; le
+varianti con anello e con ritaglio stretto in `build/logo/`. Titolo del README centrato sotto il
+logo, con la nota che il logo è alla prima iterazione, e in testa la nota che anche il README lo è
+e verrà rifinito e sfoltito.
+
+- **Come si prova**: aprire `assets/logo.png`, e il README su GitHub.

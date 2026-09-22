@@ -1,4 +1,10 @@
-# Trochilus
+<p align="center">
+  <img src="assets/logo.png" alt="Trochilus" width="170">
+</p>
+
+<h1 align="center">Trochilus</h1>
+
+<p align="center"><sub><em>First iteration of the logo. It will be revisited and will very likely change.</em></sub></p>
 
 An inference engine for Mixture-of-Experts models, written in C, with **no dependencies** — libc
 and the operating system's threads, nothing else. Kernels are chosen at runtime, so one binary
@@ -6,8 +12,11 @@ serves every CPU; the experts live on disk when they don't fit in RAM; and the r
 to the token**, verified against `transformers` in the gate.
 
 > **Status: pre-alpha, under active development.** One model family works end to end (OLMoE);
-> milestone M1, experts streamed from disk, is in progress. The engineering documents under
-> `docs/` are written in Italian; this README is the summary.
+> milestone M1, experts streamed from disk, is in progress.
+>
+> **This README is a first iteration too.** It will be refined, adjusted and recalibrated as the
+> project grows — including cutting whatever turns out to be redundant here, or beside the point
+> of what an open source repository is for. We will keep working to make it better.
 
 ---
 
