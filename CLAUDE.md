@@ -23,7 +23,8 @@ C11 + intrinsics (and assembly where measured), a Makefile, gcc/clang/MinGW-w64;
   `docs/STATUS.md`.
 - Logic and kernels: choose, build, deliver. Questions are asked up front, not halfway through.
 - **Marcello asks for the commit.** Prepare everything (tests green, documents written) and stop.
-- Private repository `namespaceMarcello/trochilus`: pushes and visibility are Marcello's call.
+- **Public repository** `namespaceMarcello/trochilus` (since 2026-09-22): everything committed is
+  visible to anyone. Pushes and visibility are Marcello's call.
 
 ### Keep it all under control: the cycle of every step
 

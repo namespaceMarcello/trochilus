@@ -40,6 +40,10 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
   Every exact optimization is tested thus: `trochilus logits` on the same tokens with the binary
   before and after, `cmp` of files.
 - 2026-09-17 — Private repository on GitHub (Marcello's request), first commit with all work so far.
+- 2026-09-22 — **The repository becomes public** (Marcello's request):
+  `github.com/namespaceMarcello/trochilus`. Checked before flipping: no model, no key and no
+  third-party report has ever been in the history, the largest object is a 174 KB document, and
+  `LICENSE` and `NOTICE` are at the root. From now on every commit is visible as it is pushed.
 - 2026-09-17 — **Correctness first, then speed** (Marcello): tokenizer, same tokens as
   llama.cpp on the real model, and speed comparison come before other optimizations; then
   block prefill, then memory and VNNI. Yes to llama.cpp download (source in `ref/`, build in
