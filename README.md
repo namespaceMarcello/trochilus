@@ -1,46 +1,61 @@
 # Trochilus
 
-An inference engine for Mixture-of-Experts models, written in C, with **no dependencies** —
-libc and the operating system's threads, nothing else. It runs on any CPU (kernels are picked at
-runtime, not at compile time), keeps the experts on disk when they don't fit in RAM, and produces
-results that are **exact to the token** against `transformers`.
-
-The target machine is an ordinary personal computer — 16-32 GB of RAM, a 4-8 GB GPU or none at
-all, an SSD — not a 128 GB workstation. The long-term goal is to run a model of hundreds of
-gigabytes on that machine, exactly, with no options to set.
-
-It is a new project, not a fork, but it does not pretend to have invented its own field: three
-engines were read line by line to build it — [colibri](https://github.com/JustVugg/colibri),
-[ds4](https://github.com/antirez/ds4) and [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp).
-What each one taught us, and what we send back to them, is in
-[What we read](#what-we-read-and-what-we-send-back).
+An inference engine for Mixture-of-Experts models, written in C, with **no dependencies** — libc
+and the operating system's threads, nothing else. Kernels are chosen at runtime, so one binary
+serves every CPU; the experts live on disk when they don't fit in RAM; and the result is **exact
+to the token**, verified against `transformers` in the gate.
 
 > **Status: pre-alpha, under active development.** One model family works end to end (OLMoE);
-> milestone M1 (experts streamed from disk) is in progress. See [Where we are](#where-we-are).
-> The engineering documents under `docs/` are written in Italian; this README is the summary.
+> milestone M1, experts streamed from disk, is in progress. The engineering documents under
+> `docs/` are written in Italian; this README is the summary.
 
 ---
 
-## What works today
+## Why
 
-- **OLMoE-1B-7B** (and any GGUF v3 file of the same family) loaded straight from Hugging Face —
+Running a model locally should depend on the computer someone already owns, not on the computer
+they would have to buy. That is the whole point of this project, and every decision in it answers
+to that:
+
+- **No minimum requirements page.** The scalar path is the definition of the engine, and AVX2,
+  AVX-512 or VNNI are accelerations chosen at runtime. A machine without any of them is slower;
+  it is never excluded.
+- **Nothing to install.** No CUDA toolkit, no BLAS, no Python, no OpenMP runtime. A compiler and
+  `make` produce a single binary that runs.
+- **The machine decides, not the user.** At startup the engine measures physical cores, CPU
+  instructions, free RAM and disk speed, and places the weights accordingly. Options exist to
+  force a choice for tests and measurements, never because someone has to set them.
+- **RAM should not decide which models you may run.** The dense part of the model stays resident
+  and the experts are read from disk under a budget, so model size stops being a wall.
+- **A smaller machine must not mean a worse answer.** The number of threads, the batch size, the
+  SIMD level and the expert budget change the speed and nothing else: the tokens are the same.
+  This is enforced by tests, not hoped for.
+- **It refuses to hurt the machine it runs on.** Before loading, the engine estimates memory and
+  declines if it would leave less than 2 GB or 10% of RAM free. It never swaps.
+
+## What we have done
+
+Working today, end to end:
+
+- **OLMoE-1B-7B** and any GGUF v3 file of the same family, loaded straight from Hugging Face with
   no conversion step. F32, F16 and Q8_0 weights.
-- CPU kernels dispatched at runtime: scalar, AVX2, AVX-512, AVX-512+VNNI. One binary for every
-  x86-64 machine. Every variant is **bit-identical** to the scalar one, and a test enforces it.
-- Byte-level BPE tokenizer read from the GGUF metadata, with NFC and Unicode classes: the same
+- CPU kernels dispatched at runtime — scalar, AVX2, AVX-512, AVX-512+VNNI — each variant
+  **bit-identical** to the scalar one, with a test that enforces it and another that proves the
+  tier you think is running is the one that ran.
+- A byte-level BPE tokenizer built from the GGUF metadata, with NFC and Unicode classes: the same
   tokens as Hugging Face `tokenizers`, at 22 MB/s.
-- `run` (raw text in, greedy generation out) and `chat` (the model's own chat template, written
-  in C, compared byte for byte against `apply_chat_template`).
-- Block prefill, prompt-driven speculative decoding, per-phase thread widths, a KV cache laid out
-  for the memory bus, and experts read from disk under a RAM budget.
-- A built-in profiler (`--profile`), microbenchmarks for memory, disk, attention and `expf`, and
-  a measurement harness that refuses to run on a busy machine.
+- `run` (text in, greedy generation out) and `chat` (the model's own chat template, written in C
+  and compared byte for byte against `apply_chat_template`).
+- Block prefill, prompt-driven speculative decoding, thread widths measured per phase, a KV cache
+  laid out for the memory bus, and experts read from disk under a RAM budget.
+- A built-in profiler, microbenchmarks for memory, disk, attention and `expf`, and a measurement
+  harness that refuses to run on a busy machine.
 
-## Measured
+### Measured
 
 Ryzen 9 7940HX (16 physical cores), 31 GB RAM, NVMe ~1.5 GB/s, Windows 11, native build, quiet
-machine, OLMoE-1B-7B Q8_0 resident in RAM. Every number is the median of N runs with the spread
-recorded; full tables and method in `docs/MISURE.md`.
+machine, OLMoE-1B-7B Q8_0 resident in RAM. Every number is the median of N runs with its spread
+recorded; the full tables and the method are in `docs/MISURE.md`.
 
 | Context | Prefill (tok/s) | Decode (tok/s) |
 |---|---|---|
@@ -51,106 +66,104 @@ recorded; full tables and method in `docs/MISURE.md`.
 
 With the experts streamed from disk instead of resident (M1, 512-token prompt): decode 35.5 /
 29.6 / 24.3 / 20.6 tok/s at 100 / 75 / 50 / 25% of the expert budget over 64 generated tokens,
-and 0.90x / 0.87x of the resident engine over 1000 tokens — **the budget barely matters once
-generation is long; the cost is the first prompt**, which has to read the whole model once
-(~4.7 s of disk).
+and 0.90x / 0.87x of the resident engine over 1000 tokens — **once generation is long the budget
+barely matters; what costs is the first prompt**, which reads the whole model once.
 
-Where the speed came from, each step measured with alternating runs and an A/A control:
+Where the speed came from. Each step was measured with alternating runs and an A/A control, and
+the ones that did not pay are written down too, in `docs/MISURE.md`, with their numbers:
 
 | Change | Effect |
 |---|---|
 | Thread pool with active waiting, one slot per thread | dispatch 53 µs → 1.5 µs at 16 threads |
 | One thread per **physical** core, spread across chiplets | prefill +30%, 8→16 cores 2.02x |
-| One weight row against 4 tokens in registers (`dot_row_x4`) | prefill +45% |
+| One weight row against 4 tokens in registers | prefill +45% |
 | KV laid out `[layer][head][position]` | decode 1.15-1.18x at 4000 tokens |
-| Attention in groups of 16 tokens, per-token work spread on the pool | prefill 1.11-1.14x at 4000 |
-| Our own `expf` instead of the C library's | prefill 1.29-1.31x at 4000, `attention` 2.3-2.6x shorter |
+| Attention in groups of 16 tokens, single-token work spread on the pool | prefill 1.11-1.14x at 4000 |
+| Our own `expf` in place of the C library's | prefill 1.29-1.31x at 4000, attention 2.3-2.6x shorter |
 | Layer-major prefill under a partial expert budget | 1.89x at 2048 tokens, 6 273 MiB read instead of 22 880 |
 
-Tokenizer, on 2.2 MB of code and prose: **13x** Hugging Face `tokenizers`, **36x**
-`llama-tokenize`, same tokens as Hugging Face.
+### What we are proud of
 
-## What we are proud of
-
-**Exactness is an invariant, not a hope.** The logits do not change when you change the number of
-threads, the batch size (`-b`), the SIMD tier, the expert budget, whether speculative decoding is
-on, or the operating system. Each one of those is a test in the gate, not a claim in a README.
-Windows and Linux produce the same logits **byte for byte** on the real model.
+**Exactness is an invariant, not a hope.** The logits do not move when you change the number of
+threads, the batch size, the SIMD tier, the expert budget, whether speculative decoding is on, or
+the operating system. Each of those is a test in the gate. Windows and Linux produce the same
+logits **byte for byte** on the real model.
 
 **Our `expf` is correctly rounded, and the proof is exhaustive.** `src/kernels/expf.c` is a
-64-entry table plus a polynomial, with the eight hard cases computed at 200 bits. `make bench-expf`
-checks **all 4 278 190 082 floats** against the reference, under gcc and under clang, and it runs
-in the gate. That is what made the two operating systems agree.
+64-entry table and a polynomial, with the eight hard cases computed at 200 bits. `make bench-expf`
+checks **all 4 278 190 082 float values** against the reference, under gcc and under clang, and it
+runs in the gate. That is what made the two operating systems agree to the byte.
 
 **Speculative decoding that cannot change the answer.** The draft comes from the text already in
-the context; verification is a single pass over 1 + k positions, and a row of a batch is bit for
-bit the same computation as a single-token pass — so the generated tokens are identical with and
-without speculation. It is speed, never a different result. None of the three engines we learned
-from proves that invariant; two of them restore a cache snapshot when a draft is rejected, which
-is both slower and weaker than a guarantee.
+the context, verification is a single pass over 1 + k positions, and every row of a pass is bit
+for bit the same computation as a single-token pass — so the generated tokens are identical with
+speculation and without it. It buys speed and can never buy a different result.
 
-**One binary, every CPU.** Kernels are chosen from `cpuid`/`hwcap` at runtime, never from
-`-march`. The scalar path is the definition; a SIMD variant that isn't bit-identical does not get
-merged. A test also proves the tier you think is running *is* the one running — equal numbers do
-not tell you which code executed.
+**No number comes from a single run.** Comparisons alternate A and B run by run, because measuring
+all of A and then all of B moves the result by 10-25% as the machine warms up — that mistake once
+cost us a good optimization, which is how we know. Every session carries an A/A control and a
+declared background load, and a difference smaller than the worst A/A of that session is written
+down as "not distinguishable".
 
-**No number comes from a single run.** Comparisons alternate A and B run by run (measuring all of
-A then all of B moves the result 10-25% as the machine heats up, and it once made us throw away a
-good optimization). Every session includes an A/A control and a background-load declaration;
-differences below the worst A/A of the session are written down as "not distinguishable".
-Optimizations that were tried and **rejected** are documented with their numbers, not deleted.
+**Every mistake becomes an automatic check.** `docs/LEZIONI.md` is the log: each entry names how
+it was found and the test, lint rule or gate check that now prevents it from coming back. The hot
+path — the code that runs on every token — is enforced by `tools/lint.py` and `tests/test_hot.c`:
+no allocation, no strings, no I/O.
 
-**Every mistake becomes an automatic check.** `docs/LEZIONI.md` is the log — each entry names how
-it was found and the test, lint rule or gate check that now prevents it. The hot path (code that
-runs on every token) is enforced by `tools/lint.py` and `tests/test_hot.c`: no allocation, no
-strings, no I/O.
-
-## Where we are
+## What we will do
 
 | Milestone | Content | State |
 |---|---|---|
 | **M0** | base, GGUF v3, converter (F32/F16/Q8_0), CPU backend with runtime dispatch, OLMoE graph, greedy, CLI, tokenizer, chat template | **done** — exact against `transformers` on Windows and Linux; the real OLMoE-1B-7B answers |
-| **M1** | experts from disk under a RAM budget: slot store, O(1) LRU, on-demand unbuffered reads, automatic plan | **in progress** — store, budget and layer-major prefill are done and measured; what remains is the cost of the first prompt (hide it behind the user's typing, or keep a store that outlives the session) and overlapping disk with compute |
-| M2 | K-quants (Q4_K, Q6_K, Q2_K, IQ2_XXS), assembly lab | not started |
-| M3 | CUDA module, hot experts in VRAM, VRAM + RAM + disk plan | not started |
-| M4 | DeepSeek V4 Flash | not started |
-| M5 | KV checkpoints on disk, server (OpenAI / Anthropic APIs), speculative decoding with a draft model | not started |
-| M6 | Vulkan and Metal modules | not started |
+| **M1** | experts from disk under a RAM budget: slot store, O(1) LRU, on-demand unbuffered reads, automatic plan | **in progress** — the store, the budget and layer-major prefill are done and measured; what remains is the cost of the first prompt and overlapping disk with compute |
+| M2 | K-quants (Q4_K, Q6_K, Q2_K, IQ2_XXS) on CPU, assembly lab | next |
+| M3 | CUDA module, hot experts in VRAM, a plan over VRAM + RAM + disk | — |
+| M4 | a model of hundreds of gigabytes on the reference laptop | — |
+| M5 | KV checkpoints on disk, a server (OpenAI and Anthropic APIs), speculative decoding with a draft model | — |
+| M6 | Vulkan and Metal modules, so the GPU path is not only NVIDIA | — |
 
-Model ladder — we only climb when the step below is exact and measured: tiny OLMoE (done) →
-**OLMoE-1B-7B (here)** → Qwen3-Coder-30B-A3B → a MoE larger than RAM → DeepSeek V4 Flash.
+The immediate steps, in order: finish M1 (make the first prompt cheap, then overlap disk reads
+with compute), bring in a second model family — Qwen3-Coder-30B-A3B, which makes long prompts and
+re-read files the thing to optimise — then K-quants, which is what puts 4-bit models within reach
+of a 16 GB machine.
+
+We only climb a step when the one below is exact and measured: tiny OLMoE (done) →
+**OLMoE-1B-7B (here)** → Qwen3-Coder-30B-A3B → a MoE larger than RAM → a frontier-size MoE.
+
+## Where we want to arrive
+
+A model of hundreds of gigabytes, answering on a laptop that cost what a laptop costs, with
+nothing to configure and nothing installed alongside it. Concretely, that means four things we do
+not have yet:
+
+1. **Size decoupled from RAM.** VRAM, RAM and disk holding one model together, with the engine
+   deciding the split from what it measured on that machine.
+2. **Every GPU, or none.** CUDA first because we have one to test on, then Vulkan and Metal, so
+   an AMD card, an Intel integrated chip or an Apple laptop are first-class — and so is a machine
+   with no GPU at all.
+3. **Small weights without silent losses.** K-quants and lower, where each format is validated
+   against the exact path before it is offered, and anything that is not bit-exact — int8
+   activations, a 16-bit KV cache — exists only as a mode you turn on knowingly, never as a
+   default that quietly changes your answers.
+4. **Still no options.** Everything above has to happen by itself on a machine the author of the
+   code has never seen.
 
 ## What is missing
 
-Honest list, so nobody has to find out by running it:
+The honest list, so nobody has to find out by running it:
 
 - **One model family.** The OLMoE graph only. The tokenizer accepts the `olmo` pretokenizer
-  family and refuses anything else (a family enters only after an oracle on its `tokenizer.json`);
-  one chat template. Qwen3-Coder is the next step.
-- **No GPU.** The backend interface is designed for it; no CUDA, Vulkan or Metal module exists yet.
-- **F32, F16 and Q8_0 only** — no K-quants, so no 4-bit models yet.
-- **arm64 detection exists, NEON kernels do not.** On ARM it would take the scalar path.
-- **Greedy only** — no sampling, no server, no API, no streaming interface beyond the CLI.
-- **A model larger than RAM does not run yet**; the memory guard refuses to load one until M1 is
-  finished.
-- **The head-to-head against llama.cpp is stale.** The last full comparison (2026-09-17) predates
-  a ~10x improvement in our prefill. The known remaining gap is the int8/VNNI dot kernel
-  (1.8-2.3x on the kernel itself), which is not bit-exact and can therefore only ever exist here
-  as a declared, off-by-default mode. A fresh comparison is pending.
-
-## Goal
-
-To make a large MoE model usable on the computer someone already owns. Concretely:
-
-1. **It configures itself.** At startup the engine measures the machine — physical cores, CPU
-   instructions, free RAM, VRAM, disk speed — and decides where everything goes. No option is
-   mandatory; options exist only to force a choice, for tests and measurements.
-2. **VRAM, RAM and disk work together**, and the experts that do not fit are read from disk while
-   the dense part stays resident.
-3. **The result stays exact.** Anything that is not bit-exact (int8 activations, a 16-bit KV
-   cache) can only exist as a declared mode, off by default, decided with quality numbers in
-   front of us.
-4. **Down to the last drop of performance**, but never by trading away point 3 silently.
+  family and refuses anything else — a family is admitted only after an oracle on its
+  `tokenizer.json` — and there is one chat template.
+- **No GPU yet.** The backend interface is designed for it; no CUDA, Vulkan or Metal module
+  exists.
+- **F32, F16 and Q8_0 only.** No K-quants, so no 4-bit models yet.
+- **arm64 detection exists, NEON kernels do not.** On ARM the engine would take the scalar path.
+- **Greedy only** — no sampling, no server, no API, nothing beyond the CLI.
+- **A model larger than RAM does not run yet**; the memory guard refuses it until M1 is finished.
+- **Measured on one machine.** All the numbers above come from a single laptop. Hybrid P/E cores
+  and multi-group Windows machines are handled in code and have never been tested on real
+  hardware.
 
 ## Build and run
 
@@ -162,59 +175,48 @@ build/trochilus run  -m model.gguf -f prompt.txt -n 200
 build/trochilus chat -m model.gguf
 ```
 
-C11 with intrinsics, a Makefile, gcc / clang / MinGW-w64. The Python tools (`tools/`) are only
-used for conversion and for the oracles — the engine itself never needs them.
+C11 with intrinsics, a Makefile, gcc / clang / MinGW-w64. The Python tools under `tools/` are used
+only for conversion and for the oracles; the engine itself never needs them.
 
 ## Documents
 
-The engineering log lives in `docs/` and is written in Italian:
+The engineering log lives in `docs/`, in Italian:
 
 | Document | Content |
 |---|---|
-| `docs/ARCHITETTURA.md` | principles, layers, execution, correctness ladder, milestones |
-| `docs/STATO.md` | where the project stands, decisions taken, next steps |
-| `docs/MISURE.md` | every measurement, including the optimizations that were rejected |
+| `docs/ARCHITETTURA.md` | principles, layers, execution, the correctness ladder, milestones |
+| `docs/STATO.md` | where the project stands, the decisions taken, the next step |
+| `docs/MISURE.md` | every measurement, including the optimisations that were rejected |
 | `docs/LEZIONI.md` | every mistake and discovery, with the check that now prevents it |
-| `docs/ORIGINI.md` | where each ported file comes from, commit by commit |
+| `docs/ORIGINI.md` | where each borrowed idea or file comes from, commit by commit |
 | `docs/COMANDI.md` | the commands: benchmarks, measurements, mutations, reports |
 
-## What we read, and what we send back
+## What we read
 
 Trochilus is written from scratch, but almost nothing in it was invented here. Three engines are
 pinned at a commit in `ref/` and read as primary sources; every idea taken from one of them is
-recorded in `docs/ORIGINI.md` together with the file and the function it came from, so that
-whoever improves that piece next knows where to look first.
+recorded in `docs/ORIGINI.md` with the file and function it came from, so that whoever improves
+that piece next knows where to look first.
 
 | Project | Some of what we learned from it |
 |---|---|
-| [colibri](https://github.com/JustVugg/colibri) — Apache-2.0, Vincenzo Fornaro | threads on **physical** cores rather than logical ones; weights read with `pread` instead of `mmap` (their own note on the RSS bug); the pretokenizer regex replayed in C over codepoints; oracles built on tiny generated models; a draft taken from the text already in the prompt; expert index → slot, one expert in one slot |
-| [ds4](https://github.com/antirez/ds4) — MIT, antirez and the ggml authors | a persistent thread pool instead of OpenMP; the vocabulary read from GGUF metadata; (token, expert) pairs sorted by expert with a counting sort; one weight row against several tokens held in registers; the GGUF type table; the GPU execution model for later |
-| [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) — MIT | the prompt processed in passes of at most 512 tokens; a weight row against a block of tokens; the two system calls that pin a thread to a processor; truncating the cache index to undo a rejected draft. It is also our speed reference in every comparison |
+| [colibri](https://github.com/JustVugg/colibri) — Apache-2.0 | threads on **physical** cores rather than logical ones; weights read with `pread` instead of `mmap`; the pretokenizer regex replayed in C over codepoints; oracles built on tiny generated models; a draft taken from the text already in the prompt; expert index → slot, one expert in one slot |
+| [ds4](https://github.com/antirez/ds4) — MIT | a persistent thread pool instead of OpenMP; the vocabulary read from GGUF metadata; (token, expert) pairs sorted by expert with a counting sort; one weight row against several tokens held in registers; the GGUF type table; the GPU execution model for later |
+| [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) — MIT | the prompt processed in passes of at most 512 tokens; a weight row against a block of tokens; the two system calls that pin a thread to a processor; truncating the cache index to undo a rejected draft |
 
-Plus the ones that are not engines: **`transformers`** and Hugging Face **`tokenizers`** are the
+And the ones that are not engines: **`transformers`** and Hugging Face **`tokenizers`** are the
 definition of a correct result here — every oracle in the gate compares against them — and the
-model we run first is **OLMoE-1B-7B**, from AI2.
+first model we run is **OLMoE-1B-7B**, from AI2.
 
-Only two files carry code that came from somewhere else (the GGUF type table in
-`src/format/gguf.c`, and `tools/make_tiny_olmoe.py`); each one names its origin, commit and path
-in its header, as `NOTICE` requires. Everything else is ours, which is exactly why the list above
-matters: the ideas were not.
+Only two files carry code that came from elsewhere: the GGUF type table in `src/format/gguf.c` and
+`tools/make_tiny_olmoe.py`. Each names its origin, commit and path in its header, as `NOTICE`
+requires. Everything else is ours — which is exactly why the list above matters, because the ideas
+were not.
 
-**And reading that closely finds defects.** Each one goes into `docs/UPSTREAM.md` with a
-reproduction, an honest statement of what actually breaks, and who it affects; where the project's
-own rules allow it, we send a fix upstream rather than keeping the finding:
-
-- [antirez/ds4#1095](https://github.com/antirez/ds4/pull/1095) — wrong GGUF block sizes for
-  `q8_1`, `iq1_s` and `iq4_nl`: a third-party file with `iq1_s` tensors makes the loader abort on
-  a size it computed itself. Found by our lint, fixed with a red-then-green test.
-- [JustVugg/colibri#1624](https://github.com/JustVugg/colibri/pull/1624) — the gcc warnings left
-  in their `make check`, which their own CONTRIBUTING forbids.
-
-For llama.cpp what we find stays a note: its contribution policy asks that a contributor write
-every word and explain every line themselves, and the way this project is built does not meet
-that bar. The findings are written down all the same, with the reproduction, in case someone
-wants to carry them over.
+Reading a codebase that closely also turns something up now and then, and when it does we send it
+back: [antirez/ds4#1095](https://github.com/antirez/ds4/pull/1095) and
+[JustVugg/colibri#1624](https://github.com/JustVugg/colibri/pull/1624).
 
 ## License
 
-Apache-2.0 — see `LICENSE` and `NOTICE`, which is the authority on third-party material.
+Apache-2.0 — see `LICENSE`, and `NOTICE` for third-party material.

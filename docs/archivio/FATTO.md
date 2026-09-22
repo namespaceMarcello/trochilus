@@ -678,25 +678,28 @@ domanda 46 ristretta a «dove va il resto» (i mancati spiegano ~115 ms su 840).
 ### 2026-09-22 — `README.md` in inglese: dove siamo, cosa manca, di cosa ci vantiamo
 
 Primo documento del repo rivolto a chi non lavora qui dentro (i `docs/` restano in italiano).
-Dice in ordine: cos'è il motore e per quale macchina, cosa funziona oggi, i numeri misurati
-(prefill 306-315 / 303-308 / 276 tok/s e decode 38.9 / 35.5 / 27.5 / 20.9 a contesto
-32/512/2048/4000, M1 sotto budget, tokenizer 13× HF), le cinque cose di cui ci vantiamo con la
-prova accanto (esattezza come invariante provato, `tr_expf` esaustivo, speculazione bit-identica,
-un binario per ogni CPU, il metodo di misura e le ottimizzazioni scartate scritte), la tabella
-delle tappe M0-M6 con lo stato vero, **cosa manca** senza sconti (una sola famiglia, niente GPU,
-niente K-quant, NEON non scritto, solo greedy, il confronto con llama.cpp vecchio di un
-prefill 10× fa), l'obiettivo, build e comandi, la mappa dei `docs/` e la provenienza con NOTICE.
+L'asse è quello chiesto da Marcello: **cosa abbiamo fatto, cosa faremo, dove arriviamo**, con in
+testa lo scopo — *democratizzare l'AI locale*: niente pagina dei requisiti minimi (lo scalare è la
+definizione, SIMD e GPU sono acceleratori), niente da installare, la macchina decide da sé, la RAM
+non decide che modelli puoi usare, e una macchina più piccola non dà una risposta peggiore (stessi
+token cambiando thread, `-b`, tier, budget).
+
+Sezioni: perché; cosa abbiamo fatto (funzionante + numeri misurati + di cosa ci vantiamo, cinque
+voci ognuna con la prova accanto); cosa faremo (tappe M0-M6 con lo stato vero e i prossimi passi in
+ordine); dove vogliamo arrivare (quattro cose che non abbiamo: dimensione slegata dalla RAM, ogni
+GPU o nessuna, pesi piccoli senza perdite silenziose, sempre zero opzioni); cosa manca senza
+sconti; build; mappa dei `docs/`; **cosa leggiamo** (colibri, ds4, llama.cpp come fonti primarie
+con le idee prese una per una, più transformers/`tokenizers`/OLMoE; due soli file di codice
+portato) e le due PR che abbiamo mandato indietro; licenza.
+
+**Fuori dal README, per scelta di Marcello** (2026-09-22): nessun confronto con altri motori e
+niente che dia il fianco — via i rapporti col tokenizer di HF e llama.cpp, via il confronto di
+velocità vecchio, via le righe su cosa i tre motori non provano e sulla policy AI di llama.cpp.
+I difetti trovati restano in `docs/UPSTREAM.md`: nel README si dice solo che ciò che si trova
+torna indietro, coi due link.
 
 I due documenti DeepSeek in `docs/` (report di terzi) entrano in `.gitignore`: non sono nostri e
 non devono finire in un repo che può diventare pubblico.
-
-Sezione **«What we read, and what we send back»** (richiesta di Marcello): i tre motori letti come
-fonti primarie con una riga di cose imparate ciascuno — colibri, ds4, llama.cpp — più transformers,
-HF `tokenizers` e OLMoE; detto chiaro che di codice portato ci sono **due file** e tutto il resto
-sono idee, ognuna tracciata in `docs/ORIGINI.md` con file e funzione d'origine. E detto che leggere
-così a fondo trova difetti: vanno in `docs/UPSTREAM.md` con la prova e, dove le regole del progetto
-lo permettono, tornano indietro come PR — link a ds4#1095 e colibri#1624, aperte; per llama.cpp le
-note restano note (la sua policy non accetta testi scritti dall'AI).
 
 - **Come si prova**: `cat README.md`; i numeri citati stanno in `docs/MISURE.md` (§Prefill su
   prompt lunghi, §Decode a contesto lungo, §M1 misurato, §Velocità — Trochilus contro llama.cpp)
