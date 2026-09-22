@@ -690,6 +690,14 @@ prefill 10× fa), l'obiettivo, build e comandi, la mappa dei `docs/` e la proven
 I due documenti DeepSeek in `docs/` (report di terzi) entrano in `.gitignore`: non sono nostri e
 non devono finire in un repo che può diventare pubblico.
 
+Sezione **«What we read, and what we send back»** (richiesta di Marcello): i tre motori letti come
+fonti primarie con una riga di cose imparate ciascuno — colibri, ds4, llama.cpp — più transformers,
+HF `tokenizers` e OLMoE; detto chiaro che di codice portato ci sono **due file** e tutto il resto
+sono idee, ognuna tracciata in `docs/ORIGINI.md` con file e funzione d'origine. E detto che leggere
+così a fondo trova difetti: vanno in `docs/UPSTREAM.md` con la prova e, dove le regole del progetto
+lo permettono, tornano indietro come PR — link a ds4#1095 e colibri#1624, aperte; per llama.cpp le
+note restano note (la sua policy non accetta testi scritti dall'AI).
+
 - **Come si prova**: `cat README.md`; i numeri citati stanno in `docs/MISURE.md` (§Prefill su
   prompt lunghi, §Decode a contesto lungo, §M1 misurato, §Velocità — Trochilus contro llama.cpp)
   e in `docs/STATO.md`; `git check-ignore -v docs/DeepSeek_V41_Tech_Report.md` deve rispondere.

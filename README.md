@@ -9,6 +9,12 @@ The target machine is an ordinary personal computer — 16-32 GB of RAM, a 4-8 G
 all, an SSD — not a 128 GB workstation. The long-term goal is to run a model of hundreds of
 gigabytes on that machine, exactly, with no options to set.
 
+It is a new project, not a fork, but it does not pretend to have invented its own field: three
+engines were read line by line to build it — [colibri](https://github.com/JustVugg/colibri),
+[ds4](https://github.com/antirez/ds4) and [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp).
+What each one taught us, and what we send back to them, is in
+[What we read](#what-we-read-and-what-we-send-back).
+
 > **Status: pre-alpha, under active development.** One model family works end to end (OLMoE);
 > milestone M1 (experts streamed from disk) is in progress. See [Where we are](#where-we-are).
 > The engineering documents under `docs/` are written in Italian; this README is the summary.
@@ -172,14 +178,43 @@ The engineering log lives in `docs/` and is written in Italian:
 | `docs/ORIGINI.md` | where each ported file comes from, commit by commit |
 | `docs/COMANDI.md` | the commands: benchmarks, measurements, mutations, reports |
 
-## Provenance and license
+## What we read, and what we send back
 
-Trochilus is a new project, not a fork. Where a piece is taken from somewhere else it is taken by
-hand, and it says so in its own file header and in `docs/ORIGINI.md` (project, commit, path, what
-was changed): from [colibri](https://github.com/JustVugg/colibri) (Apache-2.0) the CPU work, the
-disk handling and the exact tests; from [ds4](https://github.com/antirez/ds4) (MIT) the GGUF
-reader, the thread pool and the GPU execution model. From llama.cpp / ggml (MIT) we have taken
-ideas so far, not code, and only where a measurement said it was worth it. `NOTICE` is the
-authority on all of this.
+Trochilus is written from scratch, but almost nothing in it was invented here. Three engines are
+pinned at a commit in `ref/` and read as primary sources; every idea taken from one of them is
+recorded in `docs/ORIGINI.md` together with the file and the function it came from, so that
+whoever improves that piece next knows where to look first.
 
-Apache-2.0 — see `LICENSE` and `NOTICE`.
+| Project | Some of what we learned from it |
+|---|---|
+| [colibri](https://github.com/JustVugg/colibri) — Apache-2.0, Vincenzo Fornaro | threads on **physical** cores rather than logical ones; weights read with `pread` instead of `mmap` (their own note on the RSS bug); the pretokenizer regex replayed in C over codepoints; oracles built on tiny generated models; a draft taken from the text already in the prompt; expert index → slot, one expert in one slot |
+| [ds4](https://github.com/antirez/ds4) — MIT, antirez and the ggml authors | a persistent thread pool instead of OpenMP; the vocabulary read from GGUF metadata; (token, expert) pairs sorted by expert with a counting sort; one weight row against several tokens held in registers; the GGUF type table; the GPU execution model for later |
+| [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) — MIT | the prompt processed in passes of at most 512 tokens; a weight row against a block of tokens; the two system calls that pin a thread to a processor; truncating the cache index to undo a rejected draft. It is also our speed reference in every comparison |
+
+Plus the ones that are not engines: **`transformers`** and Hugging Face **`tokenizers`** are the
+definition of a correct result here — every oracle in the gate compares against them — and the
+model we run first is **OLMoE-1B-7B**, from AI2.
+
+Only two files carry code that came from somewhere else (the GGUF type table in
+`src/format/gguf.c`, and `tools/make_tiny_olmoe.py`); each one names its origin, commit and path
+in its header, as `NOTICE` requires. Everything else is ours, which is exactly why the list above
+matters: the ideas were not.
+
+**And reading that closely finds defects.** Each one goes into `docs/UPSTREAM.md` with a
+reproduction, an honest statement of what actually breaks, and who it affects; where the project's
+own rules allow it, we send a fix upstream rather than keeping the finding:
+
+- [antirez/ds4#1095](https://github.com/antirez/ds4/pull/1095) — wrong GGUF block sizes for
+  `q8_1`, `iq1_s` and `iq4_nl`: a third-party file with `iq1_s` tensors makes the loader abort on
+  a size it computed itself. Found by our lint, fixed with a red-then-green test.
+- [JustVugg/colibri#1624](https://github.com/JustVugg/colibri/pull/1624) — the gcc warnings left
+  in their `make check`, which their own CONTRIBUTING forbids.
+
+For llama.cpp what we find stays a note: its contribution policy asks that a contributor write
+every word and explain every line themselves, and the way this project is built does not meet
+that bar. The findings are written down all the same, with the reproduction, in case someone
+wants to carry them over.
+
+## License
+
+Apache-2.0 — see `LICENSE` and `NOTICE`, which is the authority on third-party material.
