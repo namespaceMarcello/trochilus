@@ -905,3 +905,52 @@ report of `src/base/prof.c` (Opus 5.5), every file through `tools/mutate_auto.py
   `CHANGED=HEAD` for only the lines changed since the last commit), report in
   `build/mutate/main.txt`, time left in `build/mutate/main.progress`. By hand: `build/trochilus generate -m <f> -p 4 -n abc` is exit 2,
   "generate: -n takes a whole number from 0 to 9223372036854775807, not 'abc'".
+
+### 2026-09-23 — The machine's marker, and the engine kept between commands (`trochilus serve`)
+The measuring scripts follow the machine's rule: `tools/measure_guard.lib` takes
+`~/.claude/macchina-ferma` for the duration of a timing measurement (noclobber, waits up to 6 h for
+another window's, refreshed before every run, given back only by its writer) and no longer stops
+or waits for other projects' containers; `tools/test_marker.sh` in `make check`,
+`tools/mutate_marker.sh` 9 of 9 red. Question 49: `trochilus serve` keeps pool, model and expert
+store; `generate`, `logits`, `run` and `chat` run in it when its endpoint answers, byte for byte the
+same (the client's directory and streams: fd passing on POSIX, pipes on Windows), idle exit, a
+rebuilt client declined by build stamp and run locally; `tools/serve_first_prompt.sh` measures it,
+`AB_WALL=1` in `ab_modes.sh`. Native `test_cli` green on Windows (the `\r\n` fix of #126).
+Check: `make check`; by hand, `build/trochilus serve -m <gguf> &`, then `build/trochilus run -m
+<gguf> -p hello` twice and `build/trochilus serve --status` (1 load, 2 requests), `serve --stop`.
+
+### 2026-09-23 — Question 49 measured; a rainbow water bar while the model loads
+`sh tools/serve_first_prompt.sh 5`: the first 2048-token prompt through `trochilus serve` takes
+7.81 s instead of 12.79 at full budget (the load gone) and 12.04 instead of 13.00 at half budget
+(docs/MEASUREMENTS.md §The engine kept between commands). While a command loads the model, stderr
+shows variant A of the bar Marcello chose (a tilted tube filling with rainbow water, "reading the
+model X/Y GiB"): the core reports bytes through `tr_model_load_progress` (after every dense
+tensor and every expert unit), `src/app/bar.c` draws at most 30 frames a second only on a
+terminal, and clears its line when the load ends or fails. `tests/test_bar.c` (golden frame from
+`build/progress-bar/preview.py`), `test_stream` checks the reported bytes; `tools/mutate_bar.sh`.
+`ab_modes.sh` with `AB_WALL=1` no longer records a failed run as a fast one
+(`tools/test_ab_modes.sh`); the measuring scripts wait for Smart App Control before taking the
+machine's marker. Check: `make check`; by hand, in Windows Terminal (not Git Bash):
+`build\trochilus.exe run -m models\OLMoE-1B-7B-0125-Instruct-Q8_0.gguf -p Hello -n 16
+--expert-budget 8192`; `TR_BAR=0` turns it off.
+
+### 2026-09-23 — The prompt reads the next layer while this one computes
+Under a partial expert budget the layer-major prompt hands layer L+1's missing units to an I/O
+thread (`tr_experts_prefetch`, a small thread and monitor API in `src/base/threads.h`) while layer
+L computes; the store's bookkeeping stays on the calling thread, a unit still in flight is waited
+for, a failed read ahead fails the eval and leaves nothing in flight. Same bytes out at every
+budget and thread count (`tests/test_prefetch.c`, TSan in `make check`); `tools/mutate_prefetch.sh`.
+2048 tokens at half budget: 11.45 → 9.39 s (docs/MEASUREMENTS.md §Reading the next layer).
+`orphans.ps1` no longer takes Git's launcher of the asking script for an orphan (LESSONS #136).
+Check: `make check`; `SET=prefetch sh tools/prefill_overlap.sh 5` (native, ~20 min);
+`TR_PREFETCH=0` turns it off.
+
+### 2026-09-24 — Three server bugs, and `make quick`
+`tests/test_serve.c` grew the cases a mutation triage asked for (malformed requests, descriptors,
+a working directory the server cannot enter, a reply of another protocol, a second model); two of
+them found real bugs in `src/app/serve.c`: a descriptor leaked per request that sent 4 descriptors
+(LESSONS #137), a double free in the client on a reply of another protocol (#138), and on
+Windows a reload of the model for the same file named with another case (#140, seen only
+natively). Mutants of serve.c alive: 128 -> 73 (205 killed, no timeout). `make
+quick`: lint, the native build and the C tests in Linux gcc, about 2 minutes, for use between
+edits (the gate stays `make check`). Check: `make quick`, `make check`.

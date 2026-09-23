@@ -28,6 +28,7 @@
 #include "../tokenizer/chat.h"
 #include "../tokenizer/tokenizer.h"
 #include "../tokenizer/unicode.h"
+#include "serve.h"
 
 static void usage(void) {
     fprintf(stderr,
@@ -43,7 +44,10 @@ static void usage(void) {
             "                [-t threads] [-c context] [-b batch] [--no-parse-special]\n"
             "  trochilus chat -m <file.gguf> [-s <system prompt>] [-n <max tokens per reply>]\n"
             "                 [-t threads] [-c context] [-b batch]\n"
-            "  -b: most tokens in one forward pass (default 512): memory and prompt speed, same results\n");
+            "  trochilus serve [-m <file.gguf>] [-t threads] [--expert-budget <MiB|min>] [--idle <minutes>]\n"
+            "  trochilus serve --stop | --status\n"
+            "  -b: most tokens in one forward pass (default 512): memory and prompt speed, same results\n"
+            "  generate, logits, run and chat run in a server when one is up (TR_SERVER=0: never)\n");
 }
 
 static void print_bytes(uint64_t n) {
@@ -350,7 +354,7 @@ static int apply_expert_mask(tr_model *model, const char *path) {
  * architecture with no such store. */
 static void print_experts(const tr_model *model) {
     tr_experts_stats st;
-    if (tr_model_expert_stats(model, &st) != 0) return;
+    if (app_expert_stats(model, &st) != 0) return;
     double mib = 1024.0 * 1024.0;
     const char *how = st.direct ? "direct" : "buffered";
     if (st.n_slots == st.n_units) {
@@ -358,10 +362,16 @@ static void print_experts(const tr_model *model) {
                 (long long)st.n_units, (double)st.n_slots * (double)st.slot_bytes / mib, how);
     } else {
         fprintf(stderr,
-                "experts: %lld of %lld units in RAM (%.0f MiB, %s), %llu hits, %llu misses, %.0f MiB read in %.2f s\n",
+                "experts: %lld of %lld units in RAM (%.0f MiB, %s), %llu hits, %llu misses, %.0f MiB read in %.2f s",
                 (long long)st.n_slots, (long long)st.n_units, (double)st.n_slots * (double)st.slot_bytes / mib, how,
                 (unsigned long long)st.hits, (unsigned long long)st.misses, (double)st.bytes_read / mib,
                 st.read_sec);
+        /* read ahead by the I/O thread (a prompt taken layer by layer), and how long the compute
+         * still waited for it: only when it happened, so every other line reads as before */
+        if (st.prefetched > 0)
+            fprintf(stderr, ", %llu of them read ahead, %.2f s waited", (unsigned long long)st.prefetched,
+                    st.prefetch_wait_sec);
+        fprintf(stderr, "\n");
     }
 }
 
@@ -450,15 +460,15 @@ static int cmd_generate(int argc, char **argv) {
     }
 
     char err[256];
-    tr_pool *pool = tr_pool_create((int)n_threads);
+    tr_pool *pool = app_pool(n_threads);
     if (pool == NULL) {
         fprintf(stderr, "generate: could not create thread pool\n");
         return 1;
     }
-    tr_model *model = tr_model_load_budget(model_path, pool, expert_budget, err, sizeof err);
+    tr_model *model = app_model(model_path, pool, expert_budget, err, sizeof err);
     if (model == NULL) {
         fprintf(stderr, "error: %s\n", err);
-        tr_pool_destroy(pool);
+        app_release(NULL, pool);
         return 1;
     }
     tr_model_set_decode_threads(model, (int)decode_threads);
@@ -467,8 +477,7 @@ static int cmd_generate(int argc, char **argv) {
     tr_session *sess = tr_session_create(model, n_ctx, n_batch, err, sizeof err);
     if (sess == NULL) {
         fprintf(stderr, "error: %s\n", err);
-        tr_model_free(model);
-        tr_pool_destroy(pool);
+        app_release(model, pool);
         return 1;
     }
     const tr_model_info *info = tr_model_get_info(model);
@@ -484,16 +493,14 @@ static int cmd_generate(int argc, char **argv) {
         fprintf(stderr, "generate: -p %" PRId64 " does not fit the context of %" PRId64 " tokens\n", n_prompt_synth,
                 ctx);
         tr_session_free(sess);
-        tr_model_free(model);
-        tr_pool_destroy(pool);
+        app_release(model, pool);
         return 1;
     }
     if (tokens_str != NULL) {
         if (parse_tokens(tokens_str, &prompt, &n_prompt) != 0) {
             fprintf(stderr, "generate: invalid --tokens\n");
             tr_session_free(sess);
-            tr_model_free(model);
-            tr_pool_destroy(pool);
+            app_release(model, pool);
             return 2;
         }
     } else {
@@ -502,8 +509,7 @@ static int cmd_generate(int argc, char **argv) {
         if (prompt == NULL) {
             fprintf(stderr, "generate: out of memory\n");
             tr_session_free(sess);
-            tr_model_free(model);
-            tr_pool_destroy(pool);
+            app_release(model, pool);
             return 1;
         }
         synth_prompt(prompt, n_prompt, info->vocab_size);
@@ -518,8 +524,7 @@ static int cmd_generate(int argc, char **argv) {
         fprintf(stderr, "generate: prompt evaluation failed (context full or token id out of range)\n");
         free(prompt);
         tr_session_free(sess);
-        tr_model_free(model);
-        tr_pool_destroy(pool);
+        app_release(model, pool);
         return 1;
     }
     double t1 = tr_time_sec();
@@ -532,8 +537,7 @@ static int cmd_generate(int argc, char **argv) {
         fprintf(stderr, "generate: out of memory\n");
         free(prompt);
         tr_session_free(sess);
-        tr_model_free(model);
-        tr_pool_destroy(pool);
+        app_release(model, pool);
         return 1;
     }
 
@@ -566,8 +570,7 @@ static int cmd_generate(int argc, char **argv) {
             free(generated);
             free(prompt);
             tr_session_free(sess);
-            tr_model_free(model);
-            tr_pool_destroy(pool);
+            app_release(model, pool);
             return 1;
         }
         memcpy(hist, prompt, (size_t)n_prompt * sizeof(int32_t));
@@ -578,8 +581,7 @@ static int cmd_generate(int argc, char **argv) {
             free(generated);
             free(prompt);
             tr_session_free(sess);
-            tr_model_free(model);
-            tr_pool_destroy(pool);
+            app_release(model, pool);
             return 1;
         }
         int32_t step[1 + TR_GREEDY_DRAFT_MAX] = {0}; /* a step fills its first `got`; no stale id past them */
@@ -631,8 +633,7 @@ static int cmd_generate(int argc, char **argv) {
     free(generated);
     free(prompt);
     tr_session_free(sess);
-    tr_model_free(model);
-    tr_pool_destroy(pool);
+    app_release(model, pool);
     return rc;
 }
 
@@ -668,23 +669,22 @@ static int cmd_logits(int argc, char **argv) {
     }
 
     char err[256];
-    tr_pool *pool = tr_pool_create((int)n_threads);
+    tr_pool *pool = app_pool(n_threads);
     if (pool == NULL) {
         fprintf(stderr, "logits: could not create thread pool\n");
         free(tokens);
         return 1;
     }
-    tr_model *model = tr_model_load_budget(model_path, pool, expert_budget, err, sizeof err);
+    tr_model *model = app_model(model_path, pool, expert_budget, err, sizeof err);
     if (model == NULL) {
         fprintf(stderr, "error: %s\n", err);
         free(tokens);
-        tr_pool_destroy(pool);
+        app_release(NULL, pool);
         return 1;
     }
     if (expert_mask_path != NULL && apply_expert_mask(model, expert_mask_path) != 0) {
         free(tokens);
-        tr_model_free(model);
-        tr_pool_destroy(pool);
+        app_release(model, pool);
         return 1;
     }
     tr_model_set_decode_threads(model, (int)decode_threads);
@@ -692,8 +692,7 @@ static int cmd_logits(int argc, char **argv) {
     if (sess == NULL) {
         fprintf(stderr, "error: %s\n", err);
         free(tokens);
-        tr_model_free(model);
-        tr_pool_destroy(pool);
+        app_release(model, pool);
         return 1;
     }
 
@@ -702,8 +701,7 @@ static int cmd_logits(int argc, char **argv) {
         fprintf(stderr, "logits: could not open '%s' for writing\n", out_path);
         free(tokens);
         tr_session_free(sess);
-        tr_model_free(model);
-        tr_pool_destroy(pool);
+        app_release(model, pool);
         return 1;
     }
 
@@ -728,8 +726,7 @@ static int cmd_logits(int argc, char **argv) {
     fclose(out);
     free(tokens);
     tr_session_free(sess);
-    tr_model_free(model);
-    tr_pool_destroy(pool);
+    app_release(model, pool);
     return rc;
 }
 
@@ -981,14 +978,14 @@ static int cmd_run(int argc, char **argv) {
     }
 
     int rc = 1;
-    tr_pool *pool = tr_pool_create((int)n_threads);
+    tr_pool *pool = app_pool(n_threads);
     tr_model *model = NULL;
     tr_session *sess = NULL;
     if (pool == NULL) {
         fprintf(stderr, "run: could not create thread pool\n");
         goto done;
     }
-    if ((model = tr_model_load_budget(model_path, pool, expert_budget, err, sizeof err)) == NULL ||
+    if ((model = app_model(model_path, pool, expert_budget, err, sizeof err)) == NULL ||
         (sess = tr_session_create(model, n_ctx, n_batch, err, sizeof err)) == NULL) {
         fprintf(stderr, "error: %s\n", err);
         goto done;
@@ -1078,8 +1075,7 @@ static int cmd_run(int argc, char **argv) {
 done:
     free(prompt);
     tr_session_free(sess);
-    tr_model_free(model);
-    tr_pool_destroy(pool);
+    app_release(model, pool);
     tr_tokenizer_free(tok);
     return rc;
 }
@@ -1246,14 +1242,14 @@ static int cmd_chat(int argc, char **argv) {
     conversation conv = {0};
     int32_t *hist = NULL;      /* the tokens in the session's cache: room for the whole context */
     size_t n_hist = 0;
-    tr_pool *pool = tr_pool_create((int)n_threads);
+    tr_pool *pool = app_pool(n_threads);
     tr_model *model = NULL;
     tr_session *sess = NULL;
     if (pool == NULL) {
         fprintf(stderr, "chat: could not create thread pool\n");
         goto done;
     }
-    if ((model = tr_model_load_budget(model_path, pool, expert_budget, err, sizeof err)) == NULL) {
+    if ((model = app_model(model_path, pool, expert_budget, err, sizeof err)) == NULL) {
         fprintf(stderr, "error: %s\n", err);
         goto done;
     }
@@ -1390,23 +1386,63 @@ done:
     free(conv.m);
     free(hist);
     tr_session_free(sess);
-    tr_model_free(model);
-    tr_pool_destroy(pool);
+    app_release(model, pool);
     tr_tokenizer_free(tok);
     return rc;
+}
+
+/* The commands that load a model, and so run in a server when one is up (src/app/serve.c):
+ * argv[0] is the command's name. 2 for any other name, which a server never runs. */
+static int model_command(int argc, char **argv) {
+    static const struct {
+        const char *name;
+        int (*run)(int argc, char **argv);
+    } kept[] = {{"generate", cmd_generate}, {"logits", cmd_logits}, {"run", cmd_run}, {"chat", cmd_chat}};
+    for (size_t k = 0; argc >= 1 && k < sizeof kept / sizeof kept[0]; k++)
+        if (strcmp(argv[0], kept[k].name) == 0) return kept[k].run(argc - 1, argv + 1);
+    fprintf(stderr, "error: a server runs only generate, logits, run and chat\n");
+    return 2;
+}
+
+/* `serve`: the server itself, or a word to the one that is up */
+static int cmd_serve(int argc, char **argv) {
+    const char *model_path = NULL;
+    int64_t n_threads = 0, idle = 30;
+    uint64_t expert_budget = 0;
+    int stop = 0, status = 0;
+    const opt opts[] = {OPT_STR("-m", &model_path),         OPT_NUM("-t", &n_threads, 0, INT_MAX),
+                        OPT_BUDGET(&expert_budget),          OPT_NUM("--idle", &idle, 0, 10080),
+                        OPT_FLAG("--stop", &stop),           OPT_FLAG("--status", &status)};
+    if (parse_opts("serve", argc, argv, opts, N_OPTS(opts)) != 0 || (stop && status) ||
+        ((stop || status) && (model_path != NULL || argc > 1))) {
+        fprintf(stderr, "usage: trochilus serve [-m <file.gguf>] [-t threads] [--expert-budget <MiB|min>]\n"
+                        "                       [--idle <minutes>]  (exit after this long unused; default 30, 0: "
+                        "never)\n"
+                        "       trochilus serve --stop | --status\n");
+        return 2;
+    }
+    if (stop) return serve_stop();
+    if (status) return serve_status();
+    serve_config cfg = {model_path, n_threads, expert_budget, idle};
+    return serve_run(&cfg, model_command);
 }
 
 /* every command gets the arguments after its name */
 static const struct {
     const char *name;
     int (*run)(int argc, char **argv);
-} commands[] = {{"cpu", cmd_cpu},           {"inspect", cmd_inspect}, {"generate", cmd_generate},
-                {"logits", cmd_logits},     {"tokenize", cmd_tokenize}, {"run", cmd_run},
-                {"chat", cmd_chat},         {"chat-template", cmd_chat_template}};
+    int loads_model;            /* 1: runs in a server when one is up; 2: and reads stdin */
+} commands[] = {{"cpu", cmd_cpu, 0},        {"inspect", cmd_inspect, 0},   {"generate", cmd_generate, 1},
+                {"logits", cmd_logits, 1},  {"tokenize", cmd_tokenize, 0}, {"run", cmd_run, 1},
+                {"chat", cmd_chat, 2},      {"chat-template", cmd_chat_template, 0}, {"serve", cmd_serve, 0}};
 
 static int real_main(int argc, char **argv) {
-    for (size_t k = 0; argc >= 2 && k < sizeof commands / sizeof commands[0]; k++)
-        if (strcmp(argv[1], commands[k].name) == 0) return commands[k].run(argc - 2, argv + 2);
+    for (size_t k = 0; argc >= 2 && k < sizeof commands / sizeof commands[0]; k++) {
+        if (strcmp(argv[1], commands[k].name) != 0) continue;
+        int rc;
+        if (commands[k].loads_model && serve_forward(argc - 1, argv + 1, commands[k].loads_model == 2, &rc)) return rc;
+        return commands[k].run(argc - 2, argv + 2);
+    }
     usage();
     return 2;
 }

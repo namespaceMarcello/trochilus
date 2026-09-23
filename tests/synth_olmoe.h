@@ -46,6 +46,17 @@ static int synth_with_tokenizer = 0;
  * same router score and the choice rests on the tie rule alone (tests/test_model_load.c). */
 static int synth_zero_router = 0;
 
+/* Set to a layer before synth_write (-1: none): only that layer's ffn_gate_inp.weight is all zeros,
+ * so every token of that layer takes experts 0..n_used-1 and the others go unused
+ * (tests/test_prefetch.c: units read ahead that nobody asks for). */
+static int synth_zero_router_layer = -1;
+static int synth_is_zero_router_layer(const char *name) {
+    char want[64];
+    if (synth_zero_router_layer < 0) return 0;
+    snprintf(want, sizeof want, "blk.%d.ffn_gate_inp.weight", synth_zero_router_layer);
+    return strcmp(name, want) == 0;
+}
+
 /* Malformed files (tests/test_model_load.c), all off by default: synth_drop, a key or a tensor of
  * that name left out; synth_set_key[i], a u32 key written with synth_set_value[i] instead, or
  * added after the others when the file has no such key; synth_reshape, a tensor whose dimension
@@ -293,7 +304,8 @@ static synth_buf synth_olmoe(const synth_params *P) {
         uint32_t tensor_seed = seed; \
         if (synth_router_from_next && strstr(nm_, "ffn_gate_inp") != NULL) tensor_seed = seed + 12; \
         int tensor_zero = (synth_zero_attn_out && strstr(nm_, "attn_output.weight") != NULL) || \
-                          (synth_zero_router && strstr(nm_, "ffn_gate_inp") != NULL); \
+                          (synth_zero_router && strstr(nm_, "ffn_gate_inp") != NULL) || \
+                          synth_is_zero_router_layer(nm_); \
         synth_tensor(&hdr, &data, nm_, (nd), ne, tensor_seed, tt, tensor_zero); \
         seed++; \
         n_tensors++; \

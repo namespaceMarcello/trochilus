@@ -15,7 +15,7 @@
 # In the container, from the repo root, after `make oracle` and `make oracle-tokenizer` have built
 # the fixtures:
 #   MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src trochilus-dev:local \
-#       sh tools/mutate_files.sh [olmoe kernels kernels_x86 expf chat unicode unicode-sweep tokenizer main prof]
+#       sh tools/mutate_files.sh [olmoe kernels kernels_x86 expf chat unicode unicode-sweep tokenizer main serve prof]
 # No name: all but unicode-sweep, one after the other. One report per file in
 # build/mutate/<name>.txt, its last line on stdout; how far it is, and how long is left, in the last
 # line of build/mutate/<name>.progress. Nothing else may load the VM meanwhile.
@@ -45,7 +45,7 @@ run() {
         > "build/mutate/$name.txt" 2> "build/mutate/$name.progress"
     tail -1 "build/mutate/$name.txt"
 }
-[ $# -gt 0 ] || set -- olmoe kernels kernels_x86 expf chat unicode tokenizer main prof
+[ $# -gt 0 ] || set -- olmoe kernels kernels_x86 expf chat unicode tokenizer main serve prof
 for f in "$@"; do
     case $f in
     olmoe) run olmoe 6 src/models/olmoe.c $MODEL_TESTS --asan --cmd "$O" --cmd "$OMIN" --cmd "$OV" ;;
@@ -57,7 +57,8 @@ for f in "$@"; do
     unicode) run unicode 12 src/tokenizer/unicode.c test_unicode test_tokenizer --asan --cmd "$TOK" ;;
     unicode-sweep) run unicode-sweep 2 src/tokenizer/unicode.c test_unicode test_tokenizer --asan --cmd "$TOKALL" ;;
     tokenizer) run tokenizer 12 src/tokenizer/tokenizer.c test_tokenizer test_cli --asan --cmd "$TOK" ;;
-    main) run main 12 src/app/main.c test_cli --asan --cmd "$O" --cmd "$TOK" ;;
+    main) run main 12 src/app/main.c test_cli test_serve --asan --cmd "$O" --cmd "$TOK" ;;
+    serve) run serve 12 src/app/serve.c test_serve test_cli --asan ;;
     prof) run prof 12 src/base/prof.c test_prof test_model_prof --asan ;;
     *) echo "mutate_files: unknown file '$f'"; exit 2 ;;
     esac

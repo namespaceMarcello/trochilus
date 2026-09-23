@@ -44,8 +44,12 @@
  *                a value placed inside the window a bigger synthetic model opens between "not
  *                enough to be fully resident" and "not enough to run at all" forces the plan's
  *                partial branch on a real load, logits still identical to a forced-resident one
+ *   progress     tr_model_load_progress (model.h tr_progress) at a resident budget: total ==
+ *                the file's dense + expert tensor bytes, one report per dense tensor and per
+ *                expert unit, done strictly growing and ending on total; at the smallest store
+ *                (really partial): total == dense bytes only, one report per dense tensor
  *
- * Seen red: tools/mutate_stream.sh.
+ * Seen red: tools/mutate_stream.sh; progress: tools/mutate_bar.sh.
  */
 #if defined(__linux__) && !defined(_POSIX_C_SOURCE)
 #define _POSIX_C_SOURCE 200809L /* setenv/unsetenv (test_mem_available, test_direct) */
@@ -824,6 +828,90 @@ static void test_mem_available(const char *argv0) {
     remove(path);
 }
 
+/* ---- progress: what tr_model_load_progress reports, against the file's own tensor sizes ---- */
+
+typedef struct {
+    int64_t calls;
+    uint64_t done, total, first_total;
+    int monotone, same_total;
+} progress_log;
+
+static void progress_record(void *ctx, uint64_t done, uint64_t total) {
+    progress_log *lg = (progress_log *)ctx;
+    if (lg->calls == 0) lg->first_total = total;
+    else if (done <= lg->done) lg->monotone = 0;
+    if (total != lg->first_total) lg->same_total = 0;
+    lg->done = done;
+    lg->total = total;
+    lg->calls++;
+}
+
+static void test_progress(const char *argv0) {
+    char path[512], err[256];
+    TR_CHECK(synth_write(&P_Q8_0, argv0, "stream_progress.gguf", path, sizeof path) == 0);
+    int checked = 0;
+
+    /* the file's own split, read straight off its directory: dense tensors and expert tensors */
+    uint64_t dense = 0, experts = 0;
+    int64_t n_dense = 0;
+    tr_gguf *g = tr_gguf_open(path, err, sizeof err);
+    TR_CHECK(g != NULL);
+    if (g != NULL) {
+        for (uint64_t i = 0; i < tr_gguf_tensor_count(g); i++) {
+            const tr_gguf_tensor *t = tr_gguf_tensor_at(g, i);
+            if (strstr(t->name, "_exps.") != NULL) {
+                experts += t->n_bytes;
+            } else {
+                dense += t->n_bytes;
+                n_dense++;
+            }
+        }
+        tr_gguf_close(g);
+    }
+    TR_CHECK(dense > 0 && experts > 0);
+
+    /* resident (budget above every unit): every dense tensor and every expert unit, one report each */
+    progress_log lg = {0, 0, 0, 0, 1, 1};
+    tr_progress pr = {progress_record, &lg};
+    tr_model *m = tr_model_load_progress(path, NULL, HUGE_BUDGET, &pr, err, sizeof err);
+    TR_CHECK(m != NULL);
+    if (m != NULL) {
+        TR_CHECK_EQ_INT(lg.first_total, dense + experts);
+        TR_CHECK(lg.same_total);
+        TR_CHECK(lg.monotone);
+        TR_CHECK_EQ_INT(lg.done, lg.total); /* the last report lands on the total */
+        TR_CHECK_EQ_INT(lg.calls, n_dense + N_UNITS);
+        checked++;
+        tr_model_free(m);
+    }
+
+    /* partial (the smallest store, 10 of 16 slots): the experts are read while running, so the
+     * load reports the dense tensors only */
+    progress_log lp = {0, 0, 0, 0, 1, 1};
+    pr.ctx = &lp;
+    m = tr_model_load_progress(path, NULL, UINT64_MAX, &pr, err, sizeof err);
+    TR_CHECK(m != NULL);
+    if (m != NULL) {
+        tr_experts_stats st;
+        TR_CHECK(tr_model_expert_stats(m, &st) == 0);
+        TR_CHECK(st.n_slots < st.n_units); /* really partial */
+        TR_CHECK_EQ_INT(lp.first_total, dense);
+        TR_CHECK(lp.same_total);
+        TR_CHECK(lp.monotone);
+        TR_CHECK_EQ_INT(lp.done, lp.total);
+        TR_CHECK_EQ_INT(lp.calls, n_dense);
+        checked++;
+        tr_model_free(m);
+    }
+
+    /* no progress asked for: the same load, nothing called */
+    m = tr_model_load_progress(path, NULL, HUGE_BUDGET, NULL, err, sizeof err);
+    TR_CHECK(m != NULL);
+    tr_model_free(m);
+    remove(path);
+    TR_CHECK_EQ_INT(checked, 2);
+}
+
 int main(int argc, char **argv) {
     const char *argv0 = argc > 0 ? argv[0] : "";
     test_content(argv0);
@@ -835,5 +923,6 @@ int main(int argc, char **argv) {
     test_rewind(argv0);
     test_direct(argv0);
     test_mem_available(argv0);
+    test_progress(argv0);
     TR_TEST_EXIT();
 }

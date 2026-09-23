@@ -166,7 +166,7 @@ decides | — | — |
 | 46 | ~~Perché il decode sotto budget migliora con la lunghezza della generazione?~~ **È l'archivio, non un warm-up** (2026-09-21, §M1 misurato): col modello residente il tempo per token non cambia da 200 a 1000 (34.64 → 33.48, dentro lo spread), sotto budget sì (26.53 → 29.84 al 25%). Un costo fisso di ~0.35 s al 50% e ~0.84 s al 25%, che i mancati in più dei primi token spiegano solo per ~115 ms. **Resta**: dove va il resto | profilo per zone dei primi 64 token contro token lontani dal prompt, stesso budget | dice se c'è una leva nella LRU dopo il prompt, e quale numero promettere con metà modello in RAM |
 | 47 | ~~Il prefill sotto budget legge gli esperti una volta per prompt?~~ **Adesso sì** (ordine per layer, 2026-09-21: 6 273 MiB e 12.41 s a 2048, **1.89×**). Prima: una volta per passata (2026-09-21, §Il prefill legge il modello una volta per passata). Il prompt si elabora a blocchi di 512 token (`OLMOE_DEFAULT_BATCH`) e ogni passata percorre tutti i layer, quindi sotto budget rilegge la tabella intera: a 2048 token **22 880 MiB invece di 6 528**, 3.65×, e cresce col prompt. Con una passata sola (`-b 2048`) il prefill fa 11.27 s invece di 23.51 (**2.09×**) e l'ultima riga di logit è identica al byte | il tempo dell'ordine per layer quando ci sarà, e la stessa misura a 4000 token (otto passate) | la leva più grossa del prefill sotto budget, e non costa precisione |
 | 48 | **Quanto del primo prompt si nasconde dietro il tempo che l'utente impiega a scrivere?** Una fase di preparazione dichiarata (idea di Marcello, 2026-09-21): appena la sessione si apre, e prima che il prompt arrivi, il motore comincia a leggere gli esperti e lo dice («leggo il modello, 6.5 GiB»). Non elimina i 4.7 s, li mette dove non danno fastidio; costa nessun bit di precisione e non serve un processo nuovo. Da decidere: cosa leggere per primo quando ancora non si sa il prompt (l'ordine dei layer è quello giusto, il layer 0 serve per primo) | tempo fra l'apertura e il primo token, con e senza la lettura anticipata, su un prompt che arriva dopo 5, 15 e 30 secondi | è la leva più economica: nessuna struttura nuova |
-| 49 | **Un processo che resta acceso fra le sessioni regge il costo che ha?** L'unico modo di togliere davvero i 4.7 s: l'archivio degli esperti vive più della sessione. Da decidere: un demone che parla coi comandi, o memoria condivisa che i processi mappano. Costo: un protocollo, il ciclo di vita, e la RAM tenuta occupata quando nessuno la usa | tempo del primo prompt della seconda sessione, archivio vivo contro archivio nuovo | toglie il divario col modello residente, non lo sposta |
+| 49 | ~~Does a process that stays up between sessions pay for what it costs?~~ **At full budget yes, at half budget little** (measured 2026-09-23, §The engine kept between commands). `trochilus serve` (built 2026-09-23, Marcello's go) keeps pool, model and store; `generate`, `logits`, `run` and `chat` run in it when its endpoint answers, byte for byte the same output (`tests/test_serve.c`). First prompt of 2048 tokens: **full budget 12.79 → 7.81 s** (the 4.98 s load gone, prefill unchanged); **half budget 13.00 → 12.04 s** (0.926×, A/A 1.020×), 139 misses fewer of 1 157. Prediction written before measuring: full loses the load (held); half gains little because the sweep evicts what the next sweep needs first, misses warm = cold (held in the mechanism, off by 12% in the misses) | where the 139 fewer misses come from (per-phase misses: prefill and decode apart); a sweep-resistant eviction at half budget (model: up to ~511 units kept, ~2.5 s) | the gap to the resident model is gone where the model fits; below budget the lever is the eviction policy |
 
 Reference machine: Ryzen 9 7940HX (Zen 4, 16 core / 32 thread, AVX-512 VNNI/BF16), 31 GB
 RAM (2×16 GB DDR5-5200), NVMe Micron 1 TB, GPU RTX 4070 Laptop 8 GB and Radeon 610M (not used
@@ -2127,7 +2127,70 @@ The four builds share the processors, so each is slower than alone (ASan 71 → 
 in the overlap, not in any single step. The real model's steps stay in a row: each loads the model,
 and two at once would ask the engine's memory guard for twice the room.
 
-## Generated mutations (2026-09-22, 2026-09-23)
+## The engine kept between commands: the first prompt (2026-09-23)
+
+Question 49: `trochilus serve` keeps pool, model and expert store; the same `generate` runs in a
+new process (cold, `TR_SERVER=0`) or through the server (warm), which finds the store the run
+before left. `sh tools/serve_first_prompt.sh 5` on `build/trochilus.exe`: OLMoE-1B-7B Q8_0, prompt
+2048, 8 tokens, `-t 16 --decode-threads 8`, median of 5 rounds after one of warm-up, rotating
+order, `AB_WALL=1` (`wall_ms`: the whole command, load included). Machine marker taken, other
+windows' containers up and paused by it; background load 2.94 logical processors busy before the
+first run and 3.34 after the last (0.83 of them the kernel's `System`, chrome 0.5-0.9). Logs in
+`build/serve_first_prompt/`.
+
+| budget | mode | wall s | prefill tok/s | misses | MiB read | A/A |
+|---|---|---|---|---|---|---|
+| half (3 264 MiB, 511 of 1024 units) | cold, new process | 13.00 (12.91–13.57) | 175.5 | 1 157 | 7 376 | coldagain: wall 1.020×, prefill 0.980× |
+| | warm, through the server | **12.04** (11.86–12.37) | 187.6 | 1 018 | 6 490 | |
+| full (whole table resident) | cold, new process | 12.79 (12.73–12.95) | 279.7 | — | — | coldagain: wall 1.004× |
+| | warm, through the server | **7.81** (7.77–8.14) | 275.4 | — | — | warmagain: wall 1.020× |
+
+1. **Full budget: the server removes the load, 4.98 s of 12.79 (0.61×).** The prefill is the same
+   (279.7 against 275.4 tok/s, within spread): what goes is the resident table's read at start,
+   the 4.7 s the question was about. The half server served 7 requests and the full one 12, each
+   with the model loaded once (`serve --status`, `server-*.log`).
+2. **Half budget: 0.96 s of 13.00 (0.926×), beyond the A/A (1.020×), the ranges apart.** The
+   prediction was "misses warm = misses cold": measured 139 fewer of 1 157 (12%, 886 MiB), and a
+   prefill 7% faster by as much (0.76 s at 2048 tokens); the other ~0.2 s is the dense part's
+   load. Where the 139 come from is not measured: a guess is the units the previous run's decode
+   reread in the first layers, which the next sweep reaches before it evicts them. The mechanism
+   holds (a store smaller than one sweep is rewritten by every prompt), its size was off.
+3. **At half budget the next lever is what a sweep evicts, not the server.** A 2048-token prompt
+   sweeps all 1024 units in layer order; LRU over a loop larger than the store keeps what the next
+   loop needs last. A policy that keeps a fixed part of the loop (the first layers, evicting the
+   most recent during a sweep) would carry up to ~511 units from one prompt to the next: up to
+   ~3 260 MiB and ~2.5 s less at the 1.33 GB/s of §Prefill reads model once per pass, with the
+   server. A model, not a measurement.
+
+## Reading the next layer while this one computes (2026-09-23)
+
+M1 work order item 3. In the layer-major prompt an I/O thread reads layer L+1's missing units
+while layer L computes (`tr_experts_prefetch`, `TR_PREFETCH=0` turns it off); the logits are the
+same bytes (`tests/test_prefetch.c`, TSan clean in `make check`). `SET=prefetch sh
+tools/prefill_overlap.sh 5`: OLMoE-1B-7B Q8_0, half budget (3 264 MiB), median of 5 after one of
+warm-up, rotating order; machine marker taken, background load 2.08 / 1.71 logical processors
+(0.87 / 0.72 of them `System`). "disk s" is now the time the compute waited for the disk, no
+longer all the disk's time. Logs in `build/prefill_overlap/`.
+
+| mode | prefill s | disk wait s | compute s | MiB read | spread |
+|---|---|---|---|---|---|
+| 2048, read ahead | **9.39** | 2.07 | 7.32 | 6 343 | 2.5% |
+| 2048, read ahead, A/A | 9.33 | 2.07 | 7.27 | 6 343 | 3.0% |
+| 2048, `TR_PREFETCH=0` | 11.45 | 4.33 | 7.11 | 6 273 | 1.3% |
+| 512, read ahead | 5.92 | 4.16 | 1.77 | 6 031 | 0.7% |
+| 512, `TR_PREFETCH=0` | 5.83 | 4.16 | 1.67 | 6 031 | 1.8% |
+
+1. **At 2048 tokens: 11.45 → 9.39 s, 1.22×** (A/A 0.6%). The ceiling was 1.61×: half of the disk
+   wait is still there (2.07 of 4.33 s), and the compute is 3% slower beside the reads (7.32
+   against 7.11). Layer 0 cannot be read ahead (~0.3 s); where the other ~1.8 s goes is not
+   measured yet (a profile per layer: is a layer's read longer than the layer before's compute?).
+2. **At 512 tokens: nothing** (5.92 against 5.83, within twice the spread, no A/A at 512). A
+   512-token prompt is one block, so it takes the pass-major path, where nothing reads ahead: as
+   designed, and the next lever there (ceiling 1.40× at 512).
+3. **70 MiB more read at 2048** (6 343 against 6 273, 11 units, 1.1%): the rule reads all of the
+   next layer's missing units once the layer just done used nearly all of its own, and a few are
+   not asked for.
+
 
 `tools/mutate_auto.py` swaps operators, drops `± 1`, swaps `return 0` / `return -1`, drops `(!`,
 one at a time, rebuilds, runs the given tests and, with `--cmd`, the oracles; a mutant whose object
@@ -2259,6 +2322,25 @@ What the survivors that are left are, read one by one:
   other four loops die first at an earlier check now that a test stops at its first failure. The
   run slowed by the orphans of #122 had "killed" three of these (the last three), failing twice
   under load: the reason every file ran again.
+
+`src/app/serve.c` (2026-09-24, `tools/mutate_files.sh serve`, whole file: it is not committed yet):
+431 mutants, 205 killed, 73 alive, 153 same object, no timeout; 128 alive and 5 timeouts before
+the new cases of `tests/test_serve.c` (raw clients, descriptors, another protocol, a second model),
+which found LESSONS #137, #138 and #140. The 73 are not read yet.
+
+**Hand-written mutations of the read ahead and of the load bar (2026-09-23).** `tools/mutate_bar.sh`:
+63 of 63 red. `tools/mutate_prefetch.sh` (the I/O thread of the layer-major prompt, gcc and ASan):
+27 of 31 red on the first run, 28 of 31 after the fix below; of the four alive, one was a flavour mistake and three are named.
+A second `tr_experts_prefetch_start` without its guard starts a second thread and leaks the
+first one's queue: only LeakSanitizer sees it, so that mutant now runs under ASan. Equivalent:
+`break` to `continue` when no victim is left (the victim search depends on the layer and the
+kept layer, not on the unit, so every later unit finds none either: more iterations, the same
+store); a failed demand read not moved to the cold end (the victim already is the coldest slot
+not in flight, and reserved slots sit at the hot end until taken in, so the free slot is the next
+victim either way); the prompt passing no kept layer (it reads ahead after the layer's own
+acquire, which makes that layer's units the most recent, and the margin of 2·n_expert + n_used
+slots leaves at least n_expert + n_used colder slots outside it: the guard never fires in this
+call order, and the store's own test of it is red).
 
 ## Attempts
 

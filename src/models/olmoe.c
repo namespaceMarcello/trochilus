@@ -124,7 +124,19 @@ typedef struct {
      * resident (nothing to save a re-read for); non-NULL only makes forward_prompt_layer_major
      * reachable, it does not force it (olmoe_eval still needs n > n_batch). */
     float *x_all;
+    /* The layer whose units the next olmoe_refresh_experts may read ahead once it has acquired
+     * its own (tr_experts_prefetch), -1: none. Set by forward_prompt_layer_major for the first
+     * block of each layer but the last; used and cleared by olmoe_refresh_experts. */
+    int64_t prefetch_layer;
 } olmoe_session;
+
+/* Reading ahead during a layer-major prompt (olmoe_refresh_experts): the next layer's missing
+ * units are read while this one computes, when this layer's first block alone asked for at least
+ * n_expert - n_expert / OLMOE_PREFETCH_SPARE_DIV of its experts. Measured on OLMoE-1B-7B (docs/
+ * MEASUREMENTS.md): a 512-token block asks for nearly every expert of every layer, so the next
+ * layer will too, and a unit read ahead is almost never one the prompt does not use. A short or
+ * narrow block leaves the next layer's reads on demand, as without reading ahead. */
+#define OLMOE_PREFETCH_SPARE_DIV 16
 
 /* ---- loading helpers ---------------------------------------------------- */
 
@@ -142,6 +154,23 @@ static int track(olmoe_model *m, void *p) {
     }
     m->owned[m->n_owned++] = p;
     return 0;
+}
+
+/* The load's progress (model.h tr_progress): bytes read so far against the load's total, handed
+ * to the caller after every tensor read at load and every expert unit tr_experts_load_all reads. */
+typedef struct {
+    const tr_progress *to; /* NULL: nobody asked */
+    uint64_t done, total;
+} load_progress;
+
+static void progress_add(load_progress *lp, uint64_t bytes) {
+    if (lp->to == NULL || lp->to->fn == NULL) return;
+    lp->done += bytes;
+    lp->to->fn(lp->to->ctx, lp->done, lp->total);
+}
+
+static void progress_unit(void *ctx, uint64_t unit_bytes) {
+    progress_add((load_progress *)ctx, unit_bytes);
 }
 
 static int req_u32(tr_gguf *g, const char *key, uint32_t *out, char *err, size_t err_len) {
@@ -169,7 +198,8 @@ static int check_shape(const tr_gguf_tensor *t, uint32_t n_dims, uint64_t ne0, u
 
 /* Loads a 1-D weight, dequantized to an owned float array regardless of its
  * on-disk type (norms are elementwise weights, tr_rmsnorm wants plain float). */
-static float *read_vec(tr_gguf *g, olmoe_model *m, const char *name, int64_t len, char *err, size_t err_len) {
+static float *read_vec(tr_gguf *g, olmoe_model *m, load_progress *lp, const char *name, int64_t len, char *err,
+                       size_t err_len) {
     const tr_gguf_tensor *t = tr_gguf_find_tensor(g, name);
     if (t == NULL) {
         snprintf(err, err_len, "missing tensor '%s'", name);
@@ -191,6 +221,7 @@ static float *read_vec(tr_gguf *g, olmoe_model *m, const char *name, int64_t len
         tr_free_aligned(raw);
         return NULL;
     }
+    progress_add(lp, t->n_bytes);
     float *out = (float *)tr_alloc_aligned((size_t)len * sizeof(float), 64);
     if (out == NULL) {
         snprintf(err, err_len, "out of memory loading '%s'", name);
@@ -207,8 +238,8 @@ static float *read_vec(tr_gguf *g, olmoe_model *m, const char *name, int64_t len
 }
 
 /* Loads a 2-D matmul weight, kept in its on-disk type (F32/F16/Q8_0). */
-static int read_mat(tr_gguf *g, olmoe_model *m, const char *name, int64_t cols, int64_t rows, tr_mat *out,
-                     char *err, size_t err_len) {
+static int read_mat(tr_gguf *g, olmoe_model *m, load_progress *lp, const char *name, int64_t cols, int64_t rows,
+                    tr_mat *out, char *err, size_t err_len) {
     const tr_gguf_tensor *t = tr_gguf_find_tensor(g, name);
     if (t == NULL) {
         snprintf(err, err_len, "missing tensor '%s'", name);
@@ -230,6 +261,7 @@ static int read_mat(tr_gguf *g, olmoe_model *m, const char *name, int64_t cols, 
         tr_free_aligned(raw);
         return -1;
     }
+    progress_add(lp, t->n_bytes);
     if (track(m, raw) != 0) {
         snprintf(err, err_len, "out of memory");
         return -1;
@@ -295,9 +327,10 @@ static void olmoe_free(void *model) {
 
 /* ---- vtable: load -------------------------------------------------------- */
 
-static void *olmoe_load(const char *path, tr_gguf *g, tr_pool *pool, uint64_t expert_budget, char *err,
-                        size_t err_len) {
+static void *olmoe_load(const char *path, tr_gguf *g, tr_pool *pool, uint64_t expert_budget,
+                        const tr_progress *progress, char *err, size_t err_len) {
     tr_kernels_init();
+    load_progress lp = {progress, 0, 0}; /* total: set once the store knows whether it is resident */
 
     olmoe_model *m = (olmoe_model *)calloc(1, sizeof *m);
     if (m == NULL) {
@@ -525,12 +558,28 @@ static void *olmoe_load(const char *path, tr_gguf *g, tr_pool *pool, uint64_t ex
         ecfg.read_align = read_align;
         m->experts = tr_experts_create(&ecfg, err, err_len);
         if (m->experts == NULL) goto fail;
+        /* what this load reads (model.h tr_progress): every dense tensor, and every expert unit
+         * only when the store is resident -- counted from the same part sizes tr_experts_load_all
+         * reports unit by unit, so the last report lands exactly on the total */
+        int resident = tr_experts_resident(m->experts);
+        uint64_t experts_at_load = 0;
+        if (resident)
+            for (int64_t i = 0; i < m->n_layers * TR_EXPERT_PARTS; i++)
+                experts_at_load += (uint64_t)part_bytes_tbl[i] * (uint64_t)m->n_expert;
+        lp.total = dense_bytes + experts_at_load;
         /* resident: fill every slot now, so forward_pass's acquire calls are hits from the very
          * first token and the reader is never called again (one path afterwards either way). */
-        if (tr_experts_resident(m->experts) && tr_experts_load_all(m->experts) != 0) {
+        if (resident && tr_experts_load_all(m->experts, progress_unit, &lp) != 0) {
             snprintf(err, err_len, "failed reading the experts at load");
             goto fail;
         }
+        /* partial: an I/O thread reads the next layer's units while a prompt computes this one
+         * (forward_prompt_layer_major). TR_PREFETCH=0, read once here, keeps every read on
+         * demand: the A/B measurement only (model.h). A store too small for it stays as it is. */
+        const char *want_prefetch = getenv("TR_PREFETCH");
+        if (!resident && (want_prefetch == NULL || strcmp(want_prefetch, "0") != 0) &&
+            tr_experts_prefetch_start(m->experts) < 0)
+            tr_log(TR_LOG_WARN, "could not start the expert store's I/O thread: every read stays on demand");
     }
 
     /* token_embd.weight: vocab size comes from its shape, not metadata. */
@@ -564,6 +613,7 @@ static void *olmoe_load(const char *path, tr_gguf *g, tr_pool *pool, uint64_t ex
             tr_free_aligned(raw);
             goto fail;
         }
+        progress_add(&lp, te->n_bytes);
         if (track(m, raw) != 0) {
             snprintf(err, err_len, "out of memory");
             goto fail;
@@ -574,10 +624,10 @@ static void *olmoe_load(const char *path, tr_gguf *g, tr_pool *pool, uint64_t ex
         m->token_embd.data = raw;
     }
 
-    m->output_norm = read_vec(g, m, "output_norm.weight", m->n_embd, err, err_len);
+    m->output_norm = read_vec(g, m, &lp, "output_norm.weight", m->n_embd, err, err_len);
     if (m->output_norm == NULL) goto fail;
 
-    if (read_mat(g, m, "output.weight", m->n_embd, m->vocab, &m->output, err, err_len) != 0) goto fail;
+    if (read_mat(g, m, &lp, "output.weight", m->n_embd, m->vocab, &m->output, err, err_len) != 0) goto fail;
 
     m->layers = (olmoe_layer *)calloc((size_t)m->n_layers, sizeof(olmoe_layer));
     if (m->layers == NULL) {
@@ -590,35 +640,35 @@ static void *olmoe_load(const char *path, tr_gguf *g, tr_pool *pool, uint64_t ex
         char name[64];
 
         snprintf(name, sizeof name, "blk.%" PRId64 ".attn_norm.weight", L);
-        layer->attn_norm = read_vec(g, m, name, m->n_embd, err, err_len);
+        layer->attn_norm = read_vec(g, m, &lp, name, m->n_embd, err, err_len);
         if (layer->attn_norm == NULL) goto fail;
 
         snprintf(name, sizeof name, "blk.%" PRId64 ".attn_q.weight", L);
-        if (read_mat(g, m, name, m->n_embd, m->n_qkv, &layer->wq, err, err_len) != 0) goto fail;
+        if (read_mat(g, m, &lp, name, m->n_embd, m->n_qkv, &layer->wq, err, err_len) != 0) goto fail;
 
         snprintf(name, sizeof name, "blk.%" PRId64 ".attn_k.weight", L);
-        if (read_mat(g, m, name, m->n_embd, m->n_kv, &layer->wk, err, err_len) != 0) goto fail;
+        if (read_mat(g, m, &lp, name, m->n_embd, m->n_kv, &layer->wk, err, err_len) != 0) goto fail;
 
         snprintf(name, sizeof name, "blk.%" PRId64 ".attn_v.weight", L);
-        if (read_mat(g, m, name, m->n_embd, m->n_kv, &layer->wv, err, err_len) != 0) goto fail;
+        if (read_mat(g, m, &lp, name, m->n_embd, m->n_kv, &layer->wv, err, err_len) != 0) goto fail;
 
         snprintf(name, sizeof name, "blk.%" PRId64 ".attn_output.weight", L);
-        if (read_mat(g, m, name, m->n_qkv, m->n_embd, &layer->wo, err, err_len) != 0) goto fail;
+        if (read_mat(g, m, &lp, name, m->n_qkv, m->n_embd, &layer->wo, err, err_len) != 0) goto fail;
 
         snprintf(name, sizeof name, "blk.%" PRId64 ".attn_q_norm.weight", L);
-        layer->q_norm = read_vec(g, m, name, m->n_qkv, err, err_len);
+        layer->q_norm = read_vec(g, m, &lp, name, m->n_qkv, err, err_len);
         if (layer->q_norm == NULL) goto fail;
 
         snprintf(name, sizeof name, "blk.%" PRId64 ".attn_k_norm.weight", L);
-        layer->k_norm = read_vec(g, m, name, m->n_kv, err, err_len);
+        layer->k_norm = read_vec(g, m, &lp, name, m->n_kv, err, err_len);
         if (layer->k_norm == NULL) goto fail;
 
         snprintf(name, sizeof name, "blk.%" PRId64 ".ffn_norm.weight", L);
-        layer->ffn_norm = read_vec(g, m, name, m->n_embd, err, err_len);
+        layer->ffn_norm = read_vec(g, m, &lp, name, m->n_embd, err, err_len);
         if (layer->ffn_norm == NULL) goto fail;
 
         snprintf(name, sizeof name, "blk.%" PRId64 ".ffn_gate_inp.weight", L);
-        if (read_mat(g, m, name, m->n_embd, m->n_expert, &layer->gate_inp, err, err_len) != 0) goto fail;
+        if (read_mat(g, m, &lp, name, m->n_embd, m->n_expert, &layer->gate_inp, err, err_len) != 0) goto fail;
 
         layer->exps = (tr_mat *)calloc((size_t)m->n_expert * 3, sizeof(tr_mat));
         if (layer->exps == NULL) {
@@ -784,6 +834,7 @@ static void *olmoe_session_create(void *model, int64_t n_ctx, int64_t n_batch, c
     s->n_ctx = actual_ctx;
     s->n_batch = B;
     s->pos = 0;
+    s->prefetch_layer = -1;
 
     int kv_rc = tr_kv_init(&s->kv, m->n_layers, m->n_head_kv, m->head_dim, actual_ctx);
     s->rope_cos = (float *)tr_alloc_aligned((size_t)rope_elems * sizeof(float), 64);
@@ -1095,6 +1146,11 @@ static void route_trace_record(olmoe_session *s, int64_t L, const int32_t *token
  * nothing: it only touches s->acquire_ids, sized at session create. -1 on a failed read. */
 static int olmoe_refresh_experts(olmoe_model *m, olmoe_session *s, int64_t L);
 
+/* Defined below, after the hot zone: waits for every unit the store is still reading ahead and
+ * counts the wait and the bytes in the profile's weight_read. 0, or -1 if a read ahead failed
+ * (tr_experts_prefetch_wait). Allocates nothing. */
+static int olmoe_prefetch_drain(olmoe_model *m, olmoe_session *s);
+
 /* Token embeddings of n_tok tokens into x ([n_tok][n_embd]). */
 static void forward_embed(olmoe_model *m, olmoe_session *s, const int32_t *tokens, int64_t n_tok, float *x) {
     tr_prof *prof = &s->prof;
@@ -1379,12 +1435,22 @@ static int forward_prompt_layer_major(olmoe_model *m, olmoe_session *s, const in
         if (prof->enabled) prof->tokens[prof->phase] += (uint64_t)len; /* once per block, not per layer */
     }
 
+    /* the first block of each layer but the last, once it has its own units, may start reading
+     * the next layer's (olmoe_refresh_experts); whatever is still in flight at the end, or when a
+     * layer fails, is waited for before returning, so nothing is read behind the caller's back */
     for (int64_t L = 0; L < m->n_layers; L++) {
         for (int64_t off = 0; off < n; off += s->n_batch) {
             int64_t len = n - off < s->n_batch ? n - off : s->n_batch;
-            if (forward_layer(m, s, L, tokens + off, len, pos_base + off, s->x_all + off * n_embd) != 0) return -1;
+            s->prefetch_layer = off == 0 && L + 1 < m->n_layers ? L + 1 : -1;
+            if (forward_layer(m, s, L, tokens + off, len, pos_base + off, s->x_all + off * n_embd) != 0) {
+                s->prefetch_layer = -1;
+                olmoe_prefetch_drain(m, s);
+                return -1;
+            }
         }
     }
+    s->prefetch_layer = -1;
+    if (olmoe_prefetch_drain(m, s) != 0) return -1;
 
     forward_logits(m, s, s->x_all, n, n_logits);
 
@@ -1457,6 +1523,12 @@ static int olmoe_refresh_experts(olmoe_model *m, olmoe_session *s, int64_t L) {
     uint64_t read_bytes = after.bytes_read - before.bytes_read;
     tr_prof_count(&s->prof, TR_PROF_WEIGHT_READ, read_bytes, read_bytes);
 
+    /* this layer's units in hand: read the next layer's ahead while this one computes, if this
+     * block asked for nearly every expert (OLMOE_PREFETCH_SPARE_DIV) */
+    if (rc == 0 && s->prefetch_layer >= 0 && n_ids >= n_expert - n_expert / OLMOE_PREFETCH_SPARE_DIV)
+        tr_experts_prefetch(m->experts, s->prefetch_layer, L);
+    s->prefetch_layer = -1;
+
     /* every expert of the layer, present or not: a stale pointer from a past layer's turn must
      * never survive, so a wrong read crashes instead of reading someone else's bytes. */
     for (int64_t e = 0; e < n_expert; e++) {
@@ -1464,6 +1536,19 @@ static int olmoe_refresh_experts(olmoe_model *m, olmoe_session *s, int64_t L) {
         layer->exps[n_expert + e].data = tr_experts_part(m->experts, L, e, 1);
         layer->exps[2 * n_expert + e].data = tr_experts_part(m->experts, L, e, 2);
     }
+    return rc;
+}
+
+static int olmoe_prefetch_drain(olmoe_model *m, olmoe_session *s) {
+    if (!tr_experts_prefetching(m->experts)) return 0;
+    tr_experts_stats before, after;
+    tr_experts_get_stats(m->experts, &before);
+    uint64_t t = tr_prof_begin(&s->prof);
+    int rc = tr_experts_prefetch_wait(m->experts);
+    tr_prof_end(&s->prof, TR_PROF_WEIGHT_READ, t);
+    tr_experts_get_stats(m->experts, &after);
+    uint64_t read_bytes = after.bytes_read - before.bytes_read;
+    tr_prof_count(&s->prof, TR_PROF_WEIGHT_READ, read_bytes, read_bytes);
     return rc;
 }
 

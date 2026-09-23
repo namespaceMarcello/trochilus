@@ -2,7 +2,10 @@
  * enough for the pool to split real work:
  *   - generating tokens performs zero memory allocations and frees (counted by linking
  *     the engine's allocator calls through --wrap, see the Makefile);
- *   - logits are bit-identical for every pool size, with and without the profiler. */
+ *   - logits are bit-identical for every pool size, with and without the profiler;
+ *   - under the smallest expert store the disk reads allocate nothing either, and neither does a
+ *     prompt taken layer by layer while the store's I/O thread reads the next layer ahead (6
+ *     layers, 24 slots of 48 units: the reads ahead are counted, so the case cannot pass idle). */
 #include <stdatomic.h>
 
 #include "test.h"
@@ -112,7 +115,43 @@ int main(int argc, char **argv) {
 #endif
     TR_CHECK(memcmp(ref, got_min, sizeof ref) == 0);
     printf("  same, under the smallest expert store (--expert-budget min): no allocations, identical logits\n");
-
     remove(path);
+
+    /* reading ahead (src/memory/experts.h tr_experts_prefetch): a prompt taken layer by layer
+     * under a store of 24 slots of 48 units, the I/O thread reading the next layer's units while
+     * this one computes -- nothing allocated on either thread, and the reads ahead really ran */
+    {
+        static const synth_params P6 = {6, 64, 4, 2, 64, 8, 2, 64, 64, TR_TYPE_F32};
+        TR_CHECK(synth_write(&P6, argc > 0 ? argv[0] : "", "test_hot_prefetch.gguf", path, sizeof path) == 0);
+        char err[256];
+        tr_pool *pool = tr_pool_create(3);
+        tr_model *model = pool ? tr_model_load_budget(path, pool, UINT64_MAX, err, sizeof err) : NULL;
+        tr_experts_stats st;
+        uint64_t slot_bytes = model != NULL && tr_model_expert_stats(model, &st) == 0 ? st.slot_bytes : 0;
+        tr_model_free(model);
+        model = slot_bytes > 0 ? tr_model_load_budget(path, pool, 24 * slot_bytes, err, sizeof err) : NULL;
+        tr_session *s = model ? tr_session_create(model, 0, 8, err, sizeof err) : NULL;
+        TR_CHECK(s != NULL);
+        if (s != NULL) {
+            int32_t tok[33];
+            for (int i = 0; i < 33; i++) tok[i] = (i * 5 + 1) % (int32_t)P6.vocab;
+            TR_CHECK(tr_session_eval(s, tok, 1) == 0);
+            unsigned long before = atomic_load(&g_allocs);
+            TR_CHECK(tr_session_eval(s, tok + 1, 32) == 0); /* 4 blocks of 8: layer by layer */
+            unsigned long allocs = atomic_load(&g_allocs) - before;
+#ifndef TR_NO_WRAP
+            TR_CHECK_EQ_INT((int)allocs, 0);
+#endif
+            TR_CHECK(tr_model_expert_stats(model, &st) == 0);
+            TR_CHECK(st.prefetched > 0);
+            printf("  a layer-major prompt reading ahead (%llu units): %lu allocations\n",
+                   (unsigned long long)st.prefetched, allocs);
+            tr_session_free(s);
+        }
+        tr_model_free(model);
+        tr_pool_destroy(pool);
+        remove(path);
+    }
+
     TR_TEST_EXIT();
 }

@@ -204,6 +204,11 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
   per zone how many bytes it reads and at how many GB/s: a zone at cap is memory-bound, one below
   is bound by something else (LESSONS #75–#76). Measurements at multiple contexts fit in **one**
   `ab_modes.sh` session, in an order putting each context after every other (`tools/decode_context.sh`).
+- 2026-09-23 — **The engine may outlive a command** (question 49, Marcello's go): `trochilus serve`
+  keeps pool, model and expert store; `generate`, `logits`, `run`, `chat` run in it when it answers,
+  transparently and byte-identical, else in their own process (`TR_SERVER=0`: never; the gate and
+  the measurements set it). No auto-start: a server is started by the user, and leaves after
+  `--idle` minutes without a command (default 30).
 
 ## Known issues
 
@@ -227,11 +232,15 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
   native measurement, declared and not corrected; what is in there asks for admin session. By day,
   with Marcello at machine and another window working, sessions cannot distinguish differences
   under 5%: deciding measurements done at night.
-- **Docker VM restarts on its own** and lights containers with restart policy (six of
-  OpenEMR, on 2026-09-19 at 15:57 and 18:40; LESSONS #87): Docker Desktop stops it when no
-  container runs, and first command needing engine restarts it (`docker ps -q` does not).
-  Guard before every run sees containers and halts comparison; inside a measurement no other
-  Docker command runs.
+- **The machine is shared with other Claude windows** (rule of 2026-09-23, LESSONS #73, #87,
+  #127): a timing measurement writes `~/.claude/macchina-ferma` ("trochilus: <script>") for its
+  duration and the other windows pause their correctness work; the containers of other projects
+  are no longer stopped nor waited for (OpenEMR's idle stack kept the old guard false for hours).
+  `tools/measure_guard.lib` takes the marker with noclobber, waits up to 6 h for another window's,
+  refreshes it before every run, gives back only its own (`tools/test_marker.sh`,
+  `tools/mutate_marker.sh`); the CPU check before every run still stops a comparison on a busy
+  machine. The other half, our Docker work pausing under another window's marker, is not done:
+  `make check` and `mutate_files.sh` do not look at it yet.
 - Project hooks (`.claude/settings.json`) work only if Claude Code starts from `trochilus` folder:
   a session opened from Desktop does not load them, even after `/hooks` (LESSONS #18).
 - Free RAM on PC often ~10–14 GB of 31: Docker containers of other projects (OpenEMR,
@@ -247,9 +256,14 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
   `q_norm` on whole projection (hidden), `k_norm` on kv_heads × head_dim, neox-style RoPE
   (`rotate_half`), softmax on all experts then top-k, normalization only with `norm_topk_prob`.
 - Speed measurements in container: models in Docker volume `trochilus-models` (GGUF + colibri
-  conversion, 14 GB), not from Windows disk (LESSONS #41). Containers of other projects stopped
-  and restarted by `tools/remeasure.sh` (2026-09-18: 9 stopped, 9 restarted); a manual `docker stop`
-  was blocked by automatic Claude Code permission control.
+  conversion, 14 GB), not from Windows disk (LESSONS #41).
+- **`trochilus serve`** (question 49): one request at a time; a client killed mid-command leaves
+  the command running to its end (on POSIX still printing on that terminal); on Windows the pipes
+  keep the default DACL (other local users could read them), and a running server locks
+  `build/trochilus.exe` (relink fails until `serve --stop` or the idle exit); `-t 0` and `-t 16`
+  are two pools to it. A rebuilt client is declined (build stamp) and runs its command itself.
+  The load's rainbow bar (`src/app/bar.c`) is drawn by the process that loads: a POSIX server
+  draws on the client's terminal but reads `TR_BAR`/`NO_COLOR`/`TERM` from its own environment.
 - PC has no clang or CUDA toolkit: Windows build with MinGW-w64 gcc 15.2 (scoop), Linux
   in `trochilus-dev` container (Ubuntu 24.04, gcc + clang; ASan, UBSan, TSan with gcc).
 - **One pool at a time** (LESSONS #63): two live pools take same slots and share same cores, and
@@ -260,17 +274,10 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
   machine has tested them. Work divided equally, so on P+E slowest core sets pace; Windows
   `EfficiencyClass` not read.
 
-- Native speed measurements want clean machine: containers of other projects must stop and
-  restart after (memory guard refuses to load model under ~10 GB free), and no agent must compile
-  in Docker meanwhile (LESSONS #57). `tools/ab_speed.sh` and `ab_spec.sh` now stop if a run does
-  not produce a number, instead of printing empty table; `threads_phase.sh` and `remeasure.sh`
-  wait for engine to see 12 GiB free before first run, because after `make check` Windows reclaims
-  memory with minutes delay (LESSONS #72).
-- **Another Claude window can light containers mid-measurement** (2026-09-19: OpenEMR at
-  95% CPU and 6.4 GiB, seven minutes in; LESSONS #73). Measurement scripts now stop at next run if
-  they see a container lit (`AB_GUARD` in `ab_modes.sh`), instead of continuing on busy machine;
-  work **without** other window's container not seen, raises spread (session `speed-auto`: 9–29%
-  vs. 4–16%). Long measurements launched when other windows idle.
+- Native speed measurements: no agent compiles in Docker meanwhile (LESSONS #57); a run that
+  produces no number stops the comparison; the scripts wait for the engine to see 12 GiB free
+  (after `make check` Windows reclaims memory minutes late, LESSONS #72). With other projects'
+  containers now left up, that wait may fail more often than with `docker stop`.
 
 ## Next steps
 
@@ -289,10 +296,7 @@ everything it started (#122: seven looping orphans had slowed and falsified a ca
 fast enough to run after a change (#124: per-check budgets, fail-fast tests, `CHANGED=HEAD`
 mutates only the changed lines): every file of `mutate_files.sh` ran again, 42 min plus 31 for `olmoe.c` (whose five kills that did not repeat are survivors again, #125).
 Open: `gguf.c`, `experts.c`, `threads.c`, `platform.c` are not in `mutate_files.sh` and their
-counts predate #117-#124; the native measurements are to follow the machine's new rule (2026-09-23):
-a timing run writes `~/.claude/macchina-ferma` for its duration, and the other windows hold off,
-where `tools/measure_guard.lib` now waits for no container at all to be running, which another
-window's idle stack (OpenEMR) can keep false for hours.
+counts predate #117-#124. The native measurements follow the machine's marker (Known issues).
 
 Steps of 17–19/09 (block prefill, `--spec`, thread pinning, adaptive draft, adversarial revision,
 remeasure with A/A, threads per phase; decode at long context and KV per head, prefill on long
@@ -356,35 +360,29 @@ software, question 41) and untouched: factory state of target PCs, M1 designed o
   §`once_per_prompt`, seen red (33 units of 16 table) then green (LESSONS #99, closed).
 - **M1 work order, decided 2026-09-21** (from numbers, not plan):
   1. ~~layer-major order in prefill~~ **done** (line above, 1.89×);
-  2. **first prompt cost** (questions 45, 48, 49): under budget each start rereads full model,
-     4.7 s, that is all gap left with resident model (12.41 vs. 7.47 s at 2048). Two paths,
-     not either/or: **hide it** behind time user takes to write (declared prep phase, Marcello
-     2026-09-21: nothing new to build, question 48) and **remove it** with expert store living
-     longer than session (49). Reload a *list* at start serves nothing: rereading disk is that
-     time;
-  3. **overlap disk and computation**: with new order cap is 1.61× at 2048 (model, not measure:
-     12.41 s vs. `max(4.68, 7.73)`), and disk no longer big half — computation is;
+  2. **first prompt cost** (questions 45, 48, 49; 4.7 s at 2048, the whole gap to the resident
+     model): **49 built 2026-09-23** (Marcello's go): `trochilus serve` keeps pool, model and
+     store between commands, same bytes out (`tests/test_serve.c`). **Measured** (MEASUREMENTS
+     §The engine kept between commands): first 2048-token prompt at full budget **12.79 → 7.81 s**
+     (the load gone), at half **13.00 → 12.04 s** (0.926×): as predicted, a store smaller than one
+     sweep is rewritten by every prompt. Below budget the lever is the eviction during a sweep
+     (keep the first layers, evict the most recent: model, up to ~2.5 s with the server). The
+     load shows the rainbow water bar (variant A, Marcello's choice, 2026-09-23). 48 (read while
+     the user types) after 3;
+  3. **overlap disk and computation**, done 2026-09-23 (MEASUREMENTS §Reading the next layer):
+     an I/O thread reads layer L+1 while L computes in the layer-major prompt; 2048 tokens at half
+     budget **11.45 → 9.39 s (1.22×)** of a 1.61× ceiling, same bytes out. Next: where the other
+     2.07 s of disk wait go (profile per layer), and the one-block prompt (≤ 512 tokens, pass-major,
+     nothing read ahead: ceiling 1.40×);
   4. **file reordering for co-activation** (mbolt, MIT): ≤ 1.15× on this disk with these
      experts, costs our format. Later.
 - **Then**: questions 42 (layer 0), 43 (from which disk up prefetch pays), 46 (fixed cost of decode).
   Three matrices in one read: **no**, in GGUF three tensors are separate (docs/ORIGINS.md
   §The expert store).
 
-- **Question 44, almost done** (2026-09-20, `docs/MEASUREMENTS.md` §Behavior on code…): on
-  OLMoE-1B-7B code **not** a small graph (25% of units cover 68–73%), **not** per-token table
-  (9–16% at layer 0), **not** static (54–65% vs. 82–86% of live router), **not** compressible by
-  silencing experts (93.9% of tokens with 50% off, on same mask text); **is** code region common
-  to C, Python, shell (Jaccard 0.68–0.77, 0.07–0.09 with English prose), and use orders experts
-  40–50 times better than chance. New: trace version 2 (token ids, margins), `--expert-mask` (measure
-  only), `tools/route_graph_report.py`, `tools/mutate_reports.py`, `tools/mask_quality.sh`, five
-  prompts `bench/prompts/trace-*.txt`. `make check` green 2026-09-20 with all this in, and 12
-  mutations of `tools/mutate_route.sh` all red (7 new: mask and margins). **Closed night
-  2026-09-20** with `sh tools/mask_quality.sh` on five texts (`build/mask/quality.txt`): with 50%
-  experts off for use token matches 93.9% (mask text), 92.8% (other C),
-  **86.0% (Python), 81.4% (shell)** — code region has a center, moving away from mask language
-  costs; on **English prose use-mask does like random** (36.4% vs. 38.8% different tokens with 75%
-  kept, KL 6.37 vs. 6.35 with 25%): experts hot on code not «best», are code's. Remains one second
-  model only.
+- **Question 44, closed 2026-09-20** (`docs/MEASUREMENTS.md` §Is code behavior a small,
+  deterministic graph?): no, in all four senses; a code region common to C, Python and shell
+  (Jaccard 0.68–0.77, 0.07–0.09 with prose). What remains: a second model.
 
 **Order decided by Marcello 2026-09-19 evening**: (a) **M1**, experts from disk, starting from
 measurements 13–16 and with GGUF and pool folders from component comparison inside (point 5);

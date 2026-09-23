@@ -25,9 +25,10 @@
 # of 4000 has just heated is not always the same length, and a mode and its A/A copy never follow
 # the same length, so the A/A difference carries that effect too.
 #
-# The containers of the other projects are stopped for the duration and started again at the end,
-# also when the script fails or is interrupted; if somebody starts one in the meantime the
-# measurement stops at the next run (AB_GUARD, docs/LESSONS.md #73). A binary Smart App Control
+# The machine's marker (~/.claude/macchina-ferma) is held for the duration and given back at the
+# end, also when the script fails or is interrupted: the other windows pause their work, their
+# containers stay up; if the CPU gets busy in the meantime the measurement stops at the next run
+# (AB_GUARD, docs/LESSONS.md #73). A binary Smart App Control
 # still blocks (docs/LESSONS.md #12) is waited for, never rebuilt: a rebuild starts the wait again.
 # When the wait goes past half an hour, a second copy built somewhere else may run at once
 # (make BUILD=build/after2 build/after2/trochilus.exe, then TROCHILUS=build/after2/trochilus.exe
@@ -72,31 +73,26 @@ wait_runs() {
 }
 # one measurement at a time, and the machine stays awake while it lasts (docs/LESSONS.md #82)
 . tools/measure_guard.lib
-measure_begin prefill_context
 trap measure_end EXIT
 trap 'exit 130' INT TERM
-[ "$WHAT" = bench ] || wait_runs $B cpu
-wait_runs $ATTNB
-[ -z "$BEFORE" ] || wait_runs $BEFORE cpu
-[ -z "$PROF_BEFORE" ] || wait_runs $PROF_BEFORE cpu
+# after the lock, before the machine's marker: a binary Smart App Control holds (up to an hour)
+# keeps no other window waiting (tools/measure_guard.lib)
+measure_ready() {
+  [ "$WHAT" = bench ] || wait_runs $B cpu
+  wait_runs $ATTNB
+  [ -z "$BEFORE" ] || wait_runs $BEFORE cpu
+  [ -z "$PROF_BEFORE" ] || wait_runs $PROF_BEFORE cpu
+}
+measure_begin prefill_context
 # which binaries these numbers belong to: a name like trochilus-before.exe is reused from one
 # session to the next, a hash is not (docs/LESSONS.md #81, #86)
 sha256sum $B $ATTNB $BEFORE $PROF_BEFORE > $OUT/binaries.sha256 2> /dev/null || true
 
-RUNNING=$(docker ps -q 2>/dev/null || true)
-restart() { measure_end; if [ -n "$RUNNING" ]; then docker start $RUNNING > /dev/null 2>&1 || true; echo "containers started again"; fi; }
-trap restart EXIT
-if [ -n "$RUNNING" ]; then
-  # the VM's file cache goes back to Windows first (docs/LESSONS.md #38), then everything stops
-  MSYS_NO_PATHCONV=1 docker run --rm --privileged trochilus-dev:local sh -c "sync; echo 3 > /proc/sys/vm/drop_caches" || true
-  docker stop $RUNNING > /dev/null
-  echo "containers stopped: $(echo $RUNNING | wc -w)"
-fi
-# from here on a running container, or a CPU busy with other work, means somebody else is using
-# the machine (tools/measure_guard.lib, tools/machine_still.sh)
-AB_GUARD=$MEASURE_AB_GUARD
-export AB_GUARD
-still() { sh -c "$AB_GUARD" || { echo "prefill_context: the machine is not still $1 (a container, or a busy CPU), stopping"; exit 3; }; }
+# the other windows' containers stay up, their work paused by the marker; from here on a CPU
+# busy with other work, or the marker lost, stops the measurement at the next run
+# (tools/measure_guard.lib, tools/machine_still.sh, docs/LESSONS.md #73, #84)
+measure_machine prefill_context
+still() { sh -c "$AB_GUARD" || { echo "prefill_context: the machine is not still $1 (the marker lost, or a busy CPU), stopping"; exit 3; }; }
 
 # The model takes 7 GiB and the memory guard wants 3 more left free; Windows needs minutes to
 # take back what the VM has released (docs/LESSONS.md #72). Up to 15 minutes, a look every 30 s.

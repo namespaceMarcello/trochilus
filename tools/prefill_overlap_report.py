@@ -16,13 +16,17 @@ import pathlib
 import re
 import sys
 
-ORDER = ["p512b100", "p512b50", "p2048b100", "p2048b50", "p2048b50one"]
+ORDER = ["p512b100", "p512b50", "p512b50off", "p2048b100", "p2048b50", "p2048b50aa", "p2048b50off",
+         "p2048b50one"]
 NAMES = {
     "p512b100": "prompt 512, residente",
     "p512b50": "prompt 512, budget 50%",
     "p2048b100": "prompt 2048, residente",
     "p2048b50": "prompt 2048, budget 50%",
     "p2048b50one": "prompt 2048, 50%, 1 passata",
+    "p512b50off": "prompt 512, 50%, no prefetch",
+    "p2048b50off": "prompt 2048, 50%, no prefetch",
+    "p2048b50aa": "prompt 2048, 50%, A/A",
 }
 
 

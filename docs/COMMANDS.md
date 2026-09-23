@@ -5,6 +5,7 @@ those used every day; here is everything, including measurements and rarely used
 
 ```bash
 make check               # the gate: lint, build 0 warning, test, ASan, TSan, repeated tests, oracles, C tests natively; prints its time
+make quick               # between edits, NOT the gate: lint, native build with 0 warnings, the C tests in Linux gcc (~2 min)
 make check 2>&1 | awk '{ print strftime("%H:%M:%S"), $0; fflush() }' > build/check.log   # the gate with a time on every line
 tools/.venv/Scripts/python.exe tools/gate_times.py build/check.log   # seconds per step of that log (docs/MEASUREMENTS.md §The gate)
 sh tools/native_tests.sh build/tests/test_*.exe   # the C tests on Windows itself; SKIPPED where Smart App Control blocks
@@ -23,12 +24,21 @@ sh tools/ab_spec.sh <gguf> <binary> bench/prompts/code.txt 8   # how much --spec
 sh tools/build_llamacpp.sh; tools/compare_llamacpp.py ...   # in container: llama.cpp, logits comparison
 tools/speed_compare.py ...   # in container: speed against llama.cpp and colibri (trochilus-models volume)
 sh tools/ab_speed.sh <gguf> <binary A> <binary B>   # two binaries alternated run by run (LESSONS #46)
-sh tools/ab_modes.sh <rounds> "a=<command>" "b=<command>"   # modes of a binary (env, flag), round-robin order, A/A (LESSONS #66)
+sh tools/ab_modes.sh <rounds> "a=<command>" "b=<command>"   # modes of a binary (env, flag), round-robin order, A/A (LESSONS #66); AB_WALL=1 adds the whole run's ms (wall_ms)
+build/trochilus serve [-m <gguf>] [-t n] [--expert-budget <MiB|min>] [--idle <min>]   # the engine kept between commands (question 49): generate/logits/run/chat run in it when it answers; TR_SERVER=0: never
+build/trochilus serve --status | --stop   # what it keeps, how many requests and loads; stop it
+sh tools/serve_first_prompt.sh [rounds]   # question 49: first prompt, new process against a kept store, half and full budget, wall_ms and misses
 build/trochilus run ... --decode-threads 8   # force decode threads (default: measured per session)
 sh tools/threads_phase.sh sweep | widths | after <binary before>   # threads per phase: -t 4/8/12/16, forced widths
 sh tools/decode_context.sh measure | widths | long | change <before>   # decode at 32/512/2048/4000 context: A/A, forced widths, bytes per zone
 tools/.venv/Scripts/python.exe tools/decode_context_report.py speed|model|zones <file>   # MEASUREMENTS tables from runs; speed counts choices and changes
 sh tools/orphans.sh      # is something of ours still on? make check and measurements don't start
+sh tools/test_marker.sh | sh tools/mutate_marker.sh   # the machine's marker (~/.claude/macchina-ferma) taken, waited for, given back; its 9 mutations all red (on a copy of the library)
+sh tools/test_ab_modes.sh   # ab_modes stops on a run that measured nothing, with and without AB_WALL (in make check)
+sh tools/mutate_bar.sh   # in container: the progress bar's mutations (physics, render, decision, clearing, the load's progress), about 6 min
+sh tools/mutate_prefetch.sh   # in container: the read ahead's mutations (store, thread API, prompt), gcc and ASan
+SET=prefetch sh tools/prefill_overlap.sh [rounds]   # native: the prompt at half budget with and without reading the next layer ahead (TR_PREFETCH=0), 512 and 2048, A/A
+TR_BAR=0 build/trochilus run ...   # no progress bar while the model loads (it is drawn only when stderr is a terminal, and not with NO_COLOR or TERM=dumb)
 sh tools/busy_machine.sh <n> <command>   # the ONLY way to load the machine: generators die with the script
 sh tools/machine_still.sh [limit] [wait] [window]   # occupied processors (who: tools/background_load.ps1): guard for every measurement
 sh tools/test_cleanup.sh   # a stopped script loses its children; without cleanup.lib trap the child stays
@@ -43,7 +53,7 @@ sh tools/experts_budget.sh measure | misses | direct   # M1: tok/s at 4 budgets,
 build/trochilus run ... --expert-budget <MiB|min>   # expert RAM (default: the plan); TR_EXPERT_BUDGET_MIB in tests
 sh tools/mutate_{route,tune,experts,stream}.sh | tools/mutate_reports.py   # in container: the mutations, all red
 python3 tools/mutate_auto.py <src/file.c> <test> [test...] [--lines A-B,C-D] [--changed REF] [--list] [--asan] [--cmd '<shell>']   # in container: generated mutations, survivors, timeouts and memory refusals listed (SURVIVED, TIMEOUT, PRESSURE); --cmd adds a check per mutant (the oracle, for a model file); --changed HEAD: only the lines changed since HEAD; a progress line per mutant on stderr
-sh tools/mutate_files.sh [olmoe kernels ... main prof]   # in container: mutate_auto on each file with its tests and oracles, build/mutate/<name>.txt, time left in build/mutate/<name>.progress; CHANGED=HEAD sh tools/mutate_files.sh <name>: only the lines changed since HEAD
+sh tools/mutate_files.sh [olmoe kernels ... main serve prof]   # in container: mutate_auto on each file with its tests and oracles, build/mutate/<name>.txt, time left in build/mutate/<name>.progress; CHANGED=HEAD sh tools/mutate_files.sh <name>: only the lines changed since HEAD
 make bench-attn          # attention on prompt (512/2048/4000) on one layer, broken down by phases, with bit control
 make bench-expf          # tr_expf on all 2^32 floats against rounded value and C library
 tools/.venv/Scripts/python.exe tools/gen_expf_table.py [--check | --scan]   # tr_expf constants from mpmath (src/kernels/expf_table.h)

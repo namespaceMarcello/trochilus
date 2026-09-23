@@ -29,9 +29,10 @@
 #
 # The decode width is FORCED to 8 everywhere (--decode-threads 8): the estimator that would
 # measure it is not validated yet (punto 0 di docs/STATUS.md), and a measurement must not rest on
-# it. The containers of the other projects are stopped for the duration and started again at the
-# end, also on failure; if somebody starts one meanwhile the session stops at the next run
-# instead of going on with a busy machine (AB_GUARD, docs/LESSONS.md #73).
+# it. The machine's marker (~/.claude/macchina-ferma) is held for the duration and given back at
+# the end, also on failure: the other windows pause their work, their containers stay up; if the
+# CPU gets busy meanwhile the session stops at the next run instead of going on with a busy
+# machine (AB_GUARD, docs/LESSONS.md #73).
 #
 # Before any speed: the store must really be reading from the disk. A run whose `experts:` line
 # says `buffered` would measure the RAM of the page cache (12-26 GB/s) and not the disk
@@ -74,23 +75,20 @@ wait_runs() {
 }
 # one measurement at a time, and the machine stays awake while it lasts (docs/LESSONS.md #82)
 . tools/measure_guard.lib
-measure_begin experts_budget
 trap measure_end EXIT
 trap 'exit 130' INT TERM
-wait_runs $B cpu
+# after the lock, before the machine's marker: a binary Smart App Control holds (up to an hour)
+# keeps no other window waiting (tools/measure_guard.lib)
+measure_ready() {
+  wait_runs $B cpu
+}
+measure_begin experts_budget
 
-RUNNING=$(docker ps -q 2>/dev/null || true)
-restart() { measure_end; if [ -n "$RUNNING" ]; then docker start $RUNNING > /dev/null 2>&1 || true; echo "containers started again"; fi; }
-trap restart EXIT
-if [ -n "$RUNNING" ]; then
-  # the VM's file cache goes back to Windows first (docs/LESSONS.md #38), then everything stops
-  MSYS_NO_PATHCONV=1 docker run --rm --privileged trochilus-dev:local sh -c "sync; echo 3 > /proc/sys/vm/drop_caches" || true
-  docker stop $RUNNING > /dev/null
-  echo "containers stopped: $(echo $RUNNING | wc -w)"
-fi
-AB_GUARD=$MEASURE_AB_GUARD
-export AB_GUARD
-still() { sh -c "$AB_GUARD" || { echo "experts_budget: the machine is not still $1 (a container, or a busy CPU), stopping"; exit 3; }; }
+# the other windows' containers stay up, their work paused by the marker; from here on a CPU
+# busy with other work, or the marker lost, stops the measurement at the next run
+# (tools/measure_guard.lib, tools/machine_still.sh, docs/LESSONS.md #73, #84)
+measure_machine experts_budget
+still() { sh -c "$AB_GUARD" || { echo "experts_budget: the machine is not still $1 (the marker lost, or a busy CPU), stopping"; exit 3; }; }
 
 # The model takes 7 GiB and the memory guard wants 3 more left free; Windows needs minutes to
 # take back what the VM has released (docs/LESSONS.md #72). Up to 15 minutes, a look every 30 s.

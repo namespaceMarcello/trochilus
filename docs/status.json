@@ -484,28 +484,36 @@
       "id": "m1-cache-sessioni",
       "tappa": "M1",
       "titolo": "Il costo del primo prompt",
-      "stato": "prossimo",
-      "cosa": "Sotto budget ogni avvio rilegge il modello intero dal disco: 4.7 secondi, ed è tutto quello che separa un budget parziale dal modello tutto in RAM. Due strade: nasconderlo (il motore comincia a leggere appena la sessione si apre, mentre tu scrivi la domanda, e lo dice) oppure toglierlo (l'archivio resta vivo fra una sessione e l'altra, in un processo che non muore). Ricaricare un elenco dal disco all'avvio invece non serve: rileggere È quel tempo.",
+      "stato": "in-corso",
+      "cosa": "Sotto budget ogni avvio rilegge il modello dal disco. `trochilus serve` tiene acceso il motore (thread, modello, archivio degli esperti) fra un comando e l'altro, e `run`, `chat`, `generate` ci girano dentro da soli quando c'è, con lo stesso output al byte. Misurato: col modello tutto in RAM il primo prompt passa da 12.8 a 7.8 secondi, il caricamento sparisce. A metà budget quasi niente (13.0 → 12.0 s): ogni prompt riscrive l'archivio da capo, quindi lì la leva è cosa buttare via durante il prompt. Mentre il modello si carica si vede la barra d'acqua arcobaleno (la variante A). Prossimo: leggere mentre scrivi (domanda 48).",
       "numeri": [
         {
-          "v": "4.7 s di disco a ogni avvio; è il divario che resta (12.41 contro 7.47 s a 2048)",
-          "d": "2026-09-21"
+          "v": "col server, modello tutto in RAM: primo prompt 12.79 → 7.81 s (via i 4.98 s di caricamento)",
+          "d": "2026-09-23"
         },
         {
-          "v": "su un prompt corto pesa di più: 4.5 s su 6.3 totali a 512 token",
-          "d": "2026-09-21"
+          "v": "col server, metà budget: 13.00 → 12.04 s (0.926×), 139 mancati in meno su 1157",
+          "d": "2026-09-23"
+        },
+        {
+          "v": "attraverso il server: stesso stdout al byte di ogni comando, modello caricato una volta",
+          "d": "2026-09-23"
+        },
+        {
+          "v": "la barra: 63 mutazioni su 63 prese dai test",
+          "d": "2026-09-23"
         }
       ],
       "domande": [
         {
+          "n": 49,
+          "stato": "chiusa",
+          "testo": "sì col modello tutto in RAM (−5 s), poco a metà budget (−1 s)"
+        },
+        {
           "n": 48,
           "stato": "aperta",
           "testo": "quanto se ne nasconde dietro il tempo che l'utente impiega a scrivere"
-        },
-        {
-          "n": 49,
-          "stato": "aperta",
-          "testo": "un processo che resta acceso fra le sessioni regge il costo che ha"
         },
         {
           "n": 45,
@@ -513,8 +521,16 @@
           "testo": "il costo del primo prompt si può togliere, o solo nascondere"
         }
       ],
-      "file": [],
-      "comandi": [],
+      "file": [
+        "src/app/serve.c",
+        "tests/test_serve.c",
+        "tools/serve_first_prompt.sh"
+      ],
+      "comandi": [
+        "build/trochilus serve -m <gguf>",
+        "build/trochilus serve --status",
+        "sh tools/serve_first_prompt.sh"
+      ],
       "dipende": [
         "m1-misure"
       ]
@@ -523,16 +539,20 @@
       "id": "m1-sovrapposizione",
       "tappa": "M1",
       "titolo": "Disco e calcolo insieme",
-      "stato": "aperto",
-      "cosa": "Oggi il motore legge, poi calcola, poi legge ancora: il disco e i core si aspettano a turno. Nel prompt si sa in anticipo quali esperti servono al layer dopo, quindi si potrebbero leggere mentre il layer di adesso lavora.",
+      "stato": "fatto",
+      "cosa": "Prima il motore leggeva, poi calcolava, poi leggeva ancora: disco e core si aspettavano a turno. Adesso, nel prompt lungo, un thread a parte legge dal disco gli esperti del layer dopo mentre i core calcolano quello di adesso. Stessi numeri al byte: cambia solo quando i dati arrivano. Resta metà dell'attesa del disco da capire, e il prompt corto (fino a 512 token) che non legge ancora in anticipo.",
       "numeri": [
         {
-          "v": "col nuovo ordine il tetto a 2048 è 1.61× (limite calcolato, non una misura)",
-          "d": "2026-09-21"
+          "v": "prompt 2048 a metà budget: 11.45 → 9.39 s (1.22×), il tetto calcolato era 1.61×",
+          "d": "2026-09-23"
         },
         {
-          "v": "si moltiplica con l'ordine per layer: 23.5 s → 11.3 → tetto 6.7",
-          "d": "2026-09-21"
+          "v": "a 512 token niente: il prompt di un blocco solo non legge in anticipo (tetto 1.40×)",
+          "d": "2026-09-23"
+        },
+        {
+          "v": "70 MiB letti in più su 6 273 (1.1%)",
+          "d": "2026-09-23"
         }
       ],
       "domande": [
@@ -542,9 +562,14 @@
           "testo": "da che velocità di disco in su conviene precaricare, e con quanti candidati"
         }
       ],
-      "file": [],
+      "file": [
+        "src/memory/experts.c (tr_experts_prefetch)",
+        "src/base/threads.c (thread e monitor)",
+        "tests/test_prefetch.c"
+      ],
       "comandi": [
-        "sh tools/prefill_overlap.sh 5"
+        "SET=prefetch sh tools/prefill_overlap.sh 5",
+        "sh tools/mutate_prefetch.sh"
       ],
       "dipende": [
         "m1-ordine-layer"

@@ -15,11 +15,12 @@
  *
  * Why this shape and not the one the sources have (measured, docs/MEASUREMENTS.md): an LRU reads less
  * than a pin learned from usage at every capacity; one reader gets the whole bandwidth of the
- * disk, eight get no more, so there is no I/O thread until there is something to overlap; and the
- * only thing to overlap would be a prefetch, which on a 1.5 GB/s disk costs more reads than it
- * saves waiting.
+ * disk, eight get no more, so there is one I/O thread and only for what can be overlapped: a
+ * prompt taken layer by layer reads the next layer's units while the current one computes
+ * (tr_experts_prefetch, below). In decode a prefetch would cost more reads than it saves waiting.
  *
- * Not thread-safe, like the model's pool: one evaluation at a time per store. No global state. */
+ * Not thread-safe, like the model's pool: one evaluation at a time per store, every call from the
+ * same thread. No global state. */
 #ifndef TR_EXPERTS_H
 #define TR_EXPERTS_H
 
@@ -59,9 +60,13 @@ typedef struct {
     uint64_t hits, misses, evictions;     /* units asked for and present / read / thrown out */
     uint64_t bytes_read;                  /* actually transferred: rounded up to read_align, so it
                                            * can exceed the units' own bytes on a direct store */
-    double read_sec;                      /* time inside the reader */
+    double read_sec;                      /* time inside the reader (the I/O thread's too) */
     int direct;                           /* 1: cfg.read_align asked for aligned reads (a direct file
                                            * handle is behind read_ctx); 0: an ordinary buffered one */
+    uint64_t prefetched;                  /* units the I/O thread read ahead (tr_experts_prefetch),
+                                           * counted in misses and bytes_read too once taken in */
+    double prefetch_wait_sec;             /* time tr_experts_acquire and tr_experts_prefetch_wait
+                                           * spent waiting for units still in flight */
 } tr_experts_stats;
 
 /* Bytes of one slot: for each of the n_layers layers, its own parts one after the other, the
@@ -87,8 +92,11 @@ void tr_experts_free(tr_experts *x);
 /* 1 when every unit has a slot: after tr_experts_load_all nothing is read again. */
 int tr_experts_resident(const tr_experts *x);
 /* Reads every unit, in file order. Only for a resident store, at load; -1 on a failed read
- * or a store that is not resident. */
-int tr_experts_load_all(tr_experts *x);
+ * or a store that is not resident. on_unit (may be NULL) is called after every unit read, with
+ * that unit's own bytes (the sum of its parts' part_bytes, not the aligned transfer
+ * tr_experts_stats.bytes_read counts): how the load reports its progress (model.h tr_progress). */
+typedef void (*tr_experts_unit_fn)(void *ctx, uint64_t unit_bytes);
+int tr_experts_load_all(tr_experts *x, tr_experts_unit_fn on_unit, void *ctx);
 
 /* The experts ids[0..n) of `layer` (distinct, 0 <= id < n_expert, 1 <= n <= n_expert) are
  * wanted now. Present: touched. Missing: read, in the order given, each into the slot of the
@@ -104,6 +112,31 @@ int tr_experts_acquire(tr_experts *x, int64_t layer, const int64_t *ids, int64_t
 const void *tr_experts_part(const tr_experts *x, int64_t layer, int64_t expert, int part);
 
 void tr_experts_get_stats(const tr_experts *x, tr_experts_stats *out);
+
+/* ---- reading ahead (docs/ARCHITECTURE.md Esperti M1: disk and computation overlapped) ----
+ * One I/O thread per store, started once and joined by tr_experts_free, fills slots reserved for
+ * it while the calling thread computes. Everything else stays on the calling thread: the index,
+ * the LRU, the stats, the choice of victims; the I/O thread only reads into a reserved slot's
+ * bytes and publishes that it is done. A reserved unit counts as present: tr_experts_acquire
+ * waits for it if it is still in flight, tr_experts_part gives NULL until it has been taken in,
+ * and no victim is ever a slot in flight. Once started, the reader may be called from the I/O
+ * thread and the calling thread at the same time (tr_file_pread may: positional reads).
+ *
+ * 0: started (or already running). 1: nothing to do -- the store is resident, or it holds fewer
+ * than 2 * n_expert + n_used slots, too few for one layer's units, the next layer's, and a
+ * token's margin; nothing changes, every read stays on demand. -1: out of memory, or no thread. */
+int tr_experts_prefetch_start(tr_experts *x);
+int tr_experts_prefetching(const tr_experts *x);
+/* Reserves a slot for every unit of `layer` not in RAM and hands it to the I/O thread, in id
+ * order (file order). A victim is the coldest slot not in flight and holding no unit of `layer`
+ * nor of `keep` (the layer computing now: its units are never evicted for the next one's); it
+ * stops at the first unit no such victim is left for. Returns the units queued; 0 when reading
+ * ahead is not started. Allocates nothing. */
+int64_t tr_experts_prefetch(tr_experts *x, int64_t layer, int64_t keep);
+/* Waits until nothing is in flight and takes every unit in. 0, or -1 if a read ahead failed
+ * since the last call: that unit is absent again (the next acquire reads it on demand), the store
+ * consistent. tr_experts_acquire returns -1 too for a unit it asked for whose read ahead failed. */
+int tr_experts_prefetch_wait(tr_experts *x);
 
 /* Tests only: swaps the reader out (to wrap it, e.g. to fail the k-th call) and back. */
 void tr_experts_get_reader(const tr_experts *x, tr_experts_read_fn *read, void **ctx);

@@ -58,4 +58,23 @@ int tr_pool_active(const tr_pool *p);
  * pool: one job at a time per pool. */
 void tr_parallel_for(tr_pool *p, int64_t n, int64_t min_chunk, tr_range_fn fn, void *ctx);
 
+/* ---- one thread of one's own, and a monitor to talk to it ----
+ * For work that is not a parallel_for: the expert store's I/O thread (src/memory/experts.c).
+ * The owner starts the thread and joins it; nothing here is global. */
+typedef struct tr_thread tr_thread;
+/* Runs fn(arg) on a new thread, not pinned. NULL if the thread could not be made. */
+tr_thread *tr_thread_start(void (*fn)(void *arg), void *arg);
+/* Waits for fn to return and frees the thread. NULL: nothing. */
+void tr_thread_join(tr_thread *t);
+
+/* A mutex and one condition variable. wait: the lock held, releases it, sleeps until a
+ * broadcast (or spuriously: always wait in a loop on the condition), and takes it back. */
+typedef struct tr_monitor tr_monitor;
+tr_monitor *tr_monitor_create(void); /* NULL on failure */
+void tr_monitor_free(tr_monitor *m);
+void tr_monitor_lock(tr_monitor *m);
+void tr_monitor_unlock(tr_monitor *m);
+void tr_monitor_wait(tr_monitor *m);
+void tr_monitor_broadcast(tr_monitor *m);
+
 #endif

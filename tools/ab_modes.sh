@@ -23,7 +23,8 @@
 # AB_GUARD, when set, is a shell command run before every run: if it fails the machine is no
 # longer the one the comparison started on, and the comparison stops there instead of mixing
 # runs of two machines (docs/LESSONS.md #73: another session started its containers again
-# seven minutes into a measurement). Example: AB_GUARD='[ -z "$(docker ps -q)" ]'.
+# seven minutes into a measurement). Example: AB_GUARD='sh tools/machine_still.sh 3.5 600 2';
+# the measuring scripts set it with measure_machine (tools/measure_guard.lib).
 set -e
 # The body is one function, called on the last line: the shell parses all of it before it runs
 # any, so editing this file while it runs cannot change a run under way (docs/LESSONS.md #69).
@@ -52,7 +53,15 @@ while [ "$R" -le "$ROUNDS" ]; do
       rm -f "$OUT"
       exit 3
     fi
-    ERR=$(sh -c "$CMD" 2>&1 >/dev/null) || true
+    # AB_WALL=1: the whole run in ms, process start and model load included (the first prompt of a
+    # session is what a user waits for, docs/MEASUREMENTS.md question 49); lower is better. Only
+    # then the clock is read (GNU date's %N), and the wall line is added after the check below: a
+    # failed run lasts some ms too, and must still stop the comparison (docs/LESSONS.md #132)
+    [ "${AB_WALL:-0}" != 1 ] || T0=$(date +%s%N)
+    RC=0
+    ERR=$(sh -c "$CMD" 2>&1 >/dev/null) || RC=$?
+    WALL=
+    [ "${AB_WALL:-0}" != 1 ] || WALL="$LABEL wall_ms $R $(( ($(date +%s%N) - T0) / 1000000 ))"
     # "width": the decode threads the run settled on, where the binary says it (measured per
     # session, so min and max across the rounds say how stable that choice is). "hits", "misses"
     # and "mib": the expert store's own counters, from the `experts:` line of a streaming run
@@ -71,13 +80,16 @@ while [ "$R" -le "$ROUNDS" ]; do
       } }')
     [ -z "$EXPERTS" ] || LINES="$LINES
 $EXPERTS"
-    # a run that measured nothing must stop the comparison, not leave a hole in the table (#56)
-    if [ -z "$LINES" ]; then
-      echo "ab_modes: '$LABEL' round $R produced no tok/s line, stopping. The run said:" >&2
+    # a run that measured nothing must stop the comparison, not leave a hole in the table (#56);
+    # nor one that failed after its prompt line (a crash in decode, a server gone mid-command)
+    if [ -z "$LINES" ] || [ "$RC" != 0 ]; then
+      echo "ab_modes: '$LABEL' round $R exited $RC or produced no tok/s line, stopping. The run said:" >&2
       printf '%s\n' "$ERR" | tail -3 >&2
       rm -f "$OUT"
       exit 1
     fi
+    [ -z "$WALL" ] || LINES="$LINES
+$WALL"
     printf '%s\n' "$LINES" | tee -a "$OUT"
     I=$((I + 1))
   done

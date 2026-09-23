@@ -17,6 +17,9 @@
 ifeq ($(origin CC),default)
 CC      := gcc
 endif
+# every test and oracle runs the engine in its own process: a `trochilus serve` left up on this
+# machine would otherwise run their commands (src/app/serve.c); tests/test_serve.c sets it back
+export TR_SERVER = 0
 BUILD   := build
 CFLAGS  ?= -O2 -g
 # -ffp-contract=off: no silent multiply-add fusion, the scalar kernels define the numbers (kernels.h)
@@ -48,7 +51,7 @@ endif
 CORE_SRC := $(wildcard src/base/*.c src/format/*.c src/kernels/*.c src/backend/*.c \
                        src/memory/*.c src/kv/*.c src/tokenizer/*.c src/models/*.c src/gen/*.c)
 CORE_OBJ := $(CORE_SRC:%.c=$(BUILD)/%.o)
-APP_OBJ  := $(BUILD)/src/app/main.o
+APP_OBJ  := $(BUILD)/src/app/main.o $(BUILD)/src/app/serve.o $(BUILD)/src/app/bar.o
 TEST_BIN := $(patsubst tests/%.c,$(BUILD)/tests/%$(EXE),$(wildcard tests/test_*.c))
 BENCH_BIN := $(BUILD)/tests/bench_kernels$(EXE)
 MEM_BIN := $(BUILD)/tests/bench_mem$(EXE)
@@ -56,7 +59,7 @@ ATTN_BIN := $(BUILD)/tests/bench_attn$(EXE)
 EXPF_BIN := $(BUILD)/tests/bench_expf$(EXE)
 DISK_BIN := $(BUILD)/tests/bench_disk$(EXE)
 
-.PHONY: all test check-gcc check-clang check-asan check-tsan check-tiny check-real oracle tier-check oracle-tokenizer chat-check oracle-real spec-check bench bench-mem bench-attn bench-expf bench-disk lint profile check check-linux clean-machine clean platform-guard
+.PHONY: all test check-gcc check-clang check-asan check-tsan check-tiny check-real oracle tier-check oracle-tokenizer chat-check oracle-real spec-check bench bench-mem bench-attn bench-expf bench-disk lint profile check check-linux clean-machine clean platform-guard quick
 all: $(BUILD)/trochilus$(EXE)
 
 # Objects of two platforms must never share a BUILD directory: a build in the container with
@@ -87,8 +90,13 @@ $(BUILD)/tests/%$(EXE): tests/%.c $(CORE_OBJ)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $< $(CORE_OBJ) -o $@ $(LDLIBS)
 
-# test_cli runs the command line built beside it (it is not linked into the test)
-$(BUILD)/tests/test_cli$(EXE): $(BUILD)/trochilus$(EXE)
+# test_cli and test_serve run the command line built beside them (it is not linked into the test)
+$(BUILD)/tests/test_cli$(EXE) $(BUILD)/tests/test_serve$(EXE): $(BUILD)/trochilus$(EXE)
+
+# test_bar links the command line's progress bar (src/app/bar.c), which the core does not hold
+$(BUILD)/tests/test_bar$(EXE): tests/test_bar.c $(CORE_OBJ) $(BUILD)/src/app/bar.o
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $< $(CORE_OBJ) $(BUILD)/src/app/bar.o -o $@ $(LDLIBS)
 
 # test_base covers src/base and links only it: its bytes then change only with src/base, and the
 # native run in `make check` is not blocked anew by every change elsewhere (tools/native_tests.sh)
@@ -255,11 +263,15 @@ DOCKER_IMG := trochilus-dev:local
 # Before anything else: nothing this project started is still running, or the gate does not
 # start (four forgotten load generators ran at 100% under two days of measurements, and a build
 # beside a measurement spoils it: docs/LESSONS.md #84, #57); and a script that is told to stop
-# takes its children with it (tools/cleanup.lib), seen failing without the trap at every run.
+# takes its children with it (tools/cleanup.lib), seen failing without the trap at every run; and
+# a measurement takes the machine's marker and gives back only its own (tools/measure_guard.lib);
+# and a comparison stops on a run that measured nothing (tools/ab_modes.sh, docs/LESSONS.md #132).
 clean-machine:
 	@mkdir -p $(BUILD) && date +%s > $(BUILD)/.check-start
 	sh tools/orphans.sh
 	sh tools/test_cleanup.sh
+	sh tools/test_marker.sh
+	sh tools/test_ab_modes.sh
 ifeq ($(OS),Windows_NT)
 check: clean-machine lint
 	$(MAKE) WERROR=1 all $(TEST_BIN) $(BENCH_BIN) $(MEM_BIN) $(ATTN_BIN) $(EXPF_BIN) $(DISK_BIN) $(BUILD)/tests/dump_rope$(EXE)
@@ -342,6 +354,20 @@ check-tsan:
 		EXTRA_LDFLAGS="-fsanitize=thread" build/linux-tsan/tests/test_base build/linux-tsan/tests/test_hot
 	TSAN_OPTIONS=halt_on_error=1 setarch $$(uname -m) -R build/linux-tsan/tests/test_base
 	TSAN_OPTIONS=halt_on_error=1 setarch $$(uname -m) -R build/linux-tsan/tests/test_hot
+
+# Between edits, NOT the gate: lint, the native build with 0 warnings, and the C tests in the
+# Linux gcc build (the container on Windows). About a minute; a step is closed by `make check`.
+ifeq ($(OS),Windows_NT)
+quick: lint
+	$(MAKE) WERROR=1 all $(TEST_BIN)
+	MSYS_NO_PATHCONV=1 docker run --rm --security-opt seccomp=unconfined -v "$(CURDIR):/src" \
+		-w /src $(DOCKER_IMG) make -j$(NPROC) BUILD=build/linux-gcc CC=gcc WERROR=1 test
+	@echo "== quick passed (not the gate: make check)"
+else
+quick: lint
+	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 test
+	@echo "== quick passed (not the gate: make check)"
+endif
 
 clean:
 	rm -rf $(BUILD)

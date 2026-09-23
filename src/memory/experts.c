@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "../base/platform.h"
+#include "../base/threads.h"
 
 /* One slot's occupant and its place in the single LRU list that threads every slot together:
  * used slots in recency order toward lru_head (hot), free slots toward lru_tail (cold). */
@@ -15,6 +16,19 @@ typedef struct {
     int32_t unit;        /* -1 when the slot is free */
     int32_t prev, next;  /* -1 at the ends of the list */
 } experts_slot;
+
+/* A slot's read ahead (tr_experts_prefetch). Every field is read and written under the store's
+ * monitor: the calling thread fills the first group and queues the slot, the I/O thread copies
+ * them, reads without the lock, and writes the second group with done = 1. */
+typedef struct {
+    int64_t layer, id;
+    tr_experts_read_fn read;
+    void *read_ctx;
+    int done, rc;
+    uint64_t bytes;
+    double sec;
+    uint64_t shift[TR_EXPERT_PARTS];
+} experts_job;
 
 struct tr_experts {
     int64_t n_layers, n_expert, n_used;
@@ -47,6 +61,17 @@ struct tr_experts {
                            * decoding and call a first id a duplicate) */
 
     tr_experts_stats stats; /* n_units, n_slots, slot_bytes and the running counters */
+
+    /* reading ahead (tr_experts_prefetch_start); io == NULL: never started, every field NULL/0 */
+    tr_thread *io;
+    tr_monitor *mon;
+    experts_job *jobs;       /* [n_slots], under mon */
+    int32_t *queue;          /* [n_slots] ring of slots for the I/O thread, under mon */
+    int64_t q_head, q_len;   /* under mon */
+    int io_stop;             /* under mon: the I/O thread ends once the queue is empty */
+    unsigned char *pending;  /* [n_slots]: reserved and not taken in yet -- calling thread only */
+    int64_t n_pending;       /* calling thread only */
+    int prefetch_failed;     /* calling thread only: a read ahead failed since the last wait */
 };
 
 static uint64_t round_up_to(uint64_t n, uint64_t align) {
@@ -99,8 +124,104 @@ static void lru_push_front(tr_experts *x, int32_t s) {
     if (x->lru_tail == -1) x->lru_tail = s;
 }
 
+static void lru_push_back(tr_experts *x, int32_t s) {
+    experts_slot *sl = &x->slots[s];
+    sl->next = -1;
+    sl->prev = x->lru_tail;
+    if (x->lru_tail != -1) x->slots[x->lru_tail].next = s;
+    x->lru_tail = s;
+    if (x->lru_head == -1) x->lru_head = s;
+}
+
+/* The coldest slot the store may take: never one in flight, and never one holding a unit of
+ * layer skip_a or skip_b (-1: no such layer). -1 if there is none. Without reading ahead this is
+ * lru_tail, the plain LRU victim. */
+static int32_t coldest_victim(const tr_experts *x, int64_t skip_a, int64_t skip_b) {
+    for (int32_t s = x->lru_tail; s != -1; s = x->slots[s].prev) {
+        if (x->pending != NULL && x->pending[s]) continue;
+        int32_t u = x->slots[s].unit;
+        if (u != -1) {
+            int64_t layer = u / x->n_expert;
+            if (layer == skip_a || layer == skip_b) continue;
+        }
+        return s;
+    }
+    return -1;
+}
+
+/* (layer, id)'s parts into the slot area at base, one read each, through read/ctx: 0, or -1 at
+ * the first part that fails. *bytes and *sec grow by what the reads before a failure moved too.
+ * Touches only fields fixed at create time (the I/O thread calls it). */
+static int read_parts(const tr_experts *x, tr_experts_read_fn read, void *ctx, int64_t layer, int64_t id,
+                      unsigned char *base, uint64_t shift[TR_EXPERT_PARTS], uint64_t *bytes, double *sec) {
+    uint64_t align = x->read_align;
+    for (int p = 0; p < TR_EXPERT_PARTS; p++) {
+        size_t idx = (size_t)layer * TR_EXPERT_PARTS + (size_t)p;
+        uint64_t file_off = x->part_offset[idx] + (uint64_t)x->part_bytes[idx] * (uint64_t)id;
+        /* align == 1: lo == file_off, hi == file_off + part_bytes -- the exact bytes. align > 1:
+         * the aligned range the read must actually cover. */
+        uint64_t lo = file_off / align * align;
+        uint64_t hi = (file_off + (uint64_t)x->part_bytes[idx] + align - 1) / align * align;
+        size_t n = (size_t)(hi - lo);
+        double t0 = tr_time_sec();
+        int rc = read(ctx, base + x->part_slot_offset[idx], n, lo);
+        *sec += tr_time_sec() - t0;
+        if (rc != 0) return -1;
+        *bytes += n;
+        shift[p] = file_off - lo;
+    }
+    return 0;
+}
+
+/* The I/O thread: takes queued slots in order, reads each one's unit, publishes it done. Ends
+ * when told to and the queue is empty. */
+static void io_main(void *arg) {
+    tr_experts *x = (tr_experts *)arg;
+    tr_monitor_lock(x->mon);
+    for (;;) {
+        while (x->q_len == 0 && !x->io_stop) tr_monitor_wait(x->mon);
+        if (x->q_len == 0) break;
+        int32_t s = x->queue[x->q_head];
+        x->q_head = (x->q_head + 1) % x->stats.n_slots;
+        x->q_len--;
+        experts_job job = x->jobs[s];
+        tr_monitor_unlock(x->mon);
+
+        job.bytes = 0;
+        job.sec = 0.0;
+        unsigned char *base = x->slab + (uint64_t)s * x->stats.slot_bytes;
+        job.rc = read_parts(x, job.read, job.read_ctx, job.layer, job.id, base, job.shift, &job.bytes, &job.sec);
+
+        tr_monitor_lock(x->mon);
+        job.done = 1;
+        x->jobs[s] = job;
+        tr_monitor_broadcast(x->mon);
+    }
+    tr_monitor_unlock(x->mon);
+}
+
+static void prefetch_stop(tr_experts *x) {
+    if (x->io != NULL) {
+        tr_monitor_lock(x->mon);
+        x->io_stop = 1;
+        tr_monitor_broadcast(x->mon);
+        tr_monitor_unlock(x->mon);
+        tr_thread_join(x->io);
+        x->io = NULL;
+    }
+    tr_monitor_free(x->mon);
+    free(x->jobs);
+    free(x->queue);
+    free(x->pending);
+    x->mon = NULL;
+    x->jobs = NULL;
+    x->queue = NULL;
+    x->pending = NULL;
+}
+
 void tr_experts_free(tr_experts *x) {
     if (x == NULL) return;
+    prefetch_stop(x); /* first: the I/O thread may still be writing into the slab */
     free(x->part_bytes);
     free(x->part_slot_offset);
     free(x->part_offset);
@@ -213,12 +334,14 @@ int tr_experts_resident(const tr_experts *x) {
     return x->stats.n_slots == x->stats.n_units;
 }
 
-/* Evicts the coldest slot (freeing its unit, if it holds one, evictions++ regardless of what
- * follows) and reads (layer, id)'s parts into it. -1 on a failed part read: the slot is left
- * free at the cold end (it is never linked to the hot end until every part succeeds), `unit`
- * stays absent, and every part read before the failure already counted in bytes_read. */
+/* Evicts the coldest slot not in flight (freeing its unit, if it holds one, evictions++
+ * regardless of what follows) and reads (layer, id)'s parts into it on this thread. -1 on a
+ * failed part read: the slot is left free at the cold end (it is never linked to the hot end until
+ * every part succeeds), `unit` stays absent, and every part read before the failure already
+ * counted in bytes_read. */
 static int experts_fill_slot(tr_experts *x, int64_t layer, int64_t id, int64_t unit) {
-    int32_t victim = x->lru_tail;
+    int32_t victim = coldest_victim(x, -1, -1);
+    if (victim == -1) return -1; /* every slot in flight: tr_experts_prefetch_start's margin forbids it */
     experts_slot *sl = &x->slots[victim];
     if (sl->unit != -1) {
         x->slot_of[sl->unit] = -1;
@@ -227,22 +350,15 @@ static int experts_fill_slot(tr_experts *x, int64_t layer, int64_t id, int64_t u
     }
 
     unsigned char *base = x->slab + (uint64_t)victim * x->stats.slot_bytes;
-    uint64_t align = x->read_align;
-    for (int p = 0; p < TR_EXPERT_PARTS; p++) {
-        size_t idx = (size_t)layer * TR_EXPERT_PARTS + (size_t)p;
-        uint64_t file_off = x->part_offset[idx] + (uint64_t)x->part_bytes[idx] * (uint64_t)id;
-        /* align == 1: lo == file_off, hi == file_off + part_bytes -- today's exact behaviour, same
-         * formula, no branch. align > 1: the aligned range the read must actually cover. */
-        uint64_t lo = file_off / align * align;
-        uint64_t hi = (file_off + (uint64_t)x->part_bytes[idx] + align - 1) / align * align;
-        size_t n = (size_t)(hi - lo);
-        double t0 = tr_time_sec();
-        int rc = x->read(x->read_ctx, base + x->part_slot_offset[idx], n, lo);
-        x->stats.read_sec += tr_time_sec() - t0;
-        if (rc != 0) return -1;
-        x->stats.bytes_read += n;
-        x->slot_part_shift[(size_t)victim * TR_EXPERT_PARTS + (size_t)p] = file_off - lo;
+    uint64_t shift[TR_EXPERT_PARTS] = {0, 0, 0};
+    int rc = read_parts(x, x->read, x->read_ctx, layer, id, base, shift, &x->stats.bytes_read, &x->stats.read_sec);
+    if (rc != 0) {
+        lru_unlink(x, victim);
+        lru_push_back(x, victim);
+        return -1;
     }
+    for (int p = 0; p < TR_EXPERT_PARTS; p++)
+        x->slot_part_shift[(size_t)victim * TR_EXPERT_PARTS + (size_t)p] = shift[p];
 
     x->slot_of[unit] = victim;
     sl->unit = (int32_t)unit;
@@ -252,12 +368,118 @@ static int experts_fill_slot(tr_experts *x, int64_t layer, int64_t id, int64_t u
     return 0;
 }
 
-int tr_experts_load_all(tr_experts *x) {
+/* Waits for slot s's read ahead and takes it in: counted (misses, prefetched, bytes, time) and an
+ * ordinary resident unit from here on, or, if the read failed, freed to the cold end with its
+ * unit absent. 0, or -1 for a failed read. */
+static int prefetch_take(tr_experts *x, int32_t s) {
+    tr_monitor_lock(x->mon);
+    if (!x->jobs[s].done) {
+        double t0 = tr_time_sec();
+        while (!x->jobs[s].done) tr_monitor_wait(x->mon);
+        x->stats.prefetch_wait_sec += tr_time_sec() - t0;
+    }
+    experts_job job = x->jobs[s];
+    tr_monitor_unlock(x->mon);
+
+    x->pending[s] = 0;
+    x->n_pending--;
+    x->stats.bytes_read += job.bytes;
+    x->stats.read_sec += job.sec;
+    if (job.rc != 0) {
+        x->slot_of[x->slots[s].unit] = -1;
+        x->slots[s].unit = -1;
+        lru_unlink(x, s);
+        lru_push_back(x, s);
+        x->prefetch_failed = 1;
+        return -1;
+    }
+    for (int p = 0; p < TR_EXPERT_PARTS; p++)
+        x->slot_part_shift[(size_t)s * TR_EXPERT_PARTS + (size_t)p] = job.shift[p];
+    x->stats.misses++;
+    x->stats.prefetched++;
+    return 0;
+}
+
+int tr_experts_prefetch_start(tr_experts *x) {
+    if (x->io != NULL) return 0;
+    if (tr_experts_resident(x) || x->stats.n_slots < 2 * x->n_expert + x->n_used) return 1;
+    size_t n = (size_t)x->stats.n_slots;
+    x->mon = tr_monitor_create();
+    x->jobs = (experts_job *)calloc(n, sizeof(experts_job));
+    x->queue = (int32_t *)calloc(n, sizeof(int32_t));
+    x->pending = (unsigned char *)calloc(n, 1);
+    x->q_head = x->q_len = 0;
+    x->io_stop = 0;
+    x->n_pending = 0;
+    x->prefetch_failed = 0;
+    if (x->mon == NULL || x->jobs == NULL || x->queue == NULL || x->pending == NULL ||
+        (x->io = tr_thread_start(io_main, x)) == NULL) {
+        prefetch_stop(x);
+        return -1;
+    }
+    return 0;
+}
+
+int tr_experts_prefetching(const tr_experts *x) {
+    return x->io != NULL;
+}
+
+int64_t tr_experts_prefetch(tr_experts *x, int64_t layer, int64_t keep) {
+    if (x->io == NULL || layer < 0 || layer >= x->n_layers) return 0;
+    int64_t queued = 0;
+    for (int64_t id = 0; id < x->n_expert; id++) {
+        int64_t unit = layer * x->n_expert + id;
+        if (x->slot_of[unit] != -1) continue;
+        int32_t v = coldest_victim(x, layer, keep);
+        if (v == -1) break;
+        experts_slot *sl = &x->slots[v];
+        if (sl->unit != -1) {
+            x->slot_of[sl->unit] = -1;
+            x->stats.evictions++;
+        }
+        /* reserved: present to the index, hot in the LRU, in flight until taken in */
+        sl->unit = (int32_t)unit;
+        x->slot_of[unit] = v;
+        lru_unlink(x, v);
+        lru_push_front(x, v);
+        x->pending[v] = 1;
+        x->n_pending++;
+
+        tr_monitor_lock(x->mon);
+        experts_job *job = &x->jobs[v];
+        memset(job, 0, sizeof *job);
+        job->layer = layer;
+        job->id = id;
+        job->read = x->read;
+        job->read_ctx = x->read_ctx;
+        x->queue[(x->q_head + x->q_len) % x->stats.n_slots] = v;
+        x->q_len++;
+        tr_monitor_broadcast(x->mon);
+        tr_monitor_unlock(x->mon);
+        queued++;
+    }
+    return queued;
+}
+
+int tr_experts_prefetch_wait(tr_experts *x) {
+    if (x->io == NULL) return 0;
+    for (int64_t s = 0; s < x->stats.n_slots && x->n_pending > 0; s++)
+        if (x->pending[s]) prefetch_take(x, (int32_t)s);
+    int failed = x->prefetch_failed;
+    x->prefetch_failed = 0;
+    return failed ? -1 : 0;
+}
+
+int tr_experts_load_all(tr_experts *x, tr_experts_unit_fn on_unit, void *ctx) {
     if (!tr_experts_resident(x)) return -1;
     for (int64_t layer = 0; layer < x->n_layers; layer++) {
+        uint64_t unit_bytes = 0;
+        for (int p = 0; p < TR_EXPERT_PARTS; p++)
+            unit_bytes += x->part_bytes[(size_t)layer * TR_EXPERT_PARTS + (size_t)p];
         for (int64_t id = 0; id < x->n_expert; id++) {
             int64_t unit = layer * x->n_expert + id;
             if (experts_fill_slot(x, layer, id, unit) != 0) return -1;
+            if (on_unit != NULL) on_unit(ctx, unit_bytes);
         }
     }
     return 0;
@@ -278,11 +500,13 @@ int tr_experts_acquire(tr_experts *x, int64_t layer, const int64_t *ids, int64_t
         x->seen_call[unit] = stamp;
     }
 
-    /* first pass: touch every unit already present, in the order given */
+    /* first pass: touch every unit already present, in the order given; one still in flight is
+     * waited for and taken in first, and one whose read ahead failed fails the call like a read */
     for (int64_t i = 0; i < n; i++) {
         int64_t unit = layer * x->n_expert + ids[i];
         int32_t slot = x->slot_of[unit];
         if (slot != -1) {
+            if (x->pending != NULL && x->pending[slot] && prefetch_take(x, slot) != 0) return -1;
             lru_unlink(x, slot);
             lru_push_front(x, slot);
             x->stats.hits++;
@@ -307,6 +531,7 @@ const void *tr_experts_part(const tr_experts *x, int64_t layer, int64_t expert, 
         return NULL;
     int32_t slot = x->slot_of[layer * x->n_expert + expert];
     if (slot == -1) return NULL;
+    if (x->pending != NULL && x->pending[slot]) return NULL; /* in flight: its bytes are not ours yet */
     size_t idx = (size_t)layer * TR_EXPERT_PARTS + (size_t)part;
     return x->slab + (uint64_t)slot * x->stats.slot_bytes + x->part_slot_offset[idx] +
            x->slot_part_shift[(size_t)slot * TR_EXPERT_PARTS + (size_t)part];

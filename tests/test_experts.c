@@ -38,6 +38,16 @@
  *   align_reuse  read_align > 1 only: a slot reused by two experts whose file offsets fall on
  *                different residues modulo the alignment both come back byte-exact -- the
  *                per-slot, per-part shift (Step B) is really taken at every fill
+ *   prefetch     the I/O thread (tr_experts_prefetch), with a reader both threads call at once
+ *                (atomic counters, a delay, a file offset that fails): start refused on a resident
+ *                store and one slot short of 2 * n_expert + n_used, accepted at exactly that;
+ *                (basic) a layer read ahead is invisible until taken in, then exact, counted as
+ *                prefetched and misses, and the held layer untouched; (victims) never the kept
+ *                layer, never a slot in flight, and nothing queued when no such victim is left;
+ *                (wait) an acquire of units still in flight waits for them; (concurrent) demand
+ *                reads beside reads ahead, no slot overwritten mid-read; (fail) a failed read
+ *                ahead leaves only that unit absent, reported once by the wait, read on demand
+ *                afterwards, and an acquire asking for it is -1; (free) freed with reads in flight
  *
  * Every test above align_reuse runs twice, at read_align 1 (buffered, today's layout) and
  * TR_FILE_DIRECT_ALIGN (direct, Step B): same contents, same LRU behaviour, same counters either
@@ -47,6 +57,7 @@
  *
  * Seen red: tools/mutate_experts.sh.
  */
+#include <stdatomic.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -426,7 +437,7 @@ static void test_resident(uint64_t align) {
     TR_CHECK(tr_experts_resident(x));
     checked++;
 
-    TR_CHECK(tr_experts_load_all(x) == 0);
+    TR_CHECK(tr_experts_load_all(x, NULL, NULL) == 0);
     TR_CHECK_EQ_INT(f.n_calls, N_LAYERS * N_EXPERT * TR_EXPERT_PARTS);
     uint64_t total = 0;
     for (int64_t layer = 0; layer < N_LAYERS; layer++)
@@ -467,7 +478,7 @@ static void test_resident(uint64_t align) {
     TR_CHECK(y != NULL);
     if (y != NULL) {
         TR_CHECK(!tr_experts_resident(y));
-        TR_CHECK(tr_experts_load_all(y) == -1);
+        TR_CHECK(tr_experts_load_all(y, NULL, NULL) == -1);
         tr_experts_free(y);
         checked++;
     }
@@ -537,7 +548,7 @@ static void test_failure(uint64_t align) {
         tr_experts *x = tr_experts_create(&cfg, err, sizeof err);
         TR_CHECK(x != NULL);
         if (x != NULL) {
-            TR_CHECK(tr_experts_load_all(x) == -1);
+            TR_CHECK(tr_experts_load_all(x, NULL, NULL) == -1);
             TR_CHECK(unit_ok(x, 0, 0, align));     /* before the failure: loaded fine */
             TR_CHECK(unit_absent(x, 0, 1)); /* its 2nd part (call 5) is the one that failed */
             TR_CHECK_EQ_INT(f.bad_align, 0);
@@ -818,7 +829,7 @@ static void test_few_layers(uint64_t align) {
     TR_CHECK(x != NULL);
     if (x != NULL) {
         TR_CHECK(tr_experts_resident(x));
-        TR_CHECK(tr_experts_load_all(x) == 0);
+        TR_CHECK(tr_experts_load_all(x, NULL, NULL) == 0);
         for (int64_t e = 0; e < FEW_EXPERT; e++)
             for (int p = 0; p < TR_EXPERT_PARTS; p++) TR_CHECK(tr_experts_part(x, 0, e, p) != NULL);
         checked++;
@@ -881,7 +892,210 @@ static void test_align_reuse(void) {
     tr_experts_free(x);
 }
 
+/* ---- prefetch: the I/O thread (tr_experts_prefetch) ----
+ * A reader both threads may call at once: its counters are atomic, and it can be slowed down (so
+ * a unit is still in flight when the test asks for it) or told to fail the next reads made by any
+ * thread but the test's own -- the I/O thread's. (Not a file offset: a direct store reads 4096
+ * bytes at a time, and one such read covers every unit of these tiny layers.) */
+
+static _Thread_local int t_test_thread; /* global-ok: 1 on the thread that runs the tests */
+
+typedef struct {
+    atomic_llong calls, bytes, fails, bad_align;
+    atomic_llong fail_io;     /* reads left to fail on a thread other than the test's */
+    double delay;             /* seconds each read takes */
+    uint64_t align_check;
+} shared_file;
+
+static int shared_read(void *ctx, void *buf, size_t n, uint64_t offset) {
+    shared_file *f = (shared_file *)ctx;
+    atomic_fetch_add(&f->calls, 1);
+    if (f->delay > 0) {
+        double t0 = tr_time_sec();
+        while (tr_time_sec() - t0 < f->delay) {
+        }
+    }
+    if (!t_test_thread && atomic_load(&f->fail_io) > 0 && atomic_fetch_sub(&f->fail_io, 1) > 0) {
+        atomic_fetch_add(&f->fails, 1);
+        return -1;
+    }
+    if (f->align_check > 1 && (offset % f->align_check != 0 || n % f->align_check != 0))
+        atomic_fetch_add(&f->bad_align, 1);
+    unsigned char *dst = (unsigned char *)buf;
+    for (size_t i = 0; i < n; i++) dst[i] = pattern_byte(offset + i);
+    atomic_fetch_add(&f->bytes, (long long)n);
+    return 0;
+}
+
+static void shared_init(shared_file *f, uint64_t align) {
+    atomic_init(&f->calls, 0);
+    atomic_init(&f->bytes, 0);
+    atomic_init(&f->fails, 0);
+    atomic_init(&f->bad_align, 0);
+    atomic_init(&f->fail_io, 0);
+    f->delay = 0.0;
+    f->align_check = align;
+}
+
+enum { PREFETCH_SLOTS = 2 * N_EXPERT + N_USED }; /* 14 of 18: the smallest store that reads ahead */
+
+static int layer_ok(const tr_experts *x, int64_t layer, uint64_t align) {
+    for (int64_t e = 0; e < N_EXPERT; e++)
+        if (!unit_ok(x, layer, e, align)) return 0;
+    return 1;
+}
+
+static int g_pf_start, g_pf_basic, g_pf_victims, g_pf_wait, g_pf_fail, g_pf_fail_acquire, g_pf_concurrent,
+    g_pf_free_in_flight;
+
+static void test_prefetch(uint64_t align) {
+    uint64_t slot_bytes = tr_experts_slot_bytes(&PART_BYTES_TABLE[0][0], N_LAYERS, align);
+    shared_file f;
+    shared_init(&f, align);
+    char err[256];
+
+    /* start: only a partial store with room for two layers and a margin */
+    {
+        uint64_t all = (uint64_t)N_LAYERS * N_EXPERT * slot_bytes; /* resident */
+        tr_experts_config cfg = mk_cfg(all, shared_read, &f, align);
+        tr_experts *x = tr_experts_create(&cfg, err, sizeof err);
+        TR_CHECK(x != NULL && tr_experts_prefetch_start(x) == 1 && !tr_experts_prefetching(x));
+        tr_experts_free(x);
+        cfg.budget_bytes = (uint64_t)(PREFETCH_SLOTS - 1) * slot_bytes;
+        x = tr_experts_create(&cfg, err, sizeof err);
+        TR_CHECK(x != NULL && tr_experts_prefetch_start(x) == 1 && !tr_experts_prefetching(x));
+        TR_CHECK(x != NULL && tr_experts_prefetch(x, 1, 0) == 0); /* not started: nothing queued */
+        tr_experts_free(x);
+        cfg.budget_bytes = (uint64_t)PREFETCH_SLOTS * slot_bytes;
+        x = tr_experts_create(&cfg, err, sizeof err);
+        TR_CHECK(x != NULL && tr_experts_prefetch_start(x) == 0 && tr_experts_prefetching(x));
+        TR_CHECK(x != NULL && tr_experts_prefetch_start(x) == 0); /* again: already running */
+        tr_experts_free(x);
+        g_pf_start++;
+    }
+
+    tr_experts_config cfg = mk_cfg((uint64_t)PREFETCH_SLOTS * slot_bytes, shared_read, &f, align);
+    tr_experts *x = tr_experts_create(&cfg, err, sizeof err);
+    TR_CHECK(x != NULL);
+    if (x == NULL) return;
+    TR_CHECK(tr_experts_prefetch_start(x) == 0);
+
+    /* basic: layer 1 read ahead while layer 0 is held; nothing of it usable until taken in; then
+     * acquire finds it all present and exact, counted as read ahead */
+    tr_experts_stats st;
+    TR_CHECK(tr_experts_acquire(x, 0, ALL_EXPERTS, N_EXPERT) == 0);
+    TR_CHECK_EQ_INT(tr_experts_prefetch(x, 1, 0), N_EXPERT);
+    int none_visible = 1;
+    for (int64_t e = 0; e < N_EXPERT; e++) none_visible &= unit_absent(x, 1, e);
+    TR_CHECK(none_visible); /* in flight, or done but not taken in: never readable */
+    TR_CHECK(tr_experts_acquire(x, 1, ALL_EXPERTS, N_EXPERT) == 0);
+    TR_CHECK(layer_ok(x, 1, align));
+    TR_CHECK(layer_ok(x, 0, align));
+    tr_experts_get_stats(x, &st);
+    TR_CHECK_EQ_INT(st.prefetched, N_EXPERT);
+    TR_CHECK_EQ_INT(st.misses, 2 * N_EXPERT);
+    TR_CHECK_EQ_INT(st.hits, N_EXPERT);
+    TR_CHECK_EQ_INT(atomic_load(&f.bad_align), 0);
+    if (none_visible && st.prefetched == N_EXPERT) g_pf_basic++;
+
+    /* victims: layer 2 ahead while layer 1 computes takes the 2 free slots and layer 0's coldest,
+     * never layer 1's; layer 0 ahead while 1 is kept finds nothing left (layer 1 kept, layer 2 in
+     * flight, layer 0 is the target itself) and queues nothing */
+    TR_CHECK_EQ_INT(tr_experts_prefetch(x, 2, 1), N_EXPERT);
+    TR_CHECK_EQ_INT(tr_experts_prefetch(x, 0, 1), 0);
+    TR_CHECK(tr_experts_prefetch_wait(x) == 0);
+    TR_CHECK(layer_ok(x, 1, align));
+    TR_CHECK(layer_ok(x, 2, align));
+    int layer0_left = 0;
+    for (int64_t e = 0; e < N_EXPERT; e++) layer0_left += !unit_absent(x, 0, e);
+    TR_CHECK_EQ_INT(layer0_left, PREFETCH_SLOTS - 2 * N_EXPERT);
+    tr_experts_get_stats(x, &st);
+    TR_CHECK_EQ_INT(st.prefetched, 2 * N_EXPERT);
+    g_pf_victims++;
+
+    /* wait: a slow reader, and the acquire comes at once: it waits for the units in flight */
+    f.delay = 0.002;
+    TR_CHECK_EQ_INT(tr_experts_prefetch(x, 0, 2), N_EXPERT - layer0_left);
+    TR_CHECK(tr_experts_acquire(x, 0, ALL_EXPERTS, N_EXPERT) == 0);
+    TR_CHECK(layer_ok(x, 0, align));
+    tr_experts_get_stats(x, &st);
+    TR_CHECK(st.prefetch_wait_sec > 0.0);
+    if (st.prefetch_wait_sec > 0.0) g_pf_wait++;
+    f.delay = 0.0;
+
+    /* concurrent: layer 1 in flight (slowly) while the calling thread reads layer 2's missing
+     * units on demand -- two readers at once, and no demand victim is a slot in flight */
+    f.delay = 0.001;
+    int64_t queued = tr_experts_prefetch(x, 1, 0);
+    TR_CHECK(queued > 0);
+    TR_CHECK(tr_experts_acquire(x, 2, ALL_EXPERTS, N_EXPERT) == 0);
+    TR_CHECK(layer_ok(x, 2, align));
+    TR_CHECK(tr_experts_prefetch_wait(x) == 0);
+    int layer1_ok = 1;
+    for (int64_t e = 0; e < N_EXPERT; e++) layer1_ok &= unit_absent(x, 1, e) || unit_ok(x, 1, e, align);
+    TR_CHECK(layer1_ok); /* every unit of layer 1 still in RAM is exact: none was overwritten mid-read */
+    TR_CHECK(layer_ok(x, 2, align));
+    f.delay = 0.0;
+    if (queued > 0 && layer1_ok) g_pf_concurrent++;
+
+    /* fail: a read ahead that fails leaves that unit absent and the rest exact; the wait reports
+     * it once; the unit is read on demand afterwards */
+    TR_CHECK(tr_experts_acquire(x, 0, ALL_EXPERTS, N_EXPERT) == 0);
+    int64_t gone = -1; /* the lowest unit of layer 1 not in RAM now: the first one read ahead */
+    for (int64_t e = N_EXPERT - 1; e >= 0; e--)
+        if (unit_absent(x, 1, e)) gone = e;
+    TR_CHECK(gone >= 0);
+    if (gone < 0) gone = 0;
+    atomic_store(&f.fail_io, 1);
+    long long fails0 = atomic_load(&f.fails);
+    queued = tr_experts_prefetch(x, 1, 0);
+    TR_CHECK(queued > 0);
+    TR_CHECK(tr_experts_prefetch_wait(x) == -1);
+    TR_CHECK(atomic_load(&f.fails) > fails0);
+    TR_CHECK(unit_absent(x, 1, gone));
+    int others_ok = 1;
+    for (int64_t e = 0; e < N_EXPERT; e++)
+        if (e != gone) others_ok &= unit_ok(x, 1, e, align);
+    TR_CHECK(others_ok); /* layer 1's other units all read ahead and exact */
+    TR_CHECK(tr_experts_prefetch_wait(x) == 0); /* reported once */
+    TR_CHECK(tr_experts_acquire(x, 1, ALL_EXPERTS, N_EXPERT) == 0);
+    TR_CHECK(layer_ok(x, 1, align));
+    if (others_ok && unit_ok(x, 1, gone, align)) g_pf_fail++;
+
+    /* fail, asked for: acquire of a unit whose read ahead failed is -1, like a failed read */
+    TR_CHECK(tr_experts_acquire(x, 2, ALL_EXPERTS, N_EXPERT) == 0);
+    gone = -1;
+    for (int64_t e = N_EXPERT - 1; e >= 0; e--)
+        if (unit_absent(x, 0, e)) gone = e;
+    TR_CHECK(gone >= 0);
+    if (gone < 0) gone = 0;
+    atomic_store(&f.fail_io, 1);
+    queued = tr_experts_prefetch(x, 0, 2);
+    TR_CHECK(queued > 0);
+    int rc = tr_experts_acquire(x, 0, &gone, 1);
+    TR_CHECK_EQ_INT(rc, -1);
+    TR_CHECK(unit_absent(x, 0, gone));
+    TR_CHECK(tr_experts_prefetch_wait(x) == -1); /* the failure, still reported to the wait */
+    TR_CHECK(tr_experts_acquire(x, 0, ALL_EXPERTS, N_EXPERT) == 0);
+    TR_CHECK(layer_ok(x, 0, align));
+    if (rc == -1) g_pf_fail_acquire++;
+    tr_experts_free(x);
+
+    /* freed with reads in flight: the I/O thread finishes and is joined, nothing leaks (ASan) */
+    x = tr_experts_create(&cfg, err, sizeof err);
+    TR_CHECK(x != NULL);
+    if (x != NULL) {
+        f.delay = 0.001;
+        TR_CHECK(tr_experts_prefetch_start(x) == 0);
+        TR_CHECK_EQ_INT(tr_experts_prefetch(x, 1, 0), N_EXPERT);
+        tr_experts_free(x);
+        f.delay = 0.0;
+        g_pf_free_in_flight++;
+    }
+}
+
 int main(void) {
+    t_test_thread = 1;
     build_part_offsets();
 
     static const uint64_t aligns[] = {1, TR_FILE_DIRECT_ALIGN};
@@ -896,8 +1110,17 @@ int main(void) {
         test_arg_errors(align);
         test_o1_evidence(align);
         test_few_layers(align);
+        test_prefetch(align);
     }
     test_align_reuse();
+    TR_CHECK(g_pf_start > 0);
+    TR_CHECK(g_pf_basic > 0);
+    TR_CHECK(g_pf_victims > 0);
+    TR_CHECK(g_pf_wait > 0);
+    TR_CHECK(g_pf_concurrent > 0);
+    TR_CHECK(g_pf_fail > 0);
+    TR_CHECK(g_pf_fail_acquire > 0);
+    TR_CHECK(g_pf_free_in_flight > 0);
 
     TR_TEST_EXIT();
 }

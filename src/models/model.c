@@ -98,7 +98,8 @@ static uint64_t apply_expert_budget_env(uint64_t budget) {
     return v > 0 ? (uint64_t)v * 1024 * 1024 : budget;
 }
 
-tr_model *tr_model_load_budget(const char *path, tr_pool *pool, uint64_t expert_budget, char *err, size_t err_len) {
+tr_model *tr_model_load_progress(const char *path, tr_pool *pool, uint64_t expert_budget, const tr_progress *progress,
+                                 char *err, size_t err_len) {
     char local_err[256];
     if (err == NULL) {
         err = local_err;
@@ -129,7 +130,8 @@ tr_model *tr_model_load_budget(const char *path, tr_pool *pool, uint64_t expert_
         return NULL;
     }
 
-    void *impl = vt->load(path, g, pool, expert_budget, err, err_len); /* takes ownership of g, also on failure */
+    /* takes ownership of g, also on failure */
+    void *impl = vt->load(path, g, pool, expert_budget, progress, err, err_len);
     if (impl == NULL) return NULL;
 
     tr_model *m = (tr_model *)malloc(sizeof *m);
@@ -147,6 +149,10 @@ tr_model *tr_model_load_budget(const char *path, tr_pool *pool, uint64_t expert_
     const char *rows = getenv("TR_DECODE_ROWS");
     if (rows != NULL && atoi(rows) >= 0) m->decode_rows = atoi(rows);
     return m;
+}
+
+tr_model *tr_model_load_budget(const char *path, tr_pool *pool, uint64_t expert_budget, char *err, size_t err_len) {
+    return tr_model_load_progress(path, pool, expert_budget, NULL, err, err_len);
 }
 
 tr_model *tr_model_load(const char *path, tr_pool *pool, char *err, size_t err_len) {

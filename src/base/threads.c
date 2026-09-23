@@ -374,3 +374,129 @@ void tr_parallel_for(tr_pool *p, int64_t n, int64_t min_chunk, tr_range_fn fn, v
     }
 }
 /* hot: end */
+
+/* ---- tr_thread and tr_monitor (threads.h) ---- */
+
+struct tr_thread {
+    void (*fn)(void *arg);
+    void *arg;
+#if defined(_WIN32)
+    HANDLE handle;
+#else
+    pthread_t handle;
+#endif
+};
+
+#if defined(_WIN32)
+static DWORD WINAPI thread_main(LPVOID arg) {
+    tr_thread *t = (tr_thread *)arg;
+    t->fn(t->arg);
+    return 0;
+}
+#else
+static void *thread_main(void *arg) {
+    tr_thread *t = (tr_thread *)arg;
+    t->fn(t->arg);
+    return NULL;
+}
+#endif
+
+tr_thread *tr_thread_start(void (*fn)(void *arg), void *arg) {
+    tr_thread *t = (tr_thread *)calloc(1, sizeof *t);
+    if (t == NULL) return NULL;
+    t->fn = fn;
+    t->arg = arg;
+#if defined(_WIN32)
+    t->handle = CreateThread(NULL, 0, thread_main, t, 0, NULL);
+    int failed = t->handle == NULL;
+#else
+    int failed = pthread_create(&t->handle, NULL, thread_main, t) != 0;
+#endif
+    if (failed) {
+        free(t);
+        return NULL;
+    }
+    return t;
+}
+
+void tr_thread_join(tr_thread *t) {
+    if (t == NULL) return;
+#if defined(_WIN32)
+    WaitForSingleObject(t->handle, INFINITE);
+    CloseHandle(t->handle);
+#else
+    pthread_join(t->handle, NULL);
+#endif
+    free(t);
+}
+
+struct tr_monitor {
+#if defined(_WIN32)
+    SRWLOCK lock;
+    CONDITION_VARIABLE cond;
+#else
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+#endif
+};
+
+tr_monitor *tr_monitor_create(void) {
+    tr_monitor *m = (tr_monitor *)calloc(1, sizeof *m);
+    if (m == NULL) return NULL;
+#if defined(_WIN32)
+    InitializeSRWLock(&m->lock);
+    InitializeConditionVariable(&m->cond);
+#else
+    if (pthread_mutex_init(&m->lock, NULL) != 0) {
+        free(m);
+        return NULL;
+    }
+    if (pthread_cond_init(&m->cond, NULL) != 0) {
+        pthread_mutex_destroy(&m->lock);
+        free(m);
+        return NULL;
+    }
+#endif
+    return m;
+}
+
+void tr_monitor_free(tr_monitor *m) {
+    if (m == NULL) return;
+#if !defined(_WIN32)
+    pthread_cond_destroy(&m->cond);
+    pthread_mutex_destroy(&m->lock);
+#endif
+    free(m);
+}
+
+void tr_monitor_lock(tr_monitor *m) {
+#if defined(_WIN32)
+    AcquireSRWLockExclusive(&m->lock);
+#else
+    pthread_mutex_lock(&m->lock);
+#endif
+}
+
+void tr_monitor_unlock(tr_monitor *m) {
+#if defined(_WIN32)
+    ReleaseSRWLockExclusive(&m->lock);
+#else
+    pthread_mutex_unlock(&m->lock);
+#endif
+}
+
+void tr_monitor_wait(tr_monitor *m) {
+#if defined(_WIN32)
+    SleepConditionVariableSRW(&m->cond, &m->lock, INFINITE, 0);
+#else
+    pthread_cond_wait(&m->cond, &m->lock);
+#endif
+}
+
+void tr_monitor_broadcast(tr_monitor *m) {
+#if defined(_WIN32)
+    WakeAllConditionVariable(&m->cond);
+#else
+    pthread_cond_broadcast(&m->cond);
+#endif
+}

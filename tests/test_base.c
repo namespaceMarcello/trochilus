@@ -723,6 +723,75 @@ static void test_pool_oversubscribed(const char *argv0) {
 #endif
 }
 
+/* ---- tr_thread and tr_monitor ----------------------------------------------
+ * One item at a time handed to a thread of our own through a monitor, 1000 times: every item
+ * arrives, in order, once; the thread finishes slowly after its last item, and tr_thread_join
+ * returns only after it has (under TSan, the plain `finished` read after the join is also the
+ * proof that join orders it). tr_thread_join(NULL) and tr_monitor_free(NULL) do nothing. */
+
+typedef struct {
+    tr_monitor *m;
+    int item, stop, received, in_order, finished;
+    int64_t sum;
+} handoff;
+
+static void handoff_consumer(void *arg) {
+    handoff *h = (handoff *)arg;
+    tr_monitor_lock(h->m);
+    for (;;) {
+        while (h->item == 0 && !h->stop) tr_monitor_wait(h->m);
+        if (h->item == 0) break; /* stop, and nothing left */
+        if (h->item != h->received + 1) h->in_order = 0;
+        h->sum += h->item;
+        h->received++;
+        h->item = 0;
+        tr_monitor_broadcast(h->m);
+    }
+    tr_monitor_unlock(h->m);
+    double t0 = tr_time_sec();
+    while (tr_time_sec() - t0 < 0.05) {
+    }
+    h->finished = 1;
+}
+
+static int g_thread_cases = 0;
+
+static void test_thread_monitor(void) {
+    handoff h;
+    memset(&h, 0, sizeof h);
+    h.in_order = 1;
+    h.m = tr_monitor_create();
+    TR_CHECK(h.m != NULL);
+    if (h.m == NULL) return;
+    tr_thread *t = tr_thread_start(handoff_consumer, &h);
+    TR_CHECK(t != NULL);
+    if (t == NULL) {
+        tr_monitor_free(h.m);
+        return;
+    }
+    for (int k = 1; k <= 1000; k++) {
+        tr_monitor_lock(h.m);
+        while (h.item != 0) tr_monitor_wait(h.m);
+        h.item = k;
+        tr_monitor_broadcast(h.m);
+        tr_monitor_unlock(h.m);
+    }
+    tr_monitor_lock(h.m);
+    while (h.item != 0) tr_monitor_wait(h.m);
+    h.stop = 1;
+    tr_monitor_broadcast(h.m);
+    tr_monitor_unlock(h.m);
+    tr_thread_join(t);
+    TR_CHECK_EQ_INT(h.finished, 1); /* join waited for the thread's slow finish */
+    TR_CHECK_EQ_INT(h.received, 1000);
+    TR_CHECK_EQ_INT(h.sum, 500500);
+    TR_CHECK(h.in_order);
+    tr_monitor_free(h.m);
+    tr_thread_join(NULL);
+    tr_monitor_free(NULL);
+    g_thread_cases++;
+}
+
 /* ---- cpu ----------------------------------------------------------------- */
 
 static void test_cpu(void) {
@@ -777,6 +846,8 @@ int main(int argc, char **argv) {
     test_pool_pinned();
     test_pool_caller_affinity_any_order();
     test_pool_oversubscribed(argc > 0 ? argv[0] : "");
+    test_thread_monitor();
+    TR_CHECK(g_thread_cases > 0);
     test_cpu();
 
     TR_TEST_EXIT();

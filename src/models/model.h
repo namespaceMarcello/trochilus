@@ -50,9 +50,29 @@ typedef struct tr_session tr_session;
  * exercised without a machine actually short on RAM; the memory guard that refuses an unsafe load
  * still queries the real machine, so safety never depends on it. TR_EXPERT_DIRECT=0 forces the
  * expert store to read through the ordinary buffered handle instead of trying an unbuffered one
- * first (docs/ARCHITECTURE.md Esperti M1, Step C), for the measurement that compares the two. */
+ * first (docs/ARCHITECTURE.md Esperti M1, Step C), for the measurement that compares the two.
+ * TR_PREFETCH=0, read once at load, keeps a partial store from reading the next layer's experts
+ * ahead while a prompt computes this one (src/memory/experts.h tr_experts_prefetch): for the A/B
+ * measurement only, the logits are the same either way. */
 tr_model *tr_model_load_budget(const char *path, tr_pool *pool, uint64_t expert_budget, char *err, size_t err_len);
 tr_model *tr_model_load(const char *path, tr_pool *pool, char *err, size_t err_len);
+
+/* How far a load has read, for whoever shows it (the command line's bar, src/app/bar.c): the core
+ * draws nothing. fn is called on the loading thread after every tensor read at load and after
+ * every expert unit read at load, with done_bytes growing and total_bytes fixed for the whole
+ * load: the dense tensors' bytes plus, when the expert store is resident, every expert's bytes
+ * (0 of them otherwise: a partial store reads its experts while running, not at load). The last
+ * call of a load that succeeds has done_bytes == total_bytes; a load that fails stops calling
+ * wherever it failed. Never called outside a load, so nothing is added to the per-token path. */
+typedef struct {
+    void (*fn)(void *ctx, uint64_t done_bytes, uint64_t total_bytes);
+    void *ctx;
+} tr_progress;
+
+/* tr_model_load_budget reporting to `progress` (NULL: nothing reported, which is exactly
+ * tr_model_load_budget). */
+tr_model *tr_model_load_progress(const char *path, tr_pool *pool, uint64_t expert_budget, const tr_progress *progress,
+                                 char *err, size_t err_len);
 void tr_model_free(tr_model *m);
 const tr_model_info *tr_model_get_info(const tr_model *m);
 /* Snapshot of the shared expert store's counters (src/memory/experts.h); -1 if this model's
@@ -199,8 +219,9 @@ typedef struct {
     /* takes ownership of g, also on failure; expert_budget: see tr_model_load_budget. path: the
      * same file g was opened from, kept only so an architecture with a shared expert store can
      * open a second, unbuffered handle on it (docs/ARCHITECTURE.md Esperti M1, Step C) -- not
-     * retained beyond this call. */
-    void *(*load)(const char *path, tr_gguf *g, tr_pool *pool, uint64_t expert_budget, char *err, size_t err_len);
+     * retained beyond this call. progress: see tr_progress, may be NULL, not retained either. */
+    void *(*load)(const char *path, tr_gguf *g, tr_pool *pool, uint64_t expert_budget, const tr_progress *progress,
+                  char *err, size_t err_len);
     void (*free)(void *model);
     const tr_model_info *(*info)(const void *model);
     int (*expert_stats)(const void *model, tr_experts_stats *out); /* -1: no store */

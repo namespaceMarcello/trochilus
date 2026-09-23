@@ -3,8 +3,9 @@
 # (docs/LESSONS.md #66): native Windows, still machine, 8 rounds, rotating order, A/A control.
 # Run from the repo root in Git Bash; about 15 minutes. Results in build/remeasure/.
 #
-# The containers of the other projects are stopped for the duration and started again at the end,
-# also when the script fails or is interrupted (docs/STATUS.md: measurements want a still machine).
+# The machine's marker (~/.claude/macchina-ferma) is held for the duration and given back at the
+# end, also when the script fails or is interrupted: the other windows pause their work, their
+# containers stay up (tools/measure_guard.lib; docs/STATUS.md: measurements want a still machine).
 #
 #   sh tools/remeasure.sh [rounds]
 set -e
@@ -21,21 +22,13 @@ mkdir -p $OUT
 
 # one measurement at a time, and the machine stays awake while it lasts (docs/LESSONS.md #82)
 . tools/measure_guard.lib
-measure_begin remeasure
-RUNNING=$(docker ps -q 2>/dev/null || true)
-restart() { measure_end; if [ -n "$RUNNING" ]; then docker start $RUNNING > /dev/null 2>&1 || true; echo "containers started again"; fi; }
-trap restart EXIT
+trap measure_end EXIT
 trap 'exit 130' INT TERM
-if [ -n "$RUNNING" ]; then
-  # the VM's file cache goes back to Windows first (docs/LESSONS.md #38), then everything stops
-  MSYS_NO_PATHCONV=1 docker run --rm --privileged trochilus-dev:local sh -c "sync; echo 3 > /proc/sys/vm/drop_caches" || true
-  docker stop $RUNNING > /dev/null
-  echo "containers stopped: $(echo $RUNNING | wc -w)"
-fi
-# from here on a running container, or a CPU busy with other work, means somebody else is using
-# the machine: ab_modes.sh stops at the next run instead of going on (docs/LESSONS.md #73, #84)
-AB_GUARD=$MEASURE_AB_GUARD
-export AB_GUARD
+measure_begin remeasure
+# the other windows' containers stay up, their work paused by the marker; from here on a CPU
+# busy with other work, or the marker lost, stops the measurement at the next run
+# (tools/measure_guard.lib, tools/machine_still.sh, docs/LESSONS.md #73, #84)
+measure_machine remeasure
 
 # The model takes 7 GiB and the memory guard wants 3 more left free; after a `make check` Windows
 # needs minutes to take back what the VM has released (docs/LESSONS.md #72). Up to 15 minutes.

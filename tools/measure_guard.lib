@@ -2,28 +2,88 @@
 # (prefill_context.sh, decode_context.sh, threads_phase.sh, remeasure.sh). What a long
 # measurement needs and nobody gave it (docs/LESSONS.md #82, #84):
 #
-#   measure_begin <name>   nothing this project started is still running (tools/orphans.sh: a
-#                          forgotten load generator, an engine, another script), or it refuses
-#                          to start (exit 6). One measurement at a time: a second script finds
-#                          the lock of the first and refuses to start (exit 5), instead of
-#                          stopping containers and running its models beside it. The lock of a
-#                          script that died is taken over. Then the machine is kept awake for as
-#                          long as the measurement lasts (tools/stay_awake.ps1, Windows only).
-#   measure_still <name>   before the first run, once the containers are stopped: the CPU is not
-#                          busy with somebody else's work, or it waits, then refuses (exit 3).
-#   measure_end            ends what the script started (tools/cleanup.lib) and releases the
-#                          lock; the caller puts it in its EXIT trap, and `exit 130` in its
-#                          INT and TERM traps.
+#   measure_begin <name>   one measurement at a time: a second script finds the lock of the first
+#                          and refuses to start (exit 5), instead of running its models beside
+#                          it; the lock of a script that died is taken over. Then the caller's
+#                          measure_ready, when it defines one (the wait for a binary Smart App
+#                          Control holds: up to an hour, and nobody else waits for it), then the
+#                          machine's marker is taken (below), nothing this project started is still
+#                          running (tools/orphans.sh: a forgotten load generator, an engine,
+#                          another script) or it refuses (exit 6), and the machine is kept awake
+#                          for as long as the measurement lasts (tools/stay_awake.ps1, Windows).
+#                          The caller sets its traps (below) before calling it.
+#   measure_machine <name> after measure_begin: names the containers left running, gives the
+#                          Docker VM's file cache back to Windows, and sets AB_GUARD.
+#   measure_still <name>   before the first run: the CPU is not busy with somebody else's work,
+#                          or it waits, then refuses (exit 3).
+#   measure_end            ends what the script started (tools/cleanup.lib), releases the lock
+#                          and the marker; the caller puts it in its EXIT trap, and `exit 130` in
+#                          its INT and TERM traps.
+#
+# The machine is shared with other Claude windows, each on its own project (docs/LESSONS.md #73,
+# #87). Their rule, since 2026-09-23: whoever measures times writes one line ("project: what") to
+# ~/.claude/macchina-ferma for as long as it measures, and the others' correctness work (tests,
+# mutations) pauses while the file is there; a file older than 6 hours is stale. So the containers
+# of the other windows are not stopped and not waited for: they stay up, idle, and a window whose
+# work does not pause shows in the CPU check before every run. The marker is written with
+# noclobber (one writer wins), refreshed before every run, and removed only by its writer.
 #
 # A measurement is stopped by killing the pid in build/.measuring.lock/pid: the script runs its
 # long steps through cleanup_run, so the signal is served at once, and its EXIT trap takes the
 # ab_modes session and the engine run under it along.
 . tools/cleanup.lib
 MEASURE_LOCK=build/.measuring.lock
+MACHINE_MARKER=${MACHINE_MARKER:-$HOME/.claude/macchina-ferma}
+MACHINE_MARKER_MAX_MIN=360
+MACHINE_MARKER_POLL=${MACHINE_MARKER_POLL:-30}
+MACHINE_MARKER_WAIT_MAX=${MACHINE_MARKER_WAIT_MAX:-21600}
+
+# the marker is there, and younger than 6 hours
+marker_fresh() {
+  [ -f "$MACHINE_MARKER" ] && [ -n "$(find "$MACHINE_MARKER" -mmin -$MACHINE_MARKER_MAX_MIN 2> /dev/null)" ]
+}
+
+# a marker of this project whose script is gone: the pid in its line no longer runs (one of
+# another checkout's live measurements is waited for like any other window's)
+marker_leftover() {
+  MARK_PID=$(head -1 "$MACHINE_MARKER" 2> /dev/null | sed -n 's/^trochilus: .* (pid \([0-9][0-9]*\), since .*/\1/p')
+  [ -n "$MARK_PID" ] && ! kill -0 "$MARK_PID" 2> /dev/null
+}
+
+# measure_mark <name>: take the marker, waiting while another window holds it, for 6 hours at
+# most (then exit 5, as for our own lock). A stale marker and a leftover of ours are removed
+# first; the line says when it was taken.
+measure_mark() {
+  mkdir -p "$(dirname "$MACHINE_MARKER")"
+  T0=$(date +%s)
+  NEXT=0
+  while :; do
+    if [ -f "$MACHINE_MARKER" ] && { ! marker_fresh || marker_leftover; }; then
+      rm -f "$MACHINE_MARKER"
+    fi
+    MEASURE_MARK_LINE="trochilus: $1 (pid $$, since $(date '+%Y-%m-%d %H:%M'))"
+    # set before the create: a TERM served right after it still gives the marker back, and
+    # measure_end removes it only while its line is this one (it holds our pid)
+    MEASURE_MARK_MINE=1
+    if (set -C; echo "$MEASURE_MARK_LINE" > "$MACHINE_MARKER") 2> /dev/null; then
+      echo "$1: $MACHINE_MARKER taken, the other windows pause their work until the end"
+      return 0
+    fi
+    WAITED=$(( $(date +%s) - T0 ))
+    if [ $WAITED -ge $MACHINE_MARKER_WAIT_MAX ]; then
+      echo "$1: another window still measures times after $((WAITED / 60)) min ($(head -1 "$MACHINE_MARKER" 2> /dev/null)): not starting"
+      exit 5
+    fi
+    if [ $WAITED -ge $NEXT ]; then
+      echo "$1: another window measures times ($(head -1 "$MACHINE_MARKER" 2> /dev/null)), waiting since $((WAITED / 60)) min"
+      NEXT=$((NEXT + 300))
+    fi
+    cleanup_run sleep $MACHINE_MARKER_POLL
+  done
+}
 
 measure_begin() {
   mkdir -p build
-  sh tools/orphans.sh || { echo "$1: not measuring beside what is listed above"; exit 6; }
   if ! mkdir $MEASURE_LOCK 2> /dev/null; then
     MEASURE_OWNER=$(cat $MEASURE_LOCK/pid 2> /dev/null || true)
     if [ -n "$MEASURE_OWNER" ] && kill -0 "$MEASURE_OWNER" 2> /dev/null; then
@@ -36,6 +96,11 @@ measure_begin() {
   echo $$ > $MEASURE_LOCK/pid
   echo "$1" > $MEASURE_LOCK/name
   MEASURE_MINE=1
+  ! command -v measure_ready > /dev/null 2>&1 || measure_ready
+  # the wait for the marker can take hours: what is left running, and the machine kept awake
+  # (tools/stay_awake.ps1 gives up after 4 hours), are looked at after it
+  measure_mark "$1"
+  sh tools/orphans.sh || { echo "$1: not measuring beside what is listed above"; exit 6; }
   if command -v powershell.exe > /dev/null 2>&1; then
     MEASURE_FLAG=$(cygpath -w "$(pwd)/$MEASURE_LOCK/pid" 2> /dev/null || echo "$MEASURE_LOCK/pid")
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/stay_awake.ps1 "$MEASURE_FLAG" > /dev/null 2>&1 &
@@ -44,13 +109,31 @@ measure_begin() {
 
 measure_end() {
   cleanup_children
-  # only the script that took the lock gives it back: one that was refused must not free it
+  # only the script that took the lock gives it back: one that was refused must not free it;
+  # the same for the marker, and only while its line is still ours
+  [ -z "$MEASURE_MARK_MINE" ] || [ "$(head -1 "$MACHINE_MARKER" 2> /dev/null)" != "$MEASURE_MARK_LINE" ] ||
+    rm -f "$MACHINE_MARKER"
   [ -z "$MEASURE_MINE" ] || rm -rf $MEASURE_LOCK
 }
 
-# What "the machine is still" means before every run (AB_GUARD of tools/ab_modes.sh): no
-# container running (docs/LESSONS.md #73) and the CPU not busy with somebody else's work (#84).
-MEASURE_AB_GUARD='[ -z "$(docker ps -q 2>/dev/null)" ] && sh tools/machine_still.sh 3.5 600 2'
+# What "the machine is still" means before every run (AB_GUARD of tools/ab_modes.sh, which runs
+# it in a shell of its own): the marker is still ours, refreshed so that a session of more than
+# 6 hours does not go stale under the others, and the CPU is not busy with somebody else's work
+# (docs/LESSONS.md #84; a container lit half way, #73, is CPU too).
+measure_machine() {
+  MEASURE_CONTAINERS=$(docker ps --format '{{.Names}}' 2> /dev/null | tr '\n' ' ' || true)
+  if [ -n "$MEASURE_CONTAINERS" ]; then
+    # give the Docker VM's file cache back to Windows (docs/LESSONS.md #38)
+    MSYS_NO_PATHCONV=1 docker run --rm --privileged trochilus-dev:local sh -c "sync; echo 3 > /proc/sys/vm/drop_caches" > /dev/null 2>&1 || true
+    echo "$1: containers left running, idle while the marker is there: $MEASURE_CONTAINERS"
+  fi
+  # a server left up by the user would run the engine of every measurement (src/app/serve.c);
+  # a script that measures one sets TR_SERVER=1 on those runs alone
+  TR_SERVER=0
+  export TR_SERVER MACHINE_MARKER MEASURE_MARK_LINE
+  AB_GUARD='[ "$(head -1 "$MACHINE_MARKER" 2> /dev/null)" = "$MEASURE_MARK_LINE" ] && touch -c "$MACHINE_MARKER" && sh tools/machine_still.sh 3.5 600 2'
+  export AB_GUARD
+}
 
 # measure_still <name>: a longer look (10 s), and a wait of up to 15 minutes for whoever is using
 # the machine to finish; then exit 3 with the names of the processes that hold the CPU.
