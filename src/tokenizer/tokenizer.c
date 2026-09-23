@@ -160,6 +160,12 @@ static int cmp_added(const void *pa, const void *pb) {
     return a->id < b->id ? -1 : (a->id > b->id);
 }
 
+/* a control or user-defined token with text: matched in the text before splitting; one
+ * predicate for the count and the fill, so the two cannot disagree */
+static int is_added(const tr_tokenizer *t, size_t i) {
+    return (t->type[i] == TR_TOKEN_CONTROL || t->type[i] == TR_TOKEN_USER_DEFINED) && t->off[i + 1] > t->off[i];
+}
+
 void tr_tokenizer_free(tr_tokenizer *t) {
     if (t == NULL) return;
     free(t->type);
@@ -370,8 +376,7 @@ tr_tokenizer *tr_tokenizer_load(const tr_gguf *g, char *err, size_t err_len) {
     /* added tokens matched in text */
     size_t n_added = 0;
     for (size_t i = 0; i < n; i++)
-        if ((t->type[i] == TR_TOKEN_CONTROL || t->type[i] == TR_TOKEN_USER_DEFINED) && t->off[i + 1] > t->off[i])
-            n_added++;
+        if (is_added(t, i)) n_added++;
     t->added = (int32_t *)malloc((n_added > 0 ? n_added : 1) * sizeof(int32_t));
     added_key *keys = (added_key *)malloc((n_added > 0 ? n_added : 1) * sizeof(added_key));
     if (t->added == NULL || keys == NULL) {
@@ -380,7 +385,7 @@ tr_tokenizer *tr_tokenizer_load(const tr_gguf *g, char *err, size_t err_len) {
     }
     n_added = 0;
     for (size_t i = 0; i < n; i++)
-        if ((t->type[i] == TR_TOKEN_CONTROL || t->type[i] == TR_TOKEN_USER_DEFINED) && t->off[i + 1] > t->off[i]) {
+        if (is_added(t, i)) {
             keys[n_added].first = (uint8_t)t->bytes[t->off[i]];
             keys[n_added].len = t->off[i + 1] - t->off[i];
             keys[n_added].id = (int32_t)i;

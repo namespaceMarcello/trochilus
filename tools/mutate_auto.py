@@ -11,7 +11,12 @@ without running anything. A mutant that builds, differs and passes every test SU
 test looks at that line, or the mutation is equivalent in a way the compiler cannot see. Read each.
 A check that fails is run again on the same mutant: only a second failure kills it; a failure that
 does not repeat is printed as FLAKY and the next checks decide (a check that fails under load
-killed mutants it could not see, docs/LESSONS.md #115).
+killed mutants it could not see, docs/LESSONS.md #115). A check that runs out of time is run
+again with three times the budget, and a mutant that times out twice is listed as TIMEOUT, to be
+read like a survivor (under load a timeout hid three survivors, docs/LESSONS.md #117). A failure
+that is the machine's memory (the engine's guard refusing a model, the OOM killer) is no verdict:
+that mutant is judged again at the end, alone, and listed as PRESSURE if refused again (a memory
+refusal that lasted killed a mutant twice, docs/LESSONS.md #119).
 
 Linux container, from the repo root; the tree is copied to /tmp, the checkout is never touched:
   MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src trochilus-dev:local \\
@@ -24,7 +29,7 @@ the C tests of a model check that every split of the work gives the same bits, n
 are right, so a model file wants the oracle too:
   --cmd '$PY /src/tools/oracle.py /src/fixtures/tiny-olmoe /src/fixtures/tiny-olmoe/model-f32.gguf
          --binary b/trochilus --expect exact'
-). Output: one line per survivor (file:line, mutation, the line), then killed / survived / same
+). Output: one line per survivor and per timeout (file:line, mutation, the line), then killed / survived / same
 object / did not build / timed out. Exit status 0 whatever survives: this is a report.
 """
 import argparse
@@ -107,12 +112,24 @@ def copy_tree(dst):
     shutil.copy("Makefile", dst)
 
 
+# a failure that says the machine had no room is no verdict on the mutant: the engine's memory
+# guard refusing a model, or the OOM killer (docs/LESSONS.md #115, #119)
+PRESSURE = re.compile(rb"not enough memory")
+
+
 def run(cmd, cwd, timeout):
+    """Exit status (None when out of time), and whether a failure was the machine's memory."""
     try:
-        return subprocess.run(cmd, cwd=cwd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                              timeout=timeout).returncode
+        p = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
     except subprocess.TimeoutExpired:
-        return None
+        return None, False
+    pressure = p.returncode != 0 and (p.returncode in (-9, 137) or PRESSURE.search(p.stdout[-65536:]) is not None)
+    return p.returncode, pressure
+
+
+def put(path, text):
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
 
 
 def main():
@@ -156,62 +173,78 @@ def main():
         base_obj = f.read()
     t1 = time.time()
     for c in checks:
-        if run(c, dirs[0], None) != 0:
+        if run(c, dirs[0], None)[0] != 0:
             sys.exit(f"mutate_auto: {' '.join(c)} fails without any mutation")
     budget = max(20.0, 10 * (time.time() - t1))
 
-    results, flaky, lock = [], [], threading.Lock()
+    results, flaky, lock = {}, [], threading.Lock()
+
+    def judge(d):
+        """The verdict on the mutant written in tree d, and the checks that failed only once."""
+        if run(mk + targets, d, 300)[0] != 0:
+            return "nobuild", []
+        if open(os.path.join(d, obj), "rb").read() == base_obj:
+            return "same", []
+        once = []
+        for c in checks:
+            rc, pressure = run(c, d, budget)
+            # a timeout too must happen twice, with room: under load a check that would pass
+            # ran out of time, and a survivor hid behind it (docs/LESSONS.md #117)
+            if rc is None:
+                rc, pressure = run(c, d, 3 * budget)
+            if rc is None:
+                return "timeout", once
+            if pressure:
+                return "pressure", once
+            # a kill must happen twice: a check that fails once under load and passes again
+            # killed mutants it cannot see (docs/LESSONS.md #115); it is reported and the next
+            # checks decide
+            if rc != 0:
+                rc, pressure = run(c, d, budget)
+                if pressure:
+                    return "pressure", once
+                if rc != 0:
+                    return "killed", once
+                once.append(" ".join(c))
+        return "survived", once
 
     def worker(w):
         d = dirs[w]
-        target = os.path.join(d, a.file)
         for k in range(w, len(todo), a.jobs):
-            no, name, line, text = todo[k]
-            with open(target, "w", encoding="utf-8", newline="\n") as f:
-                f.write(text)
-            if run(mk + targets, d, 300) != 0:
-                verdict = "nobuild"
-            elif open(os.path.join(d, obj), "rb").read() == base_obj:
-                verdict = "same"
-            else:
-                verdict = "survived"
-                for c in checks:
-                    rc = run(c, d, budget)
-                    if rc is None:
-                        verdict = "timeout"
-                        break
-                    # a kill must happen twice: a check that fails once under load and passes
-                    # again killed mutants it cannot see (docs/LESSONS.md #115); it is reported
-                    # and the next checks decide
-                    if rc != 0 and run(c, d, budget) != 0:
-                        verdict = "killed"
-                        break
-                    if rc != 0:
-                        with lock:
-                            flaky.append((no, name, " ".join(c)))
+            put(os.path.join(d, a.file), todo[k][3])
+            verdict, once = judge(d)
             with lock:
-                results.append((no, name, line, verdict))
-        with open(target, "w", encoding="utf-8", newline="\n") as f:
-            f.write(original)
+                results[k] = verdict
+                flaky.extend((todo[k][0], todo[k][1], c) for c in once)
+        put(os.path.join(d, a.file), original)
 
     threads = [threading.Thread(target=worker, args=(w,)) for w in range(a.jobs)]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
+    # the mutants the machine had no room for are judged again one at a time, nothing else of
+    # ours running; one still refused for memory is listed, to be read like a survivor
+    for k in sorted(k for k, v in results.items() if v == "pressure"):
+        put(os.path.join(dirs[0], a.file), todo[k][3])
+        verdict, once = judge(dirs[0])
+        results[k] = verdict
+        flaky.extend((todo[k][0], todo[k][1], c) for c in once)
     shutil.rmtree("/tmp/mutate_auto", ignore_errors=True)
 
-    count = {v: 0 for v in ("killed", "survived", "same", "nobuild", "timeout")}
-    for no, name, line, verdict in sorted(results):
-        count[verdict] += 1
-        if verdict == "survived":
-            print(f"SURVIVED {a.file}:{no}: {name}: {line.strip()}")
+    count = {v: 0 for v in ("killed", "survived", "same", "nobuild", "timeout", "pressure")}
+    listed = {"survived": "SURVIVED", "timeout": "TIMEOUT", "pressure": "PRESSURE"}
+    for k in sorted(results, key=lambda k: todo[k][0]):
+        no, name, line, _ = todo[k]
+        count[results[k]] += 1
+        if results[k] in listed:
+            print(f"{listed[results[k]]} {a.file}:{no}: {name}: {line.strip()}")
     for no, name, check in sorted(flaky):
         print(f"FLAKY {check}: failed once, then passed, on {a.file}:{no}: {name}")
     print(f"mutate_auto {a.file} vs {' '.join(a.tests + [f'[{c}]' for c in a.cmd])}: {len(results)} mutants, {count['killed']} killed, "
           f"{count['survived']} survived, {count['same']} same object, {count['nobuild']} did not build, "
-          f"{count['timeout']} timed out, {len(flaky)} flaky failures ({time.time() - t0:.0f} s, {a.jobs} jobs"
-          f"{', ASan' if a.asan else ''})")
+          f"{count['timeout']} timed out, {count['pressure']} refused for memory, {len(flaky)} flaky failures "
+          f"({time.time() - t0:.0f} s, {a.jobs} jobs{', ASan' if a.asan else ''})")
     return 0
 
 

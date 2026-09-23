@@ -851,3 +851,24 @@ report of `src/base/prof.c` (Opus 5.5), every file through `tools/mutate_auto.py
   §Generated mutations.
 - **What is left**: the survivors of `tokenizer.c` (75) and `main.c` (334), to read one by one; the
   numbers of the command line are parsed with `atoi`/`atoll` (`-n abc` is 0, not an error).
+
+### 2026-09-23 — The tokenizer's survivors read, and a mutation tool that stops hiding them
+
+- `tests/test_tokenizer.c` refuses every malformed tokenizer by its own message (22 files: tokens
+  missing, not strings or empty, types not int32 or out of range at both ends, merges not strings,
+  a merge missing one side or making an unused token, add_eos without its id, a caller with no
+  error buffer) and accepts the edges (token types 0 and 6, id 0 as a merge side and result, bos
+  and eos 0, a merge making a user-defined token); new cases for byte 0, a code point one past the
+  byte alphabet, `'re` and its rule at a segment's end, a 64-byte piece, an empty control token
+  against every byte value. The synthetic file counts its keys as it writes them (#113).
+- `src/tokenizer/tokenizer.c`: the added-token predicate is one helper, `is_added` (#118). No change
+  in behaviour.
+- `tools/mutate_auto.py`: a timeout repeats with three times the budget and is listed as `TIMEOUT`
+  (#117); a failure that is the machine's memory is judged again alone at the end, `PRESSURE` if
+  refused again (#119).
+- Survivors of `tokenizer.c` 75 → 43, each named in `docs/MEASUREMENTS.md` §Generated mutations.
+
+- **How to check it**: `make check`; in the container `sh tools/mutate_files.sh tokenizer`
+  (~13 min), report in `build/mutate/tokenizer.txt`.
+- **What is left**: the survivors of `main.c` (334); strict number parsing on the command line; the
+  other files' mutation runs again with the corrected tool.

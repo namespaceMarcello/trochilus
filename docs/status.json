@@ -228,7 +228,7 @@
       "tappa": "M0",
       "titolo": "Revisione e gate",
       "stato": "in-corso",
-      "cosa": "Revisione del lettore GGUF, dell'archivio degli esperti, del pool, della piattaforma e del cancello (22/09), poi del modello, dei kernel, del tokenizer e della riga di comando (23/09). Il 23: la riga di comando dimensionava i buffer da -n e -p (un trabocco vicino a 2^62) e troncava --tokens a 32 bit; tre opzioni di OLMoE non erano mai state confrontate con transformers (ora c'e' un oracolo apposta); la pressione di memoria nel VM di Docker contava come mutanti uccisi. Resta da leggere uno per uno cio' che sopravvive in tokenizer.c e main.c.",
+      "cosa": "Revisione del lettore GGUF, dell'archivio degli esperti, del pool, della piattaforma e del cancello (22/09), poi del modello, dei kernel, del tokenizer e della riga di comando (23/09). Il 23: la riga di comando dimensionava i buffer da -n e -p (un trabocco vicino a 2^62) e troncava --tokens a 32 bit; tre opzioni di OLMoE non erano mai state confrontate con transformers (ora c'e' un oracolo apposta); la pressione di memoria nel VM di Docker contava come mutanti uccisi. Poi letti i sopravvissuti di tokenizer.c (75 → 43, tutti nominati), e lo strumento delle mutazioni ha smesso di nasconderne dietro timeout da carico e rifiuti di memoria. Resta main.c (334), il parsing stretto dei numeri, e un nuovo giro sugli altri file con lo strumento corretto.",
       "numeri": [
         {
           "v": "make check: ~935 s prima, 335 s adesso (gruppi in parallelo, fixture sul volume, test_cleanup)",
@@ -257,6 +257,10 @@
         {
           "v": "riga di comando: 4 difetti, 7 casi rossi prima della correzione (exit 0, 1, 134, 139, UBSan)",
           "d": "2026-09-23"
+        },
+        {
+          "v": "mutanti sopravvissuti: tokenizer.c 75 → 43 (tutti letti); 11 timeout, tutti loop veri",
+          "d": "2026-09-23"
         }
       ],
       "domande": [],
@@ -264,7 +268,8 @@
         "src/app/main.c (buffer dal contesto, --tokens, JSON)",
         "tests/test_cli.c, tests/test_model_load.c, tests/synth_olmoe.h (tokenizer, file malformati)",
         "tools/make_tiny_olmoe.py --options, fixtures/tiny-olmoe-opts",
-        "tools/mutate_auto.py (--cmd, uccisione ripetuta), tools/mutate_files.sh"
+        "tools/mutate_auto.py (--cmd, uccisione ripetuta, TIMEOUT e PRESSURE), tools/mutate_files.sh",
+        "tests/test_tokenizer.c (rifiuti per messaggio, bordi accettati), src/tokenizer/tokenizer.c (is_added)"
       ],
       "comandi": [
         "make check",

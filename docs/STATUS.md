@@ -280,10 +280,13 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
 command line sized its buffers from `-n`/`-p` (a heap overflow near 2^62) and cast `--tokens` to
 int32; three OLMoE options had never met transformers (now `fixtures/tiny-olmoe-opts` in `make
 oracle`); memory pressure in the Docker VM had counted as mutants killed (a kill now repeats,
-`tools/mutate_files.sh` sizes its jobs to memory). Open, in order: the survivors of `tokenizer.c`
-(75, mostly malformed-metadata refusals and out-of-memory paths) and of `main.c` (334, the command
-line's untested branches), read one by one; the command line parses its numbers with `atoi`/`atoll`
-(`-n abc` is 0, not an error): strict parsing, or declared.
+`tools/mutate_files.sh` sizes its jobs to memory). `tokenizer.c` read (75 → 43, all named in
+`docs/MEASUREMENTS.md` §Generated mutations); on the way `mutate_auto.py` stopped hiding survivors
+behind load-induced timeouts and behind memory refusals that outlasted the repeat (LESSONS #117,
+#119). Open, in order: the survivors of `main.c` (334, the command line's untested branches), read
+one by one; the command line parses its numbers with `atoi`/`atoll` (`-n abc` is 0, not an error):
+strict parsing, or declared; the other files' mutation runs again with the corrected tool (~1 h,
+`sh tools/mutate_files.sh`), their counts predate #117 and #119.
 
 Steps of 17–19/09 (block prefill, `--spec`, thread pinning, adaptive draft, adversarial revision,
 remeasure with A/A, threads per phase; decode at long context and KV per head, prefill on long

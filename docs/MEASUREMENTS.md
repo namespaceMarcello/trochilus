@@ -2133,7 +2133,12 @@ and two at once would ask the engine's memory guard for twice the room.
 one at a time, rebuilds, runs the given tests and, with `--cmd`, the oracles; a mutant whose object
 file is byte-identical to the original (a branch this platform does not compile, or folded by the
 compiler) is set aside. A check that fails is run again on the same mutant, and only a second
-failure kills it (LESSONS #115: under memory pressure a load refused had counted as a kill). Linux
+failure kills it (LESSONS #115: under memory pressure a load refused had counted as a kill); a
+check out of time runs again with three times the budget, and a mutant that times out twice is
+listed (#117); a failure that is the machine's memory (the engine's guard, the OOM killer) is no
+verdict, and that mutant is judged again alone at the end (#119: a refusal that outlasted the
+repeat had killed an equivalent mutant). The rows before `tokenizer.c` were counted before #117
+and #119, and may hide a few survivors until they run again. Linux
 container, `--asan` where a mutant can read out of bounds without crashing; the checks and the jobs
 of each file are in `tools/mutate_files.sh` (jobs sized to the VM's 15 GB, not to its processors).
 Background: 2026-09-23, the other windows' containers idle (OpenEMR's stack up, not measuring).
@@ -2151,7 +2156,7 @@ Background: 2026-09-23, the other windows' containers idle (OpenEMR's stack up, 
 | `src/kernels/expf.c` | `test_expf` (the proof on every float is `bench_expf --check`, in `make check`) | 7 | 5 (1 did not build) | 1 | 1 | 0 |
 | `src/tokenizer/chat.c` (ASan) | `test_tokenizer`, `test_cli`, the tokenizer oracle | 31 | 24 (+1 timed out) | 4 (with kills made by the OOM killer) | 6 | 0 |
 | `src/tokenizer/unicode.c` (ASan) | `test_unicode`, `test_tokenizer`, the tokenizer oracle without its sweep | 120 | 80 (+11 timed out) | 27 | 17 | 2 |
-| `src/tokenizer/tokenizer.c` (ASan) | `test_tokenizer`, `test_cli`, the tokenizer oracle without its sweep | 333 | 246 (+11 timed out) | 75 | 75 (not yet read) | 1 |
+| `src/tokenizer/tokenizer.c` (ASan) | `test_tokenizer`, `test_cli`, the tokenizer oracle without its sweep | 327 | 271 (+11 timed out, each a real loop; +1 refused for memory) | 75 | 43 (all read) | 1 |
 | `src/app/main.c` (ASan) | `test_cli`, the tiny oracle, the tokenizer oracle without its sweep | 646 | 306 | 334 | 334 (not yet read) | 6 |
 
 What the survivors that are left are, read one by one:
@@ -2194,10 +2199,24 @@ What the survivors that are left are, read one by one:
   buffer); `tr_chat_render` out of memory, 1. The first run's 4 were fewer because the OOM killer
   had failed the oracle under three of them.
 - `unicode.c`: 3 more (a Hangul syllable's end, U+0080's encoding length, the ASCII class table's end) die only under the tokenizer oracle's full Unicode sweep, which `make check` runs and a run per mutant cannot afford (4 GB, `tools/mutate_files.sh unicode-sweep`); 7 died to new boundary cases in `test_unicode` (each UTF-8 length at both edges, U+10FFFF, U+DFFF, the jamo just outside the composing ranges). The 17 left: out of memory and the size overflow checks of `tr_nfc` (10, a text is at most 1 GiB); `TR_CP_INVALID_BASE + 0`, 2 (byte 0 is valid ASCII, never an invalid byte); the equal case of two binary searches, 2 (returned before); the NFC fast path's test, 3 (U+00C0, the threshold, is NFC-stable alone, and slower is not different).
-- `tokenizer.c` (**open**, 75): refusals of malformed metadata not in `test_refusals` (tokens not an
-  array, empty, too many; types of another length; merges not strings; add_eos without its id; a
-  token type out of range at the edge), out-of-memory paths, the `grow` and hash-table arithmetic,
-  the heap's tie rule and bounds in BPE, the GPT-2 rules at the end of a text.
+- `tokenizer.c`: 75 → 43. New cases in `test_tokenizer`: every metadata refusal by its own message
+  (tokens missing, not strings, empty; types not int32; merges not strings; a merge missing only one
+  side, or making an unused token; a merge starting with a space), and the edges accepted (token
+  types 0 and 6, id 0 as a merge side and result, bos and eos 0 with `add_eos`, a merge making a
+  user-defined token); U+0144, one past the byte alphabet; byte 0 alone and in a piece; `'re`, and
+  the `'re` rule at a segment's end over reused buffers; a 64-byte piece filling the symbol array;
+  an empty control token against a text of every byte value; and one helper for the added-token
+  predicate, which had two copies (LESSONS #118). The 43 left: out of memory, 14 (the `NULL` checks
+  and the `return -1` after them; `tr_nfc` fails only past its size limits); the limits themselves,
+  6 (2^24 tokens or merges, 4 GiB of token text, a 1 GiB text, `grow` at `SIZE_MAX`); sizes that
+  change nothing, 8 (`malloc(0)` or 1 on glibc, 3; a hash table or a buffer one doubling larger, 3;
+  the merge buffer's terminator, never written; `cp[n]`, never read); orderings reached only with
+  distinct operands, 6 (the added-token sort, 4; the BPE heap's rank and position, 2); the heap's
+  bounds, 4 (the slot past the end is `last` itself); the split's guards, 3 (`j = s` where `cls[s]`
+  is `k` anyway; the "every piece advances" guard, never taken); `err_len` at 0, 1; the switch's
+  default, 1 (one rule set). The 11 timeouts are real loops (a hash probe that does not move, a
+  doubling from 0, a match of length 0); the one refused for memory (`sym[n].next = n`) loops
+  emitting ids until memory runs out: caught, by its own hunger.
 - `main.c` (**open**, 334): the command line's branches no test runs — `inspect` and `cpu` (18),
   the option parsing and usage errors of every command, `logits`, `tokenize --pieces/--decode`,
   `run --route-trace`, the chat's `/reset` and its context-full turn, the speed lines.
