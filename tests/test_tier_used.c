@@ -10,7 +10,10 @@
  *   the table    for every tier this CPU has, every entry the hot zone goes through is a function
  *                of the tier's own, not scalar's: dot_f32, axpy_f32, their x4, and dot_row and
  *                dot_row_x4 of EVERY weight type the engine supports (tr_kernels_support). A new
- *                type enters the engine with its tier kernels, or this goes red.
+ *                type enters the engine with its tier kernels, or this goes red. A tier is handed
+ *                out under its own name, exactly when the CPU has it, and tr_kernels_init takes
+ *                the fastest.
+ *   the ops      tr_rmsnorm and tr_attention_head reduce through the active table.
  *   the engine   a model with each weight type, and an F32 router beside it as in every real
  *                GGUF, runs with the active table wrapped in counters: every product of every
  *                matrix must come through the active table's entry for its type. The count is
@@ -65,6 +68,7 @@ static void test_table(void) {
                 missing++;
             }
         }
+        TR_CHECK(strcmp(K->tier, tiers[t]) == 0); /* asked for one tier, handed another */
         TR_CHECK(types >= 3); /* F32, F16, Q8_0 today: a loop over nothing proves nothing */
         TR_CHECK_EQ_INT(missing, 0);
         if (missing == 0)
@@ -72,6 +76,63 @@ static void test_table(void) {
                    "weight types\n",
                    K->tier, types);
     }
+
+    /* a tier exists exactly when the CPU (capped by TR_CPU_MAX) has it, and tr_kernels_init takes
+     * the fastest one there is: the same numbers from a slower tier would pass every other test */
+    const tr_cpu_info *cpu = tr_cpu();
+    TR_CHECK((tr_kernels_tier("avx2") != NULL) == (cpu->avx2 != 0));
+    TR_CHECK((tr_kernels_tier("avx512") != NULL) == (cpu->avx512f != 0));
+    const char *best = tr_kernels_tier("avx512") != NULL ? "avx512" : tr_kernels_tier("avx2") != NULL ? "avx2" : "scalar";
+    TR_CHECK(tr_kernels_get() != NULL && strcmp(tr_kernels_get()->tier, best) == 0);
+    printf("  active tier %s, the fastest this CPU offers\n", best);
+}
+
+/* ---- the operations built on the table ---------------------------------------------------- */
+
+static const tr_kernels *g_under;
+static atomic_ullong n_dot, n_axpy;
+static float counted_dot_f32(const float *a, const float *b, int64_t n) {
+    atomic_fetch_add(&n_dot, 1);
+    return g_under->dot_f32(a, b, n);
+}
+static void counted_axpy_f32(float *y, const float *x, float a, int64_t n) {
+    atomic_fetch_add(&n_axpy, 1);
+    g_under->axpy_f32(y, x, a, n);
+}
+
+/* tr_rmsnorm and tr_attention_head reduce through the active table, not through scalar's: one
+ * dot for a norm, one dot and one axpy per position for a head. The output of the head is a
+ * buffer of exactly head_dim floats on the heap, so a write past it is ASan's. */
+static void test_ops(void) {
+    static tr_kernels counting;
+    g_under = tr_kernels_get();
+    counting = *g_under;
+    counting.dot_f32 = counted_dot_f32;
+    counting.axpy_f32 = counted_axpy_f32;
+    enum { N = 40, HEAD = 8, POS = 3 };
+    float x[N], w[N], keys[POS * HEAD], values[POS * HEAD], q[HEAD], scores[POS];
+    for (int i = 0; i < N; i++) {
+        x[i] = (float)(i % 7) - 3.0f;
+        w[i] = 1.0f + (float)i / N;
+    }
+    for (int i = 0; i < POS * HEAD; i++) {
+        keys[i] = (float)(i % 5) / 5;
+        values[i] = (float)(i % 3) - 1;
+    }
+    for (int i = 0; i < HEAD; i++) q[i] = (float)i / HEAD;
+    float *out = (float *)malloc(HEAD * sizeof(float));
+    TR_CHECK(out != NULL);
+    if (out == NULL) return;
+    atomic_store(&n_dot, 0);
+    atomic_store(&n_axpy, 0);
+    tr_kernels_set_active(&counting);
+    tr_rmsnorm(x, w, N, 1e-5f);
+    TR_CHECK_EQ_INT(atomic_load(&n_dot), 1);
+    tr_attention_head(q, keys, values, HEAD, 0, POS, HEAD, 0.5f, scores, out);
+    tr_kernels_set_active(NULL);
+    TR_CHECK_EQ_INT(atomic_load(&n_dot), 1 + POS);
+    TR_CHECK_EQ_INT(atomic_load(&n_axpy), POS);
+    free(out);
 }
 
 /* ---- the engine ------------------------------------------------------------------------- */
@@ -177,6 +238,7 @@ int main(int argc, char **argv) {
     tr_kernels_init();
     const char *argv0 = argc > 0 ? argv[0] : "";
     test_table();
+    test_ops();
     test_engine(argv0, TR_TYPE_F32, "f32");
     test_engine(argv0, TR_TYPE_F16, "f16");
     test_engine(argv0, TR_TYPE_Q8_0, "q8_0");

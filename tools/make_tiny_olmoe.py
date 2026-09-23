@@ -10,6 +10,11 @@ Output directory:
   ref.json                         prompt_ids, full_ids (greedy, transformers)
                                    and logits[pos][vocab] of a teacher-forced
                                    forward over full_ids, as float32 values
+
+--options: the same model with the three settings the default leaves off, so that the engine's
+branches for them meet transformers too: norm_topk_prob (the chosen experts' weights summed to 1),
+clip_qkv 1.0 (q and k are unit-RMS after their norms, so about a third of their values are cut)
+and rope_theta 500000 (read from the file, not the 10000 the engine falls back to).
 """
 
 import argparse
@@ -26,6 +31,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--new-tokens", type=int, default=16)
+    parser.add_argument("--options", action="store_true")
     args = parser.parse_args()
 
     output = args.output.resolve()
@@ -45,7 +51,9 @@ def main() -> int:
         max_position_embeddings=128,
         num_experts=8,
         num_experts_per_tok=2,
-        norm_topk_prob=False,
+        norm_topk_prob=args.options,
+        clip_qkv=1.0 if args.options else None,
+        rope_theta=500000.0 if args.options else 10000.0,
         eos_token_id=None,
         pad_token_id=None,
         bos_token_id=None,

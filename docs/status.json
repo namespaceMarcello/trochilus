@@ -1,7 +1,7 @@
 {
   "progetto": "Trochilus",
   "sottotitolo": "motore di inferenza per modelli MoE in C, senza dipendenze",
-  "aggiornato": "2026-09-22",
+  "aggiornato": "2026-09-23",
   "stati": {
     "fatto": "finito e provato: test verdi in make check",
     "in-corso": "ci stiamo lavorando adesso",
@@ -228,7 +228,7 @@
       "tappa": "M0",
       "titolo": "Revisione e gate",
       "stato": "in-corso",
-      "cosa": "Revisione del lettore GGUF, dell'archivio degli esperti, del pool e della piattaforma, e del cancello stesso. Sette errori corretti, due dei quali vivevano solo su Windows, dove il cancello non faceva girare nessun test: adesso i test C girano anche nativi. Il cancello impiega circa un terzo del tempo, e un mutatore generico trova le righe che nessun test guarda. Prossimo: olmoe.c, poi kernel, tokenizer, main.c.",
+      "cosa": "Revisione del lettore GGUF, dell'archivio degli esperti, del pool, della piattaforma e del cancello (22/09), poi del modello, dei kernel, del tokenizer e della riga di comando (23/09). Il 23: la riga di comando dimensionava i buffer da -n e -p (un trabocco vicino a 2^62) e troncava --tokens a 32 bit; tre opzioni di OLMoE non erano mai state confrontate con transformers (ora c'e' un oracolo apposta); la pressione di memoria nel VM di Docker contava come mutanti uccisi. Resta da leggere uno per uno cio' che sopravvive in tokenizer.c e main.c.",
       "numeri": [
         {
           "v": "make check: ~935 s prima, 335 s adesso (gruppi in parallelo, fixture sul volume, test_cleanup)",
@@ -245,18 +245,30 @@
         {
           "v": "calibrazione del profiler: errore peggiore 9.9995% → 0.00000% con uno stallo di 2 ms",
           "d": "2026-09-22"
+        },
+        {
+          "v": "mutanti sopravvissuti: prof.c 42 → 10, olmoe.c 92 → 70 (tutti nominati), kernels.c 37 → 26 (equivalenti)",
+          "d": "2026-09-23"
+        },
+        {
+          "v": "oracolo con norm_topk_prob, clip_qkv, rope_theta 500000: 16/16 token, logit entro 2.1e-7",
+          "d": "2026-09-23"
+        },
+        {
+          "v": "riga di comando: 4 difetti, 7 casi rossi prima della correzione (exit 0, 1, 134, 139, UBSan)",
+          "d": "2026-09-23"
         }
       ],
       "domande": [],
       "file": [
-        "src/base/platform.c (lettura diretta a fine file)",
-        "src/base/threads.c (TLS toccato all'ingresso, slot su linee intere)",
-        "src/base/prof.c (tr_prof_calibrate)",
-        "tools/native_tests.sh, tools/mutate_auto.py, tools/gate_times.py"
+        "src/app/main.c (buffer dal contesto, --tokens, JSON)",
+        "tests/test_cli.c, tests/test_model_load.c, tests/synth_olmoe.h (tokenizer, file malformati)",
+        "tools/make_tiny_olmoe.py --options, fixtures/tiny-olmoe-opts",
+        "tools/mutate_auto.py (--cmd, uccisione ripetuta), tools/mutate_files.sh"
       ],
       "comandi": [
         "make check",
-        "python3 tools/mutate_auto.py <src/file.c> <test> --asan"
+        "sh tools/mutate_files.sh <file>  (nel container)"
       ],
       "dipende": [
         "nucleo",

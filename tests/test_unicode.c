@@ -44,6 +44,13 @@ static void test_utf8_valid_forms(void) {
         {{0xC3, 0xA9, 0, 0}, 2, 0xE9},           /* e-acute, 2 bytes */
         {{0xE4, 0xB8, 0xAD, 0}, 3, 0x4E2D},      /* CJK "middle", 3 bytes */
         {{0xF0, 0x90, 0x80, 0x80}, 4, 0x10000},  /* U+10000, 4 bytes */
+        /* the edges of each length, both sides (a boundary moved by one is otherwise unseen) */
+        {{0x7F, 0, 0, 0}, 1, 0x7F},
+        {{0xC2, 0x80, 0, 0}, 2, 0x80},
+        {{0xDF, 0xBF, 0, 0}, 2, 0x7FF},
+        {{0xE0, 0xA0, 0x80, 0}, 3, 0x800},
+        {{0xEF, 0xBF, 0xBF, 0}, 3, 0xFFFF},
+        {{0xF4, 0x8F, 0xBF, 0xBF}, 4, 0x10FFFF}, /* the last scalar value */
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         uint32_t cp;
@@ -64,6 +71,7 @@ static void test_utf8_invalid_forms(void) {
         {{0xE0, 0x80, 0x80, 0}, 3, 0xE0},       /* overlong 3-byte (U+0000) */
         {{0xF0, 0x80, 0x80, 0x80}, 4, 0xF0},    /* overlong 4-byte (U+0000) */
         {{0xED, 0xA0, 0x80, 0}, 3, 0xED},       /* surrogate U+D800 */
+        {{0xED, 0xBF, 0xBF, 0}, 3, 0xED},       /* surrogate U+DFFF, the last one */
         {{0xF4, 0x90, 0x80, 0x80}, 4, 0xF4},    /* U+110000, above U+10FFFF */
         {{0x80, 0, 0, 0}, 1, 0x80},             /* lone continuation byte */
         {{0xE2, 0x82, 0, 0}, 2, 0xE2},          /* truncated: needs 3 bytes, only 2 given */
@@ -206,6 +214,16 @@ static void test_nfc_vectors(void) {
         uint32_t want[] = {0xAC00};
         size_t n = nfc_of_cps(in, 2, src, dst, got);
         TR_CHECK(cps_equal(got, n, want, 1));
+    }
+    /* just outside the ranges that compose algorithmically, nothing composes: an L after the
+     * last one (U+1113), a V after the last one (U+1176), U+11A7 (TBase itself, "no trailing
+     * consonant", not a T) and a T after the last one (U+11C3) */
+    {
+        uint32_t cases[4][2] = {{0x1113, 0x1161}, {0x1100, 0x1176}, {0xAC00, 0x11A7}, {0xAC00, 0x11C3}};
+        for (int i = 0; i < 4; i++) {
+            size_t n = nfc_of_cps(cases[i], 2, src, dst, got);
+            TR_CHECK(cps_equal(got, n, cases[i], 2)); /* unchanged */
+        }
     }
     /* Hangul LV + T -> LVT syllable */
     {

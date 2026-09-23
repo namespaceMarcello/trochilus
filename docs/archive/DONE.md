@@ -823,3 +823,31 @@ gate prints its time. `tools/mutate_auto.py` generates mutations for any file; `
 
 - **How to check it**: `make check` (green, "check passed in N s", "native tests: 18 passed");
   `python3 tools/mutate_auto.py src/format/gguf.c test_gguf --asan` in the container.
+
+### 2026-09-23 — Review of the model, the kernels, the tokenizer and the command line
+A review of `src/models/olmoe.c`, `src/kernels/`, `src/tokenizer/`, `src/app/main.c` and the printed
+report of `src/base/prof.c` (Opus 5.5), every file through `tools/mutate_auto.py` (LESSONS #111-#116):
+- the command line sized its buffers from `-n` and `-p`: near 2^62 the size wrapped to a few bytes
+  and the tokens ran past them in `generate`, `run` and `chat`; `--tokens` cast its ids to int32
+  (`4294967297` became token 1); `--profile-json` wrote control characters raw (#111).
+  `tests/test_cli.c` runs the binary on a synthetic model that carries a tokenizer and OLMoE's chat
+  template (`synth_with_tokenizer`), on Linux, under ASan and natively on Windows;
+- three OLMoE options had never met transformers: `norm_topk_prob`, `clip_qkv` and a `rope_theta`
+  read from the file. `fixtures/tiny-olmoe-opts` (`make_tiny_olmoe.py --options`) is in `make
+  oracle`: 16/16 tokens, logits within 2.1e-7 (#112). `tests/test_model_load.c` covers malformed
+  files one fault at a time, the bounds of `eval` and `eval_rows`, the expert mask, the router's tie
+  rule, an expert part in another type than its gate, and the edges of the route trace; a failed
+  eval keeps the logits the session had (`test_stream`);
+- the profiler's printed table is pinned on four profiles with known numbers (`test_prof`); the
+  kernel dispatch too: a tier comes under its own name, only when the CPU has it, the fastest is
+  chosen, and the norm and the attention go through the active table (`test_tier_used`);
+- `mutate_auto.py` runs extra checks per mutant (`--cmd`: the oracles) and counts a kill only when
+  the check fails twice (`FLAKY` otherwise: memory pressure in the Docker VM had killed mutants no
+  test could see, #115); `tools/mutate_files.sh` knows the checks of every file and sizes its jobs to
+  the VM's memory.
+
+- **How to check it**: `make check`; in the container `sh tools/mutate_files.sh olmoe` (or any other
+  name, docs/COMMANDS.md), survivors in `build/mutate/<name>.txt`, named in `docs/MEASUREMENTS.md`
+  §Generated mutations.
+- **What is left**: the survivors of `tokenizer.c` (75) and `main.c` (334), to read one by one; the
+  numbers of the command line are parsed with `atoi`/`atoll` (`-n abc` is 0, not an error).

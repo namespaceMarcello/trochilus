@@ -30,7 +30,8 @@
  *   failure      a wrapped reader fails the k-th real read, chosen (via a dry run) to land inside
  *                a one-token pass, and inside the SECOND internal pass of a prompt longer than
  *                n_batch: eval returns -1, tr_session_pos is exactly what it was before that
- *                eval call; the reader restored, the same eval retried gives the reference logits
+ *                eval call; the reader restored, the same eval retried gives the reference logits;
+ *                and in a session that had logits, the failed eval leaves them as they were
  *   once_per_prompt  a prompt of 36 tokens in passes of 12, on the smallest store: the units
  *                read must be at most n_units + n_slots, not passes x n_units
  *   rewind       rewind to 0 and re-evaluate the same tokens under the min store: identical
@@ -468,6 +469,54 @@ static void test_failure(const char *argv0) {
                 TR_CHECK(memcmp(tr_session_logits(s), ref[N_PROMPT - 1], sizeof ref[0]) == 0);
                 checked++;
 
+                tr_session_free(s);
+            }
+            tr_model_free(m);
+        }
+    }
+
+    /* case 3: the same failure in a session that already had logits: the failed eval leaves them
+     * as they were (the session is exactly as before the call), not emptied by the passes that ran
+     * before the failure. Pass by pass (a route trace keeps it off the layer-major path), so the
+     * first pass is the one the dry run counts after the same first token. */
+    {
+        enum { N_BATCH = 3 };
+        int64_t reads = -1;
+        tr_model *m = load_budget(path, NULL, UINT64_MAX);
+        if (m != NULL) {
+            tr_session *s = create_session(m, N_BATCH);
+            tr_experts_stats a, b;
+            if (s != NULL && tr_session_eval(s, tokens, 1) == 0) {
+                tr_model_expert_stats(m, &a);
+                if (tr_session_eval(s, tokens + 1, N_BATCH) == 0) {
+                    tr_model_expert_stats(m, &b);
+                    reads = (int64_t)(b.misses - a.misses) * TR_EXPERT_PARTS;
+                }
+            }
+            if (s != NULL) tr_session_free(s);
+            tr_model_free(m);
+        }
+        TR_CHECK(reads > 0);
+
+        m = load_budget(path, NULL, UINT64_MAX);
+        if (m != NULL) {
+            tr_session *s = create_session(m, N_BATCH);
+            if (s != NULL) {
+                TR_CHECK(tr_session_route_trace_begin(s, N_PROMPT) == 0);
+                TR_CHECK(tr_session_eval(s, tokens, 1) == 0);
+                tr_experts *ex = tr_model_experts(m);
+                fail_reader_ctx frc = {0};
+                if (ex != NULL) {
+                    tr_experts_get_reader(ex, &frc.real, &frc.real_ctx);
+                    frc.fail_at = reads + 1; /* the first read of the second pass */
+                    tr_experts_set_reader(ex, fail_reader, &frc);
+                }
+                TR_CHECK(tr_session_eval(s, tokens + 1, N_PROMPT - 1) == -1);
+                TR_CHECK_EQ_INT(tr_session_pos(s), 1);
+                const float *kept = tr_session_logits(s);
+                TR_CHECK(kept != NULL && memcmp(kept, ref[0], sizeof ref[0]) == 0);
+                checked++;
+                if (ex != NULL) tr_experts_set_reader(ex, frc.real, frc.real_ctx);
                 tr_session_free(s);
             }
             tr_model_free(m);

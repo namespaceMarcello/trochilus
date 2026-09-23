@@ -98,11 +98,14 @@ int main(int argc, char **argv) {
         for (int z = 0; z < TR_PROF_ZONE_COUNT; z++) zones += acc[z].bytes;
         TR_CHECK_EQ_INT(zones, prof2->weight_bytes_touched[TR_PHASE_PREFILL] + kv_pass);
 
-        /* a decode pass at position 3 reads 4 positions */
+        /* a decode pass at position 3 reads 4 positions; its one token uses one expert, and only
+         * that expert's matrices are counted (gate and up 4x8, down 8x4), not the idle one's */
         prof2->phase = TR_PHASE_DECODE;
         TR_CHECK(tr_session_eval(sess2, tokens, 1) == 0);
         TR_CHECK_EQ_INT(prof2->kv_bytes_read[TR_PHASE_DECODE], (uint64_t)4 * 8 * 2 * sizeof(float));
         TR_CHECK_EQ_INT(prof2->kv_bytes_read[TR_PHASE_PREFILL], kv_pass);
+        TR_CHECK_EQ_INT(prof2->acc[TR_PHASE_DECODE][TR_PROF_EXPERT_GATE_UP].bytes, 2 * 32 * sizeof(float));
+        TR_CHECK_EQ_INT(prof2->acc[TR_PHASE_DECODE][TR_PROF_EXPERT_DOWN].bytes, 32 * sizeof(float));
 
         tr_session_free(sess2);
     }
@@ -123,6 +126,20 @@ int main(int argc, char **argv) {
         TR_CHECK(tr_session_eval(sess3, longer + 20, 5) == 0);
         TR_CHECK_EQ_INT(prof3->kv_bytes_read[TR_PHASE_PREFILL], (uint64_t)(16 + 20 + 25) * 8 * 2 * sizeof(float));
         tr_session_free(sess3);
+    }
+
+    /* exactly one group: 16 tokens whose last sees 16 positions, and no empty group after it */
+    tr_session *sess4 = tr_session_create(model, 0, 0, err, sizeof err);
+    TR_CHECK(sess4 != NULL);
+    if (sess4 != NULL) {
+        tr_prof *prof4 = tr_session_prof(sess4);
+        prof4->enabled = 1;
+        prof4->phase = TR_PHASE_PREFILL;
+        int32_t sixteen[16];
+        for (int i = 0; i < 16; i++) sixteen[i] = i % 4;
+        TR_CHECK(tr_session_eval(sess4, sixteen, 16) == 0);
+        TR_CHECK_EQ_INT(prof4->kv_bytes_read[TR_PHASE_PREFILL], (uint64_t)16 * 8 * 2 * sizeof(float));
+        tr_session_free(sess4);
     }
 
     free(logits_off);

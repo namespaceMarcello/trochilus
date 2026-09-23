@@ -1,5 +1,6 @@
 /* test_tokenizer.c — the tokenizer on a synthetic GGUF: loading and its refusals, the
- * GPT-2 split rules, added tokens, BPE against a naive reference, round trips.
+ * GPT-2 split rules, added tokens, BPE against a naive reference, round trips; and a file with no
+ * chat template, whose refusal writes no message when the caller gives no buffer.
  * Agreement with Hugging Face on a real vocabulary is tools/tokenizer_oracle.py's job. */
 #include <stdint.h>
 #include <stdio.h>
@@ -8,6 +9,7 @@
 
 #include "test.h"
 #include "../src/format/gguf.h"
+#include "../src/tokenizer/chat.h"
 #include "../src/tokenizer/tokenizer.h"
 #include "../src/tokenizer/unicode.h"
 
@@ -197,6 +199,20 @@ static void test_refusals(void) {
         }
         tr_tokenizer_free(t);
     }
+}
+
+/* no tokenizer.chat_template: refused, with the reason when there is room for it, and without
+ * touching a NULL buffer whatever length comes with it */
+static void test_no_template(void) {
+    char err[256] = "";
+    TR_CHECK(write_gguf(&GOOD) == 0);
+    tr_gguf *g = tr_gguf_open(path, err, sizeof err);
+    TR_CHECK(g != NULL);
+    if (g == NULL) return;
+    TR_CHECK(tr_chat_template_find(g, err, sizeof err) == NULL);
+    TR_CHECK(strstr(err, "no tokenizer.chat_template") != NULL);
+    TR_CHECK(tr_chat_template_find(g, NULL, 16) == NULL);
+    tr_gguf_close(g);
 }
 
 static int encode_eq(const tr_tokenizer *t, const char *text, size_t len, int flags, const int32_t *want, size_t n_want);
@@ -443,6 +459,7 @@ int main(int argc, char **argv) {
     snprintf(path, sizeof path, "%.*s/%s", sl ? (int)(sl - argv[0]) : 1, sl ? argv[0] : ".", "test_tokenizer.gguf");
 
     test_refusals();
+    test_no_template();
     test_missing_byte();
     char err[256];
     tr_tokenizer *t = load(&GOOD, err, sizeof err);

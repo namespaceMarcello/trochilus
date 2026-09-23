@@ -2127,20 +2127,32 @@ The four builds share the processors, so each is slower than alone (ASan 71 → 
 in the overlap, not in any single step. The real model's steps stay in a row: each loads the model,
 and two at once would ask the engine's memory guard for twice the room.
 
-## Generated mutations (2026-09-22)
+## Generated mutations (2026-09-22, 2026-09-23)
 
 `tools/mutate_auto.py` swaps operators, drops `± 1`, swaps `return 0` / `return -1`, drops `(!`,
-one at a time, rebuilds, runs the given tests; a mutant whose object file is byte-identical to the
-original (a branch this platform does not compile, or folded by the compiler) is set aside. Linux
-container, `--jobs 14`; `--asan` where a mutant can read out of bounds without crashing.
+one at a time, rebuilds, runs the given tests and, with `--cmd`, the oracles; a mutant whose object
+file is byte-identical to the original (a branch this platform does not compile, or folded by the
+compiler) is set aside. A check that fails is run again on the same mutant, and only a second
+failure kills it (LESSONS #115: under memory pressure a load refused had counted as a kill). Linux
+container, `--asan` where a mutant can read out of bounds without crashing; the checks and the jobs
+of each file are in `tools/mutate_files.sh` (jobs sized to the VM's 15 GB, not to its processors).
+Background: 2026-09-23, the other windows' containers idle (OpenEMR's stack up, not measuring).
 
-| file | tests | mutants | killed | survived first | survived now | same object |
+| file | checks | mutants | killed | survived first | survived now | same object |
 |---|---|---|---|---|---|---|
 | `src/format/gguf.c` (ASan) | `test_gguf` | 221 | 163 (+9 timed out) | 89 | 43 | 6 |
 | `src/memory/experts.c` (ASan) | `test_experts`, `test_stream` | 100 | 87 | 27 (`test_experts` alone) | 9 | 4 |
 | `src/base/threads.c` | `test_base`, `test_hot` | 75 | 35 (+9 timed out) | 33 | 23 | 7 |
 | `src/base/platform.c` | `test_base` | 170 | 9 (+35 timed out) | 77 | 22 | 104 (Windows branches) |
-| `src/base/prof.c` | `test_prof`, `test_model_prof` | 46 | 4 | 42 | 42 | 0 |
+| `src/base/prof.c` (ASan) | `test_prof`, `test_model_prof` | 46 | 36 | 42 | 10 | 0 |
+| `src/models/olmoe.c` (ASan) | the 10 model tests, the tiny oracle, the same under the smallest store, the options oracle | 400 | 319 (+1 timed out) | 92 (9 tests, 2 oracles) | 70 | 10 |
+| `src/kernels/kernels.c` (ASan) | `test_kernels`, `test_expf`, `test_tier_used` (also under `TR_CPU_MAX=scalar`), `test_prefill`, both tiny oracles | 110 | 76 (+5 timed out) | 37 | 26 | 3 |
+| `src/kernels/kernels_x86.c` (ASan) | `test_kernels`, `test_tier_used` (also scalar) | 39 | 22 (1 did not build) | 20 | 16 | 0 |
+| `src/kernels/expf.c` | `test_expf` (the proof on every float is `bench_expf --check`, in `make check`) | 7 | 5 (1 did not build) | 1 | 1 | 0 |
+| `src/tokenizer/chat.c` (ASan) | `test_tokenizer`, `test_cli`, the tokenizer oracle | 31 | 24 (+1 timed out) | 4 (with kills made by the OOM killer) | 6 | 0 |
+| `src/tokenizer/unicode.c` (ASan) | `test_unicode`, `test_tokenizer`, the tokenizer oracle without its sweep | 120 | 80 (+11 timed out) | 27 | 17 | 2 |
+| `src/tokenizer/tokenizer.c` (ASan) | `test_tokenizer`, `test_cli`, the tokenizer oracle without its sweep | 333 | 246 (+11 timed out) | 75 | 75 (not yet read) | 1 |
+| `src/app/main.c` (ASan) | `test_cli`, the tiny oracle, the tokenizer oracle without its sweep | 646 | 306 | 334 | 334 (not yet read) | 6 |
 
 What the survivors that are left are, read one by one:
 - `gguf.c`: `return -1` → `0` after a failed read (parsing goes on over the garbage and the file is
@@ -2154,8 +2166,41 @@ What the survivors that are left are, read one by one:
   compiles out: those are the "same object").
 - `platform.c`: the POSIX error paths (`open` or `pread` failing mid-way) and the affinity calls; its
   Windows half is tested natively since #103, not here.
-- `prof.c`: all in `tr_prof_print`, the report for people; the JSON the tools read is checked.
-  **Open**: pin the printed report too, or declare it outside the tests.
+- `prof.c`: the calibration's constants (8 brackets or 9, the first or the last of two equally
+  narrow ones, one more read of the window: the same rate), and the CPUID test and the re-read of
+  the tick mode, identical on a machine with an invariant TSC. The printed table is pinned
+  (`test_prof`, four profiles with known numbers; all 30 of its mutants killed).
+- `olmoe.c`: out of memory, 42 (`track`, the session's and the trace's allocations, `err` NULL
+  after one); a read error of a dense tensor, 1 (no fault injection for them); the direct-read
+  probe, 1 (a filesystem that accepts `O_DIRECT` and fails its first read); `TR_MEM_AVAILABLE_MIB=0`,
+  1 (measurement only); the arithmetic of the "not enough memory" message, 2; `vocab <= 0`, 1 (the
+  reader refuses a zero dimension first); the memory guard's scratch estimate, 1; the layer-major
+  path taken with a resident store or at exactly `n_batch`, 2 (the same bits by construction,
+  `test_prefill`); `trace_begin(0)` allocating zero bytes, 1 (glibc returns a pointer); boundaries
+  that change nothing, 18 (a clamp at exactly ±c, an empty group of queries, an extra empty block,
+  ties of distinct ids, `n <= 0` already caught by `n_logits`, the offsets' last entry rewritten
+  by the shift, the trace's pad slot overwritten by the next layer).
+- `kernels.c`: all 26 change speed, not bits: the matmul's tiles and chunks (an empty extra block,
+  the x4 kernel skipped for the last whole group, which dot_row gives bit for bit), the redundant
+  guards of `tr_matmul_grouped` (an empty range does nothing either way), the attention's first query
+  per block (`j0` lower: a query that does not see the block does no work in it) and its block
+  bounds, a softmax maximum found at a tie.
+- `kernels_x86.c`: 16, each the last whole chunk left to the tail (the scalar lanes, bit for bit)
+  or an AVX-512 tail with an empty mask.
+- `expf.c`: the search of the exception table one entry too far: never reached, every argument
+  that gets there is in the table (proved on every float by `bench_expf --check`).
+- `chat.c`: a buffer grown one step early or one doubling more, 2; `err_len > 0` at 0, 2 (snprintf
+  of 0 bytes writes nothing); `err` NULL in the "not supported" branch, 1 (both callers pass a
+  buffer); `tr_chat_render` out of memory, 1. The first run's 4 were fewer because the OOM killer
+  had failed the oracle under three of them.
+- `unicode.c`: 3 more (a Hangul syllable's end, U+0080's encoding length, the ASCII class table's end) die only under the tokenizer oracle's full Unicode sweep, which `make check` runs and a run per mutant cannot afford (4 GB, `tools/mutate_files.sh unicode-sweep`); 7 died to new boundary cases in `test_unicode` (each UTF-8 length at both edges, U+10FFFF, U+DFFF, the jamo just outside the composing ranges). The 17 left: out of memory and the size overflow checks of `tr_nfc` (10, a text is at most 1 GiB); `TR_CP_INVALID_BASE + 0`, 2 (byte 0 is valid ASCII, never an invalid byte); the equal case of two binary searches, 2 (returned before); the NFC fast path's test, 3 (U+00C0, the threshold, is NFC-stable alone, and slower is not different).
+- `tokenizer.c` (**open**, 75): refusals of malformed metadata not in `test_refusals` (tokens not an
+  array, empty, too many; types of another length; merges not strings; add_eos without its id; a
+  token type out of range at the edge), out-of-memory paths, the `grow` and hash-table arithmetic,
+  the heap's tie rule and bounds in BPE, the GPT-2 rules at the end of a text.
+- `main.c` (**open**, 334): the command line's branches no test runs — `inspect` and `cpu` (18),
+  the option parsing and usage errors of every command, `logits`, `tokenize --pieces/--decode`,
+  `run --route-trace`, the chat's `/reset` and its context-full turn, the speed lines.
 
 ## Attempts
 

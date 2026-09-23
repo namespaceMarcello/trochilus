@@ -138,7 +138,8 @@ static int cmd_inspect(const char *path) {
 
 /* ---- generate / logits: shared helpers ------------------------------------ */
 
-/* Parses a comma-separated list of ids, e.g. "3,11,29", into a malloc'd array. */
+/* Parses a comma-separated list of ids, e.g. "3,11,29", into a malloc'd array. An id outside
+ * 0..INT32_MAX is an error, not a cast: 4294967297 was id 1 on Linux (tests/test_cli.c). */
 static int parse_tokens(const char *s, int32_t **out, int64_t *out_n) {
     int64_t cap = 16, n = 0;
     int32_t *arr = (int32_t *)malloc((size_t)cap * sizeof(int32_t));
@@ -147,8 +148,8 @@ static int parse_tokens(const char *s, int32_t **out, int64_t *out_n) {
     const char *p = s;
     while (*p != '\0') {
         char *end;
-        long v = strtol(p, &end, 10);
-        if (end == p) {
+        long long v = strtoll(p, &end, 10);
+        if (end == p || v < 0 || v > INT32_MAX) {
             free(arr);
             return -1;
         }
@@ -193,9 +194,14 @@ static void synth_prompt(int32_t *out, int64_t n, int64_t vocab_size) {
 
 /* ---- profiling: --profile-json --------------------------------------------- */
 
+/* A control character is written \u00XX: JSON has no raw ones (a tab in the model's path). */
 static void write_json_string(FILE *out, const char *s) {
     fputc('"', out);
     for (const unsigned char *p = (const unsigned char *)s; *p != '\0'; p++) {
+        if (*p < 0x20) {
+            fprintf(out, "\\u%04x", *p);
+            continue;
+        }
         if (*p == '"' || *p == '\\') fputc('\\', out);
         fputc(*p, out);
     }
@@ -410,11 +416,22 @@ static int cmd_generate(int argc, char **argv) {
         return 1;
     }
     const tr_model_info *info = tr_model_get_info(model);
+    /* Every buffer below is sized from the context, never from -p or -n alone: n * sizeof(int32_t)
+     * wraps to a few bytes for n near 2^62, and the tokens then ran past it (tests/test_cli.c). */
+    const int64_t ctx = tr_session_n_ctx(sess);
 
     /* the prompt: parsed ids, or a deterministic synthetic one of n_prompt_synth
      * ids (no tokenizer needed), for scenarios that want a long prompt. */
     int32_t *prompt = NULL;
     int64_t n_prompt = 0;
+    if (tokens_str == NULL && n_prompt_synth > ctx) {
+        fprintf(stderr, "generate: -p %" PRId64 " does not fit the context of %" PRId64 " tokens\n", n_prompt_synth,
+                ctx);
+        tr_session_free(sess);
+        tr_model_free(model);
+        tr_pool_destroy(pool);
+        return 1;
+    }
     if (tokens_str != NULL) {
         if (parse_tokens(tokens_str, &prompt, &n_prompt) != 0) {
             fprintf(stderr, "generate: invalid --tokens\n");
@@ -452,7 +469,9 @@ static int cmd_generate(int argc, char **argv) {
     double t1 = tr_time_sec();
     prof->phase = TR_PHASE_DECODE;
 
-    int32_t *generated = (int32_t *)malloc((size_t)n_gen * sizeof(int32_t));
+    /* at most every position left, plus the token the prompt's logits give */
+    int64_t n_room = ctx - n_prompt + 1;
+    int32_t *generated = (int32_t *)malloc((size_t)(n_gen < n_room ? n_gen : n_room) * sizeof(int32_t));
     if (generated == NULL && n_gen > 0) {
         fprintf(stderr, "generate: out of memory\n");
         free(prompt);
@@ -483,9 +502,9 @@ static int cmd_generate(int argc, char **argv) {
             }
         }
     } else {
-        /* the draft is read from prompt and generated tokens together, so they live in one buffer */
-        size_t cap = (size_t)(n_prompt + n_gen + n_draft + 1);
-        hist = (int32_t *)malloc(cap * sizeof(int32_t));
+        /* the draft is read from prompt and generated tokens together, so they live in one buffer,
+         * which tr_greedy fills up to the context (src/gen/greedy.h) */
+        hist = (int32_t *)malloc((size_t)ctx * sizeof(int32_t));
         if (hist == NULL) {
             fprintf(stderr, "generate: out of memory\n");
             free(generated);
@@ -497,8 +516,7 @@ static int cmd_generate(int argc, char **argv) {
         }
         memcpy(hist, prompt, (size_t)n_prompt * sizeof(int32_t));
         tr_draft_policy policy = spec_fixed ? TR_DRAFT_FIXED : TR_DRAFT_ADAPTIVE;
-        if (tr_greedy_init(&g, sess, info->vocab_size, tr_session_n_ctx(sess), n_draft, policy, hist, n_prompt) !=
-            0) {
+        if (tr_greedy_init(&g, sess, info->vocab_size, ctx, n_draft, policy, hist, n_prompt) != 0) {
             fprintf(stderr, "generate: could not start speculation\n");
             free(hist);
             free(generated);
@@ -964,7 +982,9 @@ static int cmd_run(int argc, char **argv) {
     int context_full = 0;
     int32_t eos = tr_tokenizer_eos(tok);
     tr_greedy g;
-    int32_t *hist = (int32_t *)malloc((n_prompt + (size_t)(n_max + n_draft + 1)) * sizeof(int32_t));
+    /* tr_greedy fills the history up to the context (src/gen/greedy.h); sized from -n it wrapped
+     * for n near 2^62 (tests/test_cli.c) */
+    int32_t *hist = (int32_t *)malloc((size_t)tr_session_n_ctx(sess) * sizeof(int32_t));
     if (hist == NULL) {
         fprintf(stderr, "run: out of memory\n");
         goto done;
@@ -1229,8 +1249,8 @@ static int cmd_chat(int argc, char **argv) {
 
     int rc = 1;
     conversation conv = {0};
-    int32_t *hist = NULL;      /* the tokens in the session's cache */
-    size_t n_hist = 0, hist_cap = 0;
+    int32_t *hist = NULL;      /* the tokens in the session's cache: room for the whole context */
+    size_t n_hist = 0;
     tr_pool *pool = tr_pool_create(n_threads);
     tr_model *model = NULL;
     tr_session *sess = NULL;
@@ -1256,6 +1276,9 @@ static int cmd_chat(int argc, char **argv) {
     if (n_ctx <= 0 && ctx < info->n_ctx_train)
         fprintf(stderr, "(not enough free RAM for %" PRId64 " tokens of conversation: using %" PRId64
                         "; close other programs for longer conversations)\n", info->n_ctx_train, ctx);
+    /* the cache never holds more than the context: sized from -n, n_ids + n_max wrapped for n near
+     * 2^62 (tests/test_cli.c) */
+    if ((hist = (int32_t *)malloc((size_t)tr_session_n_ctx(sess) * sizeof(int32_t))) == NULL) goto oom;
     size_t keep = 0;
     if (system != NULL) {
         char *content = copy_bytes(system, strlen(system));
@@ -1305,15 +1328,6 @@ static int cmd_chat(int argc, char **argv) {
         if (p == n_ids) p--;    /* at least one token to evaluate, for fresh logits */
         tr_session_rewind(sess, (int64_t)p);
         n_hist = p;
-        if (n_ids + (size_t)n_max > hist_cap) {     /* room for the prompt and the whole reply */
-            int32_t *h = (int32_t *)realloc(hist, (n_ids + (size_t)n_max) * sizeof(int32_t));
-            if (h == NULL) {
-                free(ids);
-                goto oom;
-            }
-            hist = h;
-            hist_cap = n_ids + (size_t)n_max;
-        }
         size_t n_new = n_ids - p;
         double t0 = tr_time_sec();
         if (tr_session_eval(sess, ids + p, (int64_t)n_new) != 0) {

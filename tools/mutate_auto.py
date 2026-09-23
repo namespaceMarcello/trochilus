@@ -9,15 +9,23 @@ the given tests run on it. A mutant whose object file comes out byte-identical c
 (a branch this platform does not compile, or code the compiler folds to the same) and is set aside
 without running anything. A mutant that builds, differs and passes every test SURVIVED: either no
 test looks at that line, or the mutation is equivalent in a way the compiler cannot see. Read each.
+A check that fails is run again on the same mutant: only a second failure kills it; a failure that
+does not repeat is printed as FLAKY and the next checks decide (a check that fails under load
+killed mutants it could not see, docs/LESSONS.md #115).
 
 Linux container, from the repo root; the tree is copied to /tmp, the checkout is never touched:
   MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src trochilus-dev:local \\
       python3 tools/mutate_auto.py src/format/gguf.c test_gguf [more tests...]
 Options: --jobs N (default: half the processors), --lines A-B (only those lines), --list (print
 the mutants, build nothing), --asan (build with AddressSanitizer and UBSan: a mutant that reads
-out of bounds is then killed, not lucky). Output: one line per survivor (file:line, mutation, the
-line), then killed / survived / same object / did not build / timed out. Exit status 0 whatever
-survives: this is a report.
+out of bounds is then killed, not lucky), --cmd "SHELL COMMAND" (repeatable: run after the tests,
+in the worker's tree, with b/trochilus built; a mutant that makes it exit non-zero is killed --
+the C tests of a model check that every split of the work gives the same bits, not that the bits
+are right, so a model file wants the oracle too:
+  --cmd '$PY /src/tools/oracle.py /src/fixtures/tiny-olmoe /src/fixtures/tiny-olmoe/model-f32.gguf
+         --binary b/trochilus --expect exact'
+). Output: one line per survivor (file:line, mutation, the line), then killed / survived / same
+object / did not build / timed out. Exit status 0 whatever survives: this is a report.
 """
 import argparse
 import os
@@ -115,6 +123,7 @@ def main():
     ap.add_argument("--lines")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--asan", action="store_true")
+    ap.add_argument("--cmd", action="append", default=[])
     a = ap.parse_args()
     rng = tuple(int(x) for x in a.lines.split("-")) if a.lines else None
     todo = list(mutants(a.file, rng))
@@ -124,6 +133,8 @@ def main():
         print(f"{len(todo)} mutants")
         return 0
     bins = [f"b/tests/{t}" for t in a.tests]
+    targets = bins + (["b/trochilus"] if a.cmd else [])
+    checks = [[f"./{b}"] for b in bins] + [["sh", "-c", c] for c in a.cmd]
     # -g0: debug info records columns, and a mutated line would differ even where the code does not
     flags = "-g0" + (" -O1 -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all"
                      if a.asan else "")
@@ -138,18 +149,18 @@ def main():
     t0 = time.time()
     for d in dirs:
         copy_tree(d)
-    base = [subprocess.run(mk + ["-j4"] + bins, cwd=d, capture_output=True) for d in dirs]
+    base = [subprocess.run(mk + ["-j4"] + targets, cwd=d, capture_output=True) for d in dirs]
     if any(b.returncode for b in base):
         sys.exit("mutate_auto: the unmutated tree does not build:\n" + base[0].stderr.decode()[-2000:])
     with open(os.path.join(dirs[0], obj), "rb") as f:
         base_obj = f.read()
     t1 = time.time()
-    for b in bins:
-        if run([f"./{b}"], dirs[0], None) != 0:
-            sys.exit(f"mutate_auto: {b} fails without any mutation")
+    for c in checks:
+        if run(c, dirs[0], None) != 0:
+            sys.exit(f"mutate_auto: {' '.join(c)} fails without any mutation")
     budget = max(20.0, 10 * (time.time() - t1))
 
-    results, lock = [], threading.Lock()
+    results, flaky, lock = [], [], threading.Lock()
 
     def worker(w):
         d = dirs[w]
@@ -158,20 +169,26 @@ def main():
             no, name, line, text = todo[k]
             with open(target, "w", encoding="utf-8", newline="\n") as f:
                 f.write(text)
-            if run(mk + bins, d, 300) != 0:
+            if run(mk + targets, d, 300) != 0:
                 verdict = "nobuild"
             elif open(os.path.join(d, obj), "rb").read() == base_obj:
                 verdict = "same"
             else:
                 verdict = "survived"
-                for b in bins:
-                    rc = run([f"./{b}"], d, budget)
+                for c in checks:
+                    rc = run(c, d, budget)
                     if rc is None:
                         verdict = "timeout"
                         break
-                    if rc != 0:
+                    # a kill must happen twice: a check that fails once under load and passes
+                    # again killed mutants it cannot see (docs/LESSONS.md #115); it is reported
+                    # and the next checks decide
+                    if rc != 0 and run(c, d, budget) != 0:
                         verdict = "killed"
                         break
+                    if rc != 0:
+                        with lock:
+                            flaky.append((no, name, " ".join(c)))
             with lock:
                 results.append((no, name, line, verdict))
         with open(target, "w", encoding="utf-8", newline="\n") as f:
@@ -189,9 +206,12 @@ def main():
         count[verdict] += 1
         if verdict == "survived":
             print(f"SURVIVED {a.file}:{no}: {name}: {line.strip()}")
-    print(f"mutate_auto {a.file} vs {' '.join(a.tests)}: {len(results)} mutants, {count['killed']} killed, "
+    for no, name, check in sorted(flaky):
+        print(f"FLAKY {check}: failed once, then passed, on {a.file}:{no}: {name}")
+    print(f"mutate_auto {a.file} vs {' '.join(a.tests + [f'[{c}]' for c in a.cmd])}: {len(results)} mutants, {count['killed']} killed, "
           f"{count['survived']} survived, {count['same']} same object, {count['nobuild']} did not build, "
-          f"{count['timeout']} timed out ({time.time() - t0:.0f} s, {a.jobs} jobs{', ASan' if a.asan else ''})")
+          f"{count['timeout']} timed out, {len(flaky)} flaky failures ({time.time() - t0:.0f} s, {a.jobs} jobs"
+          f"{', ASan' if a.asan else ''})")
     return 0
 
 

@@ -274,11 +274,16 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
 
 ## Next steps
 
-**Review (Opus 5.5, 2026-09-22)**: reader, expert store, pool and platform done (LESSONS #102–#110;
-`docs/MEASUREMENTS.md` §The gate, §Generated mutations). `make check` now runs the C tests natively
-too and takes 335 s instead of ~935. Next, in order: `src/models/olmoe.c` (hot path, layer-major
-prefill), then `src/kernels/`, `src/tokenizer/`, `src/app/main.c`, each file through
-`tools/mutate_auto.py`. Open: the printed report of `prof.c` (pin it, or declare it outside the tests).
+**Review (Opus 5.5, 2026-09-22 and 23)**: reader, expert store, pool, platform, profiler, model
+(`olmoe.c`), kernels, tokenizer and command line read, every file through `tools/mutate_auto.py`
+(LESSONS #102–#116; `docs/MEASUREMENTS.md` §The gate, §Generated mutations). Found on the 23rd: the
+command line sized its buffers from `-n`/`-p` (a heap overflow near 2^62) and cast `--tokens` to
+int32; three OLMoE options had never met transformers (now `fixtures/tiny-olmoe-opts` in `make
+oracle`); memory pressure in the Docker VM had counted as mutants killed (a kill now repeats,
+`tools/mutate_files.sh` sizes its jobs to memory). Open, in order: the survivors of `tokenizer.c`
+(75, mostly malformed-metadata refusals and out-of-memory paths) and of `main.c` (334, the command
+line's untested branches), read one by one; the command line parses its numbers with `atoi`/`atoll`
+(`-n abc` is 0, not an error): strict parsing, or declared.
 
 Steps of 17–19/09 (block prefill, `--spec`, thread pinning, adaptive draft, adversarial revision,
 remeasure with A/A, threads per phase; decode at long context and KV per head, prefill on long

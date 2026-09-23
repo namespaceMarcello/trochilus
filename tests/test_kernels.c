@@ -695,9 +695,20 @@ static void test_matmul_grouped(void) {
     }
 }
 
+/* The edges: a row length that is not a whole number of blocks, a type the reader knows nothing
+ * of, and an empty softmax, which touches nothing (NULL is never read). */
+static void test_edges(void) {
+    TR_CHECK_EQ_INT(tr_row_bytes(TR_TYPE_Q8_0, 64), 68);
+    TR_CHECK_EQ_INT(tr_row_bytes(TR_TYPE_Q8_0, 33), 0);
+    TR_CHECK_EQ_INT(tr_row_bytes((tr_type)4, 32), 0); /* 4: a type number no longer in use */
+    TR_CHECK_EQ_INT(tr_row_bytes((tr_type)TR_TYPE_COUNT, 32), 0);
+    tr_softmax(NULL, 0);
+}
+
 int main(void) {
     tr_kernels_init();
 
+    test_edges();
     test_half_to_float();
     test_q8_0_dequant();
     test_dot_f32_contract();

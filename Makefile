@@ -87,6 +87,9 @@ $(BUILD)/tests/%$(EXE): tests/%.c $(CORE_OBJ)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $< $(CORE_OBJ) -o $@ $(LDLIBS)
 
+# test_cli runs the command line built beside it (it is not linked into the test)
+$(BUILD)/tests/test_cli$(EXE): $(BUILD)/trochilus$(EXE)
+
 # test_base covers src/base and links only it: its bytes then change only with src/base, and the
 # native run in `make check` is not blocked anew by every change elsewhere (tools/native_tests.sh)
 BASE_OBJ := $(filter $(BUILD)/src/base/%,$(CORE_OBJ))
@@ -167,11 +170,21 @@ $(FIX)/model-f16.gguf: $(FIX)/ref.json tools/hf_to_gguf.py
 	$(PY) tools/hf_to_gguf.py $(FIX) $@ --type f16
 $(FIX)/model-q8_0.gguf: $(FIX)/ref.json tools/hf_to_gguf.py
 	$(PY) tools/hf_to_gguf.py $(FIX) $@ --type q8_0
-oracle: $(BUILD)/trochilus$(EXE) $(FIX)/model-f32.gguf $(FIX)/model-f16.gguf $(FIX)/model-q8_0.gguf
+# The same model with norm_topk_prob, clip_qkv and rope_theta 500000: the branches the default
+# leaves off (docs/LESSONS.md #112).
+FIXO := fixtures/tiny-olmoe-opts
+$(FIXO)/ref.json: tools/make_tiny_olmoe.py
+	$(PY) tools/make_tiny_olmoe.py --output $(FIXO) --force --options
+$(FIXO)/model-f32.gguf: $(FIXO)/ref.json tools/hf_to_gguf.py
+	$(PY) tools/hf_to_gguf.py $(FIXO) $@ --type f32
+oracle: $(BUILD)/trochilus$(EXE) $(FIX)/model-f32.gguf $(FIX)/model-f16.gguf $(FIX)/model-q8_0.gguf \
+		$(FIXO)/model-f32.gguf
 	$(PY) tools/check_gguf.py $(FIX)/model-f32.gguf --compare-hf $(FIX)
 	$(PY) tools/oracle.py $(FIX) $(FIX)/model-f32.gguf --binary $(BUILD)/trochilus$(EXE) --expect exact
 	$(PY) tools/oracle.py $(FIX) $(FIX)/model-f16.gguf --binary $(BUILD)/trochilus$(EXE) --expect exact
 	$(PY) tools/oracle.py $(FIX) $(FIX)/model-q8_0.gguf --binary $(BUILD)/trochilus$(EXE) --expect report
+	$(PY) tools/check_gguf.py $(FIXO)/model-f32.gguf --compare-hf $(FIXO)
+	$(PY) tools/oracle.py $(FIXO) $(FIXO)/model-f32.gguf --binary $(BUILD)/trochilus$(EXE) --expect exact
 
 # Every kernel tier end to end, not only the best one this CPU has (tools/tier_check.sh): the model
 # tests under TR_CPU_MAX=scalar and avx2, and the logits of the tiny fixtures identical, byte for
