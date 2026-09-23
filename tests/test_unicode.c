@@ -1,5 +1,6 @@
 /* test_unicode.c -- tests for src/tokenizer/unicode.c: UTF-8 decode/encode on every valid
- * and invalid byte pattern, round-trip fidelity, the \p{L} \p{N} \s classes on known
+ * and invalid byte pattern, round-trip fidelity, the whole-character prefix the chat prints
+ * (every lead byte cut short and whole), the \p{L} \p{N} \s classes on known
  * characters, and NFC vectors (basic composition, reordering, blocking, Hangul, invalid
  * bytes, and large combining-mark runs checked against an independent stable-sort
  * reference, not against unicode.c's own internal ccc table). */
@@ -114,6 +115,41 @@ static void test_utf8_roundtrip(void) {
         free(back);
     }
     free(cps);
+}
+
+/* tr_utf8_whole_prefix: every lead byte cut before its last continuation byte, and whole. Each
+ * case is copied to a buffer of exactly its length, so a look one byte before it is an ASan
+ * error. */
+static void test_utf8_whole_prefix(void) {
+    static const struct {
+        const char *s;
+        size_t want;
+    } cases[] = {
+        {"", 0},
+        {"a", 1},
+        {"\xC3", 0},                 /* a 2-byte lead alone */
+        {"a\xC3", 1},
+        {"\xC3\xA9", 2},             /* é whole */
+        {"\xC0", 0},                 /* 0xC0 counts as a 2-byte lead (the lowest one) */
+        {"\xE0\xA0", 0},             /* a 3-byte character one byte short (lowest 3-byte lead) */
+        {"a\xE2\x82", 1},
+        {"a\xE2\x82\xAC", 4},        /* € whole */
+        {"\xF0\x9F\x98", 0},         /* a 4-byte character one byte short (lowest 4-byte lead) */
+        {"\xF0\x9F\x98\x80", 4},     /* U+1F600 whole */
+        {"\x80", 1},                 /* stray continuation bytes: nothing waits, all of it */
+        {"\x80\x80\x80\x80", 4},
+    };
+    for (size_t k = 0; k < sizeof cases / sizeof cases[0]; k++) {
+        size_t n = strlen(cases[k].s);
+        uint8_t *buf = (uint8_t *)malloc(n > 0 ? n : 1);
+        TR_CHECK(buf != NULL);
+        if (buf == NULL) return;
+        memcpy(buf, cases[k].s, n);
+        size_t got = tr_utf8_whole_prefix(buf, n);
+        if (got != cases[k].want) fprintf(stderr, "whole prefix of case %zu: %zu, expected %zu\n", k, got, cases[k].want);
+        TR_CHECK(got == cases[k].want);
+        free(buf);
+    }
 }
 
 /* ---- \p{L} \p{N} \s classes ------------------------------------------------------------- */
@@ -405,6 +441,7 @@ int main(void) {
     test_utf8_valid_forms();
     test_utf8_invalid_forms();
     test_utf8_roundtrip();
+    test_utf8_whole_prefix();
     test_classes();
     test_nfc_vectors();
     test_nfc_stable_reorder_small();

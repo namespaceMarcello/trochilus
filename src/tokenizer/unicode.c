@@ -100,6 +100,17 @@ int tr_utf8_encode(uint32_t cp, uint8_t *out) {
     return 4;
 }
 
+size_t tr_utf8_whole_prefix(const uint8_t *s, size_t n) {
+    /* back over at most 3 continuation bytes to the byte that leads them */
+    for (size_t back = 1; back <= 3 && back <= n; back++) {
+        uint8_t c = s[n - back];
+        if ((c & 0xC0u) == 0x80u) continue;
+        size_t need = c >= 0xF0u ? 4 : c >= 0xE0u ? 3 : c >= 0xC0u ? 2 : 1;
+        return need > back ? n - back : n;
+    }
+    return n;
+}
+
 /* ---- \p{L} \p{N} \s classes ------------------------------------------------------------ */
 
 static int tr_uclass_range_cmp(uint32_t cp, const tr_uclass_range *r) {

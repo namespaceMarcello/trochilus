@@ -25,6 +25,11 @@ int tr_utf8_decode(const uint8_t *s, size_t len, uint32_t *cp);
  * for 4 bytes. Returns the bytes written (1..4). */
 int tr_utf8_encode(uint32_t cp, uint8_t *out);
 
+/* Length of the longest prefix of s[0..n) that does not end inside a UTF-8 character: n, less
+ * the bytes of a lead byte (0xC0..0xFF) at the end that still waits for its continuation bytes.
+ * The chat prints a reply up to here, so a character split across two tokens appears once. */
+size_t tr_utf8_whole_prefix(const uint8_t *s, size_t n);
+
 /* Mutually exclusive classes, as the reference regex engine sees \p{L}, \p{N}, \s. */
 typedef enum {
     TR_UCLASS_OTHER = 0,

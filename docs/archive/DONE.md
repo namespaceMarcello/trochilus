@@ -872,3 +872,36 @@ report of `src/base/prof.c` (Opus 5.5), every file through `tools/mutate_auto.py
   (~13 min), report in `build/mutate/tokenizer.txt`.
 - **What is left**: the survivors of `main.c` (334); strict number parsing on the command line; the
   other files' mutation runs again with the corrected tool.
+
+### 2026-09-23 — The command line's survivors read, and one strict option parser
+
+- `src/app/main.c`: every command reads its arguments through one table and one parser
+  (`parse_opts`): a number is decimal digits inside the option's own range, anything else (`abc`,
+  `5x`, `" 5"`, `+5`, `-1`, a value past int64) is exit 2 with the option named; an option given
+  last without its value is named too; `--expert-budget` takes 1 to 2^43 - 1 MiB or `min` (2^44
+  wrapped to 0, which means automatic: #121). `cpu` and `inspect` refuse extra arguments,
+  `tokenize` refuses `--pieces` with `--decode`, `-p 0` is a usage error. The commands are one
+  table; `tokenize --batch` and `chat-template` read their records with one function; the route
+  trace is one chain of writes; `step[]` starts zeroed.
+- `src/tokenizer/unicode.c`: `tr_utf8_whole_prefix`, the chat's cut before a split UTF-8
+  character, moved from `main.c` so a test can reach it (`test_unicode`, 13 cases).
+- `tests/test_cli.c` rewritten: stdout and stderr apart, every command and every usage error, both
+  ends of every range, `inspect`'s listing, generate against `logits`, `--spec` with drafts
+  accepted stopping at `-n`, the threads line, `--expert-mask`, `tokenize`'s modes and records,
+  the route trace's bytes, the chat against `run`, `/reset`, `chat-template`'s refusals.
+- Survivors of `main.c` 334 → 43, each named in `docs/MEASUREMENTS.md` §Generated mutations
+  (#120).
+- `tools/mutate_auto.py`: a check out of time is killed with its whole session, and a run that
+  leaves a process behind says so and fails (#122); a mutant refused for memory alone, when the
+  unmutated tree passes alone, is killed (#123); each check gets ten times its own time, fastest
+  first, with `TR_TEST_FAILFAST=1` (`tests/test.h`: a C test stops at its first failure); a
+  progress line per mutant; `--lines` takes several ranges and `--changed REF` the lines that
+  differ from a git ref (#124). `tools/mutate_files.sh`: tests without pinning or spinning,
+  progress in `build/mutate/<name>.progress`, `CHANGED=<ref>`. Every file of it ran again: the
+  whole set in 42 minutes plus 31 for `olmoe.c`; every verdict is logged with the check that gave it
+  (#125: five kills of `olmoe.c` did not repeat).
+
+- **How to check it**: `make check`; in the container `sh tools/mutate_files.sh main` (~23 min;
+  `CHANGED=HEAD` for only the lines changed since the last commit), report in
+  `build/mutate/main.txt`, time left in `build/mutate/main.progress`. By hand: `build/trochilus generate -m <f> -p 4 -n abc` is exit 2,
+  "generate: -n takes a whole number from 0 to 9223372036854775807, not 'abc'".

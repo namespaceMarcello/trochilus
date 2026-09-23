@@ -251,7 +251,7 @@ static void test_corrupted(const layout *L, const buf *valid) {
         if (g != NULL) {
             fprintf(stderr, "corruption '%s' was accepted\n", cases[i].name);
             tr_gguf_close(g);
-            tr_test_failures++;
+            TR_TEST_FAILED();
         } else {
             TR_CHECK(err[0] != 0);
         }

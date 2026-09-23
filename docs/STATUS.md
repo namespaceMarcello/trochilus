@@ -280,13 +280,19 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
 command line sized its buffers from `-n`/`-p` (a heap overflow near 2^62) and cast `--tokens` to
 int32; three OLMoE options had never met transformers (now `fixtures/tiny-olmoe-opts` in `make
 oracle`); memory pressure in the Docker VM had counted as mutants killed (a kill now repeats,
-`tools/mutate_files.sh` sizes its jobs to memory). `tokenizer.c` read (75 → 43, all named in
-`docs/MEASUREMENTS.md` §Generated mutations); on the way `mutate_auto.py` stopped hiding survivors
-behind load-induced timeouts and behind memory refusals that outlasted the repeat (LESSONS #117,
-#119). Open, in order: the survivors of `main.c` (334, the command line's untested branches), read
-one by one; the command line parses its numbers with `atoi`/`atoll` (`-n abc` is 0, not an error):
-strict parsing, or declared; the other files' mutation runs again with the corrected tool (~1 h,
-`sh tools/mutate_files.sh`), their counts predate #117 and #119.
+`tools/mutate_files.sh` sizes its jobs to memory). `tokenizer.c` read (75 → 43) and `main.c`
+(334 → 43), all named in `docs/MEASUREMENTS.md` §Generated mutations: the command line has one
+option parser, numbers strict in their own range (`-n abc` is exit 2, #120), `--expert-budget`
+bounded (#121), and `test_cli` runs every command. `mutate_auto.py` no longer hides survivors
+behind load-induced timeouts or memory refusals (#117, #119, #123), kills a timed-out check with
+everything it started (#122: seven looping orphans had slowed and falsified a campaign), and is
+fast enough to run after a change (#124: per-check budgets, fail-fast tests, `CHANGED=HEAD`
+mutates only the changed lines): every file of `mutate_files.sh` ran again, 42 min plus 31 for `olmoe.c` (whose five kills that did not repeat are survivors again, #125).
+Open: `gguf.c`, `experts.c`, `threads.c`, `platform.c` are not in `mutate_files.sh` and their
+counts predate #117-#124; the native measurements are to follow the machine's new rule (2026-09-23):
+a timing run writes `~/.claude/macchina-ferma` for its duration, and the other windows hold off,
+where `tools/measure_guard.lib` now waits for no container at all to be running, which another
+window's idle stack (OpenEMR) can keep false for hours.
 
 Steps of 17–19/09 (block prefill, `--spec`, thread pinning, adaptive draft, adversarial revision,
 remeasure with A/A, threads per phase; decode at long context and KV per head, prefill on long

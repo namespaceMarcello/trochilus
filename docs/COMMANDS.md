@@ -42,8 +42,8 @@ sh tools/mask_quality.sh   # experts off: KL and tokens against whole model (mea
 sh tools/experts_budget.sh measure | misses | direct   # M1: tok/s at 4 budgets, cost of a token, cache yes/no
 build/trochilus run ... --expert-budget <MiB|min>   # expert RAM (default: the plan); TR_EXPERT_BUDGET_MIB in tests
 sh tools/mutate_{route,tune,experts,stream}.sh | tools/mutate_reports.py   # in container: the mutations, all red
-python3 tools/mutate_auto.py <src/file.c> <test> [test...] [--lines A-B] [--list] [--asan] [--cmd '<shell>']   # in container: generated mutations, survivors, timeouts and memory refusals listed (SURVIVED, TIMEOUT, PRESSURE); --cmd adds a check per mutant (the oracle, for a model file)
-sh tools/mutate_files.sh [olmoe kernels ... main prof]   # in container: mutate_auto on each file with its tests and oracles, build/mutate/<name>.txt
+python3 tools/mutate_auto.py <src/file.c> <test> [test...] [--lines A-B,C-D] [--changed REF] [--list] [--asan] [--cmd '<shell>']   # in container: generated mutations, survivors, timeouts and memory refusals listed (SURVIVED, TIMEOUT, PRESSURE); --cmd adds a check per mutant (the oracle, for a model file); --changed HEAD: only the lines changed since HEAD; a progress line per mutant on stderr
+sh tools/mutate_files.sh [olmoe kernels ... main prof]   # in container: mutate_auto on each file with its tests and oracles, build/mutate/<name>.txt, time left in build/mutate/<name>.progress; CHANGED=HEAD sh tools/mutate_files.sh <name>: only the lines changed since HEAD
 make bench-attn          # attention on prompt (512/2048/4000) on one layer, broken down by phases, with bit control
 make bench-expf          # tr_expf on all 2^32 floats against rounded value and C library
 tools/.venv/Scripts/python.exe tools/gen_expf_table.py [--check | --scan]   # tr_expf constants from mpmath (src/kernels/expf_table.h)

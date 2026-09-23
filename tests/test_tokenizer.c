@@ -256,7 +256,7 @@ static void test_refusals(void) {
         TR_CHECK(t == NULL);
         if (strstr(err, cases[i].expect) == NULL) {
             fprintf(stderr, "refusal %zu: expected '%s' in '%s'\n", i, cases[i].expect, err);
-            tr_test_failures++;
+            TR_TEST_FAILED();
         }
         tr_tokenizer_free(t);
     }
@@ -471,7 +471,7 @@ static void test_split(const tr_tokenizer *t) {
         TR_CHECK(tr_tokenizer_split(t, cases[i].in, strlen(cases[i].in), TR_TOK_PARSE_SPECIAL, join_unit, &j) == 0);
         if (strcmp(j.buf, cases[i].want) != 0) {
             fprintf(stderr, "split %zu: got '%s', want '%s'\n", i, j.buf, cases[i].want);
-            tr_test_failures++;
+            TR_TEST_FAILED();
         }
     }
 }

@@ -16,8 +16,11 @@
 # the fixtures:
 #   MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src trochilus-dev:local \
 #       sh tools/mutate_files.sh [olmoe kernels kernels_x86 expf chat unicode unicode-sweep tokenizer main prof]
-# No name: all but unicode-sweep, one after the other (about an hour). One report per file in
-# build/mutate/<name>.txt, its last line on stdout. Nothing else may load the VM meanwhile.
+# No name: all but unicode-sweep, one after the other. One report per file in
+# build/mutate/<name>.txt, its last line on stdout; how far it is, and how long is left, in the last
+# line of build/mutate/<name>.progress. Nothing else may load the VM meanwhile.
+# After a change: CHANGED=HEAD (or any git ref) mutates only the lines that differ from it, e.g.
+#   ... trochilus-dev:local sh -c 'CHANGED=HEAD sh tools/mutate_files.sh main'
 # The body is one function, called on the last line (docs/LESSONS.md #69).
 main() {
 . tools/cleanup.lib
@@ -31,10 +34,15 @@ TOK="$TOKALL --no-sweep"
 SCALAR='TR_CPU_MAX=scalar ./b/tests/test_tier_used'
 MODEL_TESTS="test_prefill test_hot test_spec test_session test_route test_stream test_model_prof test_phase test_tier_used test_model_load"
 mkdir -p build/mutate
+# the pools of the tests neither pin nor spin: twelve jobs pinned their threads to the same cores
+# and spun on them (12 test_cli at once: 8.2-8.9 s pinned, 6.0-7.4 s not). No file here is
+# threads.c or platform.c, whose tests exercise both.
+export TR_POOL_PIN=0 TR_POOL_SPIN_US=0
 run() {
     name=$1; jobs=$2; shift 2
     echo "== $name $(date +%T)"
-    python3 tools/mutate_auto.py "$@" --jobs "$jobs" > "build/mutate/$name.txt" 2>&1
+    python3 tools/mutate_auto.py "$@" --jobs "$jobs" ${CHANGED:+--changed "$CHANGED"} \
+        > "build/mutate/$name.txt" 2> "build/mutate/$name.progress"
     tail -1 "build/mutate/$name.txt"
 }
 [ $# -gt 0 ] || set -- olmoe kernels kernels_x86 expf chat unicode tokenizer main prof

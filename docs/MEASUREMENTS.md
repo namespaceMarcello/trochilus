@@ -2137,11 +2137,20 @@ failure kills it (LESSONS #115: under memory pressure a load refused had counted
 check out of time runs again with three times the budget, and a mutant that times out twice is
 listed (#117); a failure that is the machine's memory (the engine's guard, the OOM killer) is no
 verdict, and that mutant is judged again alone at the end (#119: a refusal that outlasted the
-repeat had killed an equivalent mutant). The rows before `tokenizer.c` were counted before #117
-and #119, and may hide a few survivors until they run again. Linux
+repeat had killed an equivalent mutant); a check out of time is killed with every process it
+started, and a run that leaves one behind says so and fails (#122: the looping children of
+`main.c`'s timeouts slowed every file after it); the checks run fastest first, each with ten
+times its own time, and a C test stops at its first failure (#124); every verdict is logged with
+the check that gave it, in `build/mutate/<name>.progress`, so that a kill can be audited (#125:
+five kills of `olmoe.c` did not repeat). Every file of
+`tools/mutate_files.sh` ran again on 2026-09-23 with the corrected tool (the rows from `olmoe.c`
+down); `gguf.c`, `experts.c`, `threads.c` and `platform.c` are not in it, and their rows predate
+#117-#124. Linux
 container, `--asan` where a mutant can read out of bounds without crashing; the checks and the jobs
 of each file are in `tools/mutate_files.sh` (jobs sized to the VM's 15 GB, not to its processors).
-Background: 2026-09-23, the other windows' containers idle (OpenEMR's stack up, not measuring).
+Background: 2026-09-23, OpenEMR's stack up and idle, the ds4 window's single-core builds at nice 19.
+The whole rerun took 42 minutes without `olmoe.c` (`main.c` 23 of them) and 31 for `olmoe.c`, where
+the run with the orphans of #122 had spent 37 on `main.c` and 111 on `olmoe.c`.
 
 | file | checks | mutants | killed | survived first | survived now | same object |
 |---|---|---|---|---|---|---|
@@ -2150,14 +2159,14 @@ Background: 2026-09-23, the other windows' containers idle (OpenEMR's stack up, 
 | `src/base/threads.c` | `test_base`, `test_hot` | 75 | 35 (+9 timed out) | 33 | 23 | 7 |
 | `src/base/platform.c` | `test_base` | 170 | 9 (+35 timed out) | 77 | 22 | 104 (Windows branches) |
 | `src/base/prof.c` (ASan) | `test_prof`, `test_model_prof` | 46 | 36 | 42 | 10 | 0 |
-| `src/models/olmoe.c` (ASan) | the 10 model tests, the tiny oracle, the same under the smallest store, the options oracle | 400 | 319 (+1 timed out) | 92 (9 tests, 2 oracles) | 70 | 10 |
+| `src/models/olmoe.c` (ASan) | the 10 model tests, the tiny oracle, the same under the smallest store, the options oracle | 400 | 319 (+1 timed out) | 92 (9 tests, 2 oracles) | 70 (rerun: 65, and 5 kills that did not repeat, #125) | 10 |
 | `src/kernels/kernels.c` (ASan) | `test_kernels`, `test_expf`, `test_tier_used` (also under `TR_CPU_MAX=scalar`), `test_prefill`, both tiny oracles | 110 | 76 (+5 timed out) | 37 | 26 | 3 |
 | `src/kernels/kernels_x86.c` (ASan) | `test_kernels`, `test_tier_used` (also scalar) | 39 | 22 (1 did not build) | 20 | 16 | 0 |
 | `src/kernels/expf.c` | `test_expf` (the proof on every float is `bench_expf --check`, in `make check`) | 7 | 5 (1 did not build) | 1 | 1 | 0 |
 | `src/tokenizer/chat.c` (ASan) | `test_tokenizer`, `test_cli`, the tokenizer oracle | 31 | 24 (+1 timed out) | 4 (with kills made by the OOM killer) | 6 | 0 |
-| `src/tokenizer/unicode.c` (ASan) | `test_unicode`, `test_tokenizer`, the tokenizer oracle without its sweep | 120 | 80 (+11 timed out) | 27 | 17 | 2 |
-| `src/tokenizer/tokenizer.c` (ASan) | `test_tokenizer`, `test_cli`, the tokenizer oracle without its sweep | 327 | 271 (+11 timed out, each a real loop; +1 refused for memory) | 75 | 43 (all read) | 1 |
-| `src/app/main.c` (ASan) | `test_cli`, the tiny oracle, the tokenizer oracle without its sweep | 646 | 306 | 334 | 334 (not yet read) | 6 |
+| `src/tokenizer/unicode.c` (ASan) | `test_unicode`, `test_tokenizer`, the tokenizer oracle without its sweep | 128 | 96 (+11 timed out) | 27 | 19 (17 named, 2 die under the sweep) | 2 |
+| `src/tokenizer/tokenizer.c` (ASan) | `test_tokenizer`, `test_cli`, the tokenizer oracle without its sweep | 327 | 271 (+12 timed out, each a real loop) | 75 | 43 (all read) | 1 |
+| `src/app/main.c` (ASan) | `test_cli`, the tiny oracle, the tokenizer oracle without its sweep | 418 (646 before one parser) | 368 (+1 timed out) | 334 | 43 (all read) | 6 |
 
 What the survivors that are left are, read one by one:
 - `gguf.c`: `return -1` → `0` after a failed read (parsing goes on over the garbage and the file is
@@ -2198,7 +2207,7 @@ What the survivors that are left are, read one by one:
   of 0 bytes writes nothing); `err` NULL in the "not supported" branch, 1 (both callers pass a
   buffer); `tr_chat_render` out of memory, 1. The first run's 4 were fewer because the OOM killer
   had failed the oracle under three of them.
-- `unicode.c`: 3 more (a Hangul syllable's end, U+0080's encoding length, the ASCII class table's end) die only under the tokenizer oracle's full Unicode sweep, which `make check` runs and a run per mutant cannot afford (4 GB, `tools/mutate_files.sh unicode-sweep`); 7 died to new boundary cases in `test_unicode` (each UTF-8 length at both edges, U+10FFFF, U+DFFF, the jamo just outside the composing ranges). The 17 left: out of memory and the size overflow checks of `tr_nfc` (10, a text is at most 1 GiB); `TR_CP_INVALID_BASE + 0`, 2 (byte 0 is valid ASCII, never an invalid byte); the equal case of two binary searches, 2 (returned before); the NFC fast path's test, 3 (U+00C0, the threshold, is NFC-stable alone, and slower is not different).
+- `unicode.c`: 2 more (a Hangul syllable's end, the ASCII class table's end; U+0080's encoding length now dies without it) die only under the tokenizer oracle's full Unicode sweep, which `make check` runs and a run per mutant cannot afford (4 GB, `tools/mutate_files.sh unicode-sweep`); 7 died to new boundary cases in `test_unicode` (each UTF-8 length at both edges, U+10FFFF, U+DFFF, the jamo just outside the composing ranges). The 17 left: out of memory and the size overflow checks of `tr_nfc` (10, a text is at most 1 GiB); `TR_CP_INVALID_BASE + 0`, 2 (byte 0 is valid ASCII, never an invalid byte); the equal case of two binary searches, 2 (returned before); the NFC fast path's test, 3 (U+00C0, the threshold, is NFC-stable alone, and slower is not different).
 - `tokenizer.c`: 75 → 43. New cases in `test_tokenizer`: every metadata refusal by its own message
   (tokens missing, not strings, empty; types not int32; merges not strings; a merge missing only one
   side, or making an unused token; a merge starting with a space), and the edges accepted (token
@@ -2217,9 +2226,39 @@ What the survivors that are left are, read one by one:
   default, 1 (one rule set). The 11 timeouts are real loops (a hash probe that does not move, a
   doubling from 0, a match of length 0); the one refused for memory (`sym[n].next = n`) loops
   emitting ids until memory runs out: caught, by its own hunger.
-- `main.c` (**open**, 334): the command line's branches no test runs — `inspect` and `cpu` (18),
-  the option parsing and usage errors of every command, `logits`, `tokenize --pieces/--decode`,
-  `run --route-trace`, the chat's `/reset` and its context-full turn, the speed lines.
+- `main.c`: 334 → 43 (LESSONS #120, #122). The five option loops became one parser with a range per
+  option (646 mutants → 418), the two `--batch` readers one, the route trace one chain of writes,
+  and the chat's UTF-8 cut went to `unicode.c` (`tr_utf8_whole_prefix`, 13 cases in `test_unicode`).
+  `test_cli` now runs every command: every range at both ends and every kind of malformed number,
+  each usage error alone, `inspect`'s listing, generate's tokens against the `logits` command's
+  argmax, `--spec` with drafts accepted (the model falls into a cycle) stopping exactly at `-n`, the
+  threads line forced, unmeasured and measured, every `--expert-mask` refusal, `tokenize`'s modes and
+  malformed records, `run` stopped by a control token that is not EOS, the route trace's bytes, the
+  chat against `run` on the text its template renders, `/reset`, a message too long for the
+  context, `chat-template`'s refusals. `step[]` starts zeroed: `j <= got` read a slot the step had
+  not written, and was killed or not by whatever the stack held. The 43 left: limits no file
+  reaches, 3 (a size past TiB, a type the reader refuses, the shape text's bound: 4 dimensions of
+  20 digits fit); out of memory, 5 (`parse_tokens`, `tokenize_one` also past 1 GiB of text,
+  `conv_push`); `argmax` one float past the row (the session's buffer holds more, never larger
+  here) and a tie taken last (the synthetic model draws none), 2; a model with no experts, 3 (OLMoE
+  is the only architecture); `fclose(NULL)` where `fopen` failed, 1 (glibc declares the argument
+  nonnull and gcc drops the call); the threads line past 32 measurements, 2; `-p 0`, which its range
+  refuses first, 1; `malloc(0)`, not NULL on glibc, 1; a step that returns no token, which never
+  happens, 2; the speed lines' zero guards, 5 (two readings of the clock around a pass never
+  coincide); `read_file`, 2 (a failing size is -1, never another negative; `pread` of 0 bytes); an
+  added token with id 0 in `--pieces`, 1 (the synthetic vocabulary's are 256-259); the NUL after a
+  `--batch` buffer, 2; the chat's halving of its context under a memory refusal, 6 (no test
+  machine is short of RAM, and the session's guard reads the real machine by design); position 0
+  reused after `/reset`, 1 (the cache holds the same token there); the reply buffer's growth, 3
+  (one step early, one byte of room more or less: the reply has no terminator); the system
+  prompt's copy skipped, 1 (the synthetic model's chat answers "j\n" whatever it reads, and one
+  byte is one token, so neither the reply nor the count sees the content); a rendered conversation
+  of no tokens, 1 (the template always writes its markers); a control token other than EOS ending
+  a chat reply, 1 (the synthetic chat never draws one; `run` has its test, on a model whose EOS is
+  257). The timeout is a real loop (a malformed `--batch` record that does not advance); the
+  other four loops die first at an earlier check now that a test stops at its first failure. The
+  run slowed by the orphans of #122 had "killed" three of these (the last three), failing twice
+  under load: the reason every file ran again.
 
 ## Attempts
 

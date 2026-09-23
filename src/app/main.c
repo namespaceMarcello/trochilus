@@ -9,6 +9,8 @@
  *   trochilus chat -m <f> [-s system]                           conversation in the model's chat template
  *
  * Exit codes: 0 success, 1 runtime error, 2 usage, 3 context full before all tokens were generated. */
+#include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +27,7 @@
 #include "../models/model.h"
 #include "../tokenizer/chat.h"
 #include "../tokenizer/tokenizer.h"
+#include "../tokenizer/unicode.h"
 
 static void usage(void) {
     fprintf(stderr,
@@ -51,7 +54,11 @@ static void print_bytes(uint64_t n) {
     printf(u ? "%.2f %s" : "%.0f %s", v, unit[u]);
 }
 
-static int cmd_cpu(void) {
+static int cmd_cpu(int argc, char **argv) {
+    if (argc != 0) {
+        fprintf(stderr, "usage: trochilus cpu\n");
+        return 2;
+    }
     char line[512];
     tr_cpu_describe(tr_cpu(), line, sizeof line);
     printf("cpu: %s\n", line);
@@ -95,9 +102,13 @@ static void print_value(const tr_gguf_kv *kv) {
     }
 }
 
-static int cmd_inspect(const char *path) {
+static int cmd_inspect(int argc, char **argv) {
+    if (argc != 1) {
+        fprintf(stderr, "usage: trochilus inspect <file.gguf>\n");
+        return 2;
+    }
     char err[512];
-    tr_gguf *g = tr_gguf_open(path, err, sizeof err);
+    tr_gguf *g = tr_gguf_open(argv[0], err, sizeof err);
     if (g == NULL) {
         fprintf(stderr, "error: %s\n", err);
         return 1;
@@ -208,23 +219,86 @@ static void write_json_string(FILE *out, const char *s) {
     fputc('"', out);
 }
 
-/* --decode-threads, in every command that runs a model: 0 (the default) lets the session
- * measure how many threads its short passes want, n forces n (src/models/model.h). */
-static const char DECODE_THREADS_RANGE[] = "--decode-threads must be 1 or more (0, the default: measured)";
+/* ---- options ------------------------------------------------------------------ */
+
+/* A whole number in [lo, hi], written in decimal digits and nothing else: "-n abc" is an error,
+ * not atoll's 0, and so are "5x", " 5", "+5", "", a value past int64 and any sign (no option
+ * takes a negative number). */
+static int parse_num(const char *s, int64_t lo, int64_t hi, int64_t *out) {
+    if (s[0] < '0' || s[0] > '9') return -1;
+    errno = 0;
+    char *end;
+    long long v = strtoll(s, &end, 10);
+    if (*end != '\0' || errno != 0 || v < lo || v > hi) return -1;
+    *out = v;
+    return 0;
+}
 
 /* --expert-budget <MiB|min>, in every command that runs a model: how much RAM the shared expert
- * store gets (src/models/model.h tr_model_load_budget). Absent: automatic. "min": the smallest
- * store that can run. A number: that many MiB, forced. -1 on a value that is neither. */
-static const char EXPERT_BUDGET_RANGE[] = "--expert-budget must be a number of MiB (> 0) or 'min'";
-static int parse_expert_budget(const char *s, uint64_t *out) {
+ * store gets (src/models/model.h tr_model_load_budget). Absent: automatic (0). "min": the
+ * smallest store that can run (UINT64_MAX). A number: that many MiB, forced; at most what fits
+ * in 64 bits of bytes (2^44 MiB wrapped to 0). */
+#define BUDGET_MIB_MAX (INT64_MAX >> 20)
+static int parse_budget(const char *s, uint64_t *out) {
     if (strcmp(s, "min") == 0) {
         *out = UINT64_MAX;
         return 0;
     }
-    char *end;
-    long long mib = strtoll(s, &end, 10);
-    if (*end != '\0' || mib <= 0) return -1;
-    *out = (uint64_t)mib * 1024 * 1024;
+    int64_t mib;
+    if (parse_num(s, 1, BUDGET_MIB_MAX, &mib) != 0) return -1;
+    *out = (uint64_t)mib << 20;
+    return 0;
+}
+
+/* One option of a command, of one of four kinds: a flag (*flag = 1), a string (*str = the next
+ * argument), a whole number in [lo, hi] (*num), or --expert-budget (*budget, parse_budget). */
+typedef struct {
+    const char *name;
+    int *flag;
+    const char **str;
+    int64_t *num, lo, hi;
+    uint64_t *budget;
+} opt;
+#define OPT_FLAG(name, p) {name, p, NULL, NULL, 0, 0, NULL}
+#define OPT_STR(name, p) {name, NULL, p, NULL, 0, 0, NULL}
+#define OPT_NUM(name, p, lo, hi) {name, NULL, NULL, p, lo, hi, NULL}
+#define OPT_BUDGET(p) {"--expert-budget", NULL, NULL, NULL, 0, 0, p}
+#define N_OPTS(a) (sizeof(a) / sizeof(a)[0])
+
+/* Every command's arguments, one parser: 0, or -1 after a message naming the argument (unknown,
+ * missing its value, not a number in range). The caller then prints its usage and exits 2. */
+static int parse_opts(const char *cmd, int argc, char **argv, const opt *opts, size_t n_opts) {
+    for (int i = 0; i < argc; i++) {
+        const opt *o = NULL;
+        for (size_t k = 0; k < n_opts; k++)
+            if (strcmp(argv[i], opts[k].name) == 0) o = &opts[k];
+        if (o == NULL) {
+            fprintf(stderr, "%s: unknown argument '%s'\n", cmd, argv[i]);
+            return -1;
+        }
+        if (o->flag != NULL) {
+            *o->flag = 1;
+            continue;
+        }
+        if (i + 1 == argc) {
+            fprintf(stderr, "%s: %s needs a value\n", cmd, o->name);
+            return -1;
+        }
+        const char *v = argv[++i];
+        if (o->str != NULL) {
+            *o->str = v;
+        } else if (o->num != NULL) {
+            if (parse_num(v, o->lo, o->hi, o->num) != 0) {
+                fprintf(stderr, "%s: %s takes a whole number from %" PRId64 " to %" PRId64 ", not '%s'\n", cmd,
+                        o->name, o->lo, o->hi, v);
+                return -1;
+            }
+        } else if (parse_budget(v, o->budget) != 0) {
+            fprintf(stderr, "%s: --expert-budget takes 'min' or a number of MiB from 1 to %" PRId64 ", not '%s'\n",
+                    cmd, (int64_t)BUDGET_MIB_MAX, v);
+            return -1;
+        }
+    }
     return 0;
 }
 
@@ -345,56 +419,38 @@ static int write_profile_json(const char *path, tr_prof *prof, const char *model
 /* ---- generate -------------------------------------------------------------- */
 
 static int cmd_generate(int argc, char **argv) {
-    const char *model_path = NULL, *tokens_str = NULL, *profile_json_path = NULL, *expert_budget_str = NULL;
-    int64_t n_gen = -1, n_prompt_synth = -1, n_ctx = 0, n_batch = 0, n_draft = 0;
-    int n_threads = 0, decode_threads = 0, do_profile = 0, spec_fixed = 0;
-
-    for (int i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "--spec") == 0 && i + 1 < argc) { n_draft = atoll(argv[++i]); continue; }
-        if (strcmp(argv[i], "--decode-threads") == 0 && i + 1 < argc) { decode_threads = atoi(argv[++i]); continue; }
-        if (strcmp(argv[i], "--expert-budget") == 0 && i + 1 < argc) { expert_budget_str = argv[++i]; continue; }
-        if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) model_path = argv[++i];
-        else if (strcmp(argv[i], "--tokens") == 0 && i + 1 < argc) tokens_str = argv[++i];
-        else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) n_prompt_synth = atoll(argv[++i]);
-        else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) n_gen = atoll(argv[++i]);
-        else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) n_threads = atoi(argv[++i]);
-        else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) n_ctx = atoll(argv[++i]);
-        else if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) n_batch = atoll(argv[++i]);
-        else if (strcmp(argv[i], "--spec-fixed") == 0) spec_fixed = 1;
-        else if (strcmp(argv[i], "--profile") == 0) do_profile = 1;
-        else if (strcmp(argv[i], "--profile-json") == 0 && i + 1 < argc) profile_json_path = argv[++i];
-        else {
-            fprintf(stderr, "generate: unknown argument '%s'\n", argv[i]);
-            return 2;
-        }
-    }
+    const char *model_path = NULL, *tokens_str = NULL, *profile_json_path = NULL;
+    int64_t n_gen = -1, n_prompt_synth = -1, n_ctx = 0, n_batch = 0, n_draft = 0, n_threads = 0, decode_threads = 0;
+    int do_profile = 0, spec_fixed = 0;
+    uint64_t expert_budget = 0;
+    const opt opts[] = {OPT_STR("-m", &model_path),
+                        OPT_STR("--tokens", &tokens_str),
+                        OPT_NUM("-p", &n_prompt_synth, 1, INT64_MAX),
+                        OPT_NUM("-n", &n_gen, 0, INT64_MAX),
+                        OPT_NUM("-t", &n_threads, 0, INT_MAX),
+                        OPT_NUM("-c", &n_ctx, 0, INT64_MAX),
+                        OPT_NUM("-b", &n_batch, 0, INT64_MAX),
+                        OPT_NUM("--spec", &n_draft, 0, TR_GREEDY_DRAFT_MAX),
+                        OPT_NUM("--decode-threads", &decode_threads, 0, INT_MAX),
+                        OPT_BUDGET(&expert_budget),
+                        OPT_FLAG("--spec-fixed", &spec_fixed),
+                        OPT_FLAG("--profile", &do_profile),
+                        OPT_STR("--profile-json", &profile_json_path)};
     /* exactly one of --tokens / -p */
-    if (model_path == NULL || n_gen < 0 || (tokens_str == NULL) == (n_prompt_synth < 0)) {
+    if (parse_opts("generate", argc, argv, opts, N_OPTS(opts)) != 0 || model_path == NULL || n_gen < 0 ||
+        (tokens_str == NULL) == (n_prompt_synth < 0)) {
         fprintf(stderr,
                 "usage: trochilus generate -m <file.gguf> (--tokens id,id,... | -p <n>) -n <count>\n"
                 "                   [-t threads] [-c context] [-b batch] [--spec <draft>]\n"
-                "                   [--decode-threads <n>]  (threads of the decode; default: measured)\n"
+                "                   [--decode-threads <n>]  (threads of the decode; default 0: measured)\n"
                 "                   [--expert-budget <MiB|min>]  (experts kept in RAM; default: automatic)\n"
                 "                   [--spec-fixed]  (fixed draft length instead of adaptive, for measurement)\n"
                 "                   [--profile] [--profile-json <file>]\n");
         return 2;
     }
-    if (n_draft < 0 || n_draft > TR_GREEDY_DRAFT_MAX) {
-        fprintf(stderr, "generate: --spec must be between 0 and %d\n", TR_GREEDY_DRAFT_MAX);
-        return 2;
-    }
-    if (decode_threads < 0) {
-        fprintf(stderr, "generate: %s\n", DECODE_THREADS_RANGE);
-        return 2;
-    }
-    uint64_t expert_budget = 0;
-    if (expert_budget_str != NULL && parse_expert_budget(expert_budget_str, &expert_budget) != 0) {
-        fprintf(stderr, "generate: %s\n", EXPERT_BUDGET_RANGE);
-        return 2;
-    }
 
     char err[256];
-    tr_pool *pool = tr_pool_create(n_threads);
+    tr_pool *pool = tr_pool_create((int)n_threads);
     if (pool == NULL) {
         fprintf(stderr, "generate: could not create thread pool\n");
         return 1;
@@ -405,7 +461,7 @@ static int cmd_generate(int argc, char **argv) {
         tr_pool_destroy(pool);
         return 1;
     }
-    tr_model_set_decode_threads(model, decode_threads);
+    tr_model_set_decode_threads(model, (int)decode_threads);
     /* -c: KV cache size in tokens, 0 = model default. A small context keeps the cache and
      * the memory guard small when profiling a real model. */
     tr_session *sess = tr_session_create(model, n_ctx, n_batch, err, sizeof err);
@@ -442,7 +498,7 @@ static int cmd_generate(int argc, char **argv) {
         }
     } else {
         n_prompt = n_prompt_synth;
-        prompt = (int32_t *)malloc((size_t)(n_prompt > 0 ? n_prompt : 1) * sizeof(int32_t));
+        prompt = (int32_t *)malloc((size_t)n_prompt * sizeof(int32_t));
         if (prompt == NULL) {
             fprintf(stderr, "generate: out of memory\n");
             tr_session_free(sess);
@@ -526,7 +582,7 @@ static int cmd_generate(int argc, char **argv) {
             tr_pool_destroy(pool);
             return 1;
         }
-        int32_t step[1 + TR_GREEDY_DRAFT_MAX];
+        int32_t step[1 + TR_GREEDY_DRAFT_MAX] = {0}; /* a step fills its first `got`; no stale id past them */
         while (produced < n_gen) {
             int64_t got = tr_greedy_step(&g, step);
             if (got < 0) {
@@ -558,7 +614,7 @@ static int cmd_generate(int argc, char **argv) {
                 g.n_steps > 0 ? (double)(g.n_steps + g.n_accepted) / (double)g.n_steps : 0.0,
                 g.n_steps > 0 ? (double)g.n_drafted / (double)g.n_steps : 0.0);
     }
-    print_threads(pool, sess, decode_threads);
+    print_threads(pool, sess, (int)decode_threads);
     print_experts(model);
 
     if (do_profile) tr_prof_print(prof, stderr);
@@ -583,40 +639,24 @@ static int cmd_generate(int argc, char **argv) {
 /* ---- logits ----------------------------------------------------------------- */
 
 static int cmd_logits(int argc, char **argv) {
-    const char *model_path = NULL, *tokens_str = NULL, *out_path = NULL, *expert_budget_str = NULL;
-    const char *expert_mask_path = NULL;
-    int n_threads = 0, decode_threads = 0;
-    int64_t chunk = 1;
-
-    for (int i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) model_path = argv[++i];
-        else if (strcmp(argv[i], "--tokens") == 0 && i + 1 < argc) tokens_str = argv[++i];
-        else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) out_path = argv[++i];
-        else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) n_threads = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--decode-threads") == 0 && i + 1 < argc) decode_threads = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--expert-budget") == 0 && i + 1 < argc) expert_budget_str = argv[++i];
-        else if (strcmp(argv[i], "--expert-mask") == 0 && i + 1 < argc) expert_mask_path = argv[++i];
-        else if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) chunk = atoll(argv[++i]);
-        else {
-            fprintf(stderr, "logits: unknown argument '%s'\n", argv[i]);
-            return 2;
-        }
-    }
+    const char *model_path = NULL, *tokens_str = NULL, *out_path = NULL, *expert_mask_path = NULL;
+    int64_t n_threads = 0, decode_threads = 0, chunk = 1;
+    uint64_t expert_budget = 0;
     /* -b k: tokens evaluated k at a time (one forward pass each), one logits row per
      * evaluation, for the last token of each; -b 1 gives every position */
-    if (model_path == NULL || tokens_str == NULL || out_path == NULL || chunk <= 0) {
+    const opt opts[] = {OPT_STR("-m", &model_path),
+                        OPT_STR("--tokens", &tokens_str),
+                        OPT_STR("--out", &out_path),
+                        OPT_NUM("-t", &n_threads, 0, INT_MAX),
+                        OPT_NUM("--decode-threads", &decode_threads, 0, INT_MAX),
+                        OPT_BUDGET(&expert_budget),
+                        OPT_STR("--expert-mask", &expert_mask_path),
+                        OPT_NUM("-b", &chunk, 1, INT64_MAX)};
+    if (parse_opts("logits", argc, argv, opts, N_OPTS(opts)) != 0 || model_path == NULL || tokens_str == NULL ||
+        out_path == NULL) {
         fprintf(stderr, "usage: trochilus logits -m <file.gguf> --tokens id,id,... --out <file> [-t threads] [-b batch]\n"
                         "                       [--decode-threads <n>] [--expert-budget <MiB|min>]\n"
                         "                       [--expert-mask <file>]  (measurement only: experts switched off)\n");
-        return 2;
-    }
-    if (decode_threads < 0) {
-        fprintf(stderr, "logits: %s\n", DECODE_THREADS_RANGE);
-        return 2;
-    }
-    uint64_t expert_budget = 0;
-    if (expert_budget_str != NULL && parse_expert_budget(expert_budget_str, &expert_budget) != 0) {
-        fprintf(stderr, "logits: %s\n", EXPERT_BUDGET_RANGE);
         return 2;
     }
 
@@ -628,7 +668,7 @@ static int cmd_logits(int argc, char **argv) {
     }
 
     char err[256];
-    tr_pool *pool = tr_pool_create(n_threads);
+    tr_pool *pool = tr_pool_create((int)n_threads);
     if (pool == NULL) {
         fprintf(stderr, "logits: could not create thread pool\n");
         free(tokens);
@@ -647,7 +687,7 @@ static int cmd_logits(int argc, char **argv) {
         tr_pool_destroy(pool);
         return 1;
     }
-    tr_model_set_decode_threads(model, decode_threads);
+    tr_model_set_decode_threads(model, (int)decode_threads);
     tr_session *sess = tr_session_create(model, 0, chunk, err, sizeof err);
     if (sess == NULL) {
         fprintf(stderr, "error: %s\n", err);
@@ -779,30 +819,47 @@ static int tokenize_one(const tr_tokenizer *tok, const char *text, size_t len, i
     return 0;
 }
 
+/* The record of a --batch file that starts at *pos, "<decimal byte length>\n<bytes>" (at most
+ * 18 digits): 0 with its bytes at buf + *start, *len of them, and *pos past them; -1 with a
+ * message if it is malformed. buf holds size bytes and a NUL after them (read_file). */
+static int next_record(const char *buf, size_t size, size_t *pos, size_t *start, size_t *len) {
+    size_t p = *pos, digits = 0;
+    uint64_t rec = 0;
+    while (p < size && buf[p] >= '0' && buf[p] <= '9' && digits < 18) {
+        rec = rec * 10 + (uint64_t)(buf[p++] - '0');
+        digits++;
+    }
+    if (digits == 0 || p >= size || buf[p] != '\n' || rec > size - p - 1) {
+        fprintf(stderr, "error: malformed batch record at byte %zu\n", p);
+        return -1;
+    }
+    *start = p + 1;
+    *len = (size_t)rec;
+    *pos = p + 1 + (size_t)rec;
+    return 0;
+}
+
 static int cmd_tokenize(int argc, char **argv) {
     const char *model_path = NULL, *text = NULL, *file = NULL, *batch = NULL;
-    int flags = TR_TOK_ADD_SPECIAL | TR_TOK_PARSE_SPECIAL, mode = OUT_IDS;
-    for (int i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) model_path = argv[++i];
-        else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) text = argv[++i];
-        else if (strcmp(argv[i], "-f") == 0 && i + 1 < argc) file = argv[++i];
-        else if (strcmp(argv[i], "--batch") == 0 && i + 1 < argc) batch = argv[++i];
-        else if (strcmp(argv[i], "--no-parse-special") == 0) flags &= ~TR_TOK_PARSE_SPECIAL;
-        else if (strcmp(argv[i], "--no-add-special") == 0) flags &= ~TR_TOK_ADD_SPECIAL;
-        else if (strcmp(argv[i], "--pieces") == 0) mode = OUT_PIECES;
-        else if (strcmp(argv[i], "--decode") == 0) mode = OUT_DECODE;
-        else {
-            model_path = NULL;
-            break;
-        }
-    }
-    if (model_path == NULL || (text != NULL) + (file != NULL) + (batch != NULL) != 1) {
+    int no_parse = 0, no_add = 0, pieces = 0, decode = 0;
+    const opt opts[] = {OPT_STR("-m", &model_path),
+                        OPT_STR("-p", &text),
+                        OPT_STR("-f", &file),
+                        OPT_STR("--batch", &batch),
+                        OPT_FLAG("--no-parse-special", &no_parse),
+                        OPT_FLAG("--no-add-special", &no_add),
+                        OPT_FLAG("--pieces", &pieces),
+                        OPT_FLAG("--decode", &decode)};
+    if (parse_opts("tokenize", argc, argv, opts, N_OPTS(opts)) != 0 || model_path == NULL ||
+        (text != NULL) + (file != NULL) + (batch != NULL) != 1 || pieces + decode > 1) {
         fprintf(stderr,
                 "usage: trochilus tokenize -m <file.gguf> (-p <text> | -f <file> | --batch <file>)\n"
                 "                          [--no-parse-special] [--no-add-special] [--pieces | --decode]\n"
                 "  --batch: records of <decimal byte length>\\n<bytes>; one output line per record\n");
         return 2;
     }
+    int flags = (no_parse ? 0 : TR_TOK_PARSE_SPECIAL) | (no_add ? 0 : TR_TOK_ADD_SPECIAL);
+    int mode = pieces ? OUT_PIECES : decode ? OUT_DECODE : OUT_IDS;
     tr_stdout_binary();     /* ids and hex lines end in a bare LF on every OS */
     tr_tokenizer *tok = load_tokenizer(model_path);
     if (tok == NULL) return 1;
@@ -820,23 +877,11 @@ static int cmd_tokenize(int argc, char **argv) {
         } else if (file != NULL) {
             if (tokenize_one(tok, buf, size, flags, mode) != 0) rc = 1;
         } else {
-            size_t pos = 0;
-            while (pos < size && rc == 0) {
-                uint64_t rec = 0;
-                size_t digits = 0;
-                while (pos < size && buf[pos] >= '0' && buf[pos] <= '9' && digits < 18) {
-                    rec = rec * 10 + (uint64_t)(buf[pos++] - '0');
-                    digits++;
-                }
-                if (digits == 0 || pos >= size || buf[pos] != '\n' || rec > size - pos - 1) {
-                    fprintf(stderr, "error: malformed batch record at byte %zu\n", pos);
+            size_t pos = 0, start, len;
+            while (pos < size && rc == 0)
+                if (next_record(buf, size, &pos, &start, &len) != 0 ||
+                    tokenize_one(tok, buf + start, len, flags, mode) != 0)
                     rc = 1;
-                    break;
-                }
-                pos++;
-                if (tokenize_one(tok, buf + pos, (size_t)rec, flags, mode) != 0) rc = 1;
-                pos += (size_t)rec;
-            }
         }
         free(buf);
     }
@@ -851,55 +896,50 @@ static int cmd_tokenize(int argc, char **argv) {
  * shapes model.h documents; then (version 2) the token ids as int32 and the router margins as
  * float32 pairs (tools/route_trace_report.py and route_graph_report.py read this back; they
  * still read version 1, which stops after pred_out). 0 on success. */
+/* n items of p, or nothing when n is 0 (p may then be NULL); 1 if all were written */
+static int put(FILE *f, const void *p, size_t size, size_t n) {
+    return n == 0 || fwrite(p, size, n, f) == n;
+}
+
 static int write_route_trace(const char *path, const tr_route_trace *tr, int64_t n_prompt) {
     FILE *f = fopen(path, "wb");
     if (f == NULL) return -1;
-    int ok = fwrite("TRROUTE2", 1, 8, f) == 8;
     int64_t header[8] = {tr->n_tokens, n_prompt,     tr->n_layers,     tr->n_expert,
                           tr->n_used,   tr->n_pred, tr->expert_bytes, tr->layer_bytes};
-    if (ok) ok = fwrite(header, sizeof(int64_t), 8, f) == 8;
     size_t n_chosen = (size_t)(tr->n_tokens * tr->n_layers * tr->n_used);
     size_t n_pred = (size_t)(tr->n_tokens * tr->n_layers * tr->n_pred);
-    if (ok && n_chosen > 0) ok = fwrite(tr->chosen, sizeof(uint16_t), n_chosen, f) == n_chosen;
-    if (ok && n_pred > 0) ok = fwrite(tr->pred_in, sizeof(uint16_t), n_pred, f) == n_pred;
-    if (ok && n_pred > 0) ok = fwrite(tr->pred_out, sizeof(uint16_t), n_pred, f) == n_pred;
     size_t n_tok = (size_t)tr->n_tokens, n_margins = (size_t)(tr->n_tokens * tr->n_layers * 2);
-    if (ok && n_tok > 0) ok = fwrite(tr->tokens, sizeof(int32_t), n_tok, f) == n_tok;
-    if (ok && n_margins > 0) ok = fwrite(tr->margins, sizeof(float), n_margins, f) == n_margins;
+    int ok = put(f, "TRROUTE2", 1, 8) && put(f, header, sizeof(int64_t), 8) &&
+             put(f, tr->chosen, sizeof(uint16_t), n_chosen) && put(f, tr->pred_in, sizeof(uint16_t), n_pred) &&
+             put(f, tr->pred_out, sizeof(uint16_t), n_pred) && put(f, tr->tokens, sizeof(int32_t), n_tok) &&
+             put(f, tr->margins, sizeof(float), n_margins);
     if (fclose(f) != 0) ok = 0;
     return ok ? 0 : -1;
 }
 
 static int cmd_run(int argc, char **argv) {
-    const char *model_path = NULL, *text = NULL, *file = NULL, *route_trace_path = NULL, *expert_budget_str = NULL;
-    const char *expert_mask_path = NULL;
-    int64_t n_max = 256, n_ctx = 0, n_batch = 0, n_draft = 0;
-    int n_threads = 0, decode_threads = 0, flags = TR_TOK_ADD_SPECIAL | TR_TOK_PARSE_SPECIAL, spec_fixed = 0;
-    for (int i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "--spec") == 0 && i + 1 < argc) { n_draft = atoll(argv[++i]); continue; }
-        if (strcmp(argv[i], "--decode-threads") == 0 && i + 1 < argc) { decode_threads = atoi(argv[++i]); continue; }
-        if (strcmp(argv[i], "--route-trace") == 0 && i + 1 < argc) { route_trace_path = argv[++i]; continue; }
-        if (strcmp(argv[i], "--expert-mask") == 0 && i + 1 < argc) { expert_mask_path = argv[++i]; continue; }
-        if (strcmp(argv[i], "--expert-budget") == 0 && i + 1 < argc) { expert_budget_str = argv[++i]; continue; }
-        if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) model_path = argv[++i];
-        else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) text = argv[++i];
-        else if (strcmp(argv[i], "-f") == 0 && i + 1 < argc) file = argv[++i];
-        else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) n_max = atoll(argv[++i]);
-        else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) n_threads = atoi(argv[++i]);
-        else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) n_ctx = atoll(argv[++i]);
-        else if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) n_batch = atoll(argv[++i]);
-        else if (strcmp(argv[i], "--spec-fixed") == 0) spec_fixed = 1;
-        else if (strcmp(argv[i], "--no-parse-special") == 0) flags &= ~TR_TOK_PARSE_SPECIAL;
-        else {
-            model_path = NULL;
-            break;
-        }
-    }
-    if (model_path == NULL || (text != NULL) == (file != NULL) || n_max < 0 || n_draft < 0 ||
-        n_draft > TR_GREEDY_DRAFT_MAX) {
+    const char *model_path = NULL, *text = NULL, *file = NULL, *route_trace_path = NULL, *expert_mask_path = NULL;
+    int64_t n_max = 256, n_ctx = 0, n_batch = 0, n_draft = 0, n_threads = 0, decode_threads = 0;
+    int no_parse = 0, spec_fixed = 0;
+    uint64_t expert_budget = 0;
+    const opt opts[] = {OPT_STR("-m", &model_path),
+                        OPT_STR("-p", &text),
+                        OPT_STR("-f", &file),
+                        OPT_NUM("-n", &n_max, 0, INT64_MAX),
+                        OPT_NUM("-t", &n_threads, 0, INT_MAX),
+                        OPT_NUM("-c", &n_ctx, 0, INT64_MAX),
+                        OPT_NUM("-b", &n_batch, 0, INT64_MAX),
+                        OPT_NUM("--spec", &n_draft, 0, TR_GREEDY_DRAFT_MAX),
+                        OPT_NUM("--decode-threads", &decode_threads, 0, INT_MAX),
+                        OPT_BUDGET(&expert_budget),
+                        OPT_FLAG("--spec-fixed", &spec_fixed),
+                        OPT_STR("--route-trace", &route_trace_path),
+                        OPT_STR("--expert-mask", &expert_mask_path),
+                        OPT_FLAG("--no-parse-special", &no_parse)};
+    if (parse_opts("run", argc, argv, opts, N_OPTS(opts)) != 0 || model_path == NULL || (text != NULL) == (file != NULL)) {
         fprintf(stderr, "usage: trochilus run -m <file.gguf> (-p <text> | -f <file>) [-n <max tokens>]\n"
                         "                     [-t threads] [-c context] [-b batch] [--spec <draft>]\n"
-                        "                     [--decode-threads <n>]  (threads of the decode; default: measured)\n"
+                        "                     [--decode-threads <n>]  (threads of the decode; default 0: measured)\n"
                         "                     [--expert-budget <MiB|min>]  (experts kept in RAM; default: "
                         "automatic)\n"
                         "                     [--spec-fixed]  (fixed draft length instead of adaptive, for "
@@ -910,15 +950,7 @@ static int cmd_run(int argc, char **argv) {
                         "                     [--no-parse-special]\n");
         return 2;
     }
-    if (decode_threads < 0) {
-        fprintf(stderr, "run: %s\n", DECODE_THREADS_RANGE);
-        return 2;
-    }
-    uint64_t expert_budget = 0;
-    if (expert_budget_str != NULL && parse_expert_budget(expert_budget_str, &expert_budget) != 0) {
-        fprintf(stderr, "run: %s\n", EXPERT_BUDGET_RANGE);
-        return 2;
-    }
+    int flags = TR_TOK_ADD_SPECIAL | (no_parse ? 0 : TR_TOK_PARSE_SPECIAL);
 
     char err[256];
     size_t text_len = text != NULL ? strlen(text) : 0;
@@ -949,7 +981,7 @@ static int cmd_run(int argc, char **argv) {
     }
 
     int rc = 1;
-    tr_pool *pool = tr_pool_create(n_threads);
+    tr_pool *pool = tr_pool_create((int)n_threads);
     tr_model *model = NULL;
     tr_session *sess = NULL;
     if (pool == NULL) {
@@ -962,7 +994,7 @@ static int cmd_run(int argc, char **argv) {
         goto done;
     }
     if (expert_mask_path != NULL && apply_expert_mask(model, expert_mask_path) != 0) goto done;
-    tr_model_set_decode_threads(model, decode_threads);
+    tr_model_set_decode_threads(model, (int)decode_threads);
     const tr_model_info *info = tr_model_get_info(model);
 
     if (route_trace_path != NULL && tr_session_route_trace_begin(sess, tr_session_n_ctx(sess)) != 0) {
@@ -997,7 +1029,7 @@ static int cmd_run(int argc, char **argv) {
         free(hist);
         goto done;
     }
-    int32_t step[1 + TR_GREEDY_DRAFT_MAX];
+    int32_t step[1 + TR_GREEDY_DRAFT_MAX] = {0}; /* as in generate */
     int stopped = 0;
     while (produced < n_max && !stopped) {
         int64_t got = tr_greedy_step(&g, step);
@@ -1031,7 +1063,7 @@ static int cmd_run(int argc, char **argv) {
                 g.n_steps, g.n_accepted, g.n_drafted,
                 g.n_drafted > 0 ? 100.0 * (double)g.n_accepted / (double)g.n_drafted : 0.0,
                 g.n_steps > 0 ? (double)g.n_drafted / (double)g.n_steps : 0.0);
-    print_threads(pool, sess, decode_threads);
+    print_threads(pool, sess, (int)decode_threads);
     print_experts(model);
     if (route_trace_path != NULL) {
         const tr_route_trace *trace = tr_session_route_trace(sess);
@@ -1092,34 +1124,14 @@ static char *copy_bytes(const char *s, size_t n) {
     return p;
 }
 
-/* Length of the prefix of s[0..n) that ends on a whole UTF-8 character: a character split
- * across two tokens is printed once both halves are there. */
-static size_t utf8_whole_prefix(const char *s, size_t n) {
-    for (size_t back = 1; back <= 3 && back <= n; back++) {
-        uint8_t c = (uint8_t)s[n - back];
-        if ((c & 0xC0) == 0x80) continue;
-        size_t need = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
-        return need > back ? n - back : n;
-    }
-    return n;
-}
-
 /* For the oracle: records of --batch are a flag byte ('1': add the generation prompt) then
  * messages separated by 0x1E, each "role 0x1F content". One line per record: the rendered
  * text in hex, or with --ids its token ids (special tokens parsed, none added). */
 static int cmd_chat_template(int argc, char **argv) {
     const char *model_path = NULL, *batch = NULL;
     int ids_mode = 0;
-    for (int i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) model_path = argv[++i];
-        else if (strcmp(argv[i], "--batch") == 0 && i + 1 < argc) batch = argv[++i];
-        else if (strcmp(argv[i], "--ids") == 0) ids_mode = 1;
-        else {
-            model_path = NULL;
-            break;
-        }
-    }
-    if (model_path == NULL || batch == NULL) {
+    const opt opts[] = {OPT_STR("-m", &model_path), OPT_STR("--batch", &batch), OPT_FLAG("--ids", &ids_mode)};
+    if (parse_opts("chat-template", argc, argv, opts, N_OPTS(opts)) != 0 || model_path == NULL || batch == NULL) {
         fprintf(stderr, "usage: trochilus chat-template -m <file.gguf> --batch <file> [--ids]\n");
         return 2;
     }
@@ -1146,19 +1158,17 @@ static int cmd_chat_template(int argc, char **argv) {
     tr_chat_msg msgs[64];
     char roles[64][32];
     while (pos < size && rc == 0) {
-        uint64_t rec = 0;
-        size_t digits = 0;
-        while (pos < size && buf[pos] >= '0' && buf[pos] <= '9' && digits < 18) {
-            rec = rec * 10 + (uint64_t)(buf[pos++] - '0');
-            digits++;
-        }
-        if (digits == 0 || pos >= size || buf[pos] != '\n' || rec == 0 || rec > size - pos - 1) {
-            fprintf(stderr, "error: malformed batch record at byte %zu\n", pos);
+        size_t start, rec;
+        if (next_record(buf, size, &pos, &start, &rec) != 0) {
             rc = 1;
             break;
         }
-        const char *r = buf + pos + 1, *end = r + rec;
-        pos += 1 + (size_t)rec;
+        if (rec == 0) { /* not even the flag byte */
+            fprintf(stderr, "error: malformed batch record at byte %zu\n", start);
+            rc = 1;
+            break;
+        }
+        const char *r = buf + start, *end = r + rec;
         int gen = r[0] == '1';
         size_t n = 0;
         for (const char *p = r + 1; p < end && rc == 0;) {
@@ -1197,38 +1207,23 @@ static int cmd_chat_template(int argc, char **argv) {
 }
 
 static int cmd_chat(int argc, char **argv) {
-    const char *model_path = NULL, *system = NULL, *expert_budget_str = NULL;
-    int64_t n_max = 1024, n_ctx = 0, n_batch = 0;
-    int n_threads = 0, decode_threads = 0;
-    for (int i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) model_path = argv[++i];
-        else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) system = argv[++i];
-        else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) n_max = atoll(argv[++i]);
-        else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) n_threads = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--decode-threads") == 0 && i + 1 < argc) decode_threads = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--expert-budget") == 0 && i + 1 < argc) expert_budget_str = argv[++i];
-        else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) n_ctx = atoll(argv[++i]);
-        else if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) n_batch = atoll(argv[++i]);
-        else {
-            model_path = NULL;
-            break;
-        }
-    }
-    if (model_path == NULL || n_max <= 0) {
+    const char *model_path = NULL, *system = NULL;
+    int64_t n_max = 1024, n_ctx = 0, n_batch = 0, n_threads = 0, decode_threads = 0;
+    uint64_t expert_budget = 0;
+    const opt opts[] = {OPT_STR("-m", &model_path),
+                        OPT_STR("-s", &system),
+                        OPT_NUM("-n", &n_max, 1, INT64_MAX),
+                        OPT_NUM("-t", &n_threads, 0, INT_MAX),
+                        OPT_NUM("--decode-threads", &decode_threads, 0, INT_MAX),
+                        OPT_BUDGET(&expert_budget),
+                        OPT_NUM("-c", &n_ctx, 0, INT64_MAX),
+                        OPT_NUM("-b", &n_batch, 0, INT64_MAX)};
+    if (parse_opts("chat", argc, argv, opts, N_OPTS(opts)) != 0 || model_path == NULL) {
         fprintf(stderr, "usage: trochilus chat -m <file.gguf> [-s <system prompt>] [-n <max tokens per reply>]\n"
                         "                      [-t threads] [-c context] [-b batch]\n"
-                        "                      [--decode-threads <n>]  (threads of the decode; default: measured)\n"
+                        "                      [--decode-threads <n>]  (threads of the decode; default 0: measured)\n"
                         "                      [--expert-budget <MiB|min>]  (experts kept in RAM; default: "
                         "automatic)\n");
-        return 2;
-    }
-    if (decode_threads < 0) {
-        fprintf(stderr, "chat: %s\n", DECODE_THREADS_RANGE);
-        return 2;
-    }
-    uint64_t expert_budget = 0;
-    if (expert_budget_str != NULL && parse_expert_budget(expert_budget_str, &expert_budget) != 0) {
-        fprintf(stderr, "chat: %s\n", EXPERT_BUDGET_RANGE);
         return 2;
     }
 
@@ -1251,7 +1246,7 @@ static int cmd_chat(int argc, char **argv) {
     conversation conv = {0};
     int32_t *hist = NULL;      /* the tokens in the session's cache: room for the whole context */
     size_t n_hist = 0;
-    tr_pool *pool = tr_pool_create(n_threads);
+    tr_pool *pool = tr_pool_create((int)n_threads);
     tr_model *model = NULL;
     tr_session *sess = NULL;
     if (pool == NULL) {
@@ -1262,7 +1257,7 @@ static int cmd_chat(int argc, char **argv) {
         fprintf(stderr, "error: %s\n", err);
         goto done;
     }
-    tr_model_set_decode_threads(model, decode_threads);
+    tr_model_set_decode_threads(model, (int)decode_threads);
     const tr_model_info *info = tr_model_get_info(model);
     /* Without -c the chat takes the training context, and halves it (down to 512 tokens)
      * while the memory guard refuses the cache: a shorter conversation beats no conversation. */
@@ -1362,7 +1357,8 @@ static int cmd_chat(int argc, char **argv) {
             }
             memcpy(reply + reply_len, piece, pl);
             reply_len += pl;
-            size_t whole = utf8_whole_prefix(reply, reply_len);
+            /* a character split across two tokens is printed once both halves are there */
+            size_t whole = tr_utf8_whole_prefix((const uint8_t *)reply, reply_len);
             fwrite(reply + printed, 1, whole - printed, stdout);
             fflush(stdout);
             printed = whole;
@@ -1400,15 +1396,17 @@ done:
     return rc;
 }
 
+/* every command gets the arguments after its name */
+static const struct {
+    const char *name;
+    int (*run)(int argc, char **argv);
+} commands[] = {{"cpu", cmd_cpu},           {"inspect", cmd_inspect}, {"generate", cmd_generate},
+                {"logits", cmd_logits},     {"tokenize", cmd_tokenize}, {"run", cmd_run},
+                {"chat", cmd_chat},         {"chat-template", cmd_chat_template}};
+
 static int real_main(int argc, char **argv) {
-    if (argc >= 2 && strcmp(argv[1], "cpu") == 0) return cmd_cpu();
-    if (argc >= 3 && strcmp(argv[1], "inspect") == 0) return cmd_inspect(argv[2]);
-    if (argc >= 2 && strcmp(argv[1], "generate") == 0) return cmd_generate(argc - 2, argv + 2);
-    if (argc >= 2 && strcmp(argv[1], "logits") == 0) return cmd_logits(argc - 2, argv + 2);
-    if (argc >= 2 && strcmp(argv[1], "tokenize") == 0) return cmd_tokenize(argc - 2, argv + 2);
-    if (argc >= 2 && strcmp(argv[1], "run") == 0) return cmd_run(argc - 2, argv + 2);
-    if (argc >= 2 && strcmp(argv[1], "chat") == 0) return cmd_chat(argc - 2, argv + 2);
-    if (argc >= 2 && strcmp(argv[1], "chat-template") == 0) return cmd_chat_template(argc - 2, argv + 2);
+    for (size_t k = 0; argc >= 2 && k < sizeof commands / sizeof commands[0]; k++)
+        if (strcmp(argv[1], commands[k].name) == 0) return commands[k].run(argc - 2, argv + 2);
     usage();
     return 2;
 }
