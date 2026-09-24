@@ -26,6 +26,8 @@ struct tr_model {
     tr_pool *pool;      /* not owned; NULL: everything runs on the calling thread */
     int decode_threads; /* forced width of the short passes; 0: every session measures its own */
     int decode_rows;    /* a pass of at most this many tokens is a short one */
+    tr_gpu *gpu;        /* owned: opened by tr_model_set_gpu, closed by tr_model_free */
+    int gpu_on;         /* new sessions run the decode's attention on gpu */
 };
 
 struct tr_session {
@@ -145,6 +147,8 @@ tr_model *tr_model_load_progress(const char *path, tr_pool *pool, uint64_t exper
     m->pool = pool;
     m->decode_threads = 0;
     m->decode_rows = TR_DECODE_ROWS;
+    m->gpu = NULL;
+    m->gpu_on = 0;
     /* for measurements: where a short pass ends (0: no pass is short, every thread always) */
     const char *rows = getenv("TR_DECODE_ROWS");
     if (rows != NULL && atoi(rows) >= 0) m->decode_rows = atoi(rows);
@@ -165,6 +169,24 @@ int tr_model_expert_stats(const tr_model *m, tr_experts_stats *out) {
 
 int tr_model_set_expert_mask(tr_model *m, const unsigned char *off) {
     return m->vt->set_expert_mask(m->impl, off);
+}
+
+int tr_model_set_gpu(tr_model *m, int on, char *err, size_t err_len) {
+    if (on && m->gpu == NULL) {
+        m->gpu = tr_gpu_open(err, err_len);
+        if (m->gpu == NULL) return -1;
+    }
+    m->gpu_on = on && m->gpu != NULL;
+    m->vt->set_gpu(m->impl, m->gpu_on ? m->gpu : NULL);
+    return 0;
+}
+
+const char *tr_model_gpu_name(const tr_model *m) {
+    return m->gpu_on ? tr_gpu_name(m->gpu) : NULL;
+}
+
+int64_t tr_session_gpu_tokens(const tr_session *s) {
+    return s->vt->gpu_tokens(s->impl);
 }
 
 tr_experts *tr_model_experts(tr_model *m) {
@@ -194,6 +216,7 @@ int tr_expert_budget_plan(uint64_t available, uint64_t total, uint64_t dense, ui
 void tr_model_free(tr_model *m) {
     if (m == NULL) return;
     m->vt->free(m->impl);
+    tr_gpu_close(m->gpu); /* after the model: its sessions are gone, nothing uses the device */
     free(m);
 }
 

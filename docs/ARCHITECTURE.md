@@ -92,6 +92,7 @@ not assumed (`docs/LESSONS.md` #84–#88: four forgotten processes under two day
 | the machine is still before the session and before every run | `measure_still` and `tools/machine_still.sh` in `AB_GUARD`: occupied processors and container; waits, then stops and says who is holding the CPU |
 | every measurement declares the background load; if it is not low conclusions are not drawn | `measure_declare` writes to log occupied processors and quota of `System` before the first run and after the last |
 | a comparison has its own A/A, and a choice is judged from distribution, not from median | `tools/ab_modes.sh`; `tools/decode_context_report.py speed` prints choices and width changes |
+| a change to the decode is measured with the short protocol by default (Marcello, 2026-09-24): exactness first, the decode forced on 8 at 512 / 2048 / 4000 with A/A, the profile after; ~40 min. **Short** for what grows with the context: attention (CPU or GPU), the KV cache and its layout, anything whose cost is per cached position. **Long** (~90 min: adds context 32, the measured width, bench_mem) for what every token pays at any context: the weights' kernels and quantized types, the expert store, norms, RoPE, router and experts' path, the thread pool, pinning, threads per phase and the width's estimator; and whenever the short one shows a surprise at 512 | `sh tools/decode_context.sh change-short <before>` / `change <before>` |
 
 ## Hot path
 
@@ -129,7 +130,7 @@ remain.
 | `src/base/` | platform (files, `pread`, O_DIRECT, time, aligned memory), thread pool, CPU detection | colibri `compat.h`, `omp_tune.h` (physical cores); ds4 pool `ds4_parallel_for` |
 | `src/format/` | GGUF v3 reader, type table, metadata | ds4 `parse_metadata` / `parse_tensors`, without architecture hooks |
 | `src/kernels/` | CPU kernels per quantized type: scalar + AVX2 + AVX-512 (+VNNI) + NEON, dispatch table | colibri `quant.h`, `expert_ffn.h`; ds4 K-quant references |
-| `src/backend/` | backend interface (tensors on device, graph per token) and CPU backend | ds4 `ds4_gpu.h` (execution model), reduced to generic primitives |
+| `src/backend/` | backend interface (tensors on device, graph per token) and CPU backend; today `gpu_attn.{h,c}`: the decode's attention on an NVIDIA GPU with the CPU's bits (driver `nvcuda.dll`/`libcuda.so.1` opened at run time, PTX written in C and compiled by the driver, every float op `.rn`, `tr_expf` ported whole, the KV mirrored in VRAM, zero copy, one warp keeping the GPU awake between layers; `TR_GPU=0` keeps it on the CPU) | execution model: ds4 `ds4_gpu.h`, reduced to generic primitives; the attention kernels: new code, from measurements (`docs/MEASUREMENTS.md` §The decode's attention on the GPU) |
 | `src/memory/` | expert store (M1: RAM / disk; VRAM at M3): units (layer, expert), slots allocated once, direct index and LRU O(1), reads on demand from GGUF | ideas: colibri `olmoe.c` (expert index → slot, expert in one slot), ds4 streaming; choices from our measurements (`docs/MEASUREMENTS.md` §M1): LRU not pin from use, no I/O pool, no prediction-based preloading on slow disks; in the layer-major prompt one I/O thread reads the next layer while this one computes (1.22× at 2048); new code |
 | `src/kv/` | KV cache `[layer][head][position]`: a head's positions in row, so attention reads them at RAM bandwidth (`docs/MEASUREMENTS.md` §Decode at long context); then prefix reuse, checkpoint to disk with decay-weighted score | layout: new code, from measurements; ideas for the rest: colibri `kv_prefix.h`, `kv_fp8.h`; ds4 `ds4_kvstore.c` |
 | `src/tokenizer/` | byte-level BPE from GGUF metadata (pretokenizer families allowed only with oracle), NFC and Unicode classes probed from HF `tokenizers`, chat template per architecture | ideas: colibri `tok.h` (regex replayed in C), ds4 `vocab_load` (from GGUF); new code |
@@ -201,7 +202,9 @@ remain.
   the tightest within measured noise on those same passes, remeasures every doubling of context,
   and changes only after two concordant measurements; `--decode-threads` forces it. Width
   changes speed, never a logit (`docs/MEASUREMENTS.md` §Threads per phase).
-- **GPU**: all of one token in a single command batch, tensors stay on device (ds4).
+- **GPU**: all of one token in a single command batch, tensors stay on device (ds4). Today only a
+  decode token's attention runs there, a call per layer, same bits (`src/backend/gpu_attn.h`); a
+  laptop GPU sleeps in the CPU's gaps between layers unless kept awake (`docs/LESSONS.md` #153).
 - **KV**: in memory per session; prefix reuse by token id; checkpoint to disk with
   score `(decayed hits + 1) × tokens / bytes` (ds4).
 
@@ -256,7 +259,7 @@ per token. The directions that attack that division, one at a time, under the ru
 | **M0** | base, GGUF, converter (F32/F16/Q8_0), CPU backend scalar + AVX2 + AVX-512 with dispatch, OLMoE graph, greedy, CLI | tiny oracle exact on Windows and Linux; true OLMoE-1B-7B answers |
 | M1 | experts from disk with RAM budget: slot-based store, LRU O(1), reads on demand; **auto plan** (measures RAM, picks budget); then, on fast disks, I/O threads and preloading | small forced budget → byte-identical logits; no option necessary |
 | M2 | K-quant on CPU — **Q4_K in** (2026-09-24: scalar, AVX2, AVX-512 bit-identical, gguf-py bit for bit, real model decode 1.5× Q8_0), then Q6_K, Q2_K, IQ2_XXS; assembly workshop | bit-identical kernels, microbenchmarks |
-| M3 | CUDA module (mmq from ggml via ds4), hot experts in VRAM, VRAM + RAM + disk plan | same tokens as CPU; a model larger than RAM runs on reference PC |
+| M3 | CUDA, exact (every op `.rn`, the CPU's orders): **the decode's attention in** (2026-09-24, logits identical to the byte through the engine), then the dense weights (Q8_0 GEMV measured exact at 97% of VRAM bandwidth), hot experts in VRAM, VRAM + RAM + disk plan (model: ~4× at 2048) | same bytes as CPU; a model larger than RAM runs on reference PC |
 | M4 | DeepSeek V4 Flash | tiny oracle exact; runs on reference PC |
 | M5 | KV checkpoint to disk, server, speculative decode | — |
 | M6 | Vulkan modules (AMD/Intel GPU, integrated; colibri has `backend_vulkan.c`) and Metal | same tokens as CPU |

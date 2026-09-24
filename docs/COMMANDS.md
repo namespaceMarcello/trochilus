@@ -36,7 +36,12 @@ build/trochilus run ... --decode-threads 8   # force decode threads (default: me
 sh tools/threads_phase.sh sweep | widths | after <binary before>   # threads per phase: -t 4/8/12/16, forced widths
 sh tools/decode_context.sh measure | widths | long | change <before> | change-short <before>   # decode at 32/512/2048/4000 context: A/A, forced widths, bytes per zone; change-short, THE DEFAULT for a change: exactness, forced 8 at 512/2048/4000, the profile after (~40 min)
 tools/.venv/Scripts/python.exe tools/decode_context_report.py speed|model|zones <file>   # MEASUREMENTS tables from runs; speed counts choices and changes
+TR_GPU=0 build/trochilus run ...   # the decode's attention stays on the CPU (default: on the NVIDIA GPU when there is one, same bits; TR_GPU=1: say why a GPU could not be opened)
+sh tools/gpu_exact.sh [full|quick] [binary]   # native: GPU against CPU through the engine, byte for byte (full: real model, logits of 2000 positions, tokens after 4000, speculation; quick: the 2-layer cut, in make check); fails if nvidia-smi sees a GPU the engine did not use
+build/tests/bench_gpu_attn.exe info | check <probe dir> [--zero-copy] | edge | expf | time --data <probe dir> --n 2048|4000 --only abcezdws   # the GPU attention premise: bits on the probe dumps, edge cases, tr_expf on all 2^32 floats, time per layer (d: the decode's bursts, w: keep-warm); --mutate fma|tree|sumtree|zero|expf must fail
+build/tests/bench_gpu_q8.exe info | check [--mutate norn|tree|order] | time [--runs 200] [--gap-us 1000]   # the exact Q8_0 matrix-vector product on the GPU: bits against dot_row, GB/s
 build/tests/bench_attn_bw.exe 2048 --runs 19 [variant...]   # why the CPU's decode attention reads below the RAM's speed: variants (engine, head, prefetch, read, read4, mutant) paired step by step, bits checked
+build/tests/bench_expf32.exe --slow-all --error --threads 8   # the exact exp in float32 only (for the GPU) against tr_expf on all 2^32 floats, both variants, ~40 s; --no-timing for the check alone
 build/tests/bench_kvpack.exe roundtrip | bits | time [--run <name>|all]   # the KV packed in 28 bits, lossless: round trip, the attention's bits on the probe dumps, time against F32 (KVPACK_PROBE_DIR)
 make attn-probe   # build/probe/trochilus: a diagnostic engine that writes each decode token's q, K, V and output (tools/attn_probe.c); never the engine
 TR_PROBE_DIR=<dir> TR_PROBE_KV_AT=<prompt tokens + n> build/probe/trochilus.exe run -m <gguf> -f <prompt> -n <n> -t 8   # the dump: K and V at the last token, q and the output of every token

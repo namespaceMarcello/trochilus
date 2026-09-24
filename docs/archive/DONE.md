@@ -1041,3 +1041,22 @@ short measurement protocol, the default from now on: `sh tools/decode_context.sh
 <before>` (exactness, 8 threads at 512 / 2048 / 4000 with A/A, the profile after; ~40 min). Tests: `test_attention_group` covers both branches; a mutation of the new branch red (140
 mismatches); on the real model logits of 600 positions and the tokens after 4000 identical to
 commit 718a84c. Check: `make check`; `build/tests/bench_attn_bw.exe 2048 --runs 19`.
+
+### 2026-09-24 — The decode's attention on the GPU, with the CPU's bits
+`src/backend/gpu_attn.{h,c}`: the NVIDIA driver opened at run time (`tr_lib_open` in `platform`,
+nothing linked), three PTX kernels a layer written in C (scores appending the new key and value,
+`tr_expf` in double, values summed by shuffles in the lane tree's order), every float op `.rn`, the
+KV mirrored in VRAM (prompt passes through `tr_gpu_attn_write`, keys position-minor), zero copy for
+the 24 KB in and 8 KB out of a decode call, and one warp spinning between calls so the laptop GPU
+keeps its clocks; the last pass of a prompt or of a speculative check wakes the GPU too
+(`tr_gpu_attn_warm`, one warp at a time), so the first decode tokens do not pay the clocks' climb
+(LESSONS #158, #159). The model opens the device (`tr_model_set_gpu`), each session its cache; the
+command line turns it on when there is a GPU (`TR_GPU=0` off, `TR_GPU=1` says why not) and reports
+`gpu: <name>, attention of N decode tokens`. A driver error sends the session back to the CPU,
+whose cache is always whole. Tests: `tests/test_gpu_attn.c` (8010 head outputs against scalar and
+AVX-512, 0 floats differ; counters on exceptions, underflows, subnormal exponentials, poisoned
+rows; skipped without a GPU), `tools/mutate_gpu.sh` (7 of 7 red), `tools/gpu_exact.sh full` (logits
+of 2000 decode positions, tokens after 4000, a speculative run: identical) and `quick` in the gate.
+Premise benches: `tests/bench_gpu_attn.c`, `tests/bench_gpu_q8.c` (MEASUREMENTS §The decode's
+attention on the GPU: the premise). Check: `make check`; `sh tools/gpu_exact.sh full`;
+`build/trochilus run -m <gguf> -f prompt.txt -n 200` (the `gpu:` line).

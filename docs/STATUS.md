@@ -4,6 +4,14 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
 
 ## Decisions
 
+- 2026-09-24 — **The long-context decode goes faster only exactly** (Marcello): no KV at 16 bits
+  with rounding. The criterion: logits identical to the byte to today's engine, batch = token by
+  token, every tier = scalar. Closes point 6's «KV at 16 bits» and order (b) as no. A GPU is a tier
+  like the others (every op `.rn`, the CPU's orders: question 51): it runs the decode's attention
+  by default when the machine has one (`TR_GPU=0` keeps the CPU).
+- 2026-09-24 — **A change to the decode is measured with the short protocol** (Marcello):
+  `decode_context.sh change-short` (exactness, the decode on 8 threads at 512 / 2048 / 4000 with A/A,
+  the profile after; ~40 min); the full `change` only for what every token pays at any context.
 - 2026-09-24 — **Sources to take the best from** (Marcello): besides colibri, ds4 and llama.cpp,
   ik_llama.cpp for M2 (K-quant and IQ_K CPU kernels, read before writing Q4_K), ktransformers
   for M3, Adaptive-K as our own non-exact experiment (question 50); ArcLight and bitnet.cpp
@@ -285,6 +293,29 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
 
 ## Next steps
 
+**Day of 2026-09-24: the long-context decode, exact** (MEASUREMENTS §Skipping cached positions
+exactly and the five sections after it; LESSONS #152–#157):
+- **skipping positions exactly: closed** before any kernel: OLMoE's attention is flat (no score 30
+  below its max in 65 M positions), an oracle skips ≤ 0.2% of the bytes. The probe (`make
+  attn-probe`, `tools/attn_skip_report.py`) checks the premise again on the next model;
+- **the decode's attention on the GPU, built** (`src/backend/gpu_attn.{h,c}`): the same bytes
+  through the engine (`tools/gpu_exact.sh`: logits of 2000 decode positions, tokens after 4000, a
+  speculative run); **decode 1.31–1.32× at 2048 and 1.54–1.58× at 4000** (A/B against 718a84c,
+  measured width; the token at 4000 44.8 → 29.8 ms). A laptop GPU sleeps between layers unless one
+  warp keeps it awake (LESSONS #153, +12–17 W while decoding), and after a prompt it starts cold
+  unless the prompt's last pass wakes it (#158);
+- CPU: **one position at a time** for a decode token: exact, kept, but not distinguishable on a
+  still machine (0.96–1.05× a token, the zone −9% at 2048; the bench's 1.10–1.13× was under load,
+  LESSONS #160); the KV packed in 28 bits exact, 1.13× fewer bytes, not timed yet (question 57);
+- speculation at long context (question 52): nil on prose, 1.57 tokens a pass rewriting code,
+  1.66× net on repetitive code; a pass of ~4 rows reads ~2.8× the experts;
+- **next** (no agents, Marcello): first the premises of questions 53-58 in one session (the Q4/Q8
+  agreement for a GPU draft with exact verification, the experts of a k-row pass, the prefill's
+  distance from the peak for assembly, the weights' entropy, the packed KV's time, the SIMD exact
+  exp); then M3 by their numbers: the dense weights on the GPU (Q8_0 GEMV exact at 97% of VRAM
+  bandwidth; model 1.64× at 2048, 1.92× at 4000), the Q4 model whole on the GPU (fast, and 53's
+  draft), the verification pipeline; 59-60 are Marcello's decisions, 61 comes after M4.
+
 **Night of 2026-09-24** (DONE, MEASUREMENTS):
 - the gate 428 → 238 s (next: the native side beside the container, `oracle-real` under `min`);
 - **where we lose to llama.cpp** (same Q8_0, container, raced again after two weight rows per
@@ -293,8 +324,7 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
   and 1.06× at 512. **At 2048 the whole
   gap is the KV's bytes** (profile by zone, MEASUREMENTS §Decode at context 2048): every zone reads
   memory at 38–51 GB/s, and our F32 KV is 518 MiB per token against llama.cpp's F16 259; halving it
-  gives 1.18× (~1.25× on Q4_K weights). No exact lever left (≤ 3%): KV at 16 bits, point 6, is
-  Marcello's call;
+  gives 1.18× (~1.25× on Q4_K weights): the exact answer is the day's block above;
 - **M2: Q4_K and Q6_K**, exact against their own dequantized weights (gguf-py bit for bit, the cuts
   against transformers in `make check`). Per element against Q8_0: Q4_K AVX-512 0.84–0.90×, AVX2
   0.53–0.63× (a lookup there: rejected); Q6_K AVX-512 0.85×, AVX2 0.85× (256 quants unpacked once,
@@ -334,43 +364,14 @@ software, question 41) and untouched: factory state of target PCs, M1 designed o
   `TR_EXPERT_BUDGET_MIB`, `experts:` line, `weight_read` zone), and reads **without system cache**
   (`tr_file_open_direct`, aligned to 4096, `TR_EXPERT_DIRECT=0` to force). Tests: `tests/test_experts.c`,
   `tests/test_stream.c`, oracles under `min`, real model `cmp` to byte; 23 red mutations.
-- **Measured night 2026-09-20** (`docs/MEASUREMENTS.md` §M1 measured; clean machine, background load
-  1.0–1.4 processors of 16, decode width forced to 8, A/A on every mode):
-  `experts_budget.sh measure | misses | long | direct`, results in `build/experts_budget/`.
-  **M1 works: cost is the prompt.**
-  - decode 35.45 / 29.56 / 24.27 / 20.56 tok/s at 100 / 75 / 50 / 25% with 64 tokens generated, but
-    **at long generation budget matters little**: 0.90× and 0.87× of resident at 1000 tokens;
-  - prefill **306.9 tok/s if model in RAM and 80–84 with any partial budget** (512-token prompt):
-    prompt reads full model (6031 MiB vs. 6528 table), ~4.4 s disk. Cliff between resident and
-    non-resident, not between budgets — but **we make part of cliff ourselves**: at 2048 tokens
-    prompt reads 22,880 MiB, four times table, one per pass (question 47 below);
-  - one generated token costs **0.3 units at 50%** right after prompt and **0.03** far: simulation
-    of question 14 (22.4) answered another question — engine enters decode with LRU filled by
-    prompt (LESSONS #98, check `tools/check_measurements.py` in `make check`);
-  - direct read vs. system cache, same budget and bytes: prefill 81.4 vs. 197.0 (**2.42×**), decode
-    24.2 vs. 32.6. Guard refusing to measure without `direct` was right: without it, every M1 number
-    inflated 2.4× on prompt.
-- **Decided from here**: (a) **no prefetch in decode** — far from prompt missing 0.03–0.14 units
-  per token, nothing to hide; if needed it is in prompt (question 43);
-  (b) budget not the lever it seemed: between 25% and 75% swing 4% at long generation.
-- **Question 46, half closed** (2026-09-21 night, with full budget in same session): fixed cost
-  at generation start **not with resident model** (34.64 → 33.48 tok/s from 200 to 1000 tokens,
-  within spread) and present under budget (~0.35 s at 50%, ~0.84 s at 25%). Expert store settling
-  after prompt, not kernels warming: preparation phase (48) cannot hide it. Misses explain ~115 ms
-  of 840.
-- **Measured 2026-09-21, question 47** (`docs/MEASUREMENTS.md` §Prefill reads model once per pass;
-  `sh tools/prefill_overlap.sh`): prompt processed in blocks of 512 tokens and each pass traverses
-  all layers, so under budget **rereads entire table each pass**. At 2048 tokens: 22,880 MiB instead
-  of 6,528 and 23.51 s; with one pass only (`-b 2048`) 6,273 MiB and **11.27 s, 2.09×**, last logit
-  row byte-identical. Computation not worse (6.67 s vs. 7.24).
-- **Layer-major order, written 2026-09-21** (`forward_layer` + `forward_prompt_layer_major` in
-  `src/models/olmoe.c`; full prompt hidden state in `s->x_all`, allocated at session creation and
-  only with partial expert store — no alloc in hot path). At 2048 tokens:
-  **6,273 MiB instead of 22,880 and 12.41 s instead of 23.51, 1.89×**, computation not
-  distinguishable; at 512 (one pass only) nothing changes; at full budget previous path. With
-  `--route-trace` stays on old order: trace numbers rows from `n_tokens`, which advances only
-  after last layer. Check in `make check`: `tests/test_stream.c`
-  §`once_per_prompt`, seen red (33 units of 16 table) then green (LESSONS #99, closed).
+- **Measured 2026-09-20/21** (MEASUREMENTS §M1 measured, §Prefill reads model once per pass):
+  **M1 works, the cost is the prompt**: decode 35.5 / 29.6 / 24.3 / 20.6 tok/s at 100 / 75 / 50 /
+  25% (64 tokens), 0.90× and 0.87× of resident at 1000 tokens; direct reads give 2.42× the system
+  cache's prefill (the guard was right). Decided: no prefetch in decode (0.03–0.14 units a token
+  far from the prompt); the budget is not the lever (4% between 25 and 75%). Question 46 half
+  closed: the fixed cost at generation start is the store settling (~0.35 s at 50%), absent when
+  resident. Layer-major prefill (question 47): 2048 tokens read 6,273 MiB instead of 22,880, 12.41 s
+  instead of 23.51 (**1.89×**), `tests/test_stream.c` §`once_per_prompt` (LESSONS #99).
 - **M1 work order, decided 2026-09-21** (from numbers, not plan):
   1. ~~layer-major order in prefill~~ **done** (line above, 1.89×);
   2. **first prompt cost** (questions 45, 48, 49; 4.7 s at 2048, the whole gap to the resident
@@ -399,7 +400,7 @@ software, question 41) and untouched: factory state of target PCs, M1 designed o
 
 **Order decided by Marcello 2026-09-19 evening**: (a) **M1**, experts from disk, starting from
 measurements 13–16 and with GGUF and pool folders from component comparison inside (point 5);
-(b) KV at 16 bits as declared mode (point 6); (c) int8 in prefill as declared mode, after 16-bit
+(b) ~~KV at 16 bits as declared mode~~ no (2026-09-24); (c) int8 in prefill as declared mode, after 16-bit
 bench (point 3, question 33); (d) `--spec` from match length (point 1, question 32); (e) closed
 as «no», with rationale in MEASUREMENTS: `tr_expf` in SIMD (question 39), 2 MB pages on Windows
 (question 5), width per zone (question 34). **Estimator validation (point 0) comes after all
@@ -452,17 +453,9 @@ forces width** (`--decode-threads`), never `auto`: no conclusion rests on unvali
    hold KV: if per-position as ours was, 2026-09-19 measurement (attention from 32–35 to 47–48 GB/s
    with one head's positions in a row) is flag for `UPSTREAM.md`. GGUF and pool folders done within
    M1; measurements 13–16 (routing, expert cache, SSD) are its first piece (order above).
-6. Decode at long context: **exact part done** (decision 2026-09-19 above: 38.9 tok/s at context
-   32, 35.5 at 512, 27.5 at 2048, 20.9 at 4000, at 8 threads). Remain, in order:
-   - **KV at 16 bits, yes or no** (question 36, Marcello decides): only large lever left at long
-     context, estimated by bytes **+5% at 512, +16–19% at 2048, +26–31% at 4000** and half KV
-     memory (at 8 bits: +6–7%, +20–25%, +33–43%). Not exact: only as declared mode off by default,
-     decided with quality numbers front (KL and first token vs. exact mode on real model, greedy
-     tokens equal over 1000 generated; llama.cpp, which does this and 8-bit activations, at KL 9e–3).
-   - comparison with llama.cpp decode at alternating runs (question 19), now to be redone at long
-     context too: part of its advantage there was our KV read with jumps;
-   - exact side, little and scattered: zones under cap (question 35: 6–11% total); width per zone
-     closed as «no» (question 34: 2.1% at context 4000, below threshold).
+6. Decode at long context: KV at 16 bits **closed as no** (decision 2026-09-24); the exact levers
+   are the day's block above (GPU attention, one position at a time, the packed KV). Remains the
+   race with llama.cpp at long context after them (question 19).
 7. Memory: bandwidth measured (~57 GB/s, question 4) and decode uses 89–94%. 2 MB pages
    (question 5) closed as «no» on Windows: ask privilege normal user does not have.
 8. Pinning on Linux: code there and `make check` proves it, numbers no (need real Linux machine,

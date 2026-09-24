@@ -352,6 +352,14 @@ static int apply_expert_mask(tr_model *model, const char *path) {
 /* After print_threads: how many (layer, expert) units are resident, and, once the store has had
  * to read from disk, its running counters (src/memory/experts.h). Nothing printed for an
  * architecture with no such store. */
+/* Where the decode's attention ran (src/backend/gpu_attn.h): only when a GPU was open, so the
+ * report of a machine without one reads as before. */
+static void print_gpu(const tr_model *model, const tr_session *sess) {
+    const char *name = tr_model_gpu_name(model);
+    if (name == NULL) return;
+    fprintf(stderr, "gpu: %s, attention of %lld decode tokens\n", name, (long long)tr_session_gpu_tokens(sess));
+}
+
 static void print_experts(const tr_model *model) {
     tr_experts_stats st;
     if (app_expert_stats(model, &st) != 0) return;
@@ -618,6 +626,7 @@ static int cmd_generate(int argc, char **argv) {
     }
     print_threads(pool, sess, (int)decode_threads);
     print_experts(model);
+    print_gpu(model, sess);
 
     if (do_profile) tr_prof_print(prof, stderr);
     /* fewer tokens than asked is a failure, not a success with short output (LESSONS #17) */
@@ -722,6 +731,7 @@ static int cmd_logits(int argc, char **argv) {
     }
 
     print_experts(model);
+    print_gpu(model, sess);
 
     fclose(out);
     free(tokens);
@@ -1062,6 +1072,7 @@ static int cmd_run(int argc, char **argv) {
                 g.n_steps > 0 ? (double)g.n_drafted / (double)g.n_steps : 0.0);
     print_threads(pool, sess, (int)decode_threads);
     print_experts(model);
+    print_gpu(model, sess);
     if (route_trace_path != NULL) {
         const tr_route_trace *trace = tr_session_route_trace(sess);
         if (trace == NULL || write_route_trace(route_trace_path, trace, (int64_t)n_prompt) != 0) {
@@ -1382,6 +1393,7 @@ oom:
     fprintf(stderr, "chat: out of memory\n");
 done:
     if (model != NULL) print_experts(model);
+    if (model != NULL && sess != NULL) print_gpu(model, sess);
     conv_truncate(&conv, 0);
     free(conv.m);
     free(hist);

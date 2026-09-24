@@ -129,8 +129,21 @@ tr_pool *app_pool(int64_t n_threads) {
     return g_serve.pool;
 }
 
+/* The decode's attention on the GPU when the machine has one (src/backend/gpu_attn.h): the same
+ * bits, so it is not a mode, only a faster road. TR_GPU=0 keeps it on the CPU; unset, no device or
+ * no driver means nothing happens and nothing is said; TR_GPU=1 asks for it and says on stderr why
+ * it could not open one. In a server, the server's own environment decides. */
+static tr_model *with_gpu(tr_model *m) {
+    const char *env = getenv("TR_GPU");
+    if (m == NULL || (env != NULL && strcmp(env, "0") == 0)) return m;
+    char why[256] = "";
+    int asked = env != NULL && strcmp(env, "1") == 0;
+    if (tr_model_set_gpu(m, 1, why, sizeof why) != 0) tr_log(asked ? TR_LOG_WARN : TR_LOG_DEBUG, "gpu: none (%s)", why);
+    return m;
+}
+
 tr_model *app_model(const char *path, tr_pool *pool, uint64_t expert_budget, char *err, size_t err_len) {
-    if (!g_serve.serving) return tr_bar_load(path, pool, expert_budget, err, err_len);
+    if (!g_serve.serving) return with_gpu(tr_bar_load(path, pool, expert_budget, err, err_len));
     char full[4096], stamp[64], key[sizeof g_serve.key];
     full_path(path, full, sizeof full);
     file_stamp(path, stamp, sizeof stamp);
@@ -142,9 +155,9 @@ tr_model *app_model(const char *path, tr_pool *pool, uint64_t expert_budget, cha
              * forced off, whatever this process's own TR_BAR/NO_COLOR/TERM/tty say. */
             tr_bar b;
             tr_bar_init(&b, 0, NULL, NULL, NULL, NULL);
-            g_serve.model = tr_bar_load_with(&b, path, pool, expert_budget, err, err_len);
+            g_serve.model = with_gpu(tr_bar_load_with(&b, path, pool, expert_budget, err, err_len));
         } else {
-            g_serve.model = tr_bar_load(path, pool, expert_budget, err, err_len);
+            g_serve.model = with_gpu(tr_bar_load(path, pool, expert_budget, err, err_len));
         }
         if (g_serve.model == NULL) return NULL;
         snprintf(g_serve.key, sizeof g_serve.key, "%s", key);

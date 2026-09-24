@@ -91,6 +91,14 @@ void tr_stdout_binary(void);
  * NULL at end of input (Ctrl+D, Ctrl+Z) or if memory ran out. */
 char *tr_stdin_line(size_t *len);
 
+/* A shared library opened at run time (LoadLibrary, dlopen): how the core reaches a GPU driver
+ * without linking it, so a machine without one still starts. NULL when it is not there. */
+typedef struct tr_lib tr_lib;
+tr_lib *tr_lib_open(const char *name);
+/* The address of an exported symbol, NULL if the library has none by that name. */
+void *tr_lib_sym(tr_lib *lib, const char *name);
+void tr_lib_close(tr_lib *lib);
+
 #if defined(_WIN32)
 #include <wchar.h>
 /* Windows gives wmain its arguments in UTF-16: the same arguments as UTF-8 strings

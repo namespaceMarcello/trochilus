@@ -111,7 +111,7 @@ def check_tests_no_tmpfile():
 # /* hot: begin */ and /* hot: end */. A line may allow a name with /* hot-ok: name -- reason */.
 HOT_FILES = ["src/models/olmoe.c", "src/models/model.c", "src/kernels/kernels.c", "src/kernels/kernels_x86.c",
              "src/kernels/kernels_internal.h", "src/kernels/expf.c", "src/base/threads.c", "src/base/prof.h",
-             "src/kv/kv.c", "src/kv/kv.h"]
+             "src/kv/kv.c", "src/kv/kv.h", "src/backend/gpu_attn.c", "src/backend/gpu_attn.h"]
 HOT_RULES = [
     ("allocazione", re.compile(r"\b(malloc|calloc|realloc|free|tr_alloc_aligned|tr_free_aligned|"
                                r"_aligned_malloc|_aligned_free|posix_memalign|aligned_alloc)\s*\(")),

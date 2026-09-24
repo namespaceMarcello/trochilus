@@ -74,6 +74,7 @@ typedef struct {
     tr_experts *experts; /* shared store for every layer's gate/up/down experts (Esperti M1) */
     unsigned char *expert_off; /* [n_layers][n_expert], 1: never chosen (tr_model_set_expert_mask,
                                 * measurement only); NULL: every expert can be chosen */
+    tr_gpu *gpu; /* not owned (tr_model_set_gpu): new sessions run the decode's attention there */
 
     /* every tr_alloc_aligned buffer owned by this model, freed on destroy */
     void **owned;
@@ -99,6 +100,13 @@ typedef struct {
     tr_prof prof; /* disabled by default (zero-initialized in olmoe_session_create) */
 
     tr_kv kv; /* [n_layers][n_head_kv][n_ctx][head_dim]: one head's positions in a row (src/kv/kv.h) */
+    /* The same keys and values in VRAM, and a decode token's attention run there with the same
+     * bits (src/backend/gpu_attn.h); NULL: the CPU. Every pass writes both caches, so the CPU's is
+     * always whole: a driver error sets gpu_failed and the session goes on without the GPU. */
+    tr_gpu_attn *gpu;
+    int gpu_failed;
+    int gpu_warm;       /* this pass is the last of a multi-token eval: keep the GPU awake (gpu_attn.h) */
+    int64_t gpu_tokens; /* decode tokens whose attention ran on the GPU */
 
     /* RoPE cos/sin per position: [n_ctx][head_dim / 2] each (tr_rope_table) */
     float *rope_cos, *rope_sin;
@@ -722,6 +730,15 @@ static int olmoe_expert_stats(const void *model, tr_experts_stats *out) {
     return 0;
 }
 
+/* model.h: tr_model_set_gpu (the device is the wrapper's; sessions created afterwards use it) */
+static void olmoe_set_gpu(void *model, tr_gpu *gpu) {
+    ((olmoe_model *)model)->gpu = gpu;
+}
+
+static int64_t olmoe_gpu_tokens(const void *session) {
+    return ((const olmoe_session *)session)->gpu_tokens;
+}
+
 /* Measurement only (model.h: tr_model_set_expert_mask). */
 static int olmoe_set_expert_mask(void *model, const unsigned char *off) {
     olmoe_model *m = (olmoe_model *)model;
@@ -758,6 +775,7 @@ static void olmoe_session_free(void *session) {
     olmoe_session *s = (olmoe_session *)session;
     if (s == NULL) return;
     olmoe_route_trace_free(s->trace);
+    tr_gpu_attn_free(s->gpu);
     tr_kv_free(&s->kv);
     tr_free_aligned(s->rope_cos);
     tr_free_aligned(s->rope_sin);
@@ -885,6 +903,14 @@ static void *olmoe_session_create(void *model, int64_t n_ctx, int64_t n_batch, c
         return NULL;
     }
     tr_rope_table(s->rope_cos, s->rope_sin, actual_ctx, m->head_dim, m->rope_freq_base);
+    /* The GPU is a faster road to the same bits, never a requirement: a device that cannot take
+     * this session (shape, VRAM) leaves it on the CPU; the command line's gpu: line says where the
+     * decode ran, the reason is a debug line. */
+    if (m->gpu != NULL && m->n_head_kv == m->n_head) {
+        char why[256] = "";
+        s->gpu = tr_gpu_attn_create(m->gpu, m->n_layers, m->n_head, m->head_dim, actual_ctx, why, sizeof why);
+        if (s->gpu == NULL) tr_log(TR_LOG_DEBUG, "gpu: the attention stays on the CPU (%s)", why);
+    }
     return s;
 }
 
@@ -1271,24 +1297,39 @@ static int forward_layer(olmoe_model *m, olmoe_session *s, int64_t L, const int3
     wc.pos0 = pos0;
     wc.n_kv = n_kv;
     tr_parallel_for(pool, n_tok, per_chunk, kv_write_body, &wc);
+    /* the VRAM cache gets the same rows; a decode token's own row goes with its attention call */
+    if (s->gpu != NULL && !s->gpu_failed && n_tok > 1 &&
+        (tr_gpu_attn_write(s->gpu, L, pos0, n_tok, s->k, s->v) != 0 ||
+         (s->gpu_warm && tr_gpu_attn_warm(s->gpu, TR_GPU_WARM_MAX_NS) != 0)))
+        s->gpu_failed = 1;
     tr_prof_end(prof, TR_PROF_KV_WRITE, t);
 
     t = tr_prof_begin(prof);
-    attn_ctx ac;
-    ac.q = s->q;
-    ac.kv = &s->kv;
-    ac.scores = s->scores;
-    ac.out = s->attn_concat;
-    ac.scale = scale;
-    ac.layer = L;
-    ac.n_qkv = n_qkv;
-    ac.head_dim = head_dim;
-    ac.group = n_head / n_head_kv;
-    ac.n_tok = n_tok;
-    ac.pos0 = pos0;
-    ac.score_stride = s->score_stride;
-    /* an item costs ~30 ns per cached position: short contexts keep several per chunk */
-    tr_parallel_for(pool, n_head * n_tok, 1 + 256 / (pos0 + n_tok), attn_body, &ac);
+    /* one decode token: on the GPU when the session has one, the same bits (gpu_attn.h) */
+    int on_gpu = s->gpu != NULL && !s->gpu_failed && n_tok == 1;
+    if (on_gpu && tr_gpu_attn_decode(s->gpu, L, pos0, s->q, s->k, s->v, scale, s->attn_concat) != 0) {
+        s->gpu_failed = 1;
+        on_gpu = 0;
+    }
+    if (!on_gpu) {
+        attn_ctx ac;
+        ac.q = s->q;
+        ac.kv = &s->kv;
+        ac.scores = s->scores;
+        ac.out = s->attn_concat;
+        ac.scale = scale;
+        ac.layer = L;
+        ac.n_qkv = n_qkv;
+        ac.head_dim = head_dim;
+        ac.group = n_head / n_head_kv;
+        ac.n_tok = n_tok;
+        ac.pos0 = pos0;
+        ac.score_stride = s->score_stride;
+        /* an item costs ~30 ns per cached position: short contexts keep several per chunk */
+        tr_parallel_for(pool, n_head * n_tok, 1 + 256 / (pos0 + n_tok), attn_body, &ac);
+    } else if (L == m->n_layers - 1) {
+        s->gpu_tokens++;
+    }
     tr_prof_end(prof, TR_PROF_ATTENTION, t);
     if (prof->enabled) tr_prof_count_kv(prof, TR_PROF_ATTENTION, attn_kv_bytes(n_tok, pos0, n_head, head_dim));
 
@@ -1499,6 +1540,7 @@ static int olmoe_eval(void *session, const int32_t *tokens, int64_t n, int64_t n
      * same rows. A trace is measurement only (--route-trace), so it takes the pass-major path and
      * keeps its rows right, instead of the trace growing a second way of counting. */
     if (s->x_all != NULL && n > s->n_batch && s->trace == NULL) {
+        s->gpu_warm = 0; /* a prompt read from disk is slow: the GPU is not kept awake through it */
         if (forward_prompt_layer_major(m, s, tokens, n, n_logits) != 0) {
             s->pos = pos0;
             return -1;
@@ -1509,6 +1551,8 @@ static int olmoe_eval(void *session, const int32_t *tokens, int64_t n, int64_t n
 
     for (int64_t off = 0; off < n; off += s->n_batch) {
         int64_t len = n - off < s->n_batch ? n - off : s->n_batch;
+        /* the last pass of a prompt or of a speculative check wakes the GPU for the decode after it */
+        s->gpu_warm = off + len == n;
         if (forward_pass(m, s, tokens + off, len, off + len == n ? n_logits : 0) != 0) {
             s->pos = pos0;
             return -1;
@@ -1794,4 +1838,6 @@ const tr_arch_vtable tr_olmoe_vtable = {
     olmoe_route_trace_begin,
     olmoe_route_trace_get,
     olmoe_set_expert_mask,
+    olmoe_set_gpu,
+    olmoe_gpu_tokens,
 };

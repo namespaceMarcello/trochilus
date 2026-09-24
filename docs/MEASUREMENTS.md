@@ -169,8 +169,18 @@ decides | — | — |
 | 48 | **Quanto del primo prompt si nasconde dietro il tempo che l'utente impiega a scrivere?** Una fase di preparazione dichiarata (idea di Marcello, 2026-09-21): appena la sessione si apre, e prima che il prompt arrivi, il motore comincia a leggere gli esperti e lo dice («leggo il modello, 6.5 GiB»). Non elimina i 4.7 s, li mette dove non danno fastidio; costa nessun bit di precisione e non serve un processo nuovo. Da decidere: cosa leggere per primo quando ancora non si sa il prompt (l'ordine dei layer è quello giusto, il layer 0 serve per primo) | tempo fra l'apertura e il primo token, con e senza la lettura anticipata, su un prompt che arriva dopo 5, 15 e 30 secondi | è la leva più economica: nessuna struttura nuova |
 | 49 | ~~Does a process that stays up between sessions pay for what it costs?~~ **At full budget yes, at half budget little** (measured 2026-09-23, §The engine kept between commands). `trochilus serve` (built 2026-09-23, Marcello's go) keeps pool, model and store; `generate`, `logits`, `run` and `chat` run in it when its endpoint answers, byte for byte the same output (`tests/test_serve.c`). First prompt of 2048 tokens: **full budget 12.79 → 7.81 s** (the 4.98 s load gone, prefill unchanged); **half budget 13.00 → 12.04 s** (0.926×, A/A 1.020×), 139 misses fewer of 1 157. Prediction written before measuring: full loses the load (held); half gains little because the sweep evicts what the next sweep needs first, misses warm = cold (held in the mechanism, off by 12% in the misses) | where the 139 fewer misses come from (per-phase misses: prefill and decode apart); a sweep-resistant eviction at half budget (model: up to ~511 units kept, ~2.5 s) | the gap to the resident model is gone where the model fits; below budget the lever is the eviction policy |
 | 50 | **How much disk does Adaptive-K take away, and what does it change?** (Marcello's source, docs/ORIGINS.md §Sources not yet studied): a token uses fewer than 8 experts when the router is confident, the lowest-weight ones dropped until the kept ones hold a share p of the router's weight. Prediction, written first: at p = 0.9 about 5-6 experts a token, misses at half budget down 20-35%, KL against the exact mode small but not 0; the token changed in a few % of positions | route trace (`--route-trace`): per p, experts kept per token and their weight (no engine change); then a declared mode (env or flag, never the default) at half budget through `tools/ab_modes.sh` (misses, prefill, decode) and KL against the exact mode (`tools/mask_quality.sh`) | under a partial budget every expert skipped is a unit not read from disk: a lever on M1's bottleneck, if the quality holds |
-| 51 | **Can the decode's attention run on the GPU with the same bits, and what does it give at long context?** (2026-09-24, after the skip family closed, §Skipping cached positions exactly). Prediction, written first: bits identical if every float op carries an explicit `.rn` and `tr_expf` is ported whole (its double arithmetic too); per layer (16 heads) at 2048 the kernels ~150 µs (32 MiB at ~220 GB/s) and the round trip (copies of q, k, v in and the output out, launch, sync, WDDM) 30–60 µs, so 180–210 µs against the CPU's 704: the token 36.8 → ~28.7 ms (**1.28×**); at 4000 the attention 22.6 → ~5.4 ms, the token 48.1 → ~31 ms (**~1.55×**) | `tests/bench_gpu_attn.c`: the driver loaded at run time, the kernels as PTX; every query of the six dumps of `make attn-probe` against the CPU's bits, a mutation seen red; per layer at 2048 and 4000 the kernels alone, the round trip, a plain streaming read (median of ≥ 50) | the one exact lever left of the size of the KV's bytes: the same bytes read 4-5× faster, and more the longer the context |
+| 51 | ~~Can the decode's attention run on the GPU with the same bits, and what does it give at long context?~~ **Premise measured 2026-09-24** (§The decode's attention on the GPU: the premise): 0 of 25 344 head outputs differ; 185 µs a layer at 2048 and 319 at 4000 with keep-warm and zero copy (CPU 704 and 1415), 1.29× and 1.57× projected; **in the engine 1.31–1.32× at 2048 and 1.54–1.58× at 4000** with the measured width (§The decode's attention on the GPU, in the engine). (2026-09-24, after the skip family closed, §Skipping cached positions exactly). Prediction, written first: bits identical if every float op carries an explicit `.rn` and `tr_expf` is ported whole (its double arithmetic too); per layer (16 heads) at 2048 the kernels ~150 µs (32 MiB at ~220 GB/s) and the round trip (copies of q, k, v in and the output out, launch, sync, WDDM) 30–60 µs, so 180–210 µs against the CPU's 704: the token 36.8 → ~28.7 ms (**1.28×**); at 4000 the attention 22.6 → ~5.4 ms, the token 48.1 → ~31 ms (**~1.55×**) | `tests/bench_gpu_attn.c`: the driver loaded at run time, the kernels as PTX; every query of the six dumps of `make attn-probe` against the CPU's bits, a mutation seen red; per layer at 2048 and 4000 the kernels alone, the round trip, a plain streaming read (median of ≥ 50) | the one exact lever left of the size of the KV's bytes: the same bytes read 4-5× faster, and more the longer the context |
 | 52 | ~~How many tokens does a speculative pass give at long context?~~ **Closed 2026-09-24** (§Speculation at long context): 1.04-1.13 on free prose, 1.57 rewriting code, 3.29 on repetitive code (1.66x net at 4000); a pass of ~4 rows reads ~2.8x the experts. Prediction, written first: on tasks that quote or rework the prompt (rewriting code, summarizing section by section) 1.5–2.5 tokens a pass, on free prose ~1.1; the KV bytes per token divide by it, the union of the experts of a multi-row pass eats part of the gain | `run -f <task of ~2000 and ~4000 tokens> -n 256` with and without `--spec 8`: tokens, passes, tokens identical | the engine already reads the KV once per pass (`tr_attention_group`): what it is worth where the KV is 30-46% of the token |
+| 53 | **Draft on the GPU, exact verification: how often do the Q4_K and the Q8_0 of the same model pick the same token?** (2026-09-24) A Q4 copy of the model on the GPU drafts 8 tokens, the exact engine checks them in one pass (batch = token by token: the accepted tokens have exact logits). Prediction, written first: top-1 agreement 95–98% on prose and 97–99% on code (llama.cpp's int8 activations sit at KL 9e-3 from us; 4.5-bit weights move more), so 6–7.5 tokens accepted a pass of 8 on prose, 7–8 on code | teacher-forced on real text (the session's prose and code prompts, `tools/quantize_q4k.sh` makes the Q4_K): feed the Q8_0's greedy tokens to both, count top-1 agreement per position; then accepted tokens per pass of 8 | at ≥ ~95% agreement, ~600 MB read a token instead of 1200 at 2048 (dense weights and KV once per pass, experts ~5×): **~2×** on top of the GPU attention, exact by construction; the draft needs M3's Q4 model whole on the GPU |
+| 54 | **How many experts does a pass of k rows read?** (2026-09-24) Prediction, written first: against one token's experts, 1.7–1.8× at k = 2, 2.8× at 4 (measured), 4.2–5× at 8, 5.5–6.5× at 16 (it saturates at 64 / 8 = 8×) | from `--route-trace` on real text: the union of the experts of k consecutive tokens, per layer, k = 1..16 | measured 2.8× at ~4 rows (§Speculation at long context); it sets the cost of 53's verification and of speculation on any MoE, and fine-grained MoEs (256 experts) may overlap less |
+| 55 | **How close is the prefill's matmul to the CPU's peak?** (2026-09-24) Prediction, written first: 35–50% of the no-FMA peak (0.7–1.0 of ~2 TFLOP/s on 16 cores) | FLOP/s of `tr_matmul` on the real shapes (`bench_kernels`' whole-matrix lines) against the no-FMA peak of this Zen 4 (2 FMUL + 2 FADD pipes) | estimated 40-50% (~0.75 of ~2 TFLOP/s): room for a hand-written AVX-512 assembly microkernel using all 32 zmm (M2's assembly workshop; gcc spills, LESSONS #45); near the peak, none |
+| 56 | **How far does lossless compression shrink the real weights?** (2026-09-24) Prediction, written first: Q8_0's codes carry 6.3–7.0 bits of their 8 (12–20% of the code bytes), Q4_K's 3.5–3.8 of their 4 (5–12%) | entropy of the codes of Q8_0 and Q4_K per block and per tensor (and FP8/BF16 when such a model arrives); a layout that decodes at memory speed (fixed width, or block ANS) | bytes are the wall at every level (RAM, disk, PCIe) while compute idles in decode; guess ~8-12% on Q4, more on FP8/BF16 (~30% on BF16 elsewhere); for a model streamed from disk the gain is proportional |
+| 57 | **Does the KV packed in 28 bits pay on a still machine?** (2026-09-24) Prediction, written first: 1.00–1.08× on the attention zone at 2048 and 4000: the four positions decoded at a time come in the x4 order that cost 10% (§The decode's attention, one position at a time), and may eat most of the 1.13× in bytes | `build/tests/bench_kvpack.exe time --run all`, native, marker held | exact, 1.13× fewer bytes (§The KV packed in 28 bits): ~1.04× at 2048, ~1.06× at 4000 for a CPU-only machine, if decoding hides under the memory time (four positions at a time may inherit the x4 order's penalty) |
+| 58 | **The float-only exact exp in SIMD: what does it give the prefill?** (2026-09-24) Prediction, written first: the softmax and SiLU zones 3–8× faster, the prefill 1.03–1.06× at 2048–4000 | an AVX-512 and an AVX2 tier of `tests/bench_expf32.c`'s algorithm, exhaustively proven like `tr_expf`, then the prefill's softmax and SiLU zones | 3-6% of the prefill at 2048-4000; the GPU prefill needs it anyway (FP64 at 1/64 rate) |
+| 59 | **FMA in the definition?** (Marcello's decision, 2026-09-24) | the prefill's matmul with and without FMA on an ARM (Apple) and an Intel machine | about free on this Zen 4 (separate FADD pipes), up to half the peak compute on ARM and some Intel; C99 `fmaf`, FMA3, NEON and CUDA `fma.rn` keep every tier identical; changes today's bytes once |
+| 60 | **An exactly rounded dot product (Kulisch-style accumulation) as the definition?** (Marcello's decision, 2026-09-24) | the cost of an exact dot on AVX-512 VNNI with the activations' mantissas sliced in bytes, against the float lane path | a result independent of the order: any SIMD width, the GPU or a sum split across machines gives the same bits by construction, and it is more accurate; changes today's bytes once |
+| 62 | **The model scanned like a genome: is there exact structure nobody reads once?** (Marcello, 2026-09-24: a discovery comes from looking patiently at real data others filtered away) Approximate engines compress the weights with loss and never look for exact repeats; an exact engine can read anything that repeats exactly once, without changing a bit. Prediction, written first: trained weights hold almost no exact repeats (≤ 0.1% of Q8_0 blocks), the routing holds strong co-activation, the KV holds token-determined parts beyond layer 0 in no layer | a hash of every Q8_0 block (34 bytes) over the whole file: duplicates, all-zero blocks, rows shared between experts, per-tensor entropy (with 56); in the routing traces the pairs and groups of experts that fire together (co-activation arrays, for placement and file order); in the probe's dumps, any layer whose keys or values depend on the token alone | cheap, on real data, not done by anyone: most of it may give zero, like the exact skips; what repeats exactly is bytes saved exactly |
+| 61 | **Exactness as the asset for a frontier model locally** (after M4, 2026-09-24): a computation that gives the same bytes anywhere can be moved in time (the KV of your files computed while the machine idles, reused byte for byte), in space (several home machines splitting a model: their RAM bandwidth adds up), and checked (work done by an untrusted fast machine, verified by recomputing random spots) | a KV checkpoint to disk and back per 1000 tokens; one layer across two machines on a LAN (~28 KB a hop at 7168 dims); detection probability against spot-check cost | a 671B MoE reads ~20 GB a token at Q4 (0.35 s from RAM, 13 s from this disk): the wall moves only by adding bandwidth or by not paying the prefill at question time; approximate engines cannot do any of the three |
 
 Reference machine: Ryzen 9 7940HX (Zen 4, 16 core / 32 thread, AVX-512 VNNI/BF16), 31 GB
 RAM (2×16 GB DDR5-5200), NVMe Micron 1 TB, GPU RTX 4070 Laptop 8 GB and Radeon 610M (not used
@@ -1193,6 +1203,7 @@ davvero byte diviso banda, ma le bande **erano due**, e nessuna era 41:
 
 | contesto (a metà risposta) | misurato prima | formula a 41 GB/s | byte al secondo, prima | misurato dopo | formula a 48.2 GB/s | byte al secondo, dopo |
 |---|---|---|---|---|---|---|
+| 56 | 37.97 | 33.11 (−13%) | 47.0 GB/s | 38.91 | 38.91 | 48.2 GB/s |
 | 536 | 33.00 | 30.06 (−9%) | 45.0 | 35.48 | 35.32 (−0.5%) | 48.4 |
 | 2072 | 24.19 | 23.21 (−4%) | 42.7 | 27.50 | 27.27 (−0.8%) | 48.6 |
 | 4024 | 18.04 | 17.99 (−0.3%) | 41.1 | 20.91 | 21.15 (+1.2%) | 47.7 |
@@ -2731,6 +2742,135 @@ bytes first; a KV at context 2048 is 518 MiB a token:
 | a key's top 3 bytes always, the low byte on demand (graded precision) | yes | with a ≈ 1/N every product needs ~13 bits: 4–12% of elements undecided, so almost no row is | ≤ 1–2% | dead by arithmetic |
 | keys and values recomputed from the layer's input (8 KiB a position instead of 16) | yes | half the bytes, ~34 GFLOP a layer a token | a loss | dead |
 
+## The decode's attention on the GPU: the premise (2026-09-24)
+
+Question 51, measured before the engine by an agent on `tests/bench_gpu_attn.c` (native; the
+driver `nvcuda.dll` loaded at run time, no toolkit; the kernels PTX written in C and compiled by
+the driver; RTX 4070 Laptop, 8 GB GDDR6, sm_89, WDDM, driver 595.97). Three kernels a layer:
+scores (one thread per position, keys stored position-minor so a warp reads in a row, the new key
+and value appended in the same launch), exponentials (`tr_expf`'s own double arithmetic), values
+(32 dims a block, the 16-lane sum by shuffles in `tr_lane_combine`'s tree, the values streamed
+through shared memory, one warp adding them in position order). Every float operation carries
+`.rn`; no `fma`, `.approx` or `.ftz`.
+
+**Bits**: all six probe runs, every layer, head and query: 25 344 head outputs × 128 floats against
+`tr_attention_group` (scalar table), **0 differ**; 164 synthetic cases (1 to 4096 positions across
+every block border, −0, equal scores, scores landing on `tr_expf`'s exception arguments; counters:
+90 exceptions, 361 605 underflows, 93 222 subnormal `e`) 0 differ; the GPU's `tr_expf` equals the
+CPU's on all 2^32 floats. Mutations patched into the PTX at run time, all red: `.rn` dropped
+(321 124 floats differ), the dot's tree swapped, the sum's shuffle order reversed, the output
+started at −0 (red on the synthetic −0 cases), the exception table removed.
+
+**Time a layer** (16 heads, the prose ~4000 dump, 1 GiB of VRAM rotated so L2 is always cold;
+median of 64 calls, or 64 tokens × 16 layers for the bursts):
+
+| a layer | 2048 positions (CPU 704 µs) | 4000 positions (CPU 1415 µs) |
+|---|---|---|
+| kernels only | 156.7 µs (214 GB/s) | 290.8 µs (225 GB/s) |
+| a plain read of the same bytes | 140.3 µs (239 GB/s) | 266.4 µs (246 GB/s) |
+| round trip with the copy engine, back to back | 214.6 µs | 348.8 µs |
+| round trip in zero copy (the kernels read and write pinned memory), back to back | 157.9 µs | 292.5 µs |
+| **the real pattern**: 1.6 ms of CPU between calls, no keep-warm | 390 µs (p90 754), and rising over a 6 s run | 390–919 µs |
+| **the real pattern with keep-warm + zero copy** | **184.6 µs** (flat over 6 s) | **318.6 µs** |
+
+- **A laptop GPU sleeps between two layers.** At 2048 its utilization is 9–15%: the driver steps
+  down to P3–P4, the SM clock from 1605 to 255–345 MHz, the memory from 8101 to 6001 MHz, and the
+  attention gets 2–3× slower. One warp on a second stream spinning on `%globaltimer` through the
+  CPU's gap keeps P0 at 2580 / 8101 MHz: +12–17 W while decoding.
+- **Projected token**: 36.8 → 28.5 ms at 2048 (**1.29×**), 48.2 → 30.6 ms at 4000 (**1.57×**) —
+  the prediction was 1.28× and ~1.55×. With the copy engine 1.25× and 1.53×; without keep-warm
+  ~1.14× and unstable.
+- The floor of any GPU call (an empty kernel and its sync) is 6.4 µs; the exponentials cost 9–14 µs
+  a layer (FP64 at 1/64 rate): an FP32 correctly rounded exp with the double one as the fallback
+  of the hard cases would take most of it back.
+
+**The dense weights too** (M3's first piece, an agent on `tests/bench_gpu_q8.c`): the Q8_0
+matrix-vector product with `dot_row`'s bits (16 threads a row, thread l takes elements l and
+l + 16 of every block, the 16 lanes combined by shuffles in the tree's order) on the GGUF layout as
+it is: **0 of 1 091 008 floats differ** over 486 products (all 64 attention matrices, the output
+head, synthetic rows with subnormal and zero scales, −128 quants, ±0, inf, NaN); three mutations
+red (no `.rn`: ptxas does fuse the pair into FFMA, 75% of the floats change). 97% of a plain VRAM
+read on the large shapes (head 50304 × 2048: 452 µs, 242 GB/s). A token's dense weights (16 fused
+QKV, 16 output projections, the head): **2.38 ms on the GPU** with compute-engine-only round trips
+against ~7.7 ms on the CPU. The copy engine costs 35–60 µs a call on small shapes; a gap over
+~1.5 ms slows the next call (2048 × 2048: 38 → 67 µs after 5–20 ms).
+
+**Where it leads** (an agent's model, `m3plan/model.py` in the session's scratch, from the numbers
+above; ms a token, × against today's CPU on Q8_0):
+
+| placement | 512 | 2048 | 4000 |
+|---|---|---|---|
+| CPU today | 27.5 | 36.8 | 48.1 |
+| (a) the attention on the GPU | 25.8 (1.07×) | 28.7 (1.28×) | 31.2 (1.54×) |
+| (b) + the dense weights | 20.5 (1.34×) | 22.5 (1.64×) | 25.0 (1.92×) |
+| (c) + the experts that fit in VRAM, the rest on the CPU | 7.3 (3.8×) | 9.3 (4.0×) | 11.8 (4.1×) |
+| (d) Q4_K_M whole on the GPU | 4.8 | 6.8 | 9.4 |
+
+The model's own falsifiers: the exact GEMV at 180–235 GB/s (measured 242 on the head), the
+per-token overhead of ~146 dependent kernels (0.4–1.2 ms), the round trip (20–80 µs host-driven,
+5–15 through mapped flags), the burst penalty, usable VRAM (~7 GiB), cold experts per token at
+87–95% residency. The exact mix of the experts stays in one place in the definition's order (the
+8 outputs in increasing id); NaN payloads differ between x86 and NVIDIA, so the bytes are the same
+while every value is finite.
+
+## The decode's attention on the GPU, in the engine (2026-09-24)
+
+`src/backend/gpu_attn.{h,c}` in the engine (DONE), exact through it (`tools/gpu_exact.sh full`:
+logits of 2000 decode positions, tokens after 4000, a speculative run, all identical; the
+`change` stage of `decode_context.sh`: logits of 600 positions and tokens after 4000 identical to
+commit 718a84c). Then `PROF_BEFORE=build/trb.exe sh tools/decode_context.sh change build/trb.exe 6`
+(native, marker held, background load 2.57 then 1.25 logical processors, 6 rounds, before =
+718a84c, after = the GPU by default).
+
+**First A/B, without the warm-up below** (decode tok/s at 8 threads forced, median of 6; A/A ≤ 2.2%
+at 2048 and 4000, 6.0% at 512):
+
+| context | before | after | after / before (the four pairs) |
+|---|---|---|---|
+| 32 | 36.81 / 36.87 | 37.23 / 36.88 | 1.000–1.011×: not distinguishable |
+| 512 | 32.60 / 34.56 | 36.28 / 35.64 | 1.031–1.113× |
+| 2048 | 26.71 / 26.52 | 32.77 / 33.42 | **1.226–1.260×** |
+| 4000 | 21.51 / 21.12 | 27.61 / 27.02 | **1.256–1.307×** |
+
+The prefill not distinguishable (A/A up to 7.3%). The profile by zone (median of 5, 8 threads, the
+two profiles not alternated): the attention 11.76 → **3.18 ms a token at 2048** (199 µs a layer,
+170 GB/s, as the premise), but 19.72 → **10.43 ms at 4000** (652 µs a layer, twice the premise's
+305–319).
+
+**Where the other half went at 4000: the GPU was cold.** Per call of the engine's attention zone
+(`generate -p <n> -n 24..48 --profile`): 195–198 µs from 2040 to 2100 positions, then 382 at 2300,
+795–951 at 2600, 574–1079 at 3000, 685 at 4000, and 214 or 359 at 2048 in two runs of the same
+command: not a function of the context. The module alone (a scratch program through the public API,
+the decode's pattern, 12 tokens a context) is linear and steady: 166 / 183 / 205 / 236 / 302 µs at
+2048 / 2300 / 2600 / 3000 / 4000 — the same on the probe's real prose and synthetic data, with 8
+threads burning cores (303 at 4000), with 8 threads reading 64 MiB of RAM in every gap (+20 µs), and
+the engine the same with 16 or 8 pool threads. What differs is the start: after a prompt of seconds
+the GPU has idled at P5–P8, and its clocks take hundreds of ms to climb back (sampled: 1605 MHz for
+~400 ms, then 2565); over 40 decode tokens that is most of the run (436–694 µs a call), over 400 it
+is not (**315 µs a call at 3000–3400**). The decode_context runs generate 48 tokens: they measured
+the climb. **The fix** (`tr_gpu_attn_warm`): the last pass of every multi-token eval (the prompt's
+last, a speculative check) launches the keep-warm warp after each layer's write, at most 200 ms at a
+time (Windows resets a kernel near 2 s), ending at the first decode call. 40 tokens after the
+prompt, alternated with the binary without it: **3000: 508–578 → 260–264 µs a call, 29.1–30.7 →
+33.3–35.1 tok/s; 4000: 698–812 → 322–323 µs, 27.0–28.2 → 34.1–34.3 tok/s.** Bits unchanged
+(`test_gpu_attn` runs its cases with that warp napping; `gpu_exact.sh quick`).
+
+**The A/B again, with the warm-up** (the same command, 6 rounds; background load 1.23 logical
+processors after the last run; results in `build/decode_context-gpu2/`):
+
+| context | 8 threads forced: after / before (the four pairs) | measured width: after / before | prediction |
+|---|---|---|---|
+| 32 | 0.960–1.008× (A/A 2.6%): not distinguishable | 0.982–1.003× | — |
+| 512 | 1.039–1.068× | 1.044–1.069× | — |
+| 2048 | 1.195–1.276× | **1.307–1.324×** | 1.28× |
+| 4000 | 1.431–1.508× | **1.535–1.584×** | 1.57× |
+
+Worst A/A 4.0% (8 threads) and 2.1% (measured width). The profile by zone (8 threads, median of
+5): at 2048 the token 35.21 → 27.92 ms, the attention 10.51 → 3.20 ms (170 GB/s); at 4000 the
+token 44.78 → **29.75 ms (1.51×)**, the attention 20.29 → 5.20 ms (203 GB/s, 325 µs a layer: the
+premise's). The queue fix of LESSONS #159 changes no decode time (4000, 40 tokens, alternated:
+329–334 µs a call before it, 323–330 after).
+
 ## The decode's attention, one position at a time (2026-09-24)
 
 Why the CPU's decode attention reads its KV at 46-48 GB/s when a plain read of the same bytes gets
@@ -2789,6 +2929,34 @@ a synthetic block with every float class unpacks exactly, 5 escapes as designed.
 measured — four samples on the loaded machine gave anything from 1.79× faster to 1.70× slower.
 Open: the still machine's answer, and whether decoding four positions at a time inherits the x4
 order's penalty above (the packed rows would be read one at a time too).
+
+## An exact exp in float32 only, for the GPU (2026-09-24)
+
+`tr_expf` computes in double: on this GPU FP64 runs at 1/64 rate, fine for a decode token's 32 K
+exponentials, not for a GPU prefill's ~2.5 G (softmax and SiLU of a 4000-token prompt). An agent
+wrote, in `tests/bench_expf32.c`, a correctly rounded exp with float32 and int32 operations only
+(so, being correctly rounded, the same function as `tr_expf`): reduction on 256 intervals with
+`fma` (or ln2/256 in three 8-bit pieces without it), the 2^(j/256) table as 256 float pairs (2 KB),
+a degree-3 minimax polynomial, the result as a float-float pair and a rounding test with an
+absolute margin D = 2^-39 on y (the analytic worst case 2^-39.9 with fma, 2^-39.5 without);
+results below 2^-126 rounded on the subnormal grid; the ambiguous ones to a slow path in 64-bit
+fixed point on 32-bit limbs (Taylor of degree 9, margin 8 units of 2^-62 against an error under
+3.4). Every constant computed at 300 bits (mpmath) and checked by the bench.
+
+- **All 2^32 floats, both variants: 0 differ from `tr_expf`** (run as 26 one-thread slices of
+  ≤ 15 s while this session's measurement held the machine); the slow path alone over its whole
+  range [−104, 88.72], 2 239 853 081 floats: 0 differ; the largest error of the fast pair 0.32–0.37
+  of D. **9.4e-6 of the arguments** fall back (2 in 65 536 softmax arguments).
+- CPU, one thread (indicative: the machine was measuring): **3.10–3.22 ns with fma against
+  `tr_expf`'s 3.59–3.60**, 5.6 ns without fma; the slow path 82 ns. On the GPU ~31 instructions
+  (21 FP32) against `tr_expf`'s ~16 FP64 ops, ~1000 FP32 issue slots at 1/64.
+- Mutations, all seen: a table entry one ulp up (8864 wrong), D = 2^-45, the slow path's 1/6!
+  term dropped, the subnormal grid off by a binade, the low product dropped; the table's low half
+  one ulp up is an equivalent mutant (inside D's slack, every result still correctly rounded),
+  seen only by the constants check, which exists for that (LESSONS #83).
+- Not in the engine: the GPU prefill will use it (with `fma.rn`, the table in shared memory; NaN
+  payloads differ between x86 and NVIDIA). The gate builds the bench; its exhaustive run
+  (`--no-timing --slow-all --error`, ~40 s on 8 threads) enters the gate with its first user.
 
 ## Speculation at long context (2026-09-24)
 
@@ -2856,4 +3024,6 @@ machine shared with other work and are noisy); every `--spec` output identical t
 | 2026-09-24 | a row decoded once per tile of 16 tokens, then the F32 x4 kernel (not built: measured the F32 x4 kernel alone) | Q8_0 x4 43 926 / 36 771 M/s (n 2048 / 4096) | F32 x4 44 779 / 33 135 | 3% | rejected: the matmul is bound by loading the input rows, not by decoding the weights |
 | 2026-09-24 | skipping cached positions exactly (exp exactly 0; absorption in the lane sum and in the output; keys and values split in high and low 16 bits; norm, block and low-rank bounds), premise on the real model before any kernel | KV read per decode token: all of it | oracle (every value known): 0.998-1.000 of the bytes; no score 30 below its max in 65 M positions | six runs, all layers and heads | **rejected before code**: OLMoE's QK-norm keeps the attention flat (§Skipping cached positions exactly) |
 | 2026-09-24 | the KV packed in 28 bits, lossless (premise bench, `tests/bench_kvpack.c`) | 4 bytes a value | 3.53-3.55 bytes a value (1.13× fewer); 25 344 queries give the F32 attention's bits | time not measured: on the loaded machine anything from 1.79× faster to 1.70× slower | open: question 57 |
+| 2026-09-24 | the decode's attention on the GPU (`src/backend/gpu_attn`, the same bytes; keep-warm between layers, warm-up in the prompt's last pass) | decode at 8 threads, 512 / 2048 / 4000: 35.0 / 29.1 / 22.1 tok/s | 37.4 / 34.8 / 33.4 | A/A ≤ 4.0% | **kept, on by default when there is a GPU**: 1.04-1.07× / 1.20-1.28× / 1.43-1.51× (measured width: 1.31-1.32× at 2048, 1.54-1.58× at 4000) |
+| 2026-09-24 | an exact exp with float32 and int32 only, to run on the GPU at full rate (`tests/bench_expf32.c`, premise) | `tr_expf` 3.59-3.60 ns (double) | 3.10-3.22 ns with fma, 5.6 without; 0 of 2^32 differ | one thread, loaded machine | open: question 58 |
 | 2026-09-24 | the decode's attention one position at a time (`tr_attention_group` with one query runs `tr_attention_head`), the same bits | decode at 8 threads, 512 / 2048 / 4000: 35.5 / 28.3 / 22.6 tok/s; the attention zone at 2048 11.00 ms | 36.1 / 27.9 / 22.2; the zone 10.02 ms | A/A 2.9% | kept, but **not distinguishable** on a still machine (0.96-1.05×); the bench's 1.10-1.13× was measured under load (LESSONS #160) |

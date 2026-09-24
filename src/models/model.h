@@ -20,6 +20,7 @@
 #include "../base/threads.h"
 #include "../format/gguf.h"
 #include "../memory/experts.h" /* tr_experts_stats: tr_model_expert_stats */
+#include "../backend/gpu_attn.h" /* tr_gpu: tr_model_set_gpu */
 
 typedef struct {
     const char *arch;           /* general.architecture */
@@ -84,6 +85,17 @@ int tr_model_expert_stats(const tr_model *m, tr_experts_stats *out);
  * clears the mask. -1 (nothing changes) if a layer would be left with fewer experts than a token
  * uses, or memory runs out. Copies off. Not during an evaluation. */
 int tr_model_set_expert_mask(tr_model *m, const unsigned char *off);
+
+/* The decode's attention on the GPU (src/backend/gpu_attn.h): with on, opens the first CUDA device
+ * for this model, and every session created afterwards keeps its keys and values in VRAM too and
+ * runs a decode token's attention there, with the same bits; with 0, sessions created afterwards
+ * stay on the CPU (the device stays open until tr_model_free). -1 with a message when there is no
+ * usable device: nothing changes. Not while a session of this model exists. */
+int tr_model_set_gpu(tr_model *m, int on, char *err, size_t err_len);
+/* The device's name while the GPU is on for new sessions, else NULL. */
+const char *tr_model_gpu_name(const tr_model *m);
+/* Decode tokens whose attention ran on the GPU in this session (0 on the CPU). */
+int64_t tr_session_gpu_tokens(const tr_session *s);
 
 /* A conversation with room for n_ctx tokens (n_ctx <= 0: the training context, at most
  * 4096). n_batch is the most tokens run in one forward pass (<= 0: 512; never more than
@@ -238,6 +250,9 @@ typedef struct {
     int (*route_trace_begin)(void *session, int64_t max_tokens);
     const tr_route_trace *(*route_trace)(const void *session);
     int (*set_expert_mask)(void *model, const unsigned char *off);
+    /* the device new sessions use for the decode's attention, NULL: none (not owned) */
+    void (*set_gpu)(void *model, tr_gpu *gpu);
+    int64_t (*gpu_tokens)(const void *session);
 } tr_arch_vtable;
 
 #endif

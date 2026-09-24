@@ -34,9 +34,9 @@
     {
       "id": "M3",
       "titolo": "Modulo CUDA",
-      "sommario": "GPU come modulo caricabile, esperti caldi in VRAM",
-      "stato": "aperto",
-      "criterio": "stessi token della CPU; un modello più grande della RAM gira sul PC di riferimento"
+      "sommario": "la GPU esatta: prima l'attenzione del decode, poi i pesi densi, poi gli esperti in VRAM",
+      "stato": "in-corso",
+      "criterio": "stessi byte della CPU; un modello più grande della RAM gira sul PC di riferimento"
     },
     {
       "id": "M4",
@@ -154,7 +154,15 @@
       "cosa": "La memoria del contesto messa in modo che la CPU la legga di seguito invece che a salti. Il contesto lungo era il caso peggiore: adesso legge alla velocità della RAM.",
       "numeri": [
         {
-          "v": "contesto 2048: tutto il distacco da llama.cpp (1.16-1.26×) è la KV a 32 bit contro la loro a 16 (518 contro 259 MiB per token); a 16 bit darebbe 1.18×, non esatto: decide Marcello",
+          "v": "saltare posizioni in modo esatto: chiuso prima di scrivere un kernel, l'attenzione di OLMoE è piatta e anche un oracolo salta al più lo 0.2% dei byte",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "decode una posizione alla volta: esatto, tenuto; a macchina ferma sul token non si distingue (0.96-1.05×, la zona -9% a 2048); il banco dava 1.10-1.13× sotto carico",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "contesto 2048: il distacco da llama.cpp (1.16-1.26×) era la KV a 32 bit contro la loro a 16 (518 contro 259 MiB per token); la KV a 16 bit è un no (Marcello, 2026-09-24: solo esatto)",
           "d": "2026-09-24"
         },
         {
@@ -163,13 +171,14 @@
         }
       ],
       "domande": [
-        "a 16 bit la KV, sì o no? (modo dichiarato, non esatto)"
+        "la KV compressa a 28 bit, esatta, 1.13× meno byte: quanto rende a macchina ferma, su una macchina senza GPU?"
       ],
       "file": [
         "src/kv/kv.c"
       ],
       "comandi": [
-        "sh tools/decode_context.sh measure"
+        "sh tools/decode_context.sh measure",
+        "make attn-probe && tools/.venv/Scripts/python.exe tools/attn_skip_report.py <dump>"
       ],
       "dipende": [
         "kernel"
@@ -786,16 +795,87 @@
       ]
     },
     {
-      "id": "m3-cuda",
+      "id": "m3-attn",
       "tappa": "M3",
-      "titolo": "Modulo CUDA",
+      "titolo": "L'attenzione del decode sulla GPU",
+      "stato": "fatto",
+      "cosa": "Il pezzo più lento del decode a contesto lungo, l'attenzione, gira sulla GPU con gli stessi bit della CPU: ogni operazione arrotondata come la definizione, niente fusioni. Il driver si apre mentre il programma gira: chi non ha la GPU non se ne accorge. Un portatile addormenta la GPU fra uno strato e l'altro: un solo gruppo di thread la tiene sveglia.",
+      "numeri": [
+        {
+          "v": "uno strato a contesto 2048: 168 µs contro 704 della CPU; a 4000: 305 contro 1415",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "logit identici al byte attraverso il motore: 2000 posizioni di decode, i token dopo 4000, un giro speculativo",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "decode nel motore, A/B a macchina ferma: 1.31-1.32× a 2048, 1.54-1.58× a 4000 (previsto 1.29 e 1.57); il token a 4000 da 44.8 a 29.8 ms",
+          "d": "2026-09-24"
+        }
+      ],
+      "domande": [
+        "tenerla sveglia costa 12-17 W mentre genera: sempre, o solo dal contesto in cui conviene?"
+      ],
+      "file": [
+        "src/backend/gpu_attn.c",
+        "tests/test_gpu_attn.c",
+        "tools/gpu_exact.sh"
+      ],
+      "comandi": [
+        "sh tools/gpu_exact.sh full",
+        "TR_GPU=0 build/trochilus run -m <gguf> -f prompt.txt"
+      ],
+      "dipende": [
+        "kv"
+      ]
+    },
+    {
+      "id": "m3-denso",
+      "tappa": "M3",
+      "titolo": "I pesi densi sulla GPU",
+      "stato": "prossimo",
+      "cosa": "Le matrici che ogni token legge tutte (attenzione e testa di uscita, circa 395 MB a token) in VRAM, accanto alla KV. Il prodotto matrice-vettore Q8_0 sulla GPU dà gli stessi bit della CPU.",
+      "numeri": [
+        {
+          "v": "prodotto Q8_0 esatto al 97% della banda della VRAM; i pesi densi di un token 2.4 ms contro ~7.7 sulla CPU",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "modello: 1.64× a 2048, 1.92× a 4000 insieme all'attenzione",
+          "d": "2026-09-24"
+        }
+      ],
+      "domande": [],
+      "file": [
+        "tests/bench_gpu_q8.c"
+      ],
+      "comandi": [
+        "build/tests/bench_gpu_q8.exe check"
+      ],
+      "dipende": [
+        "m3-attn"
+      ]
+    },
+    {
+      "id": "m3-esperti",
+      "tappa": "M3",
+      "titolo": "Gli esperti in VRAM",
       "stato": "aperto",
       "cosa": "La GPU come modulo caricabile, non come dipendenza: chi non ce l'ha non se ne accorge. Gli esperti più caldi in VRAM, il resto in RAM e su disco, con un piano unico che decide cosa sta dove.",
-      "numeri": [],
-      "domande": [],
+      "numeri": [
+        {
+          "v": "modello: con gli esperti che stanno in VRAM ~4× a 2048 (9.3 ms a token contro 36.8)",
+          "d": "2026-09-24"
+        }
+      ],
+      "domande": [
+        "un exp esatto con soli float32 per la GPU (il prefill ne vuole miliardi, e i double lì vanno a 1/64)"
+      ],
       "file": [],
       "comandi": [],
       "dipende": [
+        "m3-denso",
         "m1-cache-sessioni",
         "m2-kquant"
       ]
@@ -813,7 +893,7 @@
       ],
       "comandi": [],
       "dipende": [
-        "m3-cuda"
+        "m3-esperti"
       ]
     },
     {
@@ -823,6 +903,10 @@
       "stato": "fatto",
       "cosa": "Indovinare più token in una volta riusando pezzi del prompt, e verificarli tutti insieme. Gli stessi token di prima, solo più in fretta quando il testo si ripete — come succede nel codice.",
       "numeri": [
+        {
+          "v": "a contesto lungo: nulla sulla prosa (1.04-1.13 token a passata), 1.57 riscrivendo codice, 1.66× netto sul codice ripetitivo; una passata di ~4 righe legge ~2.8× gli esperti",
+          "d": "2026-09-24"
+        },
         {
           "v": "--spec 0/1/4/8/15 danno lo stesso testo; il guadagno dipende dal prompt",
           "d": "2026-09-18"
@@ -891,7 +975,7 @@
       "file": [],
       "comandi": [],
       "dipende": [
-        "m3-cuda"
+        "m3-esperti"
       ]
     }
   ]

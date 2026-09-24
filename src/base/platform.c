@@ -29,6 +29,7 @@
 #  include <fcntl.h>
 #  include <io.h>
 #else
+#  include <dlfcn.h>
 #  include <errno.h>
 #  include <fcntl.h>
 #  include <sched.h>
@@ -505,6 +506,40 @@ int tr_mem_info(tr_meminfo *out) {
 #endif /* __APPLE__ */
 
 #endif /* POSIX */
+
+/* The handle is the library itself, cast: tr_lib is never defined, only pointed to. */
+tr_lib *tr_lib_open(const char *name) {
+#if defined(_WIN32)
+    /* no dialog box when the library is missing or broken: the caller reads NULL */
+    UINT old = SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
+    HMODULE h = LoadLibraryA(name);
+    SetErrorMode(old);
+    return (tr_lib *)h;
+#else
+    return (tr_lib *)dlopen(name, RTLD_NOW | RTLD_LOCAL);
+#endif
+}
+
+void *tr_lib_sym(tr_lib *lib, const char *name) {
+    if (lib == NULL) return NULL;
+#if defined(_WIN32)
+    FARPROC p = GetProcAddress((HMODULE)lib, name);
+    void *out;
+    memcpy(&out, &p, sizeof out); /* a function pointer as data, without the cast warning */
+    return out;
+#else
+    return dlsym((void *)lib, name);
+#endif
+}
+
+void tr_lib_close(tr_lib *lib) {
+    if (lib == NULL) return;
+#if defined(_WIN32)
+    FreeLibrary((HMODULE)lib);
+#else
+    dlclose((void *)lib);
+#endif
+}
 
 /* Bytes up to '\n'; the line without "\n" or "\r\n". NULL at end of input. */
 static char *read_line_bytes(FILE *in, size_t *len) {

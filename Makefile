@@ -44,7 +44,7 @@ LDLIBS  := -Wl,--no-insert-timestamp $(EXTRA_LDFLAGS)
 PY      ?= tools/.venv/Scripts/python.exe
 else
 EXE     :=
-LDLIBS  := -lpthread -lm $(EXTRA_LDFLAGS)
+LDLIBS  := -lpthread -lm -ldl $(EXTRA_LDFLAGS)
 PY      ?= tools/.venv/bin/python
 endif
 
@@ -58,6 +58,8 @@ MEM_BIN := $(BUILD)/tests/bench_mem$(EXE)
 ATTN_BIN := $(BUILD)/tests/bench_attn$(EXE)
 EXPF_BIN := $(BUILD)/tests/bench_expf$(EXE)
 DISK_BIN := $(BUILD)/tests/bench_disk$(EXE)
+# premise benches of 2026-09-24 (docs/MEASUREMENTS.md): built by the gate so they do not rot, run by hand
+RESEARCH_BIN := $(foreach b,bench_gpu_attn bench_gpu_q8 bench_attn_bw bench_kvpack bench_expf32,$(BUILD)/tests/$(b)$(EXE))
 
 .PHONY: all attn-probe test check-gcc check-clang check-asan check-tsan check-tiny check-real check-cut oracle tier-check oracle-tokenizer chat-check oracle-real spec-check bench bench-mem bench-attn bench-expf bench-disk lint profile check check-linux clean-machine clean platform-guard quick
 all: $(BUILD)/trochilus$(EXE)
@@ -292,7 +294,8 @@ clean-machine:
 	sh tools/test_ab_modes.sh
 ifeq ($(OS),Windows_NT)
 check: clean-machine lint
-	$(MAKE) WERROR=1 all $(TEST_BIN) $(BENCH_BIN) $(MEM_BIN) $(ATTN_BIN) $(EXPF_BIN) $(DISK_BIN) $(BUILD)/tests/dump_rope$(EXE) $(BUILD)/tests/dump_dequant$(EXE)
+	$(MAKE) WERROR=1 all $(TEST_BIN) $(BENCH_BIN) $(MEM_BIN) $(ATTN_BIN) $(EXPF_BIN) $(DISK_BIN) $(BUILD)/tests/dump_rope$(EXE) $(BUILD)/tests/dump_dequant$(EXE) \
+		$(RESEARCH_BIN)
 	@# the diagnostic probe's branch of olmoe.c (make attn-probe) still compiles, with 0 warnings
 	$(CC) $(filter-out -MMD -MP,$(CFLAGS)) -Werror -DTR_ATTN_PROBE -fsyntax-only src/models/olmoe.c tools/attn_probe.c
 	@# the models volume, when it exists, replaces models/ read over the Windows bind mount:
@@ -306,6 +309,9 @@ check: clean-machine lint
 	@# the C tests once more on Windows itself: its branches of src/base never run in the container
 	@# (docs/LESSONS.md #103, #106); a binary Smart App Control blocks is SKIPPED, not failed
 	sh tools/native_tests.sh $(TEST_BIN)
+	@# the decode's attention on this machine's GPU gives the CPU's bytes through the whole engine
+	@# (the real model's 2-layer cut; skipped without a GPU, the cut, or with the exe blocked)
+	sh tools/gpu_exact.sh quick $(BUILD)/trochilus$(EXE)
 	@echo "== check passed in $$(( $$(date +%s) - $$(cat $(BUILD)/.check-start) )) s (native Windows build: 0 warnings, C tests natively; tests, ASan and oracles: Linux)"
 else
 check: clean-machine lint check-linux
