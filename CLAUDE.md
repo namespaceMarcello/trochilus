@@ -8,6 +8,13 @@ token against transformers. Born by taking the best of colibri (Apache-2.0) and 
 C11 + intrinsics (and assembly where measured), a Makefile, gcc/clang/MinGW-w64; the Python tools
 (`tools/.venv`: torch CPU + transformers) serve conversion and oracles only.
 
+**The spirit: read the project like a genome** (Marcello, 2026-09-24). Every byte of the weights,
+the KV, the routing and the engine's time is data to sequence patiently, where others filtered it
+away. Measure before believing; write the prediction before measuring; invent the next idea from
+the numbers; push every lever to the limit the hardware allows (the peak FLOP/s, the bandwidth, the
+exact bytes), not to "good enough". A premise that gives zero is a discovery too: written, closed,
+next. Pioneer: what nobody has measured is where to look first.
+
 ---
 
 ## How to work
