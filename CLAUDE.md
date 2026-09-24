@@ -102,7 +102,9 @@ tools/.venv/Scripts/python.exe tools/<script>.py        # on Linux/macOS: tools/
 **Every other command is in `docs/COMMANDS.md`**: oracles per model and per platform, benches
 (`bench-disk`, `bench-mem`, `bench-attn`, `bench-expf`), the native measurements with their guards
 (`experts_budget.sh`, `prefill_overlap.sh`, `decode_context.sh`, `threads_phase.sh`,
-`ab_modes.sh`), the mutations, the Python reports, the map of the project.
+`ab_modes.sh`), the mutations, the Python reports, the map of the project. A change to the decode is
+measured with `sh tools/decode_context.sh change-short <binary-before>` (~40 min; the full `change`,
+~90 min, only for what every token pays whatever its context: docs/ARCHITECTURE.md §Profiling).
 
 Before delivering: `make check` green. On Windows correctness runs in Docker
 (`trochilus-dev:local`): Smart App Control blocks freshly compiled binaries (LESSONS #12).

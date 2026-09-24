@@ -157,7 +157,8 @@ void tr_attention_head(const float *q, const float *keys, const float *values, i
  * changes is the order in memory: a block of TR_ATTN_BLOCK positions meets every query of the
  * group while it sits in the cache, so the keys and the values come from memory once per group
  * instead of once per query (docs/MEASUREMENTS.md "Prefill su prompt lunghi"). A decode token is a
- * group of one.
+ * group of one, and runs as tr_attention_head: position by position, one ascending stream the
+ * prefetcher follows (docs/MEASUREMENTS.md "The decode's attention, one position at a time").
  * scores: n_q rows of scratch owned by the caller, row j at scores + j*score_stride and at
  * least first_n_pos + j floats long. */
 void tr_attention_group(const float *q, int64_t q_stride, const float *keys, const float *values, int64_t n_q,

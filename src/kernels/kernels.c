@@ -550,6 +550,16 @@ void tr_attention_head(const float *q, const float *keys, const float *values, i
 void tr_attention_group(const float *q, int64_t q_stride, const float *keys, const float *values, int64_t n_q,
                         int64_t first_n_pos, int64_t head_dim, float scale, float *scores, int64_t score_stride,
                         float *out, int64_t out_stride) {
+    /* One query (a decode token) goes position by position: tr_attention_head's single dot and
+     * axpy read each key and value row as one ascending stream, which the prefetcher follows;
+     * the x4 kernels read four rows 512 bytes apart a cache line of each in turn, and a lone query
+     * shares nothing across them. Same bits (the x4 kernels are four calls by contract), the
+     * decode's attention 1.10-1.13x faster (docs/MEASUREMENTS.md "The decode's attention, one
+     * position at a time"). */
+    if (n_q == 1) {
+        tr_attention_head(q, keys, values, head_dim, 0, first_n_pos, head_dim, scale, scores, out);
+        return;
+    }
     const tr_kernels *k = g_active != NULL ? g_active : tr_kernels_scalar();
     int64_t last_n_pos = first_n_pos + n_q - 1;
     for (int64_t t0 = 0; t0 < last_n_pos; t0 += TR_ATTN_BLOCK) {

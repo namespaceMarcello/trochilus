@@ -2731,6 +2731,50 @@ bytes first; a KV at context 2048 is 518 MiB a token:
 | a key's top 3 bytes always, the low byte on demand (graded precision) | yes | with a ≈ 1/N every product needs ~13 bits: 4–12% of elements undecided, so almost no row is | ≤ 1–2% | dead by arithmetic |
 | keys and values recomputed from the layer's input (8 KiB a position instead of 16) | yes | half the bytes, ~34 GFLOP a layer a token | a loss | dead |
 
+## The decode's attention, one position at a time (2026-09-24)
+
+Why the CPU's decode attention reads its KV at 46-48 GB/s when a plain read of the same bytes gets
+52-54 (an agent on `tests/bench_attn_bw.c`: `bench_mem`'s cache shape, 64 MiB of other memory
+through the caches between layers, every run on a different layer so no layer survives in L3 —
+two runs on the same layer back to back read at 55 GB/s instead of 47; the machine was loaded by
+other agents, so steps paired one by one and only the quiet ones kept). Timed inside each worker at
+2048 on 8 threads (µs a layer): the engine K 351.9, softmax 18.9, V 319.4, 36.4 waiting at the end;
+a plain read K 323.0, V 297.1, 31.2 waiting. **The gap is in the K and V passes, and it is the x4
+kernels' order**: `dot_f32_x4`/`axpy_f32_x4` read four rows 512 bytes apart a cache line of each
+in turn (lines 0, 8, 16, 24, 1, 9, ...), which the prefetcher does not follow as one stream; the
+same reads in that order with no arithmetic run at 0.82-0.86× of the engine.
+
+| variant (8 threads, 2048 unless said; ratio = engine time ÷ variant time, median of the quiet steps) | ratio |
+|---|---|
+| engine against its own copy (A/A) | 0.995-1.007 |
+| **one position at a time** (`tr_attention_head`) | **1.101** [1.066-1.134]; 1.130 in a busier session; AVX2 tier 1.093; at 4000 **1.133** |
+| x4 kernels + a prefetch of every line 4 KiB ahead | 1.084-1.145; at 4000 1.124-1.151 (2 and 8 KiB, `nta`: the same; 16 KiB, `t1`/`t2`: worse) |
+| one position at a time + prefetch | 1.095: nothing more |
+| exponentials hidden (fused passes; two heads interleaved) | no gain: other threads keep the bus busy meanwhile |
+| one position at a time on 4 / 6 / 8 / 12 / 16 threads | 1.079 / 1.096 / 1.100 / 1.102 / 1.103 |
+| the K pass split over threads, then softmax and V per head | worse (1.068-1.085) |
+| a plain read of the same bytes (the ceiling) | 1.100-1.160 |
+
+Every variant gave the engine's bits in every layer at 1, 5, 65, 2047, 2048 and 4000 positions on
+the AVX-512 and AVX2 tiers; a mutant (V blocks reversed) differs in every layer. Huge pages need
+SeLockMemoryPrivilege (`VirtualAlloc(MEM_LARGE_PAGES)` fails with 1314): not available. What is
+left after the fix (51.4-52.1 GB/s against 52.3-53 for the plain read) is the end-of-layer wait
+and the 1 MiB streams of a head. **Built**: `tr_attention_group` takes a group of one position by
+position (`src/kernels/kernels.c`; test: `test_attention_group` covers both branches). Prediction
+for the engine on a still machine, written first: the attention zone 11.26 → 10.0-10.2 ms at 2048
+and 22.64 → 20.0-20.2 at 4000, the token **~1.03× and ~1.05×**.
+
+**Measured: not distinguishable on a still machine.** `TR_GPU=0 PROF_BEFORE=build/trb.exe sh
+tools/decode_context.sh change-short build/trb.exe 6` (the short protocol's first run; logits of
+600 positions and tokens after 4000 identical to 718a84c; background load 1.12 logical processors
+after the last run; `build/decode_context/`), decode at 8 threads, after / before over the four
+pairs: 512 1.004–1.047×, 2048 0.959–1.002×, 4000 0.978–1.007×, worst A/A 2.9%. The profile by zone:
+the attention 2.68 → 2.62 ms at 512, **11.00 → 10.02 ms at 2048** (49.4 → 54.2 GB/s), 20.67 →
+20.48 at 4000. On a still machine the engine before already read its KV at 49–52 GB/s, not the
+46–48 of the bench's loaded sessions: the x4 order costs little when nothing else fights for the
+memory, and the bench's 1.10–1.13× (1.15–1.25 per repetition under more load) was mostly that
+contention (LESSONS #160). Kept: exact, never slower, and it helps on a loaded machine.
+
 ## The KV packed in 28 bits: the premise (2026-09-24)
 
 An agent on `tests/bench_kvpack.c` built the lossless format of §Skipping cached positions exactly
@@ -2812,3 +2856,4 @@ machine shared with other work and are noisy); every `--spec` output identical t
 | 2026-09-24 | a row decoded once per tile of 16 tokens, then the F32 x4 kernel (not built: measured the F32 x4 kernel alone) | Q8_0 x4 43 926 / 36 771 M/s (n 2048 / 4096) | F32 x4 44 779 / 33 135 | 3% | rejected: the matmul is bound by loading the input rows, not by decoding the weights |
 | 2026-09-24 | skipping cached positions exactly (exp exactly 0; absorption in the lane sum and in the output; keys and values split in high and low 16 bits; norm, block and low-rank bounds), premise on the real model before any kernel | KV read per decode token: all of it | oracle (every value known): 0.998-1.000 of the bytes; no score 30 below its max in 65 M positions | six runs, all layers and heads | **rejected before code**: OLMoE's QK-norm keeps the attention flat (§Skipping cached positions exactly) |
 | 2026-09-24 | the KV packed in 28 bits, lossless (premise bench, `tests/bench_kvpack.c`) | 4 bytes a value | 3.53-3.55 bytes a value (1.13× fewer); 25 344 queries give the F32 attention's bits | time not measured: on the loaded machine anything from 1.79× faster to 1.70× slower | open: question 57 |
+| 2026-09-24 | the decode's attention one position at a time (`tr_attention_group` with one query runs `tr_attention_head`), the same bits | decode at 8 threads, 512 / 2048 / 4000: 35.5 / 28.3 / 22.6 tok/s; the attention zone at 2048 11.00 ms | 36.1 / 27.9 / 22.2; the zone 10.02 ms | A/A 2.9% | kept, but **not distinguishable** on a still machine (0.96-1.05×); the bench's 1.10-1.13× was measured under load (LESSONS #160) |

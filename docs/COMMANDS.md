@@ -34,8 +34,9 @@ build/trochilus serve --status | --stop   # what it keeps, how many requests and
 sh tools/serve_first_prompt.sh [rounds]   # question 49: first prompt, new process against a kept store, half and full budget, wall_ms and misses
 build/trochilus run ... --decode-threads 8   # force decode threads (default: measured per session)
 sh tools/threads_phase.sh sweep | widths | after <binary before>   # threads per phase: -t 4/8/12/16, forced widths
-sh tools/decode_context.sh measure | widths | long | change <before>   # decode at 32/512/2048/4000 context: A/A, forced widths, bytes per zone
+sh tools/decode_context.sh measure | widths | long | change <before> | change-short <before>   # decode at 32/512/2048/4000 context: A/A, forced widths, bytes per zone; change-short, THE DEFAULT for a change: exactness, forced 8 at 512/2048/4000, the profile after (~40 min)
 tools/.venv/Scripts/python.exe tools/decode_context_report.py speed|model|zones <file>   # MEASUREMENTS tables from runs; speed counts choices and changes
+build/tests/bench_attn_bw.exe 2048 --runs 19 [variant...]   # why the CPU's decode attention reads below the RAM's speed: variants (engine, head, prefetch, read, read4, mutant) paired step by step, bits checked
 build/tests/bench_kvpack.exe roundtrip | bits | time [--run <name>|all]   # the KV packed in 28 bits, lossless: round trip, the attention's bits on the probe dumps, time against F32 (KVPACK_PROBE_DIR)
 make attn-probe   # build/probe/trochilus: a diagnostic engine that writes each decode token's q, K, V and output (tools/attn_probe.c); never the engine
 TR_PROBE_DIR=<dir> TR_PROBE_KV_AT=<prompt tokens + n> build/probe/trochilus.exe run -m <gguf> -f <prompt> -n <n> -t 8   # the dump: K and V at the last token, q and the output of every token

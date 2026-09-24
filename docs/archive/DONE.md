@@ -1029,3 +1029,15 @@ what each criterion would skip. On six real runs (prose, code, synthetic; ~2000 
 whole family closed (MEASUREMENTS §Skipping cached positions exactly, LESSONS #152). The gate
 compiles the probe's branch of `olmoe.c` (0 warnings). Check: `make attn-probe`, then the two
 commands in `docs/COMMANDS.md`.
+
+### 2026-09-24 — The decode's attention one position at a time
+A decode token's attention read its KV at 46-48 GB/s where a plain read of the same bytes gets 52-54:
+the x4 kernels read four rows 512 bytes apart a cache line of each in turn, an order the prefetcher
+does not follow, and a lone query shares nothing across the four. `tr_attention_group` now takes a
+group of one position by position (`tr_attention_head`): same bits, the attention 1.10-1.13× in the
+agent's bench under load, not distinguishable a token on a still machine (the zone −9% at 2048;
+`tests/bench_attn_bw.c`, MEASUREMENTS §The decode's attention, one position at a time). With it the
+short measurement protocol, the default from now on: `sh tools/decode_context.sh change-short
+<before>` (exactness, 8 threads at 512 / 2048 / 4000 with A/A, the profile after; ~40 min). Tests: `test_attention_group` covers both branches; a mutation of the new branch red (140
+mismatches); on the real model logits of 600 positions and the tokens after 4000 identical to
+commit 718a84c. Check: `make check`; `build/tests/bench_attn_bw.exe 2048 --runs 19`.

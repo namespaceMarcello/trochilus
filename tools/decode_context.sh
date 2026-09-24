@@ -31,6 +31,18 @@
 #       default width and with the decode forced on 8; then bench_mem and the profile of the new
 #       binary. About 90 minutes. PROF_BEFORE=<binary> profiles that binary too (profile-before):
 #       a binary older than the bytes per zone has no such numbers, its twin built with them has.
+#   sh tools/decode_context.sh change-short <binary-before> [rounds, default 6]
+#       THE DEFAULT for measuring a change (Marcello, 2026-09-24): exact as in `change`, then
+#       speed-d8-short, the decode forced on 8 at contexts 512, 2048 and 4000, each with its A/A
+#       copy, then the profile of the new binary on those three scenarios
+#       (bench/scenarios-decode-context-d8.json; PROF_BEFORE=<binary> profiles that one too). About
+#       40 minutes instead of 90. What it leaves out: context 32 (the attention is 2% of the token
+#       there), the measured width (the noisiest, and a matter of its own) and bench_mem (a fact of
+#       the machine, not of the change). Short for what grows with the context (attention on CPU
+#       or GPU, the KV cache and its layout); the full `change` for what every token pays at any
+#       context (weights' kernels and types, expert store, norms, RoPE, router, experts' path, pool,
+#       pinning, threads per phase and the width's estimator), and when the short one surprises at
+#       512 (docs/ARCHITECTURE.md §Profiling).
 #
 # The order of the 16 modes of a session holds every context after every context once (a de
 # Bruijn sequence over the 4 contexts): a run on the machine a 4000-token prompt has just heated
@@ -58,7 +70,8 @@ case "$WHAT" in
   measure|widths) R=${2:-8} ;;
   long) R=${2:-5} ;;
   change) BEFORE=$2; R=${3:-8}; [ -f "$BEFORE" ] || { echo "decode_context: no binary '$BEFORE'"; exit 2; } ;;
-  *) echo "usage: decode_context.sh measure [rounds] | widths [rounds] | long [runs] | change <binary-before> [rounds]"; exit 2 ;;
+  change-short) BEFORE=$2; R=${3:-6}; [ -f "$BEFORE" ] || { echo "decode_context: no binary '$BEFORE'"; exit 2; } ;;
+  *) echo "usage: decode_context.sh measure [rounds] | widths [rounds] | long [runs] | change <binary-before> [rounds] | change-short <binary-before> [rounds]"; exit 2 ;;
 esac
 mkdir -p $OUT
 [ -f $B ] && [ -f $MEMB ] && [ -f $M ] || { echo "decode_context: $B, $MEMB or $M is missing"; exit 1; }
@@ -153,6 +166,22 @@ session() {
   sed -n '/^medians/,$p' $OUT/$NAME.txt
 }
 
+# The same over three contexts (change-short): 512 2048 4000 in the order 0 0 1 0 2 1 1 2 2 0 1 2,
+# which holds every ordered pair of contexts once and every context four times; the first two
+# take the two modes, the last two their A/A copies.
+session_short() {
+  NAME=$1; LA=$2; BA=$3; AA=$4; LB=$5; BB=$6; AB=$7
+  a() { echo "$LA-$1$3=$(gen $BA $1 $2 "$AA")"; }
+  b() { echo "$LB-$1$3=$(gen $BB $1 $2 "$AB")"; }
+  echo "##### $NAME"
+  cleanup_run sh tools/ab_modes.sh $R \
+     "$(a 512 600)" "$(b 512 600)" "$(a 2048 2200)" "$(a 512 600 -again)" \
+     "$(a 4000 4096)" "$(b 2048 2200)" "$(a 2048 2200 -again)" "$(b 4000 4096)" \
+     "$(a 4000 4096 -again)" "$(b 512 600 -again)" "$(b 2048 2200 -again)" "$(b 4000 4096 -again)" \
+     > $OUT/$NAME.txt
+  sed -n '/^medians/,$p' $OUT/$NAME.txt
+}
+
 # Before any speed: the two binaries give the same numbers on the real model, or there is
 # nothing to compare. `logits -b k` writes one row per pass of k tokens, the last token's:
 # 600 positions one token a pass (the decode, context growing to 600), then passes of 64 on 8
@@ -214,6 +243,13 @@ elif [ "$WHAT" = measure ]; then
   bench_mem measure
   session speed auto $B "" d8 $B "--decode-threads 8"
   profile measure $B
+elif [ "$WHAT" = change-short ]; then
+  exact > $OUT/exact.txt 2>&1 || { cat $OUT/exact.txt; echo "decode_context: before and after differ, nothing to measure"; exit 4; }
+  cat $OUT/exact.txt
+  session_short speed-d8-short before8 $BEFORE "--decode-threads 8" after8 $B "--decode-threads 8"
+  SCEN=bench/scenarios-decode-context-d8.json
+  [ -z "$PROF_BEFORE" ] || profile before-short $PROF_BEFORE
+  profile change-short $B
 else
   # in a || list set -e is off inside the function: every comparison returns by itself
   exact > $OUT/exact.txt 2>&1 || { cat $OUT/exact.txt; echo "decode_context: before and after differ, nothing to measure"; exit 4; }

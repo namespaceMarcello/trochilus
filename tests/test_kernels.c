@@ -787,7 +787,8 @@ static void test_attention_head(void) {
  * scores included, and nothing is written outside its own slice of the output or past the end
  * of its own row of scores. Groups start and
  * end all around the borders of a block of positions (TR_ATTN_BLOCK) and of the 4 positions of
- * an x4 kernel; strides are wider than what is used. */
+ * an x4 kernel; strides are wider than what is used. Both branches: groups of 1 (a decode token,
+ * position by position) and groups of 2 to 19 (blocks and the x4 kernels). */
 static void test_attention_group(void) {
     enum { MAX_POS = 300, MAX_DIM = 130, MAX_Q = 19, SCORE_STRIDE = MAX_POS + 7 };
     static const int64_t dims[] = {1, 5, 16, 100, 128};
