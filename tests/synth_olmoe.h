@@ -1,6 +1,7 @@
 /* synth_olmoe.h — writes a synthetic OLMoE GGUF (deterministic weights) of any size, so
  * model tests need no external fixture or Python tool. Norms are f32; matrices are f32, f16,
- * Q8_0 (then every matrix row length, n_embd and n_ff, must be a multiple of 32) or Q4_K (of 256). */
+ * Q8_0 (then every matrix row length, n_embd and n_ff, must be a multiple of 32), Q4_K or Q6_K (of
+ * 256). */
 #ifndef TR_TEST_SYNTH_OLMOE_H
 #define TR_TEST_SYNTH_OLMOE_H
 
@@ -15,7 +16,7 @@
 
 typedef struct {
     uint32_t layers, n_embd, n_head, n_head_kv, n_ff, n_expert, n_used, vocab, ctx;
-    tr_type type; /* of the 2-D and 3-D tensors: TR_TYPE_F32, TR_TYPE_F16, TR_TYPE_Q8_0 or TR_TYPE_Q4_K */
+    tr_type type; /* of the 2-D and 3-D tensors: TR_TYPE_F32, F16, Q8_0, Q4_K or Q6_K */
 } synth_params;
 
 /* Set to 1 before synth_write: the router's matrix is F32 whatever `type` is, as in every real
@@ -223,6 +224,27 @@ static void synth_tensor(synth_buf *hdr, synth_buf *data, const char *name, int 
                 }
                 synth_put(data, &v, 1);
             }
+        }
+        return;
+    }
+    if (type == TR_TYPE_Q6_K) {
+        /* quants and int8 scales random, d in [2^-14, 2^-13) (exponent bits 1) at the block's
+         * end: weights d*sc*(q-32) below 0.5, most below 0.1 */
+        for (uint64_t b = 0; b < n / 256; b++) {
+            for (int k = 0; k < 208; k++) {
+                uint8_t v = 0;
+                if (!zero) {
+                    seed = seed * 1103515245u + 12345u;
+                    v = (uint8_t)(seed >> 16);
+                }
+                synth_put(data, &v, 1);
+            }
+            uint16_t d = 0;
+            if (!zero) {
+                seed = seed * 1103515245u + 12345u;
+                d = (uint16_t)((1u << 10) | ((seed >> 16) & 0x3FFu));
+            }
+            synth_put(data, &d, sizeof d);
         }
         return;
     }

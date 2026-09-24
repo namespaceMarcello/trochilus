@@ -77,7 +77,8 @@ same ≥ 99% on 1000 code tokens | coding levers (files already read, long conte
 KV read **slower than weights**: 32-36 GB/s vs 47-54, one head reading 512 bytes every 8 KiB.
 With one head's positions in a row KV reads at 47 GB/s and 32-512 decode loses 8.8% (38.9 →
 35.5), cost of extra bytes. Measured: §Decode at long context. Comparison with llama.cpp
-alternating runs stays question 19 | — | — |
+alternating runs stays question 19. At 2048 (2026-09-24, §Decode at context 2048): the whole gap
+(1.16–1.26×) is our F32 KV against their F16, 518 against 259 MiB per token; the lever is point 6 | — | — |
 | 19 | Decode 4-16 threads: is llama.cpp really ahead 8-12%? | `tools/speed_compare.py` two engines
 alternating run per run in same session (between sessions llama.cpp median moved 3-7%) | says
 if leverage in multi-thread decode or just noise |
@@ -2463,6 +2464,96 @@ System). Tokens/s, series a / b; `build/race_q4k/`.
   one): no loss, where 0.8–1.0× was predicted, the dequantization hidden behind the x4 kernel;
 - against llama.cpp on the same Q4_K file: their decode 1.07× ours at 16 threads, 1.17× at 8 (one
   series each), their prefill 2.1× and 1.8× (their 8-bit activations).
+
+## Q6_K on the CPU, and the Q4_K_M model (2026-09-24)
+
+M2's second step: Q6_K weights against float activations, exact as Q4_K is (scalar the definition,
+gguf-py bit for bit in `tools/check_dequant.py`, AVX2 and AVX-512 bit for bit the scalar), so that
+Q4_K_M, the file people download, runs: for OLMoE's 64 experts llama-quantize puts Q6_K in
+`output.weight` and in `attn_v` and `ffn_down_exps` of 8 of the 16 layers (17 tensors), Q4_K
+elsewhere. The SIMD kernels unpack a block's 256 quants once into q − 32 as int8 (ik_llama.cpp's
+DequantizerQ6K), then go as Q8_0 does: widen, convert, multiply by the sub-block's scale. No lookup:
+a sub-block is 16 weights of 64 possible values, so building the table costs 4 multiplies per 16
+weights before any lookup, against one conversion and one multiply without it.
+
+**Prediction, written before measuring.** Microbenchmark (rows in cache): AVX-512 and AVX2 Q6_K
+0.85–1.0× Q8_0's elements per second in dot_row and x4 (the per-element path is Q8_0's, the unpack
+~20 instructions per 256 elements and 16 scale products per block on top), so above Q4_K on AVX2
+(0.53–0.63×) and about equal to it on AVX-512; scalar 0.4–0.5× Q8_0 (the bit picking per element).
+Real model: Q4_K_M reads per generated token ~10% more bytes than Q4_K (output.weight 80.6 against
+58 MiB, half the layers' ffn_down at 0.82 against 0.56 bytes per weight: ~730 against ~660 MB), so
+decode 0.90–0.95× Q4_K; prefill, where compute counts, 0.95–1.05×.
+
+**Microbenchmark** (`sh tools/bench_kernels.sh`: native, a copy one byte longer, the machine's
+marker, still machine; declared load 3.6 before and 2.5 after, ~0.25 of it System; median of 7 runs
+of 200 ms; one core; rows in cache). Millions of elements per second, n = 2048 / 4096;
+`build/bench_kernels/`.
+
+| tier | dot_row Q8_0 | dot_row Q4_K | dot_row Q6_K | Q6_K / Q8_0 | x4 Q8_0 | x4 Q4_K | x4 Q6_K | Q6_K / Q8_0 |
+|---|---|---|---|---|---|---|---|---|
+| scalar | 1660 / 1921 | 888 / 827 | 553 / 573 | 0.30–0.33 | 2688 / 2705 | 1844 / 1836 | 1526 / 1527 | 0.56–0.57 |
+| avx2 | 18521 / 19024 | 10296 / 10844 | 13792 / 15191 | 0.74–0.80 | 41812 / 37521 | 28673 / 28884 | 36798 / 36179 | 0.88–0.96 |
+| avx512 | 21399 / 21711 | 17336 / 17902 | 18130 / 18527 | **0.85** | 44234 / 37448 | 37455 / 36934 | 39342 / 37436 | **0.89–1.00** |
+
+Spread under 1.2% on the AVX-512 lines, 19–56% on AVX2's (a ratio there holds to ±20%). Against the
+prediction: AVX-512 in the range (0.85–1.0), AVX2 a little below it on the single row (0.74–0.80:
+the 256-byte unpack, stored and reloaded, weighs on a row that has only one input to spread it
+over; on x4 it is spread over four, 0.88–0.96), scalar below it (0.30–0.33: the bit picking per
+element costs more than guessed; scalar is the definition, not a path any x86-64 CPU runs). Q6_K is
+faster than Q4_K per element on both SIMD tiers (AVX2 1.3–1.4×, AVX-512 1.05×): Q4_K's AVX2 path
+pays a shift or a mask, a conversion, a multiply and a subtraction per element, Q6_K's a conversion
+and a multiply.
+
+**Exactness on the real model.** The Q4_K_M file (`sh tools/quantize_q4k.sh m`, llama-quantize from
+our Q8_0 without --pure: 4.21 GB, 17 tensors Q6_K), cut to 2 layers (where attn_v, ffn_down_exps
+and output are all Q6_K), against transformers on its own dequantized weights (`make oracle-real`
+with `REAL_MODEL_Q4KM`, in `make check`): 27 + 32 and 1024 + 32 tokens, greedy 32/32 on both, logits
+within 1.3e-5 and 1.96e-4, argmax 1056/1056, every batch size bit-identical to one token per pass.
+The whole model writes what the Q4_K writes on "The capital of France is".
+
+**Real model, Q4_K_M against Q4_K** (`sh tools/race_q4k.sh 5 m`: container, all in RAM, prompt 512,
+128 generated, median of 5 after a warm-up, order Q4_K_M Q4_K Q4_K Q4_K_M, then llama.cpp on the
+Q4_K_M; marker held, still machine before each series, declared load 2.5 before and 3.2 after).
+Tokens/s, series a / b; `build/race_q4km/`.
+
+| threads | Q4_K_M prefill | Q4_K prefill | Q4_K_M decode | Q4_K decode | llama.cpp Q4_K_M prefill | llama.cpp Q4_K_M decode |
+|---|---|---|---|---|---|---|
+| 16 | 210.2 / 207.5 | 211.1 / 214.3 | **45.1 / 44.6** | 48.0 / 47.8 | 418.7 | 49.0 |
+| 8 | 184.4 / 181.2 | 180.4 / 180.5 | **44.7 / 42.8** | 45.9 / 45.0 | 317.1 | 49.6 |
+
+- decode **0.93–0.94× Q4_K at 16 threads**, 0.95–0.97× at 8 (A/A 0.5% and 2% for Q4_K, 1.2% and
+  4.4% for Q4_K_M): inside the prediction (0.90–0.95×), the ~10% more bytes per token of the Q6_K
+  tensors;
+- prefill 0.97–0.99× at 16 threads, 1.00–1.02× at 8: the same, as predicted;
+- against llama.cpp on the same Q4_K_M: their decode 1.09–1.10× ours at 16 threads, 1.11–1.16× at 8
+  (on the Q4_K it was 1.07× and 1.17×), their prefill 2.0× and 1.7× (their 8-bit activations).
+
+## Decode at context 2048: where the gap with llama.cpp is (2026-09-24)
+
+Question 18, before writing any code: llama.cpp decodes 1.16× faster than us at 16 threads and 1.26×
+at 8 at context 2048, 1.04–1.09× at 512 (§Speed — again). Profile by zone on the current binary
+(`tools/profile_suite.py` on the two 2048 scenarios of `bench/scenarios-decode-context.json`,
+native, a copy one byte longer; marker held, still machine, declared load 2.4 before and 2.2
+after; median of 5; tokens identical in every run and thread count; `build/prof2048.txt`).
+
+| zone (decode, Q8_0, context 2048) | 8 threads: ms/token | share | MiB read/token | GB/s |
+|---|---|---|---|---|
+| attention | 11.26 | 30.6% | 518 (KV) | 48 |
+| expert_gate_up | 11.07 | 30.1% | 544 | 51 |
+| expert_down | 5.58 | 15.1% | 272 | 51 |
+| qkv_proj | 4.24 | 11.5% | 204 | 50 |
+| lm_head | 2.11 | 5.7% | 104 | 51 |
+| attn_out_proj | 1.83 | 5.0% | 68 | 38 |
+| token | 36.83 (27.15 tok/s) | | 1718 | 49 |
+
+At 16 threads the same within 2% (26.73 tok/s). Every zone reads memory at 38–51 GB/s of the ~57
+the machine gives (question 4): the decode is the bytes it reads. Our KV cache is F32, 518 MiB per
+token at 2048; llama.cpp's is F16 by default, 259. Halving the attention's bytes at the same speed
+takes 5.6 ms of 36.8: **1.18×, the whole measured gap** (1.16–1.26×). The exact side has little left:
+attention at 48 GB/s against the weights' 51 (≤ 0.7 ms, 2%), attn_out_proj at 38 (≤ 0.5 ms, 1.3%).
+No code written: the lever is the KV at 16 bits, a declared mode that is not exact (Next steps
+point 6, question 36, Marcello's call). With Q4_K weights (~660–730 MB per token instead of 1200)
+the KV is ~43% of the decode at 2048 and the same lever gives ~1.25×.
 
 ## Attempts
 

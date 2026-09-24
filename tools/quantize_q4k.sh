@@ -3,12 +3,15 @@
 # download (M2, first step). --pure: every matrix llama-quantize quantizes becomes Q4_K, none Q6_K
 # as Q4_K_M would mix them (the router and the norms stay F32, as llama-quantize keeps them);
 # --allow-requantize: the source is already quantized, so these weights are Q8_0's rounded again,
-# a model for the engine's speed and exactness, not for its quality. Runs in the trochilus-dev
-# container, on the models volume:
+# a model for the engine's speed and exactness, not for its quality. With the argument `m`: Q4_K_M,
+# llama-quantize's own mix without --pure (for OLMoE's 64 experts: Q6_K for output.weight and for
+# attn_v and ffn_down_exps in the layers use_more_bits picks, Q4_K for the rest), the file people
+# download. Runs in the trochilus-dev container, on the models volume:
 #   MSYS_NO_PATHCONV=1 docker run --rm -v "$PWD:/src" -v trochilus-models:/src/models -w /src \
-#       trochilus-dev:local sh tools/quantize_q4k.sh
-# Output: models/OLMoE-1B-7B-0125-Instruct-Q4_K.gguf (about 3.9 GB; `make check` then runs its
-# 2-layer cut against transformers, REAL_MODEL_Q4K in the Makefile).
+#       trochilus-dev:local sh tools/quantize_q4k.sh [m]
+# Output: models/OLMoE-1B-7B-0125-Instruct-Q4_K.gguf (about 3.9 GB) or -Q4_K_M.gguf (about 4.2 GB);
+# `make check` then runs their 2-layer cuts against transformers (REAL_MODEL_Q4K, REAL_MODEL_Q4KM in
+# the Makefile).
 set -e
 # The body is one function, called on the last line (docs/LESSONS.md #69).
 main() {
@@ -16,13 +19,14 @@ main() {
 trap cleanup_children EXIT
 trap 'exit 130' INT TERM
 SRC=models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf
-DST=models/OLMoE-1B-7B-0125-Instruct-Q4_K.gguf
+if [ "${1:-}" = m ]; then DST=models/OLMoE-1B-7B-0125-Instruct-Q4_K_M.gguf PURE= TYPE=Q4_K_M
+else DST=models/OLMoE-1B-7B-0125-Instruct-Q4_K.gguf PURE=--pure TYPE=Q4_K; fi
 Q=ref/llama.cpp/build-trochilus/bin/llama-quantize
 [ -f $SRC ] || { echo "quantize_q4k: $SRC is missing"; exit 1; }
 [ -x $Q ] || sh tools/build_llamacpp.sh
 FREE=$(df -Pk models | awk 'NR == 2 { print int($4 / 1048576) }')
 [ "$FREE" -ge 8 ] || { echo "quantize_q4k: $FREE GB free on the models volume, 8 wanted"; exit 1; }
-cleanup_run $Q --allow-requantize --pure $SRC $DST.tmp Q4_K "$(nproc)"
+cleanup_run $Q --allow-requantize $PURE $SRC $DST.tmp $TYPE "$(nproc)"
 mv -f $DST.tmp $DST
 ls -la $DST
 }

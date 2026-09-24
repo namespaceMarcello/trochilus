@@ -2,7 +2,7 @@
  * tools/check_dequant.py, which compares it bit for bit with gguf-py's (llama.cpp's Python
  * package, the reader our converters and oracles use):
  *
- *   dump_dequant <q8_0|q4_k> <blocks.bin> <out.f32>
+ *   dump_dequant <q8_0|q4_k|q6_k> <blocks.bin> <out.f32>
  *
  * Reads whole blocks, writes one float per element in the machine's byte order. The scalar table
  * is the definition (kernels.h); the SIMD tiers are held to it by tests/test_kernels.c. A tool for
@@ -17,12 +17,13 @@
 
 int main(int argc, char **argv) {
     if (argc != 4) {
-        fprintf(stderr, "usage: dump_dequant <q8_0|q4_k> <blocks.bin> <out.f32>\n");
+        fprintf(stderr, "usage: dump_dequant <q8_0|q4_k|q6_k> <blocks.bin> <out.f32>\n");
         return 2;
     }
     tr_type type;
     if (strcmp(argv[1], "q8_0") == 0) type = TR_TYPE_Q8_0;
     else if (strcmp(argv[1], "q4_k") == 0) type = TR_TYPE_Q4_K;
+    else if (strcmp(argv[1], "q6_k") == 0) type = TR_TYPE_Q6_K;
     else {
         fprintf(stderr, "dump_dequant: unknown type %s\n", argv[1]);
         return 2;

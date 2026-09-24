@@ -24,8 +24,8 @@ sh tools/ab_spec.sh <gguf> <binary> bench/prompts/code.txt 8   # how much --spec
 sh tools/build_llamacpp.sh; tools/compare_llamacpp.py ...   # in container: llama.cpp, logits comparison
 tools/speed_compare.py ...   # in container: speed against llama.cpp and colibri (trochilus-models volume)
 sh tools/race_llama.sh [runs]   # by the native rules: Trochilus vs llama.cpp, prompts 512 and 2048, 16 and 8 threads, A B B A (~30 min)
-sh tools/race_q4k.sh [runs]     # by the native rules: the real model in Q4_K against Q8_0, and llama.cpp on the Q4_K (~20 min)
-MSYS_NO_PATHCONV=1 docker run --rm -v "$PWD:/src" -v trochilus-models:/src/models -w /src trochilus-dev:local sh tools/quantize_q4k.sh   # models/...-Q4_K.gguf from our Q8_0
+sh tools/race_q4k.sh [runs] [m]   # by the native rules: the real model in Q4_K against Q8_0, and llama.cpp on the Q4_K; with m, Q4_K_M against Q4_K (~20 min)
+MSYS_NO_PATHCONV=1 docker run --rm -v "$PWD:/src" -v trochilus-models:/src/models -w /src trochilus-dev:local sh tools/quantize_q4k.sh [m]   # models/...-Q4_K.gguf from our Q8_0; with m, ...-Q4_K_M.gguf (Q4_K and Q6_K, llama-quantize's own mix)
 tools/.venv/Scripts/python.exe tools/check_dequant.py --binary build/tests/dump_dequant.exe   # every dequantization bit for bit gguf-py's (in make check)
 sh tools/ab_speed.sh <gguf> <binary A> <binary B>   # two binaries alternated run by run (LESSONS #46)
 sh tools/ab_modes.sh <rounds> "a=<command>" "b=<command>"   # modes of a binary (env, flag), round-robin order, A/A (LESSONS #66); AB_WALL=1 adds the whole run's ms (wall_ms)
@@ -41,12 +41,14 @@ sh tools/test_marker.sh | sh tools/mutate_marker.sh   # the machine's marker (~/
 sh tools/test_ab_modes.sh   # ab_modes stops on a run that measured nothing, with and without AB_WALL (in make check)
 sh tools/mutate_bar.sh   # in container: the progress bar's mutations (physics, render, decision, clearing, the load's progress), about 6 min
 sh tools/mutate_prefetch.sh   # in container: the read ahead's mutations (store, thread API, prompt), gcc and ASan
+sh tools/mutate_q6k.sh   # in container: Q6_K's 14 mutations (scalar, unpack, AVX2, AVX-512, tables, engine, reader), all red; about 5 min
 SET=prefetch sh tools/prefill_overlap.sh [rounds]   # native: the prompt at half budget with and without reading the next layer ahead (TR_PREFETCH=0), 512 and 2048, A/A
 TR_BAR=0 build/trochilus run ...   # no progress bar while the model loads (it is drawn only when stderr is a terminal, and not with NO_COLOR or TERM=dumb)
 sh tools/busy_machine.sh <n> <command>   # the ONLY way to load the machine: generators die with the script
 sh tools/machine_still.sh [limit] [wait] [window]   # occupied processors (who: tools/background_load.ps1): guard for every measurement
 sh tools/test_cleanup.sh   # a stopped script loses its children; without cleanup.lib trap the child stays
 make bench               # microbenchmark of kernels (median + noise)
+sh tools/bench_kernels.sh   # the same by the native rules (marker, still machine, load declared), a one-byte-longer copy; CONTAINER=1 in trochilus-dev; build/bench_kernels/
 make bench-mem           # RAM bandwidth (sequential, sparse), engine matmul, attention on both layouts
 make bench-disk          # disk for who reads experts, no system cache (DISK_FILE=<file>)
 build/trochilus run ... --route-trace <file>   # routing trace: experts picked and predicted

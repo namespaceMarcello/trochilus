@@ -175,6 +175,55 @@ static void k_dot_row_x4_q4_k(const void *row, const float *x, int64_t stride, i
     for (int t = 0; t < TR_DOT_TOKENS; t++) out[t] = lane_combine(lane[t]);
 }
 
+/* ---- Q6_K: 256 elements/block in 16 sub-blocks of 16 (kernels_internal.h) ---- */
+
+static void k_dequant_q6_k(const void *row, float *out, int64_t n) {
+    const unsigned char *p = (const unsigned char *)row;
+    int64_t nb = n / TR_Q6_K_BLOCK_ELEMS;
+    for (int64_t b = 0; b < nb; b++) {
+        const unsigned char *blk = p + (size_t)b * TR_Q6_K_BLOCK_BYTES;
+        float scale[16];
+        tr_q6_k_scales(blk, scale);
+        float *o = out + b * TR_Q6_K_BLOCK_ELEMS;
+        for (int i = 0; i < TR_Q6_K_BLOCK_ELEMS; i++) o[i] = scale[i >> 4] * (float)tr_q6_k_quant(blk, i);
+    }
+}
+
+/* the dequantized weight in every product, as Q4_K: dot_row is dot_f32(dequant_row) bit for bit */
+static float k_dot_row_q6_k(const void *row, const float *x, int64_t n) {
+    const unsigned char *p = (const unsigned char *)row;
+    int64_t nb = n / TR_Q6_K_BLOCK_ELEMS;
+    float lane[TR_LANES] = {0};
+    int64_t k = 0;
+    for (int64_t b = 0; b < nb; b++) {
+        const unsigned char *blk = p + (size_t)b * TR_Q6_K_BLOCK_BYTES;
+        float scale[16];
+        tr_q6_k_scales(blk, scale);
+        for (int i = 0; i < TR_Q6_K_BLOCK_ELEMS; i++, k++) {
+            float w = scale[i >> 4] * (float)tr_q6_k_quant(blk, i);
+            lane[k % TR_LANES] += w * x[k];
+        }
+    }
+    return lane_combine(lane);
+}
+
+static void k_dot_row_x4_q6_k(const void *row, const float *x, int64_t stride, int64_t n, float *out) {
+    const unsigned char *p = (const unsigned char *)row;
+    int64_t nb = n / TR_Q6_K_BLOCK_ELEMS;
+    float lane[TR_DOT_TOKENS][TR_LANES] = {{0}};
+    int64_t k = 0;
+    for (int64_t b = 0; b < nb; b++) {
+        const unsigned char *blk = p + (size_t)b * TR_Q6_K_BLOCK_BYTES;
+        float scale[16];
+        tr_q6_k_scales(blk, scale);
+        for (int i = 0; i < TR_Q6_K_BLOCK_ELEMS; i++, k++) {
+            float w = scale[i >> 4] * (float)tr_q6_k_quant(blk, i);
+            for (int t = 0; t < TR_DOT_TOKENS; t++) lane[t][k % TR_LANES] += w * x[t * stride + k];
+        }
+    }
+    for (int t = 0; t < TR_DOT_TOKENS; t++) out[t] = lane_combine(lane[t]);
+}
+
 static void k_dot_row_x4_f32(const void *row, const float *x, int64_t stride, int64_t n, float *out) {
     const float *w = (const float *)row;
     float lane[TR_DOT_TOKENS][TR_LANES] = {{0}};
@@ -205,7 +254,8 @@ size_t tr_row_bytes(tr_type type, int64_t n) {
 }
 
 int tr_kernels_support(tr_type type) {
-    return type == TR_TYPE_F32 || type == TR_TYPE_F16 || type == TR_TYPE_Q8_0 || type == TR_TYPE_Q4_K;
+    return type == TR_TYPE_F32 || type == TR_TYPE_F16 || type == TR_TYPE_Q8_0 || type == TR_TYPE_Q4_K ||
+           type == TR_TYPE_Q6_K;
 }
 
 static tr_kernels g_scalar_kernels;          /* global-ok: kernel tables depend only on the CPU */
@@ -223,14 +273,17 @@ static void build_scalar_table(tr_kernels *k) {
     k->dot_row[TR_TYPE_F16] = k_dot_row_f16;
     k->dot_row[TR_TYPE_Q8_0] = k_dot_row_q8_0;
     k->dot_row[TR_TYPE_Q4_K] = k_dot_row_q4_k;
+    k->dot_row[TR_TYPE_Q6_K] = k_dot_row_q6_k;
     k->dot_row_x4[TR_TYPE_F32] = k_dot_row_x4_f32;
     k->dot_row_x4[TR_TYPE_F16] = k_dot_row_x4_f16;
     k->dot_row_x4[TR_TYPE_Q8_0] = k_dot_row_x4_q8_0;
     k->dot_row_x4[TR_TYPE_Q4_K] = k_dot_row_x4_q4_k;
+    k->dot_row_x4[TR_TYPE_Q6_K] = k_dot_row_x4_q6_k;
     k->dequant_row[TR_TYPE_F32] = k_dequant_f32;
     k->dequant_row[TR_TYPE_F16] = k_dequant_f16;
     k->dequant_row[TR_TYPE_Q8_0] = k_dequant_q8_0;
     k->dequant_row[TR_TYPE_Q4_K] = k_dequant_q4_k;
+    k->dequant_row[TR_TYPE_Q6_K] = k_dequant_q6_k;
 }
 
 const tr_kernels *tr_kernels_scalar(void) {

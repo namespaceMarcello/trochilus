@@ -290,14 +290,18 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
   the smallest store (92 s);
 - **where we lose to llama.cpp** (same Q8_0, container): prefill **1.8×** at 16 threads, 1.5× at 8
   (was 13×; what is left is mostly their int8 activations, our declared int8 mode (c)); decode
-  **1.16×** at 16 threads and 1.26× at 8 at context 2048 (the attention over a long KV, question
-  18: now the largest gap in decode), 1.04–1.09× at context 512 (at 16 threads within the noise);
-- **M2 started: Q4_K**, exact against its own dequantized weights (gguf-py bit for bit, the cut
-  against transformers in `make check`); AVX-512 kernel 0.84–0.90× Q8_0 per element, AVX2
-  0.53–0.63× (the 16-value lookup there too: tried, no gain, rejected). The real model
-  in Q4_K (`tools/quantize_q4k.sh`, from our Q8_0): **decode 1.5× the Q8_0**, prefill the same,
-  llama.cpp's decode on it 1.07–1.17× ours. Next in M2: Q6_K (Q4_K_M mixes it in), then the prefill
-  in float with a row dequantized once per tile; and M1 with Q4_K experts (half the disk).
+  **1.16×** at 16 threads and 1.26× at 8 at context 2048, 1.04–1.09× at 512. **At 2048 the whole
+  gap is the KV's bytes** (profile by zone, MEASUREMENTS §Decode at context 2048): every zone reads
+  memory at 38–51 GB/s, and our F32 KV is 518 MiB per token against llama.cpp's F16 259; halving it
+  gives 1.18× (~1.25× on Q4_K weights). No exact lever left (≤ 3%): KV at 16 bits, point 6, is
+  Marcello's call;
+- **M2: Q4_K and Q6_K**, exact against their own dequantized weights (gguf-py bit for bit, the cuts
+  against transformers in `make check`). Per element against Q8_0: Q4_K AVX-512 0.84–0.90×, AVX2
+  0.53–0.63× (a lookup there: rejected); Q6_K AVX-512 0.85×, AVX2 0.74–0.80× (a block's 256 quants
+  unpacked once, then Q8_0's path; 14 mutations of 14 red). Real models from our Q8_0
+  (`tools/quantize_q4k.sh [m]`): Q4_K **decode 1.5× the Q8_0**; **Q4_K_M** (Q6_K in 17 tensors) runs,
+  decode 0.93× the Q4_K, prefill the same, llama.cpp's decode on it 1.09× ours. Next in M2: the
+  prefill in float with a row dequantized once per tile; and M1 with Q4_K experts (half the disk).
 
 **Review (Opus 5.5, 2026-09-22 and 23)**: reader, expert store, pool, platform, profiler, model
 (`olmoe.c`), kernels, tokenizer and command line read, every file through `tools/mutate_auto.py`
@@ -306,13 +310,11 @@ command line sized its buffers from `-n`/`-p` (a heap overflow near 2^62) and ca
 int32; three OLMoE options had never met transformers (now `fixtures/tiny-olmoe-opts` in `make
 oracle`); memory pressure in the Docker VM had counted as mutants killed (a kill now repeats,
 `tools/mutate_files.sh` sizes its jobs to memory). `tokenizer.c` read (75 → 43) and `main.c`
-(334 → 43), all named in `docs/MEASUREMENTS.md` §Generated mutations: the command line has one
-option parser, numbers strict in their own range (`-n abc` is exit 2, #120), `--expert-budget`
-bounded (#121), and `test_cli` runs every command. `mutate_auto.py` no longer hides survivors
-behind load-induced timeouts or memory refusals (#117, #119, #123), kills a timed-out check with
-everything it started (#122: seven looping orphans had slowed and falsified a campaign), and is
-fast enough to run after a change (#124: per-check budgets, fail-fast tests, `CHANGED=HEAD`
-mutates only the changed lines): every file of `mutate_files.sh` ran again, 42 min plus 31 for `olmoe.c` (whose five kills that did not repeat are survivors again, #125).
+(334 → 43), survivors named in `docs/MEASUREMENTS.md` §Generated mutations (one option parser,
+strict numbers: #120, #121). `mutate_auto.py` no longer hides survivors behind timeouts or memory
+refusals (#117, #119, #123), kills a timed-out check with what it started (#122), and runs after a
+change (#124: `CHANGED=HEAD` mutates only the changed lines); every file of `mutate_files.sh` ran
+again (#125).
 Open: `gguf.c`, `experts.c`, `threads.c`, `platform.c` are not in `mutate_files.sh` and their
 counts predate #117-#124. The native measurements follow the machine's marker (Known issues).
 

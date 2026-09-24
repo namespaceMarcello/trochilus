@@ -4,11 +4,12 @@
 # reference: prompt 512, 128 generated, 16 and 8 threads, through tools/speed_compare.py (median
 # of RUNS runs after one warm-up, the decode width forced to the thread count).
 #
-#   sh tools/race_q4k.sh [runs]        from the repo root, in Git Bash; about 20 minutes
+#   sh tools/race_q4k.sh [runs] [m]    from the repo root, in Git Bash; about 20 minutes
 #
-# Order Q4_K, Q8_0, Q8_0, Q4_K: two series per file, their gap the A/A. The Q4_K file comes from
+# Order Q4_K, Q8_0, Q8_0, Q4_K: two series per file, their gap the A/A. With `m`: Q4_K_M against
+# Q4_K in the same order, llama.cpp on the Q4_K_M. The Q4_K and Q4_K_M files come from
 # tools/quantize_q4k.sh. The rules of every native measurement (tools/measure_guard.lib).
-# Results in build/race_q4k/.
+# Results in build/race_q4k/ (build/race_q4km/ with `m`).
 set -e
 # The body is one function, called on the last line (docs/LESSONS.md #69).
 main() {
@@ -16,7 +17,8 @@ R=${1:-5}
 M8=models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf
 M4=models/OLMoE-1B-7B-0125-Instruct-Q4_K.gguf
 LB=ref/llama.cpp/build-trochilus/bin/llama-bench
-OUT=build/race_q4k
+if [ "${2:-}" = m ]; then A=models/OLMoE-1B-7B-0125-Instruct-Q4_K_M.gguf NA=q4km B=$M4 NB=q4k OUT=build/race_q4km
+else A=$M4 NA=q4k B=$M8 NB=q8 OUT=build/race_q4k; fi
 mkdir -p $OUT
 [ -f build/linux-gcc/trochilus ] && [ -f $LB ] || { echo "race_q4k: build/linux-gcc/trochilus or $LB is missing"; exit 1; }
 . tools/measure_guard.lib
@@ -39,11 +41,11 @@ series() {
     --llama-bench $LB --engines $1 --threads 16,8 --prompt 512 --gen 128 --runs $R \
     --out $OUT/$3.json > $OUT/$3.txt 2>&1 || { echo "race_q4k: $3 failed"; tail -5 $OUT/$3.txt; exit 1; }
 }
-series trochilus $M4 q4k-a
-series trochilus $M8 q8-a
-series trochilus $M8 q8-b
-series trochilus $M4 q4k-b
-series llama.cpp $M4 llama-q4k
+series trochilus $A $NA-a
+series trochilus $B $NB-a
+series trochilus $B $NB-b
+series trochilus $A $NA-b
+series llama.cpp $A llama-$NA
 measure_declare "after the last series" >> $OUT/load.txt
 tail -1 $OUT/load.txt
 echo "race_q4k: done, results in $OUT"

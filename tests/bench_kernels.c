@@ -72,6 +72,15 @@ static void fill_row(tr_type type, uint8_t *row, int64_t n) {
             for (int i = 4; i < 144; i++) blk[i] = (uint8_t)((frand() + 1.0f) * 127.9f);
         }
         break;
+    case TR_TYPE_Q6_K:
+        for (int64_t b = 0; b < n / 256; b++) {
+            uint8_t *blk = row + 210 * b;
+            uint16_t d = 0x1C00 | (uint16_t)((rng_state >> 30) & 0x3FF);     /* small positive scale */
+            frand();
+            for (int i = 0; i < 208; i++) blk[i] = (uint8_t)((frand() + 1.0f) * 127.9f);
+            memcpy(blk + 208, &d, 2);
+        }
+        break;
     default:
         break;
     }
@@ -515,7 +524,7 @@ int main(int argc, char **argv) {
     static const int64_t sizes[] = {64, 1024, 2048, 4096};
     static const struct { const char *name; tr_type type; } kinds[] = {
         {"dot_f32", TR_TYPE_COUNT}, {"dot_row f16", TR_TYPE_F16}, {"dot_row q8_0", TR_TYPE_Q8_0},
-        {"dot_row q4_k", TR_TYPE_Q4_K},
+        {"dot_row q4_k", TR_TYPE_Q4_K}, {"dot_row q6_k", TR_TYPE_Q6_K},
     };
 
     int64_t max_n = 4096;
@@ -552,6 +561,7 @@ int main(int argc, char **argv) {
     for (int64_t i = 0; i < max_n * TR_DOT_TOKENS; i++) x4[i] = frand();
     static const struct { const char *name; tr_type type; } kinds4[] = {
         {"dot_row q8_0 x4", TR_TYPE_Q8_0}, {"dot_row q4_k x4", TR_TYPE_Q4_K},
+        {"dot_row q6_k x4", TR_TYPE_Q6_K},
     };
     for (size_t t = 0; t < sizeof tiers / sizeof tiers[0]; t++) {
         const tr_kernels *k = tr_kernels_tier(tiers[t]);

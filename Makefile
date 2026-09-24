@@ -236,6 +236,9 @@ REAL_MODEL := models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf
 # the same model quantized to Q4_K from the Q8_0 by llama-quantize (tools/quantize_q4k.sh)
 REALFIX_Q4K := models/olmoe-2layer-q4k
 REAL_MODEL_Q4K := models/OLMoE-1B-7B-0125-Instruct-Q4_K.gguf
+# and in Q4_K_M, llama-quantize's own mix of Q4_K and Q6_K (tools/quantize_q4k.sh m)
+REALFIX_Q4KM := models/olmoe-2layer-q4km
+REAL_MODEL_Q4KM := models/OLMoE-1B-7B-0125-Instruct-Q4_K_M.gguf
 $(REALFIX)/model.gguf: $(REAL_MODEL) tools/make_olmoe_2layer_gguf.py
 	$(PY) tools/make_olmoe_2layer_gguf.py $(REAL_MODEL) $@
 $(REALFIX)/ref.json: $(REALFIX)/model.gguf tools/make_olmoe_2layer_ref.py
@@ -351,6 +354,9 @@ check-cut:
 	@# the same cut of the real model quantized to Q4_K (tools/quantize_q4k.sh; skipped without it)
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle-real \
 		REAL_MODEL=$(REAL_MODEL_Q4K) REALFIX=$(REALFIX_Q4K)
+	@# and in Q4_K_M, where Q6_K meets Q4_K in one model (tools/quantize_q4k.sh m; skipped without it)
+	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle-real \
+		REAL_MODEL=$(REAL_MODEL_Q4KM) REALFIX=$(REALFIX_Q4KM)
 
 check-gcc:
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 TEST_TMP=/tmp/tr-test/gcc test

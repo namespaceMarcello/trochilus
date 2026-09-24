@@ -674,6 +674,168 @@ static void avx512_dot_row_x4_q4_k(const void *row, const float *x, int64_t stri
     out[3] = tr_lane_combine(lane);
 }
 
+/* ---- Q6_K (kernels_internal.h): each weight scale * (q - 32), as scalar computes it ---- */
+/* A sub-block is 16 weights of 64 possible values each: no lookup (building 64 values costs more
+ * than the 16 conversions they would replace). The block's 256 quants are unpacked once, 32 bytes
+ * at a time, into q - 32 as int8 in element order (ik_llama.cpp's DequantizerQ6K), and from there
+ * the weights come as Q8_0's do: widen, convert, multiply by the sub-block's scale. */
+
+/* Half h of a block (128 elements): A = ql[64h .. +31], B = ql[64h + 32 .. +31], H = qh[32h ..
+ * +31]; its four runs of 32 are A's low nibbles with H's bits 0-1 above them, B's low with bits
+ * 2-3, A's high with bits 4-5, B's high with bits 6-7. The 16-bit shifts carry bits across the
+ * two bytes of a word only where the masks drop them. */
+TR_TARGET_AVX2
+static inline void avx2_q6_k_unpack(const unsigned char *blk, unsigned char q[TR_Q6_K_BLOCK_ELEMS]) {
+    const __m256i m4 = _mm256_set1_epi8(0x0F), m2 = _mm256_set1_epi8(0x30), k32 = _mm256_set1_epi8(32);
+    for (int h = 0; h < 2; h++) {
+        __m256i a = _mm256_loadu_si256((const __m256i *)(const void *)(blk + 64 * h));
+        __m256i b = _mm256_loadu_si256((const __m256i *)(const void *)(blk + 64 * h + 32));
+        __m256i hb = _mm256_loadu_si256((const __m256i *)(const void *)(blk + TR_Q6_K_QH_OFFSET + 32 * h));
+        __m256i q0 = _mm256_or_si256(_mm256_and_si256(a, m4), _mm256_and_si256(_mm256_slli_epi16(hb, 4), m2));
+        __m256i q1 = _mm256_or_si256(_mm256_and_si256(b, m4), _mm256_and_si256(_mm256_slli_epi16(hb, 2), m2));
+        __m256i q2 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(a, 4), m4), _mm256_and_si256(hb, m2));
+        __m256i q3 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(b, 4), m4),
+                                     _mm256_and_si256(_mm256_srli_epi16(hb, 2), m2));
+        __m256i *o = (__m256i *)(void *)(q + 128 * h);
+        _mm256_storeu_si256(o, _mm256_sub_epi8(q0, k32));
+        _mm256_storeu_si256(o + 1, _mm256_sub_epi8(q1, k32));
+        _mm256_storeu_si256(o + 2, _mm256_sub_epi8(q2, k32));
+        _mm256_storeu_si256(o + 3, _mm256_sub_epi8(q3, k32));
+    }
+}
+
+TR_TARGET_AVX2
+static float avx2_dot_row_q6_k(const void *row, const float *x, int64_t n) {
+    const unsigned char *p = (const unsigned char *)row;
+    int64_t nb = n / TR_Q6_K_BLOCK_ELEMS;
+    __m256 lo = _mm256_setzero_ps(), hi = _mm256_setzero_ps();
+    for (int64_t b = 0; b < nb; b++) {
+        const unsigned char *blk = p + (size_t)b * TR_Q6_K_BLOCK_BYTES;
+        const float *xb = x + b * TR_Q6_K_BLOCK_ELEMS;
+        unsigned char q[TR_Q6_K_BLOCK_ELEMS];
+        float scale[16];
+        avx2_q6_k_unpack(blk, q);
+        tr_q6_k_scales(blk, scale);
+        for (int j = 0; j < 16; j++) {
+            __m256 s = _mm256_set1_ps(scale[j]);
+            __m256 w0 = _mm256_mul_ps(s, avx2_i8_to_ps(q + 16 * j));
+            __m256 w1 = _mm256_mul_ps(s, avx2_i8_to_ps(q + 16 * j + 8));
+            lo = _mm256_add_ps(lo, _mm256_mul_ps(w0, _mm256_loadu_ps(xb + 16 * j)));
+            hi = _mm256_add_ps(hi, _mm256_mul_ps(w1, _mm256_loadu_ps(xb + 16 * j + 8)));
+        }
+    }
+    float lane[TR_LANES];
+    _mm256_storeu_ps(lane, lo);
+    _mm256_storeu_ps(lane + 8, hi);
+    return tr_lane_combine(lane);
+}
+
+TR_TARGET_AVX2
+static void avx2_dot_row_x4_q6_k(const void *row, const float *x, int64_t stride, int64_t n, float *out) {
+    const unsigned char *p = (const unsigned char *)row;
+    int64_t nb = n / TR_Q6_K_BLOCK_ELEMS;
+    /* named registers, never an array (see avx2_dot_row_x4_q8_0) */
+    __m256 lo0 = _mm256_setzero_ps(), hi0 = _mm256_setzero_ps(), lo1 = _mm256_setzero_ps(),
+           hi1 = _mm256_setzero_ps(), lo2 = _mm256_setzero_ps(), hi2 = _mm256_setzero_ps(),
+           lo3 = _mm256_setzero_ps(), hi3 = _mm256_setzero_ps();
+    for (int64_t b = 0; b < nb; b++) {
+        const unsigned char *blk = p + (size_t)b * TR_Q6_K_BLOCK_BYTES;
+        const float *xb = x + b * TR_Q6_K_BLOCK_ELEMS;
+        unsigned char q[TR_Q6_K_BLOCK_ELEMS];
+        float scale[16];
+        avx2_q6_k_unpack(blk, q);
+        tr_q6_k_scales(blk, scale);
+        for (int j = 0; j < 16; j++) {
+            __m256 s = _mm256_set1_ps(scale[j]);
+            __m256 w0 = _mm256_mul_ps(s, avx2_i8_to_ps(q + 16 * j));
+            __m256 w1 = _mm256_mul_ps(s, avx2_i8_to_ps(q + 16 * j + 8));
+            const float *x0 = xb + 16 * j, *x1 = x0 + stride, *x2 = x1 + stride, *x3 = x2 + stride;
+            lo0 = _mm256_add_ps(lo0, _mm256_mul_ps(w0, _mm256_loadu_ps(x0)));
+            hi0 = _mm256_add_ps(hi0, _mm256_mul_ps(w1, _mm256_loadu_ps(x0 + 8)));
+            lo1 = _mm256_add_ps(lo1, _mm256_mul_ps(w0, _mm256_loadu_ps(x1)));
+            hi1 = _mm256_add_ps(hi1, _mm256_mul_ps(w1, _mm256_loadu_ps(x1 + 8)));
+            lo2 = _mm256_add_ps(lo2, _mm256_mul_ps(w0, _mm256_loadu_ps(x2)));
+            hi2 = _mm256_add_ps(hi2, _mm256_mul_ps(w1, _mm256_loadu_ps(x2 + 8)));
+            lo3 = _mm256_add_ps(lo3, _mm256_mul_ps(w0, _mm256_loadu_ps(x3)));
+            hi3 = _mm256_add_ps(hi3, _mm256_mul_ps(w1, _mm256_loadu_ps(x3 + 8)));
+        }
+    }
+    float lane[TR_LANES];
+    _mm256_storeu_ps(lane, lo0);
+    _mm256_storeu_ps(lane + 8, hi0);
+    out[0] = tr_lane_combine(lane);
+    _mm256_storeu_ps(lane, lo1);
+    _mm256_storeu_ps(lane + 8, hi1);
+    out[1] = tr_lane_combine(lane);
+    _mm256_storeu_ps(lane, lo2);
+    _mm256_storeu_ps(lane + 8, hi2);
+    out[2] = tr_lane_combine(lane);
+    _mm256_storeu_ps(lane, lo3);
+    _mm256_storeu_ps(lane + 8, hi3);
+    out[3] = tr_lane_combine(lane);
+}
+
+/* 16 int8 at p -> 16 exact floats */
+TR_TARGET_AVX512
+static inline __m512 avx512_i8_to_ps(const unsigned char *p) {
+    return _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(const void *)p)));
+}
+
+TR_TARGET_AVX512
+static float avx512_dot_row_q6_k(const void *row, const float *x, int64_t n) {
+    const unsigned char *p = (const unsigned char *)row;
+    int64_t nb = n / TR_Q6_K_BLOCK_ELEMS;
+    __m512 acc = _mm512_setzero_ps();
+    for (int64_t b = 0; b < nb; b++) {
+        const unsigned char *blk = p + (size_t)b * TR_Q6_K_BLOCK_BYTES;
+        const float *xb = x + b * TR_Q6_K_BLOCK_ELEMS;
+        unsigned char q[TR_Q6_K_BLOCK_ELEMS];
+        float scale[16];
+        avx2_q6_k_unpack(blk, q);
+        tr_q6_k_scales(blk, scale);
+        for (int j = 0; j < 16; j++) {
+            __m512 w = _mm512_mul_ps(_mm512_set1_ps(scale[j]), avx512_i8_to_ps(q + 16 * j));
+            acc = _mm512_add_ps(acc, _mm512_mul_ps(w, _mm512_loadu_ps(xb + 16 * j)));
+        }
+    }
+    float lane[TR_LANES];
+    _mm512_storeu_ps(lane, acc);
+    return tr_lane_combine(lane);
+}
+
+TR_TARGET_AVX512
+static void avx512_dot_row_x4_q6_k(const void *row, const float *x, int64_t stride, int64_t n, float *out) {
+    const unsigned char *p = (const unsigned char *)row;
+    int64_t nb = n / TR_Q6_K_BLOCK_ELEMS;
+    __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps(), acc2 = _mm512_setzero_ps(),
+           acc3 = _mm512_setzero_ps();
+    for (int64_t b = 0; b < nb; b++) {
+        const unsigned char *blk = p + (size_t)b * TR_Q6_K_BLOCK_BYTES;
+        const float *xb = x + b * TR_Q6_K_BLOCK_ELEMS;
+        unsigned char q[TR_Q6_K_BLOCK_ELEMS];
+        float scale[16];
+        avx2_q6_k_unpack(blk, q);
+        tr_q6_k_scales(blk, scale);
+        for (int j = 0; j < 16; j++) {
+            __m512 w = _mm512_mul_ps(_mm512_set1_ps(scale[j]), avx512_i8_to_ps(q + 16 * j));
+            const float *x0 = xb + 16 * j, *x1 = x0 + stride, *x2 = x1 + stride, *x3 = x2 + stride;
+            acc0 = _mm512_add_ps(acc0, _mm512_mul_ps(w, _mm512_loadu_ps(x0)));
+            acc1 = _mm512_add_ps(acc1, _mm512_mul_ps(w, _mm512_loadu_ps(x1)));
+            acc2 = _mm512_add_ps(acc2, _mm512_mul_ps(w, _mm512_loadu_ps(x2)));
+            acc3 = _mm512_add_ps(acc3, _mm512_mul_ps(w, _mm512_loadu_ps(x3)));
+        }
+    }
+    float lane[TR_LANES];
+    _mm512_storeu_ps(lane, acc0);
+    out[0] = tr_lane_combine(lane);
+    _mm512_storeu_ps(lane, acc1);
+    out[1] = tr_lane_combine(lane);
+    _mm512_storeu_ps(lane, acc2);
+    out[2] = tr_lane_combine(lane);
+    _mm512_storeu_ps(lane, acc3);
+    out[3] = tr_lane_combine(lane);
+}
+
 /* hot: end */
 
 /* ---- tables --------------------------------------------------------------- */
@@ -702,6 +864,8 @@ const tr_kernels *tr_kernels_x86_tier(const char *tier) {
             g_avx2.dot_row_x4[TR_TYPE_Q8_0] = avx2_dot_row_x4_q8_0;
             g_avx2.dot_row[TR_TYPE_Q4_K] = avx2_dot_row_q4_k;
             g_avx2.dot_row_x4[TR_TYPE_Q4_K] = avx2_dot_row_x4_q4_k;
+            g_avx2.dot_row[TR_TYPE_Q6_K] = avx2_dot_row_q6_k;
+            g_avx2.dot_row_x4[TR_TYPE_Q6_K] = avx2_dot_row_x4_q6_k;
             g_avx2_built = 1;
         }
         return &g_avx2;
@@ -723,6 +887,8 @@ const tr_kernels *tr_kernels_x86_tier(const char *tier) {
             g_avx512.dot_row_x4[TR_TYPE_Q8_0] = avx512_dot_row_x4_q8_0;
             g_avx512.dot_row[TR_TYPE_Q4_K] = avx512_dot_row_q4_k;
             g_avx512.dot_row_x4[TR_TYPE_Q4_K] = avx512_dot_row_x4_q4_k;
+            g_avx512.dot_row[TR_TYPE_Q6_K] = avx512_dot_row_q6_k;
+            g_avx512.dot_row_x4[TR_TYPE_Q6_K] = avx512_dot_row_x4_q6_k;
             g_avx512_built = 1;
         }
         return &g_avx512;

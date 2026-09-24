@@ -15,7 +15,8 @@ and fails if never taken: per type, a block with a NaN, an infinite and a subnor
   tools/.venv/Scripts/python.exe tools/check_dequant.py --binary build/tests/dump_dequant.exe
   (in the gate: tools/.venv/bin/python ... --binary build/linux-gcc/tests/dump_dequant)
 Seen red: tests/test_kernels.c and this file under a mutation of tr_q4_k_scales (the high bits of
-min[4..7] taken from byte j instead of j + 4), docs/MEASUREMENTS.md §Q4_K.
+min[4..7] taken from byte j instead of j + 4), docs/MEASUREMENTS.md §Q4_K; for Q6_K (its f16 d at
+the block's end, byte 208) under the four scalar mutations of tools/mutate_q6k.sh.
 """
 import argparse
 import os
@@ -27,30 +28,31 @@ import numpy as np
 from gguf.constants import GGMLQuantizationType
 from gguf.quants import dequantize
 
-# name: (gguf type, elements per block, bytes per block, bytes of f16 scales at the block's head)
+# name: (gguf type, elements per block, bytes per block, where its f16 scales start, their bytes)
 TYPES = {
-    "q8_0": (GGMLQuantizationType.Q8_0, 32, 34, 2),
-    "q4_k": (GGMLQuantizationType.Q4_K, 256, 144, 4),
+    "q8_0": (GGMLQuantizationType.Q8_0, 32, 34, 0, 2),
+    "q4_k": (GGMLQuantizationType.Q4_K, 256, 144, 0, 4),
+    "q6_k": (GGMLQuantizationType.Q6_K, 256, 210, 208, 2),
 }
 
 
 def make_blocks(name, n, rng):
-    _, _, nbytes, head = TYPES[name]
+    _, _, nbytes, at, head = TYPES[name]
     raw = rng.integers(0, 256, size=(n, nbytes), dtype=np.uint8)
-    halves = raw[:, :head].copy().view(np.uint16)
+    halves = raw[:, at:at + head].copy().view(np.uint16)
     ordinary = (halves & 0x83FF) | (rng.integers(1, 31, size=halves.shape, dtype=np.uint16) << 10)
     special = (np.arange(n) % 4 == 3)[:, None]
     halves = np.where(special, halves, ordinary).astype(np.uint16)
     # one block of each kind for sure: NaN, infinite, subnormal scale (the counters below)
     halves[3, 0], halves[7, 0], halves[11, 0] = 0x7E01, 0xFC00, 0x0003
-    raw[:, :head] = halves.view(np.uint8).reshape(n, head)
+    raw[:, at:at + head] = halves.view(np.uint8).reshape(n, head)
     return raw
 
 
 def check(binary, name, n_blocks, seed):
-    qtype, elems, _, head = TYPES[name]
+    qtype, elems, _, at, _ = TYPES[name]
     raw = make_blocks(name, n_blocks, np.random.default_rng(seed))
-    f16 = raw[:, :2].copy().view(np.float16).astype(np.float32).reshape(-1)
+    f16 = raw[:, at:at + 2].copy().view(np.float16).astype(np.float32).reshape(-1)
     reached = {"nan": int(np.isnan(f16).sum()), "inf": int(np.isinf(f16).sum()),
                "subnormal": int(((f16 != 0) & (np.abs(f16) < 6.1035e-05)).sum())}
     with tempfile.TemporaryDirectory() as tmp:

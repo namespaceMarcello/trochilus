@@ -83,6 +83,36 @@ static inline unsigned tr_q4_k_quant(const unsigned char *qs, int i) {
     return (i & 32) ? byte >> 4 : byte & 0x0F;
 }
 
+/* Q6_K (ggml's block_q6_K): 256 elements in 210 bytes. 128 bytes of low 4 bits (ql), 64 of high 2
+ * bits (qh), sixteen int8 scales, then f16 d. Element i belongs to sub-block j = i / 16 and weighs
+ * scale[j] * (q - 32), q its 6-bit quant, with scale[j] = d * sc_j, every product rounded to float:
+ * the order ggml's dequantize_row_q6_K and gguf-py's Q6_K.dequantize_blocks use (tools/
+ * check_dequant.py). Element i = 128h + 32c + l (h = 0..1, c = 0..3, l = 0..31) takes the low
+ * (c < 2) or high (c >= 2) nibble of ql[64h + 32(c & 1) + l] and bits 2c, 2c+1 of qh[32h + l]. */
+#define TR_Q6_K_BLOCK_ELEMS 256
+#define TR_Q6_K_BLOCK_BYTES 210
+#define TR_Q6_K_QH_OFFSET 128
+#define TR_Q6_K_SCALES_OFFSET 192
+#define TR_Q6_K_D_OFFSET 208
+
+/* scale[j] of the block at blk, j = 0..15 */
+static inline void tr_q6_k_scales(const unsigned char *blk, float scale[16]) {
+    uint16_t hd;
+    memcpy(&hd, blk + TR_Q6_K_D_OFFSET, 2);
+    float d = tr_half_to_float(hd);
+    const int8_t *sc = (const int8_t *)(blk + TR_Q6_K_SCALES_OFFSET);
+    for (int j = 0; j < 16; j++) scale[j] = d * (float)sc[j];
+}
+
+/* q - 32 of element i (0..255) of the block at blk: -32..31 */
+static inline int tr_q6_k_quant(const unsigned char *blk, int i) {
+    int h = i >> 7, c = (i >> 5) & 3, l = i & 31;
+    unsigned lo = blk[64 * h + 32 * (c & 1) + l];
+    lo = (c & 2) ? lo >> 4 : lo & 0x0F;
+    unsigned hi = (blk[TR_Q6_K_QH_OFFSET + 32 * h + l] >> (2 * c)) & 3u;
+    return (int)(lo | (hi << 4)) - 32;
+}
+
 /* ((l0+l1)+(l2+l3)) + ((l4+l5)+(l6+l7)), same for 8..15, halves added last. */
 static inline float tr_lane_combine(const float lane[TR_LANES]) {
     float s01 = lane[0] + lane[1], s23 = lane[2] + lane[3];

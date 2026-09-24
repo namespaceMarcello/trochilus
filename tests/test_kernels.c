@@ -1,4 +1,4 @@
-/* test_kernels.c — tests for src/kernels/kernels.c: half->float, Q8_0 and Q4_K dequant,
+/* test_kernels.c — tests for src/kernels/kernels.c: half->float, Q8_0, Q4_K and Q6_K dequant,
  * the 16-lane reduction contract (kernels.h) against an independent in-test
  * implementation, dot_row == dot_f32(dequantized), every SIMD tier == scalar,
  * rope/swiglu/attention == their first per-element definitions, tr_matmul
@@ -136,6 +136,47 @@ static void test_q4_k_dequant(void) {
     TR_CHECK_EQ_INT(checked, 512);
 }
 
+/* ---- Q6_K dequant on blocks packed as ggml's quantize_row_q6_K_ref packs them ---- */
+
+/* L = q + 32 runs through all 64 values, the scales through both signs and the int8 ends; d = 1
+ * then 0.5 (read at the block's end) make every weight exact: d * sc * (L - 32). */
+static void test_q6_k_dequant(void) {
+    const tr_kernels *K = tr_kernels_tier("scalar");
+    TR_CHECK(K != NULL);
+    if (K == NULL) return;
+
+    static const int sc[16] = {1, -1, 127, -128, 2, 37, -50, 63, 0, 5, -7, 100, -3, 11, 64, -64};
+    unsigned char blk[2 * 210] = {0};
+    for (int b = 0; b < 2; b++) {
+        unsigned char *ql = blk + 210 * b, *qh = ql + 128;
+        for (int j = 0; j < 256; j += 128) {
+            for (int l = 0; l < 32; l++) {
+                int L[4];
+                for (int c = 0; c < 4; c++) L[c] = ((j + l + 32 * c) * 7 + 3) % 64;
+                ql[l] = (unsigned char)((L[0] & 0xF) | ((L[2] & 0xF) << 4));
+                ql[l + 32] = (unsigned char)((L[1] & 0xF) | ((L[3] & 0xF) << 4));
+                qh[l] = (unsigned char)((L[0] >> 4) | ((L[1] >> 4) << 2) | ((L[2] >> 4) << 4) | ((L[3] >> 4) << 6));
+            }
+            ql += 64;
+            qh += 32;
+        }
+        for (int j = 0; j < 16; j++) blk[210 * b + 192 + j] = (unsigned char)(int8_t)sc[j];
+        uint16_t d = b == 0 ? 0x3C00 : 0x3800; /* 1.0 and 0.5 in binary16 */
+        memcpy(blk + 210 * b + 208, &d, 2);
+    }
+
+    float out[512];
+    K->dequant_row[TR_TYPE_Q6_K](blk, out, 512);
+    int checked = 0;
+    for (int i = 0; i < 512; i++, checked++) {
+        float d = i < 256 ? 1.0f : 0.5f;
+        /* (d * sc) * (q - 32) in floats: scale 0 times a negative quant is -0, as in ggml */
+        float expect = (d * (float)sc[(i % 256) / 16]) * (float)((i % 256 * 7 + 3) % 64 - 32);
+        TR_CHECK(bit_eq(out[i], expect));
+    }
+    TR_CHECK_EQ_INT(checked, 512);
+}
+
 /* ---- dot_f32 against the explicit in-test lane contract ------------------- */
 
 static void test_dot_f32_contract(void) {
@@ -241,6 +282,30 @@ static void test_dot_row_q4_k(void) {
     for (int t = 0; t < TR_DOT_TOKENS; t++) TR_CHECK(bit_eq(out[t], ref_dot_f32(dequant, x + t * N, N)));
 }
 
+/* Q6_K: the same two checks */
+static void test_dot_row_q6_k(void) {
+    const tr_kernels *K = tr_kernels_tier("scalar");
+    TR_CHECK(K != NULL);
+    if (K == NULL) return;
+
+    enum { N = 512 };                  /* two blocks */
+    static unsigned char row[2 * 210];
+    static float x[4 * N], dequant[N];
+    unsigned seed = 6262u;
+    for (int i = 0; i < 2 * 210; i++) row[i] = (unsigned char)(next_rand(&seed) >> 16);
+    for (int b = 0; b < 2; b++) {
+        uint16_t d = (uint16_t)(0x1C00u + (next_rand(&seed) & 0x3FFu)); /* ~0.004..0.008 */
+        memcpy(row + 210 * b + 208, &d, 2);
+    }
+    for (int i = 0; i < 4 * N; i++) x[i] = rand_float(&seed);
+
+    K->dequant_row[TR_TYPE_Q6_K](row, dequant, N);
+    TR_CHECK(bit_eq(K->dot_row[TR_TYPE_Q6_K](row, x, N), ref_dot_f32(dequant, x, N)));
+    float out[TR_DOT_TOKENS];
+    K->dot_row_x4[TR_TYPE_Q6_K](row, x, N, N, out);
+    for (int t = 0; t < TR_DOT_TOKENS; t++) TR_CHECK(bit_eq(out[t], ref_dot_f32(dequant, x + t * N, N)));
+}
+
 /* ---- every SIMD tier == scalar, bit for bit (NaN: any NaN) ---------------- */
 
 static int same_float(float a, float b) {
@@ -284,6 +349,18 @@ static void fill_q4_k(unsigned char *row, int64_t nb, unsigned *seed, int specia
             if (!special || (r & 63u) != 0) bits = (uint16_t)((bits & 0x83FFu) | ((8u + (r >> 3) % 14u) << 10));
             memcpy(blk + 2 * h, &bits, 2);
         }
+    }
+}
+
+/* Q6_K blocks: every byte random (every quant and int8 scale); d as Q4_K's */
+static void fill_q6_k(unsigned char *row, int64_t nb, unsigned *seed, int special) {
+    for (int64_t b = 0; b < nb; b++) {
+        unsigned char *blk = row + b * 210;
+        for (int i = 0; i < 208; i++) blk[i] = (unsigned char)(next_rand(seed) >> 16);
+        unsigned r = next_rand(seed);
+        uint16_t bits = (uint16_t)((r >> 8) & 0xFFFFu);
+        if (!special || (r & 63u) != 0) bits = (uint16_t)((bits & 0x83FFu) | ((4u + (r >> 3) % 14u) << 10));
+        memcpy(blk + 208, &bits, 2);
     }
 }
 
@@ -406,6 +483,21 @@ static void count_diffs(const tr_kernels *K, const tr_kernels *S, unsigned seed,
                 }
             }
         }
+        /* Q6_K rows of 1 to 16 blocks, the same two checks */
+        for (int64_t nb = 1; nb <= 16; nb++) {
+            fill_q6_k(row, nb, &seed, round % 2);
+            int64_t n = nb * 256;
+            if (!same_float(K->dot_row[TR_TYPE_Q6_K](row, b, n), S->dot_row[TR_TYPE_Q6_K](row, b, n))) (*bad_row)++;
+            if (K->dot_row_x4[TR_TYPE_Q6_K] != NULL && 4 * n <= CMP_MAX_N) {
+                float xk[TR_DOT_TOKENS], xs[TR_DOT_TOKENS];
+                K->dot_row_x4[TR_TYPE_Q6_K](row, b, n, n, xk);
+                S->dot_row_x4[TR_TYPE_Q6_K](row, b, n, n, xs);
+                for (int t = 0; t < TR_DOT_TOKENS; t++) {
+                    if (!same_float(xk[t], xs[t])) (*bad_row)++;
+                    if (!same_float(xk[t], K->dot_row[TR_TYPE_Q6_K](row, b + t * n, n))) (*bad_row)++;
+                }
+            }
+        }
     }
 }
 
@@ -434,6 +526,12 @@ static float wrong_dot_row_q8_0(const void *row, const float *x, int64_t n) {
 static float wrong_dot_row_q4_k(const void *row, const float *x, int64_t n) {
     static float w[CMP_MAX_N];
     tr_kernels_tier("scalar")->dequant_row[TR_TYPE_Q4_K](row, w, n);
+    return wrong_dot_f32(w, x, n);
+}
+
+static float wrong_dot_row_q6_k(const void *row, const float *x, int64_t n) {
+    static float w[CMP_MAX_N];
+    tr_kernels_tier("scalar")->dequant_row[TR_TYPE_Q6_K](row, w, n);
     return wrong_dot_f32(w, x, n);
 }
 
@@ -489,6 +587,12 @@ static void test_tiers_match_scalar(void) {
     count_diffs(&wrong, S, 7u, &bad_dot, &bad_row, &bad_axpy, &bad_x4);
     TR_CHECK_EQ_INT(bad_dot + bad_axpy + bad_x4, 0);
     TR_CHECK(bad_row > 0);
+    /* and a wrong Q6_K row alone */
+    wrong = *S;
+    wrong.dot_row[TR_TYPE_Q6_K] = wrong_dot_row_q6_k;
+    count_diffs(&wrong, S, 7u, &bad_dot, &bad_row, &bad_axpy, &bad_x4);
+    TR_CHECK_EQ_INT(bad_dot + bad_axpy + bad_x4, 0);
+    TR_CHECK(bad_row > 0);
 
     for (size_t t = 0; t < sizeof tiers / sizeof tiers[0]; t++) {
         const tr_kernels *K = tr_kernels_tier(tiers[t]);
@@ -503,7 +607,7 @@ static void test_tiers_match_scalar(void) {
         TR_CHECK_EQ_INT(bad_row, 0);
         TR_CHECK_EQ_INT(bad_axpy, 0);
         TR_CHECK_EQ_INT(bad_x4, 0);
-        printf("  tier %-8s dot_f32, axpy_f32, their x4, dot_row and dot_row_x4 of f32, f16, q8_0 and q4_k %s\n", K->tier,
+        printf("  tier %-8s dot_f32, axpy_f32, their x4, dot_row and dot_row_x4 of f32, f16, q8_0, q4_k and q6_k %s\n", K->tier,
                bad_dot == 0 && bad_row == 0 && bad_axpy == 0 && bad_x4 == 0 ? "identical to scalar"
                                                                             : "DIFFER from scalar");
     }
@@ -814,6 +918,9 @@ static void test_edges(void) {
     TR_CHECK_EQ_INT(tr_row_bytes(TR_TYPE_Q4_K, 512), 288);
     TR_CHECK_EQ_INT(tr_row_bytes(TR_TYPE_Q4_K, 288), 0);
     TR_CHECK(tr_kernels_support(TR_TYPE_Q4_K));
+    TR_CHECK_EQ_INT(tr_row_bytes(TR_TYPE_Q6_K, 512), 420);
+    TR_CHECK_EQ_INT(tr_row_bytes(TR_TYPE_Q6_K, 128), 0);
+    TR_CHECK(tr_kernels_support(TR_TYPE_Q6_K));
     TR_CHECK_EQ_INT(tr_row_bytes((tr_type)4, 32), 0); /* 4: a type number no longer in use */
     TR_CHECK_EQ_INT(tr_row_bytes((tr_type)TR_TYPE_COUNT, 32), 0);
     tr_softmax(NULL, 0);
@@ -826,10 +933,12 @@ int main(void) {
     test_half_to_float();
     test_q8_0_dequant();
     test_q4_k_dequant();
+    test_q6_k_dequant();
     test_dot_f32_contract();
     test_dot_row_f16();
     test_dot_row_q8_0();
     test_dot_row_q4_k();
+    test_dot_row_q6_k();
     test_tiers_match_scalar();
     test_rope_table();
     test_swiglu_threads();

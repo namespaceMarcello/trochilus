@@ -142,6 +142,20 @@ ik_llama.cpp `f3d6e6e` (`ggml/src/iqk/iqk_gemm_kquants.cpp` `DequantizerQ4K`, `S
 | large prompts | 8-bit GEMM | Q4_K converted to 8-bit rows (`iqk_convert_q4_k_q8_1_r8`), then 8-bit GEMM | not taken (8 bits) | the float form of the idea, a row dequantized once per tile of tokens and the F32 kernel on it, is to be measured |
 | IQ_K types | — | its own types (IQ2_K … IQ6_K), better quality per bit | not now | not among the GGUF types of llama.cpp that our reader follows; such files come only from ik's quantizer |
 
+### Q6_K on the CPU: what was taken from llama.cpp and ik_llama.cpp (2026-09-24)
+
+`src/kernels` Q6_K (scalar in `kernels.c`, AVX2 and AVX-512 in `kernels_x86.c`, the block in
+`kernels_internal.h`) is new code, written after reading llama.cpp `b49650a` (`ggml-common.h`
+`block_q6_K`, `ggml-quants.c` `dequantize_row_q6_K` and `quantize_row_q6_K_ref`,
+`gguf-py/gguf/quants.py` `Q6_K`, `src/llama-quant.cpp` for which tensors Q4_K_M makes Q6_K) and
+ik_llama.cpp `f3d6e6e` (`ggml/src/iqk/iqk_gemm_kquants.cpp` `DequantizerQ6K`, AVX2 and AVX-512).
+
+| Choice | llama.cpp | ik_llama.cpp | Trochilus | Why |
+|---|---|---|---|---|
+| the block and its weights | `block_q6_K`: 128 bytes of low nibbles, 64 of high 2 bits, 16 int8 scales, f16 d last; weight `d*sc*(q-32)` | the same block | read as it is in the file; the weight `(d*sc)*(q-32)`, each product rounded to float | taken: the file format and gguf-py's order (`tools/check_dequant.py`: 1M floats bit for bit, scale 0 times a negative quant is -0 in both) |
+| the activations | Q8_K, integer dot | Q8_K, the `-32` folded into a min term (`-32*d` times the activations' sums) | float, never quantized; the `-32` inside each weight | as for Q4_K: the dot of the dequantized weight is the definition |
+| decoding the weights in SIMD | masks and shifts on bytes, int8 products | **the 6-bit values assembled on bytes, 32 at a time: low nibbles OR (high bits shifted into 0x30)** (`DequantizerQ6K::prepare`) | taken: a block's 256 quants assembled that way once, minus 32, into int8 on the stack; then Q8_0's path per element (widen, convert, multiply by the sub-block's scale) | the byte form makes 32 quants in ~5 instructions; a lookup like Q4_K's AVX-512 one does not pay here (64 values per 16 weights) |
+
 ## Sources not yet studied (2026-09-24)
 
 Proposed by Marcello to improve and evolve Trochilus; my first read of each, from what they declare

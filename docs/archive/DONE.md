@@ -981,3 +981,20 @@ llama.cpp redone on the current binary: prefill 1.8× theirs at 16 threads (was 
 context 512, 1.16× at 2048 (MEASUREMENTS §Speed — again). Check: `make check`; `make bench`;
 `sh tools/race_q4k.sh`; `build/trochilus run -m models/OLMoE-1B-7B-0125-Instruct-Q4_K.gguf -f
 prompt.txt`.
+
+### 2026-09-24 — Q6_K on the CPU, and the Q4_K_M model
+The engine reads Q6_K weights (M2, second step), so Q4_K_M, the file people download, runs: scalar
+dequantization and dot row in `src/kernels/kernels.c` (gguf-py's order, the dequantized weight in
+every product; the block in `kernels_internal.h`), AVX2 and AVX-512 bit for bit the same in
+`kernels_x86.c`: a block's 256 quants assembled once on bytes into q − 32 (ik_llama.cpp's way), then
+Q8_0's path per element (ORIGINS §Q6_K on the CPU). Tests: a block packed as ggml packs it, dot =
+dot of the dequantized row, every tier against scalar with a wrong Q6_K kernel that must be seen,
+the reader's Q6_K sizes (`test_gguf`, one test for both k-quants), a synthetic Q6_K model through
+the active table in every tier, `tools/check_dequant.py` with Q6_K (1M floats bit for bit gguf-py's);
+`tools/mutate_q6k.sh`, 14 mutations, all red. `tools/quantize_q4k.sh m` makes the real OLMoE in
+Q4_K_M from our Q8_0 (17 tensors Q6_K: output, and attn_v and ffn_down_exps in 8 layers); its
+2-layer cut meets transformers in `make check` (`REAL_MODEL_Q4KM`: 32/32 tokens, logits within
+2e-4); the whole model writes what the Q4_K writes on "The capital of France is". Measured:
+MEASUREMENTS §Q6_K on the CPU. Check: `make check`; `sh tools/mutate_q6k.sh` (container);
+`sh tools/bench_kernels.sh`; `sh tools/race_q4k.sh 5 m`; `build/trochilus run -m
+models/OLMoE-1B-7B-0125-Instruct-Q4_K_M.gguf -f prompt.txt`.

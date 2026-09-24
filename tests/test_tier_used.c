@@ -154,6 +154,7 @@ COUNTED(TR_TYPE_F32, f32)
 COUNTED(TR_TYPE_F16, f16)
 COUNTED(TR_TYPE_Q8_0, q8_0)
 COUNTED(TR_TYPE_Q4_K, q4_k)
+COUNTED(TR_TYPE_Q6_K, q6_k)
 
 static void counted_dot_f32_x4(const float *a, const float *b, int64_t stride, int64_t n, float *out) {
     atomic_fetch_add(&n_dot_x4, 1);
@@ -177,10 +178,12 @@ static void test_engine(const char *argv0, tr_type type, const char *name, long 
     counting.dot_row[TR_TYPE_F16] = row_f16;
     counting.dot_row[TR_TYPE_Q8_0] = row_q8_0;
     counting.dot_row[TR_TYPE_Q4_K] = row_q4_k;
+    counting.dot_row[TR_TYPE_Q6_K] = row_q6_k;
     if (g_real->dot_row_x4[TR_TYPE_F32] != NULL) counting.dot_row_x4[TR_TYPE_F32] = x4_f32;
     if (g_real->dot_row_x4[TR_TYPE_F16] != NULL) counting.dot_row_x4[TR_TYPE_F16] = x4_f16;
     if (g_real->dot_row_x4[TR_TYPE_Q8_0] != NULL) counting.dot_row_x4[TR_TYPE_Q8_0] = x4_q8_0;
     if (g_real->dot_row_x4[TR_TYPE_Q4_K] != NULL) counting.dot_row_x4[TR_TYPE_Q4_K] = x4_q4_k;
+    if (g_real->dot_row_x4[TR_TYPE_Q6_K] != NULL) counting.dot_row_x4[TR_TYPE_Q6_K] = x4_q6_k;
     counting.dot_f32_x4 = counted_dot_f32_x4;
     counting.axpy_f32_x4 = counted_axpy_f32_x4;
     for (int i = 0; i < TR_TYPE_COUNT; i++) {
@@ -248,5 +251,6 @@ int main(int argc, char **argv) {
     test_engine(argv0, TR_TYPE_F16, "f16", N_EMBD, N_FF);
     test_engine(argv0, TR_TYPE_Q8_0, "q8_0", N_EMBD, N_FF);
     test_engine(argv0, TR_TYPE_Q4_K, "q4_k", 256, 256);   /* rows of whole 256-element blocks */
+    test_engine(argv0, TR_TYPE_Q6_K, "q6_k", 256, 256);
     TR_TEST_EXIT();
 }

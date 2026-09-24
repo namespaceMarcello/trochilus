@@ -192,9 +192,10 @@ static void test_valid(const buf *b) {
     tr_gguf_close(g);
 }
 
-/* A Q4_K tensor: its bytes counted in blocks of 256 elements and 144 bytes, a row read by its
- * range; a row that is not whole blocks refused by name (the type table, src/format/gguf.c). */
-static void test_q4_k(void) {
+/* A k-quant tensor (Q4_K: 144 bytes a block, Q6_K: 210): its bytes counted in blocks of 256
+ * elements, a row read by its range; a row that is not whole blocks refused by name (the type table,
+ * src/format/gguf.c). */
+static void test_k_quant(tr_type type, const char *refusal, int bb) {
     int checked = 0;
     for (int bad = 0; bad < 2; bad++) {
         buf b = {0};
@@ -206,26 +207,27 @@ static void test_q4_k(void) {
         put_u32(&b, 2);
         put_u64(&b, bad ? 128 : 256);
         put_u64(&b, 3);
-        put_u32(&b, TR_TYPE_Q4_K);
+        put_u32(&b, type);
         put_u64(&b, 0);
         pad_to(&b, 32);
-        for (int i = 0; i < 3 * 144; i++) { uint8_t v = (uint8_t)i; put(&b, &v, 1); }
+        for (int i = 0; i < 3 * bb; i++) { uint8_t v = (uint8_t)i; put(&b, &v, 1); }
         TR_CHECK(write_file(b.data, b.len) == 0);
         char err[256] = "";
         tr_gguf *g = tr_gguf_open(path, err, sizeof err);
         if (bad) {
-            TR_CHECK(g == NULL && strstr(err, "not a multiple of q4_k block 256") != NULL);
+            TR_CHECK(g == NULL && strstr(err, refusal) != NULL);
             checked++;
         } else {
             const tr_gguf_tensor *t = g != NULL ? tr_gguf_find_tensor(g, "w") : NULL;
             TR_CHECK(t != NULL);
             if (t != NULL) {
-                TR_CHECK_EQ_INT(t->type, TR_TYPE_Q4_K);
+                TR_CHECK_EQ_INT(t->type, type);
                 TR_CHECK_EQ_INT(t->n_elems, 768);
-                TR_CHECK_EQ_INT(t->n_bytes, 432);
-                uint8_t row[144];
-                TR_CHECK(tr_gguf_read_range(g, t, 288, row, 144) == 0 && row[0] == (uint8_t)288 && row[143] == (uint8_t)431);
-                TR_CHECK(tr_gguf_read_range(g, t, 289, row, 144) == -1);
+                TR_CHECK_EQ_INT(t->n_bytes, 3 * bb);
+                uint8_t row[256];
+                TR_CHECK(tr_gguf_read_range(g, t, 2 * (uint64_t)bb, row, (size_t)bb) == 0 && row[0] == (uint8_t)(2 * bb) &&
+                         row[bb - 1] == (uint8_t)(3 * bb - 1));
+                TR_CHECK(tr_gguf_read_range(g, t, 2 * (uint64_t)bb + 1, row, (size_t)bb) == -1);
                 checked++;
             }
         }
@@ -513,7 +515,8 @@ int main(int argc, char **argv) {
     test_corrupted(&L, &valid);
     test_fuzz(&valid);
     test_more();
-    test_q4_k();
+    test_k_quant(TR_TYPE_Q4_K, "not a multiple of q4_k block 256", 144);
+    test_k_quant(TR_TYPE_Q6_K, "not a multiple of q6_k block 256", 210);
     remove(path);
     free(valid.data);
     TR_TEST_EXIT();
