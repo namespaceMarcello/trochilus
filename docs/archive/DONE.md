@@ -1096,3 +1096,24 @@ lines, every matmul with and without x8), `bench_kernels --matrix` (each type wi
 Numbers in MEASUREMENTS §Two rows against eight tokens. Check: `make check`; `sh tools/mutate_row2.sh`
 in the container; `sh tools/bench_native.sh bench_peak --runs 15`; `sh tools/prefill_context.sh
 change <binary before>`.
+
+### 2026-09-24 — Pieces 1 and 4 against the references, faster mutations, the gate's native side beside it
+- Piece 1 (the prompt's CPU matmul) read in llama.cpp, ik_llama.cpp, ds4 and colibri, and their
+  kernels measured alone on bench_peak's shapes (`tools/bench_ggml.sh`: ggml's public API against
+  the static libraries of `ref/llama.cpp/build-trochilus`); piece 4 (softmax and exp) read and
+  measured on every float (`tools/bench_expf_refs.sh`). MEASUREMENTS §The prompt's matmul against
+  the four references, §Softmax and exp against the references; ORIGINS rows 1 and 4.
+- Question 63 (decode a panel of rows once, then F32 over every token): `bench_peak`'s `mix x8 f32`
+  stream, `row2_x8_f32`, the panel matmul beside `tr_matmul` byte for byte (red under an FMA,
+  `-DBENCH_PANEL_MUTATE`), `--one-core`.
+- `test_dequant_is_the_dots_weight` (tests/test_kernels.c): `dot_row == dot_f32(dequant_row)` on
+  every tier, every type, special values; red under an FMA in the AVX-512 Q8_0 dot (LESSONS #169).
+- `tools/mutate_auto.py`: a gcov pass lists the mutants on lines no check runs (UNCOVERED) instead
+  of building them; with `--asan` the sanitizers judge only the plain build's survivors; the trees
+  built once and copied. `prof.c` 30 → 9 s with the same verdicts. `tools/mutate_files.sh` gains
+  `gguf`, `experts`, `threads`, `platform`, all four run (build/mutate/).
+- The gate: the native C tests run beside the container (`tools/beside.sh`, its test
+  `tools/test_beside.sh` in the gate, red without the trap).
+Check: `make check`; in the container `sh tools/bench_ggml.sh`, `sh tools/bench_expf_refs.sh`,
+`sh tools/mutate_files.sh prof`; `sh tools/test_beside.sh`; `sh tools/bench_native.sh bench_peak
+--runs 15 --one-core`.

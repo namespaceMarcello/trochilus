@@ -24,6 +24,8 @@ sh tools/ab_spec.sh <gguf> <binary> bench/prompts/code.txt 8   # how much --spec
 sh tools/build_llamacpp.sh; tools/compare_llamacpp.py ...   # in container: llama.cpp, logits comparison
 tools/speed_compare.py ...   # in container: speed against llama.cpp and colibri (trochilus-models volume)
 sh tools/race_llama.sh [runs]   # by the native rules: Trochilus vs llama.cpp, prompts 512 and 2048, 16 and 8 threads, A B B A (~30 min)
+sh tools/bench_ggml.sh   # in container: llama.cpp's own matmul kernels alone (ggml API, ref/llama.cpp/build-trochilus), bench_peak's shapes, Q8_0 and Q4_K, mul_mat and mul_mat_id, Q4_K also repacked; 1 and 16 threads, median of 15 (~1 min)
+sh tools/bench_expf_refs.sh [threads]   # in container: llama.cpp's exp (ggml_v_expf) and the C library's against tr_expf on every float (how many differ, worst ulp), then ns a value on one core (~1 min)
 sh tools/race_q4k.sh [runs] [m]   # by the native rules: the real model in Q4_K against Q8_0, and llama.cpp on the Q4_K; with m, Q4_K_M against Q4_K (~20 min)
 MSYS_NO_PATHCONV=1 docker run --rm -v "$PWD:/src" -v trochilus-models:/src/models -w /src trochilus-dev:local sh tools/quantize_q4k.sh [m]   # models/...-Q4_K.gguf from our Q8_0; with m, ...-Q4_K_M.gguf (Q4_K and Q6_K, llama-quantize's own mix)
 tools/.venv/Scripts/python.exe tools/check_dequant.py --binary build/tests/dump_dequant.exe   # every dequantization bit for bit gguf-py's (in make check)
@@ -64,6 +66,8 @@ TR_BAR=0 build/trochilus run ...   # no progress bar while the model loads (it i
 sh tools/busy_machine.sh <n> <command>   # the ONLY way to load the machine: generators die with the script
 sh tools/machine_still.sh [limit] [wait] [window]   # occupied processors (who: tools/background_load.ps1): guard for every measurement
 sh tools/test_cleanup.sh   # a stopped script loses its children; without cleanup.lib trap the child stays
+sh tools/beside.sh <log> '<first>' <second...>   # the first command in the background (output held, shown at the end), the second in the foreground; either failing fails it; the gate runs the native C tests beside the container this way
+sh tools/test_beside.sh   # beside.sh's exit codes and output, and no first command left when the second fails (red without the trap); in make check
 make bench               # microbenchmark of kernels (median + noise)
 sh tools/bench_kernels.sh   # the same by the native rules (marker, still machine, load declared), a one-byte-longer copy; CONTAINER=1 in trochilus-dev; build/bench_kernels/; lines above 10% spread named in noisy.txt; bench_kernels --matrix: the whole-matrix tables only (each type with an x8 kernel also without it, -x8, in turn)
 make bench-mem           # RAM bandwidth (sequential, sparse), engine matmul, attention on both layouts
@@ -75,8 +79,8 @@ sh tools/mask_quality.sh   # experts off: KL and tokens against whole model (mea
 sh tools/experts_budget.sh measure | misses | direct   # M1: tok/s at 4 budgets, cost of a token, cache yes/no
 build/trochilus run ... --expert-budget <MiB|min>   # expert RAM (default: the plan); TR_EXPERT_BUDGET_MIB in tests
 sh tools/mutate_{route,tune,experts,stream}.sh | tools/mutate_reports.py   # in container: the mutations, all red
-python3 tools/mutate_auto.py <src/file.c> <test> [test...] [--lines A-B,C-D] [--changed REF] [--list] [--asan] [--cmd '<shell>']   # in container: generated mutations, survivors, timeouts and memory refusals listed (SURVIVED, TIMEOUT, PRESSURE); --cmd adds a check per mutant (the oracle, for a model file); --changed HEAD: only the lines changed since HEAD; a progress line per mutant on stderr
-sh tools/mutate_files.sh [olmoe kernels ... main serve prof]   # in container: mutate_auto on each file with its tests and oracles, build/mutate/<name>.txt, time left in build/mutate/<name>.progress; CHANGED=HEAD sh tools/mutate_files.sh <name>: only the lines changed since HEAD
+python3 tools/mutate_auto.py <src/file.c> <test> [test...] [--lines A-B,C-D] [--changed REF] [--list] [--asan] [--cmd '<shell>'] [--no-coverage]   # in container: generated mutations, survivors, timeouts, memory refusals and mutants on lines no check runs listed (SURVIVED, TIMEOUT, PRESSURE, UNCOVERED: a gcov pass first); --asan: the sanitizers judge the plain build's survivors; --cmd adds a check per mutant (the oracle, for a model file); --changed HEAD: only the lines changed since HEAD; a progress line per mutant on stderr
+sh tools/mutate_files.sh [olmoe kernels ... main serve prof gguf experts threads platform]   # in container: mutate_auto on each file with its tests and oracles, build/mutate/<name>.txt, time left in build/mutate/<name>.progress; CHANGED=HEAD sh tools/mutate_files.sh <name>: only the lines changed since HEAD
 make bench-attn          # attention on prompt (512/2048/4000) on one layer, broken down by phases, with bit control
 make bench-expf          # tr_expf on all 2^32 floats against rounded value and C library
 tools/.venv/Scripts/python.exe tools/gen_expf_table.py [--check | --scan]   # tr_expf constants from mpmath (src/kernels/expf_table.h)

@@ -106,6 +106,15 @@ the ones that did not pay are written down too, in `docs/MEASUREMENTS.md`, with 
 The context table above predates the GPU attention and the two-row kernels; it will be measured
 again as a whole.
 
+Against the references, piece by piece (`docs/ORIGINS.md` §Every piece). llama.cpp's own matrix
+kernels called alone through ggml, on our shapes, one core (indicative: a loaded machine):
+
+| Kernel | llama.cpp | Trochilus |
+|---|---|---|
+| MoE experts, Q8_0 (two thirds of OLMoE's prompt) | 72 GFLOP/s | **102 GFLOP/s** |
+| Dense projections, Q8_0 | **163 GFLOP/s** (8-bit activations) | 102 GFLOP/s, exact |
+| `exp` on all 2^32 floats | rounds 3.4% of them otherwise | correctly rounded, every one |
+
 ### What we are proud of
 
 **Exactness is an invariant, not a hope.** The logits do not move when you change the number of
@@ -132,7 +141,9 @@ down as "not distinguishable".
 **Every mistake becomes an automatic check.** `docs/LESSONS.md` is the log: each entry names how
 it was found and the test, lint rule or gate check that now prevents it from coming back. The hot
 path — the code that runs on every token — is enforced by `tools/lint.py` and `tests/test_hot.c`:
-no allocation, no strings, no I/O.
+no allocation, no strings, no I/O. The engine's files go through generated mutations, fourteen of
+them so far (`tools/mutate_files.sh`): a changed operator that no test notices is read one by one,
+and either a test is written that kills it or the reason it cannot matter is written down.
 
 ## What we will do
 

@@ -35,7 +35,14 @@ are right, so a model file wants the oracle too:
 object / did not build / timed out. Exit status 0 whatever survives: this is a report.
 Speed: the checks run fastest first, each with ten times its own time as budget, and with
 TR_TEST_FAILFAST=1 (tests/test.h: a C test stops at its first failed check); stderr gets one line
-per mutant judged, with how long is left.
+per mutant judged, with how long is left. Three more, 2026-09-24:
+- a coverage pass first (gcov, -O0, every check once, beside the builds): a mutant on a line of
+  code no check runs cannot be killed, and it was the dearest one (every check to its end, twice
+  under ASan's slowness); it is listed UNCOVERED, not built (--no-coverage: judge them all);
+- with --asan, the plain build judges every mutant and the sanitizers only its survivors: a kill
+  is a kill in either build, and the plain one runs its checks 2-4x faster;
+- the trees are built once and copied (their mtimes kept, so make finds them up to date), not
+  built once per job.
 """
 import argparse
 import os
@@ -177,6 +184,78 @@ def put(path, text):
         f.write(text)
 
 
+ROOT = "/tmp/mutate_auto"
+
+
+def copy_built(src, dst):
+    """A worker's tree as a copy of one already built: copy2 keeps every mtime, so make finds every
+    object up to date, and the build of every target is paid once instead of once per job."""
+    if os.path.exists(dst):
+        shutil.rmtree(dst)
+    shutil.copytree(src, dst, symlinks=True)
+
+
+def phase(jobs, suffix, make, targets, checks, obj):
+    """The trees of one build (plain, or with the sanitizers): tree 0 built, the others copies of
+    it made before any check writes in it; the unmutated object; and the checks, fastest first,
+    each with ten times its own time on the unmutated tree as budget (at least 20 s), not ten times
+    all of them together: a timeout of a 1-minute test cost 53 minutes of a job when the budget was
+    the sum of the test and two oracles; and the fastest check runs first, so a mutant that dies
+    dies soon."""
+    dirs = [f"{ROOT}/{w}{suffix}" for w in range(jobs)]
+    copy_tree(dirs[0])
+    b = subprocess.run(make + ["-j8"] + targets, cwd=dirs[0], capture_output=True)
+    if b.returncode:
+        sys.exit("mutate_auto: the unmutated tree does not build:\n" + b.stderr.decode()[-2000:])
+    for d in dirs[1:]:
+        copy_built(dirs[0], d)
+    with open(os.path.join(dirs[0], obj), "rb") as f:
+        base_obj = f.read()
+    timed = []
+    for c in checks:
+        t = time.time()
+        if run(c, dirs[0], None)[0] != 0:
+            sys.exit(f"mutate_auto: {' '.join(c)} fails without any mutation")
+        timed.append((time.time() - t, c))
+    timed.sort(key=lambda tc: tc[0])
+    return {"dirs": dirs, "make": make, "base_obj": base_obj, "checks": [c for _, c in timed],
+            "budgets": [max(20.0, 10 * t) for t, _ in timed]}
+
+
+# gcov's first field on a line: "-" no code, "#####" code never run, else a count
+GCOV_LINE = re.compile(r"^\s*([^:]+):\s*(\d+):")
+
+
+def uncovered_lines(path, targets, checks):
+    """The lines of path that are code no check runs, from one pass of every check over a tree
+    built with --coverage at -O0 (where gcov gives each line its own count). A line gcov calls no
+    code ("-": a declaration, an initializer, the rest of a statement) is not in the set, so its
+    mutants are judged. None when the pass cannot be trusted: a check that fails in that build, or
+    no report from gcov. A line only a race or a timing reaches (the pool's spin) may be missed by
+    one pass: its mutant is listed UNCOVERED, to be read like a survivor, never counted killed."""
+    d = f"{ROOT}/cov"
+    copy_tree(d)
+    mk = ["make", "BUILD=b", "CC=gcc", "EXTRA_CFLAGS=-g0 -O0 --coverage", "EXTRA_LDFLAGS=--coverage", "-j8"]
+    if subprocess.run(mk + targets, cwd=d, capture_output=True).returncode != 0:
+        return None
+    for c in checks:
+        if run(c, d, None)[0] != 0:
+            return None
+    g = subprocess.run(["gcov", "-o", os.path.join("b", os.path.dirname(path)), path], cwd=d,
+                       capture_output=True, text=True)
+    report = os.path.join(d, os.path.basename(path) + ".gcov")
+    if g.returncode != 0 or not os.path.exists(report):
+        return None
+    zero = set()
+    with open(report, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            m = GCOV_LINE.match(line)
+            if m and m.group(1).strip() == "#####":
+                zero.add(int(m.group(2)))
+    shutil.rmtree(d, ignore_errors=True)
+    return zero
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("file")
@@ -187,6 +266,7 @@ def main():
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--asan", action="store_true")
     ap.add_argument("--cmd", action="append", default=[])
+    ap.add_argument("--no-coverage", action="store_true")
     a = ap.parse_args()
     rng = [tuple(int(x) for x in r.split("-")) for r in a.lines.split(",")] if a.lines else None
     if a.changed:
@@ -202,41 +282,45 @@ def main():
         return 0
     bins = [f"b/tests/{t}" for t in a.tests]
     targets = bins + (["b/trochilus"] if a.cmd else [])
-    checks = [[f"./{b}"] for b in bins] + [["sh", "-c", c] for c in a.cmd]
-    # -g0: debug info records columns, and a mutated line would differ even where the code does not
-    flags = "-g0" + (" -O1 -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all"
-                     if a.asan else "")
-    mk = ["make", "BUILD=b", "CC=gcc", f"EXTRA_CFLAGS={flags}"]
-    if a.asan:
-        mk.append("EXTRA_LDFLAGS=-fsanitize=address,undefined")
+    all_checks = [[f"./{b}"] for b in bins] + [["sh", "-c", c] for c in a.cmd]
     obj = "b/" + a.file[:-2] + ".o"
     original = open(a.file, encoding="utf-8").read()
-
-    # every worker gets its own tree, built once: a mutant then recompiles one object and relinks
-    dirs = [f"/tmp/mutate_auto/{w}" for w in range(a.jobs)]
     t0 = time.time()
-    for d in dirs:
-        copy_tree(d)
-    base = [subprocess.run(mk + ["-j4"] + targets, cwd=d, capture_output=True) for d in dirs]
-    if any(b.returncode for b in base):
-        sys.exit("mutate_auto: the unmutated tree does not build:\n" + base[0].stderr.decode()[-2000:])
-    with open(os.path.join(dirs[0], obj), "rb") as f:
-        base_obj = f.read()
-    # each check gets ten times its own time on the unmutated tree (at least 20 s), not ten times
-    # all of them together: a timeout of a 1-minute test cost 53 minutes of a job when the budget
-    # was the sum of the test and two oracles; and the fastest check runs first, so a mutant that
-    # dies dies soon
-    timed = []
-    for c in checks:
-        t = time.time()
-        if run(c, dirs[0], None)[0] != 0:
-            sys.exit(f"mutate_auto: {' '.join(c)} fails without any mutation")
-        timed.append((time.time() - t, c))
-    timed.sort(key=lambda tc: tc[0])
-    checks = [c for _, c in timed]
-    budgets = [max(20.0, 10 * t) for t, _ in timed]
 
-    results, flaky, lock = {}, [], threading.Lock()
+    # the lines no check runs (gcov): their mutants cannot be killed, and a survivor was the dearest
+    # mutant, every check run to its end; they are listed, not built. The pass runs beside the
+    # builds of the trees below (its budgets only grow by it: ten times a check's time under load)
+    cov = {}
+    cov_thread = None
+    if not a.no_coverage:
+        cov_thread = threading.Thread(target=lambda: cov.update(zero=uncovered_lines(a.file, targets, all_checks)))
+        cov_thread.start()
+
+    # -g0: debug info records columns, and a mutated line would differ even where the code does not
+    plain = phase(a.jobs, "", ["make", "BUILD=b", "CC=gcc", "EXTRA_CFLAGS=-g0"], targets, all_checks, obj)
+    # with --asan the sanitizers judge only what the plain build lets live: a kill there is a kill
+    # (a check failed twice), and the plain build runs its checks 2-4x faster
+    asan = phase(a.jobs, "a", ["make", "BUILD=b", "CC=gcc",
+                               "EXTRA_CFLAGS=-g0 -O1 -fno-omit-frame-pointer -fsanitize=address,undefined "
+                               "-fno-sanitize-recover=all", "EXTRA_LDFLAGS=-fsanitize=address,undefined"],
+                 targets, all_checks, obj) if a.asan else None
+
+    uncovered = None
+    if cov_thread is not None:
+        cov_thread.join()
+        uncovered = cov.get("zero")
+        if uncovered is None:
+            print("mutate_auto: the coverage pass could not be trusted (a check failed or gcov had no "
+                  "report): every mutant is judged", file=sys.stderr, flush=True)
+    results = {}
+    run_k = []
+    for k, (no, _, _, _) in enumerate(todo):
+        if uncovered is not None and no in uncovered:
+            results[k] = "uncovered"
+        else:
+            run_k.append(k)
+
+    flaky, lock = [], threading.Lock()
     progress = {"done": 0, "t": time.time()}
 
     def tick(k, verdict, why):
@@ -245,20 +329,20 @@ def main():
         alone had been reported killed, docs/LESSONS.md #125)."""
         progress["done"] += 1
         n, el = progress["done"], time.time() - progress["t"]
-        left = el / n * (len(todo) - n)
-        print(f"{n}/{len(todo)} judged, {el / 60:.1f} min, about {left / 60:.0f} min left | "
+        left = el / n * (len(run_k) - n)
+        print(f"{n}/{len(run_k)} judged, {el / 60:.1f} min, about {left / 60:.0f} min left | "
               f"{a.file}:{todo[k][0]}: {todo[k][1]}: {verdict}{' by ' + why if why else ''}", file=sys.stderr,
               flush=True)
 
-    def judge(d):
-        """The verdict on the mutant written in tree d, the checks that failed only once, and the
-        check that decided it with its exit statuses."""
-        if run(mk + targets, d, 300)[0] != 0:
+    def judge(ph, d):
+        """The verdict on the mutant written in tree d of phase ph, the checks that failed only
+        once, and the check that decided it with its exit statuses."""
+        if run(ph["make"] + targets, d, 300)[0] != 0:
             return "nobuild", [], ""
-        if open(os.path.join(d, obj), "rb").read() == base_obj:
+        if open(os.path.join(d, obj), "rb").read() == ph["base_obj"]:
             return "same", [], ""
         once = []
-        for c, budget in zip(checks, budgets):
+        for c, budget in zip(ph["checks"], ph["budgets"]):
             name = " ".join(c)[-60:]
             rc, pressure = run(c, d, budget)
             # a timeout too must happen twice, with room: under load a check that would pass
@@ -281,16 +365,31 @@ def main():
                 once.append(" ".join(c))
         return "survived", once, ""
 
+    def verdict_of(w, k):
+        """Mutant k in worker w's trees: the plain build first, the sanitizers on what it lets live."""
+        d = plain["dirs"][w]
+        put(os.path.join(d, a.file), todo[k][3])
+        verdict, once, why = judge(plain, d)
+        if asan is not None and verdict == "survived":
+            da = asan["dirs"][w]
+            put(os.path.join(da, a.file), todo[k][3])
+            v2, once2, why2 = judge(asan, da)
+            once += once2
+            # an object the sanitizers' build compiles the same is the plain build's survivor
+            if v2 != "same":
+                verdict, why = v2, (why2 + " under ASan" if why2 else "")
+        return verdict, once, why
+
     def worker(w):
-        d = dirs[w]
-        for k in range(w, len(todo), a.jobs):
-            put(os.path.join(d, a.file), todo[k][3])
-            verdict, once, why = judge(d)
+        for k in run_k[w::a.jobs]:
+            verdict, once, why = verdict_of(w, k)
             with lock:
                 results[k] = verdict
                 flaky.extend((todo[k][0], todo[k][1], c) for c in once)
                 tick(k, verdict, why)
-        put(os.path.join(d, a.file), original)
+        for ph in (plain, asan):
+            if ph is not None:
+                put(os.path.join(ph["dirs"][w], a.file), original)
 
     threads = [threading.Thread(target=worker, args=(w,)) for w in range(a.jobs)]
     for t in threads:
@@ -306,8 +405,7 @@ def main():
     pending = sorted(k for k, v in results.items() if v == "pressure")
     t_alone = time.time()
     for i, k in enumerate(pending, 1):
-        put(os.path.join(dirs[0], a.file), todo[k][3])
-        verdict, once, why = judge(dirs[0])
+        verdict, once, why = verdict_of(0, k)
         results[k] = verdict
         flaky.extend((todo[k][0], todo[k][1], c) for c in once)
         print(f"{i}/{len(pending)} judged again alone (refused for memory), {(time.time() - t_alone) / 60:.1f} min | "
@@ -315,16 +413,16 @@ def main():
               flush=True)
     # nothing of ours may outlive the run (docs/LESSONS.md #122): counted in the last line, and
     # stopped
-    orphans = left_behind(dirs)
+    orphans = left_behind([ROOT])
     for pid in orphans:
         try:
             os.kill(pid, signal.SIGKILL)
         except OSError:
             pass
-    shutil.rmtree("/tmp/mutate_auto", ignore_errors=True)
+    shutil.rmtree(ROOT, ignore_errors=True)
 
-    count = {v: 0 for v in ("killed", "survived", "same", "nobuild", "timeout", "pressure")}
-    listed = {"survived": "SURVIVED", "timeout": "TIMEOUT", "pressure": "PRESSURE"}
+    count = {v: 0 for v in ("killed", "survived", "same", "nobuild", "timeout", "pressure", "uncovered")}
+    listed = {"survived": "SURVIVED", "timeout": "TIMEOUT", "pressure": "PRESSURE", "uncovered": "UNCOVERED"}
     for k in sorted(results, key=lambda k: todo[k][0]):
         no, name, line, _ = todo[k]
         count[results[k]] += 1
@@ -333,11 +431,13 @@ def main():
     for no, name, check in sorted(flaky):
         print(f"FLAKY {check}: failed once, then passed, on {a.file}:{no}: {name}")
     print(f"mutate_auto {a.file} vs {' '.join(a.tests + [f'[{c}]' for c in a.cmd])}: {len(results)} mutants, {count['killed']} killed, "
-          f"{count['survived']} survived, {count['same']} same object, {count['nobuild']} did not build, "
+          f"{count['survived']} survived, {count['uncovered']} on lines no check runs, {count['same']} same object, "
+          f"{count['nobuild']} did not build, "
           f"{count['timeout']} timed out, {count['pressure']} refused for memory, {len(flaky)} flaky failures, "
           f"{len(pending)} judged again alone ({(time.time() - t_alone) / 60:.0f} min), "
           f"{len(orphans)} processes left behind "
-          f"({time.time() - t0:.0f} s, {a.jobs} jobs{', ASan' if a.asan else ''})")
+          f"({time.time() - t0:.0f} s, {a.jobs} jobs{', ASan on the plain build survivors' if a.asan else ''}"
+          f"{'' if uncovered is not None else ', no coverage pass'})")
     return 1 if orphans else 0
 
 

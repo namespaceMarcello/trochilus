@@ -50,7 +50,9 @@ next. Pioneer: what nobody has measured is where to look first.
 Goal: the success rate rises with every request. It is measured in `docs/LESSONS.md` (the "found
 by" column): no mistake should reach Marcello if a test could have caught it first.
 
-1. **Before**: `docs/STATUS.md`, then `grep` in `docs/LESSONS.md` for the area being touched.
+1. **Before**: `docs/STATUS.md`, then `grep` in `docs/LESSONS.md` for the area being touched, then
+   the piece's row in `docs/ORIGINS.md` §Every piece: if it is not "read and measured", reading and
+   racing the references (`ref/`, `tools/bench_ggml.sh` for ggml's kernels alone) is the first step.
 2. **A mistake or a discovery**, as soon as it happens, however small: one line in
    `docs/LESSONS.md`.
 3. **Every mistake becomes a check**: a test that reproduces it (red before the fix, green after),

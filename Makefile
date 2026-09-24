@@ -264,10 +264,12 @@ oracle-real: $(BUILD)/trochilus$(EXE)
 spec-check: $(BUILD)/trochilus$(EXE)
 	@if [ ! -f $(REAL_MODEL) ]; then echo "spec-check: SKIPPED, $(REAL_MODEL) not found"; else \
 		$(BUILD)/trochilus$(EXE) run -m $(REAL_MODEL) -f bench/prompts/code-edit.txt -n 64 --spec 0 \
-			> $(BUILD)/spec-0.txt 2>/dev/null && \
+			> $(BUILD)/spec-0.txt 2>$(BUILD)/spec-0.err || \
+			{ echo "spec-check: --spec 0 failed:"; cat $(BUILD)/spec-0.err; exit 1; }; \
 		for k in 1 4 8 15; do \
 			$(BUILD)/trochilus$(EXE) run -m $(REAL_MODEL) -f bench/prompts/code-edit.txt -n 64 --spec $$k \
-				> $(BUILD)/spec-$$k.txt 2>$(BUILD)/spec-$$k.err || exit 1; \
+				> $(BUILD)/spec-$$k.txt 2>$(BUILD)/spec-$$k.err || \
+				{ echo "spec-check: --spec $$k failed:"; cat $(BUILD)/spec-$$k.err; exit 1; }; \
 			cmp $(BUILD)/spec-0.txt $(BUILD)/spec-$$k.txt || exit 1; \
 			grep -qE "speculation: [0-9]+ passes, [1-9][0-9]*/[1-9][0-9]* drafted" $(BUILD)/spec-$$k.err || \
 				{ echo "spec-check: --spec $$k accepted no draft, it proves nothing"; \
@@ -290,6 +292,7 @@ clean-machine:
 	@mkdir -p $(BUILD) && date +%s > $(BUILD)/.check-start
 	sh tools/orphans.sh
 	sh tools/test_cleanup.sh
+	sh tools/test_beside.sh
 	sh tools/test_marker.sh
 	sh tools/test_ab_modes.sh
 ifeq ($(OS),Windows_NT)
@@ -299,16 +302,20 @@ check: clean-machine lint
 	@# the diagnostic probe's branch of olmoe.c (make attn-probe) still compiles, with 0 warnings
 	$(CC) $(filter-out -MMD -MP,$(CFLAGS)) -Werror -DTR_ATTN_PROBE -fsyntax-only src/models/olmoe.c tools/attn_probe.c
 	@# the models volume, when it exists, replaces models/ read over the Windows bind mount:
-	@# the real-model checks load the same file from ext4 instead of 9p (docs/LESSONS.md #41)
-	MSYS_NO_PATHCONV=1 docker run --rm --security-opt seccomp=unconfined -v "$(CURDIR):/src" \
+	@# the real-model checks load the same file from ext4 instead of 9p (docs/LESSONS.md #41).
+	@# Beside it (tools/beside.sh), the C tests once more on Windows itself: its branches of src/base
+	@# never run in the container (docs/LESSONS.md #103, #106); a binary Smart App Control blocks is
+	@# SKIPPED, not failed. They share nothing with the container but the processors (they write
+	@# beside their binaries, the container in build/linux-* and its own /tmp); their output comes
+	@# when the container's gate ends
+	MSYS_NO_PATHCONV=1 sh tools/beside.sh $(BUILD)/native-tests.log \
+		"env -u MSYS_NO_PATHCONV sh tools/native_tests.sh $(TEST_BIN)" \
+		docker run --rm --security-opt seccomp=unconfined -v "$(CURDIR):/src" \
 		$$(docker volume inspect trochilus-models > /dev/null 2>&1 && echo "-v trochilus-models:/src/models") \
 		-w /src $(DOCKER_IMG) make check-linux
 	@# give the Docker VM's file cache back to Windows (docs/LESSONS.md #38)
 	MSYS_NO_PATHCONV=1 docker run --rm --privileged $(DOCKER_IMG) sh -c "sync; echo 3 > /proc/sys/vm/drop_caches"
 	sh tools/check_argv_utf8.sh $(BUILD)/trochilus$(EXE) $(TOKFIX)/vocab.gguf
-	@# the C tests once more on Windows itself: its branches of src/base never run in the container
-	@# (docs/LESSONS.md #103, #106); a binary Smart App Control blocks is SKIPPED, not failed
-	sh tools/native_tests.sh $(TEST_BIN)
 	@# the decode's attention on this machine's GPU gives the CPU's bytes through the whole engine
 	@# (the real model's 2-layer cut; skipped without a GPU, the cut, or with the exe blocked)
 	sh tools/gpu_exact.sh quick $(BUILD)/trochilus$(EXE)

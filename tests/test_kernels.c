@@ -636,6 +636,65 @@ static void wrong_axpy_f32_x4(float *y, const float *x, int64_t stride, const fl
         y[k] = y[k] + ((a[0] * x[k] + a[1] * x[stride + k]) + (a[2] * x[2 * stride + k] + a[3] * x[3 * stride + k]));
 }
 
+/* ---- the weight in every dot is dequant_row's float, in every tier ------------------------ */
+/* dot_row(row, x) == dot_f32(dequant_row(row), x) bit for bit (NaN: any NaN), for every type and
+ * tier, ordinary and special values, rows up to 4096 (and 4113 for F16's tail lanes): a matmul
+ * may then decode a panel of rows once and run F32 over every token without moving a bit
+ * (docs/MEASUREMENTS.md question 63). test_dot_row_* hold it for the scalar tier on two blocks.
+ * Branch covered: each tier's own dot_row and dot_f32 (never scalar's through a NULL); a panel
+ * one ulp off in every weight must fail it for each type, and the comparisons are counted. */
+enum { DQ_TYPES = 4 };
+static const tr_type g_dq_types[DQ_TYPES] = {TR_TYPE_F16, TR_TYPE_Q8_0, TR_TYPE_Q4_K, TR_TYPE_Q6_K};
+
+static void fill_row_of(tr_type type, unsigned char *row, int64_t n, unsigned *seed, int special) {
+    if (type == TR_TYPE_F16) fill_f16(row, n, seed, special);
+    if (type == TR_TYPE_Q8_0) fill_q8_0(row, n / 32, seed, special);
+    if (type == TR_TYPE_Q4_K) fill_q4_k(row, n / 256, seed, special);
+    if (type == TR_TYPE_Q6_K) fill_q6_k(row, n / 256, seed, special);
+}
+
+/* per type, the rows whose dot differs from dot_f32 over the decoded panel; with `wrong`, every
+ * finite nonzero weight of the panel one ulp up (a panel decoded otherwise than the dot) */
+static void dequant_dot_diffs(const tr_kernels *K, int wrong, int bad[DQ_TYPES], long *compared) {
+    static unsigned char row[2 * CMP_MAX_N];
+    static float x[CMP_MAX_N], w[CMP_MAX_N];
+    static const int64_t sizes[] = {256, 512, 2048, 4096, 4113};
+    unsigned seed = 2463u;
+    for (int t = 0; t < DQ_TYPES; t++) {
+        tr_type type = g_dq_types[t];
+        bad[t] = 0;
+        for (size_t s = 0; s < sizeof sizes / sizeof sizes[0]; s++) {
+            int64_t n = sizes[s];
+            if (type != TR_TYPE_F16 && n % 256 != 0) continue;
+            for (int special = 0; special < 2; special++) {
+                fill_row_of(type, row, n, &seed, special);
+                for (int64_t i = 0; i < n; i++) x[i] = rand_special(&seed, special);
+                K->dequant_row[type](row, w, n);
+                if (wrong)
+                    for (int64_t i = 0; i < n; i++)
+                        if (isfinite(w[i]) && w[i] != 0.0f) w[i] = nextafterf(w[i], INFINITY);
+                if (!same_float(K->dot_row[type](row, x, n), K->dot_f32(w, x, n))) bad[t]++;
+                (*compared)++;
+            }
+        }
+    }
+}
+
+static void test_dequant_is_the_dots_weight(void) {
+    static const char *const tiers[] = {"scalar", "avx2", "avx512"};
+    int bad[DQ_TYPES];
+    for (size_t i = 0; i < sizeof tiers / sizeof tiers[0]; i++) {
+        const tr_kernels *K = tr_kernels_tier(tiers[i]);
+        if (K == NULL) continue; /* this CPU (or TR_CPU_MAX, tools/tier_check.sh) lacks the tier */
+        long compared = 0;
+        dequant_dot_diffs(K, 0, bad, &compared);
+        for (int t = 0; t < DQ_TYPES; t++) TR_CHECK_EQ_INT(bad[t], 0);
+        TR_CHECK(compared > 0);
+        dequant_dot_diffs(K, 1, bad, &compared);
+        for (int t = 0; t < DQ_TYPES; t++) TR_CHECK(bad[t] > 0);
+    }
+}
+
 static void test_tiers_match_scalar(void) {
     static const char *const tiers[] = {"avx2", "avx512"};
     const tr_kernels *S = tr_kernels_tier("scalar");
@@ -1102,6 +1161,7 @@ int main(void) {
     test_dot_row_q4_k();
     test_dot_row_q6_k();
     test_tiers_match_scalar();
+    test_dequant_is_the_dots_weight();
     test_rope_table();
     test_swiglu_threads();
     test_attention_head();

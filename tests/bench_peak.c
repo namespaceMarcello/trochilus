@@ -15,7 +15,17 @@
  *              run by run in turn.
  * FLOPs are the matmul's useful ones, 2 per weight and token (the scale multiply not counted).
  *
- *   build/tests/bench_peak.exe [--runs N]      native, still machine (tools/measure_guard.lib)
+ * The panel premise (ik_llama.cpp's idea, docs/MEASUREMENTS.md "Two rows against eight tokens"):
+ * decode a panel of P weight rows once with dequant_row into f32, then row2_x8_f32 (the same lane
+ * contract and mul-then-add as avx512_dot_row2_x8_q8_0, never FMA) over every group of 8 tokens,
+ * instead of decoding each weight vector once per 8 tokens as tr_matmul does today. "panel P=16"
+ * and "P=32" lines run beside each matmul shape and type; "mix x8 f32" is the same asm stream with
+ * the decode replaced by a plain load, the ceiling that arithmetic could reach without one. Every
+ * panel shape and type is checked against tr_matmul by memcmp before it is timed; the counter
+ * g_panel_kernel_calls (checked > 0 at the end of main) is the branch that check exercises, so it
+ * cannot pass without row2_x8_f32 ever having run.
+ *
+ *   build/tests/bench_peak.exe [--runs N] [--one-core]   native, still machine (tools/measure_guard.lib)
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -189,11 +199,40 @@ __attribute__((target("avx512f"))) static void mix_x8(int64_t iters, const uint8
     memcpy(f, &a0, sizeof f);
     g_sink = f[0];
 }
+
+/* The same stream with the decode removed: two plain loads of already-decoded f32 weights (w, u)
+ * from L1 instead of MIX_CODES's widen-convert-scale. The arithmetic after the loads is unchanged
+ * (the same MIX_PAIR), so this is the ceiling the panel premise below could reach if decoding a
+ * row cost nothing at all. */
+#define MIX_CODES_F32 "vmovups (%[q]), %[w]\n\tvmovups 64(%[q]), %[u]\n\t"
+#define MIX_IN_F32 [q] "r"(q), [x] "r"(x)
+
+__attribute__((target("avx512f"))) static void mix_x8_f32(int64_t iters, const uint8_t *q, const float *x) {
+    __m512 z = _mm512_set1_ps(g_zero);
+    __m512 a0 = z, a1 = z, a2 = z, a3 = z, a4 = z, a5 = z, a6 = z, a7 = z;
+    __m512 b0 = z, b1 = z, b2 = z, b3 = z, b4 = z, b5 = z, b6 = z, b7 = z, w, u, v0, v1, t0, t1, t2, t3;
+    for (int64_t i = 0; i < iters; i++) {
+        __asm__ volatile(MIX_CODES_F32 MIX_PAIR("0", "64", "a0", "b0", "a1", "b1") MIX_PAIR("128", "192", "a2", "b2", "a3", "b3")
+                         : [a0] "+v"(a0), [a1] "+v"(a1), [a2] "+v"(a2), [a3] "+v"(a3), [b0] "+v"(b0), [b1] "+v"(b1),
+                           [b2] "+v"(b2), [b3] "+v"(b3), MIX_TEMPS
+                         : MIX_IN_F32
+                         : "memory");
+        __asm__ volatile(MIX_PAIR("256", "320", "a4", "b4", "a5", "b5") MIX_PAIR("384", "448", "a6", "b6", "a7", "b7")
+                         : [a4] "+v"(a4), [a5] "+v"(a5), [a6] "+v"(a6), [a7] "+v"(a7), [b4] "+v"(b4), [b5] "+v"(b5),
+                           [b6] "+v"(b6), [b7] "+v"(b7), [v0] "=&v"(v0), [v1] "=&v"(v1), [t0] "=&v"(t0),
+                           [t1] "=&v"(t1), [t2] "=&v"(t2), [t3] "=&v"(t3)
+                         : [x] "r"(x), [w] "v"(w), [u] "v"(u)
+                         : "memory");
+    }
+    float f[16];
+    memcpy(f, &a0, sizeof f);
+    g_sink = f[0];
+}
 #endif
 
 typedef struct {
     int kind;          /* 0: peak512, 1: peak256, 2: row2, 3: mix_x4, 4: mix_x8, 5: peak_fma, 6: mix_x8_fma,
-                        * 7: row2_x8 */
+                        * 7: row2_x8, 8: mix_x8_f32 */
     int64_t iters;     /* loop iterations (peak) or calls (row2) per thread */
     int64_t cols;
     uint8_t *rows[64]; /* per worker: two Q8_0 rows */
@@ -210,6 +249,7 @@ static void peak_fn(void *ctx, int64_t begin, int64_t end, int worker) {
         if (j->kind == 4) mix_x8(j->iters, j->rows[worker], j->x[worker]);
         if (j->kind == 5) peak_fma(j->iters);
         if (j->kind == 6) mix_x8_fma(j->iters, j->rows[worker], j->x[worker]);
+        if (j->kind == 8) mix_x8_f32(j->iters, j->rows[worker], j->x[worker]);
 #endif
         if (j->kind == 2) {
             const tr_kernels *k = tr_kernels_get();
@@ -264,11 +304,191 @@ static void fill_q8_0(uint8_t *row, int64_t n, uint64_t *s) {
     }
 }
 
+#if HAVE_X86
+/* Q4_K row filler, copied from tests/test_kernels.c (next_rand, fill_q4_k): every byte random
+ * (every nibble, scale and min). special=0 always keeps d and dmin ordinary (never a subnormal,
+ * inf or NaN scale): kernels.h's contract only promises the same NaN on every variant, not the
+ * same payload inside it, so a NaN block could make an exact panel/tr_matmul memcmp fail for a
+ * reason that has nothing to do with this bench's premise. */
+static unsigned next_rand(unsigned *seed) {
+    *seed = *seed * 1103515245u + 12345u;
+    return *seed;
+}
+static void fill_q4_k(unsigned char *row, int64_t nb, unsigned *seed, int special) {
+    for (int64_t b = 0; b < nb; b++) {
+        unsigned char *blk = row + b * 144;
+        for (int i = 4; i < 144; i++) blk[i] = (unsigned char)(next_rand(seed) >> 16);
+        for (int h = 0; h < 2; h++) {
+            unsigned r = next_rand(seed);
+            uint16_t bits = (uint16_t)((r >> 8) & 0xFFFFu);
+            if (!special || (r & 63u) != 0) bits = (uint16_t)((bits & 0x83FFu) | ((8u + (r >> 3) % 14u) << 10));
+            memcpy(blk + 2 * h, &bits, 2);
+        }
+    }
+}
+
+/* ---- the panel premise (ik_llama.cpp's idea, docs/MEASUREMENTS.md "Two rows against eight
+ * tokens"): decode a panel of P weight rows once with dequant_row, then run a pure-f32 two-row
+ * eight-token kernel over every group of 8 tokens, instead of decoding each weight vector once per
+ * 8 tokens as avx512_dot_row2_x8_q8_0 does today. avx512_pair_sums and the tree it builds
+ * (BP_ROW2X8_OUT/BP_ROW2_PAIR/BP_ROW2X8_STEP) are copied verbatim from src/kernels/kernels_x86.c's
+ * avx512_pair_sums/TR_ROW2X8_OUT/TR_ROW2_PAIR/TR_ROW2X8_STEP: same lane contract (element e of
+ * token t into lane e%16, increasing e), same mul-then-add (never FMA outside BENCH_PANEL_MUTATE),
+ * same pairwise tree, so row2_x8_f32 fed dequant_row's output must be bit-identical to tr_matmul
+ * (kernels.h: dot_row(row,x) is dot_f32(dequant_row(row),x) bit for bit; dot_row2_x8's own doc:
+ * "each sum is still its own dot_row, bit for bit"). */
+__attribute__((target("avx512f")))
+static inline __m512 avx512_pair_sums(__m512 a, __m512 b) {
+    const __m512i even = _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30);
+    const __m512i odd = _mm512_setr_epi32(1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31);
+    return _mm512_add_ps(_mm512_permutex2var_ps(a, even, b), _mm512_permutex2var_ps(a, odd, b));
+}
+
+#define BP_ROW2X8_OUT(out) \
+    do { \
+        __m512 s0_ = avx512_pair_sums(avx512_pair_sums(avx512_pair_sums(a0, a1), avx512_pair_sums(a2, a3)), \
+                                      avx512_pair_sums(avx512_pair_sums(a4, a5), avx512_pair_sums(a6, a7))); \
+        __m512 s1_ = avx512_pair_sums(avx512_pair_sums(avx512_pair_sums(b0, b1), avx512_pair_sums(b2, b3)), \
+                                      avx512_pair_sums(avx512_pair_sums(b4, b5), avx512_pair_sums(b6, b7))); \
+        _mm512_storeu_ps(out, avx512_pair_sums(s0_, s1_)); \
+    } while (0)
+
+#ifndef BENCH_PANEL_MUTATE
+#define BP_ROW2_PAIR(xr, e, w, u, A, B) \
+    do { \
+        __m512 v_ = _mm512_loadu_ps((xr) + (e)); \
+        A = _mm512_add_ps(A, _mm512_mul_ps(w, v_)); \
+        B = _mm512_add_ps(B, _mm512_mul_ps(u, v_)); \
+    } while (0)
+#else
+/* the mutation (-DBENCH_PANEL_MUTATE): FMA instead of separate mul and add, one rounding instead
+ * of two; the exactness check below must fail on it against tr_matmul's mul-then-add Q8_0/Q4_K */
+#define BP_ROW2_PAIR(xr, e, w, u, A, B) \
+    do { \
+        __m512 v_ = _mm512_loadu_ps((xr) + (e)); \
+        A = _mm512_fmadd_ps(w, v_, A); \
+        B = _mm512_fmadd_ps(u, v_, B); \
+    } while (0)
+#endif
+
+#define BP_ROW2X8_STEP(e, w, u) \
+    do { \
+        __m512 w_ = (w), u_ = (u); \
+        BP_ROW2_PAIR(x, e, w_, u_, a0, b0); \
+        BP_ROW2_PAIR(x1, e, w_, u_, a1, b1); \
+        BP_ROW2_PAIR(x2, e, w_, u_, a2, b2); \
+        BP_ROW2_PAIR(x3, e, w_, u_, a3, b3); \
+        BP_ROW2_PAIR(x4, e, w_, u_, a4, b4); \
+        BP_ROW2_PAIR(x5, e, w_, u_, a5, b5); \
+        BP_ROW2_PAIR(x6, e, w_, u_, a6, b6); \
+        BP_ROW2_PAIR(x7, e, w_, u_, a7, b7); \
+    } while (0)
+
+/* row2_x8_f32 calls from the panel path below: covers the branch the exactness check exercises
+ * (checked > 0 at the end of main), so that check cannot pass without ever running it. */
+static int64_t g_panel_kernel_calls = 0;
+
+/* Two already-decoded f32 weight rows against eight input rows, sixteen accumulators: the same
+ * contract as avx512_dot_row2_x8_q8_0, minus the decode. out[0..7]: row0's dot with tokens 0..7;
+ * out[8..15]: row1's, the same layout as dot_row2_x8. */
+__attribute__((target("avx512f")))
+static void row2_x8_f32(const float *w0, const float *w1, const float *x, int64_t stride, int64_t n, float *out) {
+    __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps(), a2 = _mm512_setzero_ps(), a3 = _mm512_setzero_ps();
+    __m512 a4 = _mm512_setzero_ps(), a5 = _mm512_setzero_ps(), a6 = _mm512_setzero_ps(), a7 = _mm512_setzero_ps();
+    __m512 b0 = _mm512_setzero_ps(), b1 = _mm512_setzero_ps(), b2 = _mm512_setzero_ps(), b3 = _mm512_setzero_ps();
+    __m512 b4 = _mm512_setzero_ps(), b5 = _mm512_setzero_ps(), b6 = _mm512_setzero_ps(), b7 = _mm512_setzero_ps();
+    const float *x1 = x + stride, *x2 = x1 + stride, *x3 = x2 + stride, *x4 = x3 + stride, *x5 = x4 + stride,
+                *x6 = x5 + stride, *x7 = x6 + stride;
+    for (int64_t e = 0; e < n; e += TR_LANES)
+        BP_ROW2X8_STEP(e, _mm512_loadu_ps(w0 + e), _mm512_loadu_ps(w1 + e));
+    BP_ROW2X8_OUT(out);
+    g_panel_kernel_calls++;
+}
+
+/* One panel job: dequant_row's P rows [r0, r0+P) into this worker's scratch (panel[worker],
+ * allocated before timing), then row2_x8_f32 over every group of 8 tokens and row pair.
+ * y[t * rows + r], the same layout as tr_matmul. n_tokens is always a multiple of 8 and rows a
+ * multiple of P in this bench's shapes (checked once by the caller before timing starts, never on
+ * this hot loop). */
+typedef struct {
+    tr_type type;
+    int64_t rows, cols, n_tokens, P;
+    const void *w;
+    const float *x;
+    float *y;
+    float *panel[64]; /* per worker, P * cols floats */
+} panel_job;
+
+/* The panel's decode in AVX-512, the floats dequant_row gives (Q8_0 scale * q, one rounding; Q4_K
+ * scale * q - min, the product exact and the difference rounded once: docs/LESSONS.md #169). The
+ * first run decoded with the scalar dequant_row, one element at a time against x8's sixteen: at 64
+ * tokens that decode cost about as much as the panel's arithmetic, which is not the premise. */
+__attribute__((target("avx512f")))
+static void panel_dequant_q8_0(const unsigned char *row, float *out, int64_t n) {
+    for (int64_t b = 0; b < n / TR_Q8_0_BLOCK_ELEMS; b++) {
+        const unsigned char *blk = row + (size_t)b * TR_Q8_0_BLOCK_BYTES;
+        __m512 d = _mm512_set1_ps(tr_q8_0_block_scale(blk));
+        for (int e = 0; e < TR_Q8_0_BLOCK_ELEMS; e += TR_LANES) {
+            __m128i q = _mm_loadu_si128((const __m128i *)(const void *)(blk + TR_Q8_0_SCALE_BYTES + e));
+            _mm512_storeu_ps(out + b * TR_Q8_0_BLOCK_ELEMS + e,
+                             _mm512_mul_ps(d, _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(q))));
+        }
+    }
+}
+__attribute__((target("avx512f")))
+static void panel_dequant_q4_k(const unsigned char *row, float *out, int64_t n) {
+    const __m512i low = _mm512_set1_epi32(0x0F);
+    for (int64_t b = 0; b < n / TR_Q4_K_BLOCK_ELEMS; b++) {
+        const unsigned char *blk = row + (size_t)b * TR_Q4_K_BLOCK_BYTES, *qs = blk + TR_Q4_K_QS_OFFSET;
+        float scale[8], min[8];
+        tr_q4_k_scales(blk, scale, min);
+        float *o = out + b * TR_Q4_K_BLOCK_ELEMS;
+        for (int c = 0; c < 4; c++)
+            for (int h = 0; h < 2; h++) {
+                __m512i q = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(const void *)(qs + 32 * c + 16 * h)));
+                __m512 s0 = _mm512_set1_ps(scale[2 * c]), m0 = _mm512_set1_ps(min[2 * c]);
+                __m512 s1 = _mm512_set1_ps(scale[2 * c + 1]), m1 = _mm512_set1_ps(min[2 * c + 1]);
+                __m512 lo = _mm512_cvtepi32_ps(_mm512_and_si512(q, low));
+                __m512 hi = _mm512_cvtepi32_ps(_mm512_srli_epi32(q, 4));
+                _mm512_storeu_ps(o + 64 * c + 16 * h, _mm512_sub_ps(_mm512_mul_ps(s0, lo), m0));
+                _mm512_storeu_ps(o + 64 * c + 32 + 16 * h, _mm512_sub_ps(_mm512_mul_ps(s1, hi), m1));
+            }
+    }
+}
+
+static void panel_fn(void *ctx, int64_t begin, int64_t end, int worker) {
+    panel_job *j = (panel_job *)ctx;
+    const unsigned char *base = (const unsigned char *)j->w;
+    size_t rb = tr_row_bytes(j->type, j->cols);
+    float *buf = j->panel[worker];
+    for (int64_t p = begin; p < end; p++) {
+        int64_t r0 = p * j->P;
+        for (int64_t i = 0; i < j->P; i++) {
+            const unsigned char *r = base + (size_t)(r0 + i) * rb;
+            if (j->type == TR_TYPE_Q4_K) panel_dequant_q4_k(r, buf + i * j->cols, j->cols);
+            else panel_dequant_q8_0(r, buf + i * j->cols, j->cols);
+        }
+        for (int64_t t = 0; t < j->n_tokens; t += 8) {
+            const float *xt = j->x + t * j->cols;
+            for (int64_t rp = 0; rp < j->P; rp += 2) {
+                float out[16];
+                row2_x8_f32(buf + rp * j->cols, buf + (rp + 1) * j->cols, xt, j->cols, j->cols, out);
+                for (int e = 0; e < 8; e++) {
+                    j->y[(t + e) * j->rows + r0 + rp] = out[e];
+                    j->y[(t + e) * j->rows + r0 + rp + 1] = out[8 + e];
+                }
+            }
+        }
+    }
+}
+#endif
+
 int main(int argc, char **argv) {
-    int runs = 7, below_kernel = 0;
+    int runs = 7, below_kernel = 0, n_counts = 2;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--runs") == 0 && i + 1 < argc) runs = atoi(argv[++i]);
-        else { fprintf(stderr, "usage: bench_peak [--runs N]\n"); return 2; }
+        else if (strcmp(argv[i], "--one-core") == 0) n_counts = 1; /* the 16-core lines are noise anyway */
+        else { fprintf(stderr, "usage: bench_peak [--runs N] [--one-core]\n"); return 2; }
     }
     if (runs < 3) runs = 3;
     if (runs > MAX_RUNS) runs = MAX_RUNS;
@@ -288,7 +508,7 @@ int main(int argc, char **argv) {
         if (j.rows[w] == NULL || j.x[w] == NULL) { fprintf(stderr, "out of memory\n"); return 1; }
     }
     printf("\n%-8s %-26s %12s %7s\n", "threads", "what", "GFLOP/s", "spread");
-    for (int c = 0; c < 2; c++) {
+    for (int c = 0; c < n_counts; c++) {
         int n = counts[c];
         tr_pool *pool = tr_pool_create(n);
         double sp, g, peak = 0.0;
@@ -318,6 +538,17 @@ int main(int argc, char **argv) {
             g = run_job(pool, n, &j, 5000000.0 * 512, runs, &sp);
             printf("%-8d %-26s %12.1f %6.1f%%\n", n, "mix x8 (asm, L1)", g, sp * 100);
             below_kernel |= peak > 0.0 && g > peak * 1.02;
+            for (int w = 0; w < n; w++) {
+                float *wf = (float *)(void *)j.rows[w];
+                for (int i = 0; i < 32; i++) wf[i] = 1.0f;
+            }
+            j.kind = 8; j.iters = 5000000;
+            g = run_job(pool, n, &j, 5000000.0 * 512, runs, &sp);
+            printf("%-8d %-26s %12.1f %6.1f%%\n", n, "mix x8 f32 (asm, L1)", g, sp * 100);
+            /* not checked against peak: it has 16 independent accumulator chains (a0-a7, b0-b7)
+             * against peak's 6, plus its loads run on ports the multiplies and adds do not use, so
+             * it is not bound by the 6-chain peak the same way (like peak_fma/mix_x8_fma above,
+             * measured but not gated: a different ceiling, not a broken one). */
         }
         if (cpu->avx512f && cpu->fma) {
             j.kind = 5; j.iters = 10000000;
@@ -391,9 +622,107 @@ int main(int argc, char **argv) {
             g_sink = y[0];
             tr_free_aligned(w); tr_free_aligned(x); tr_free_aligned(y);
         }
+#if HAVE_X86
+        if (cpu->avx512f) {
+            static const struct { int64_t rows, cols, nt; int q4k; } pshapes[4] = {
+                {1024, 2048, 64, 0}, {2048, 1024, 64, 0}, {2048, 2048, 512, 0}, {1024, 2048, 64, 1},
+            };
+            for (int s = 0; s < 4; s++) {
+                int64_t rows = pshapes[s].rows, cols = pshapes[s].cols, nt = pshapes[s].nt;
+                tr_type type = pshapes[s].q4k ? TR_TYPE_Q4_K : TR_TYPE_Q8_0;
+                const char *tname = pshapes[s].q4k ? " q4_k" : "";
+                /* assert: every shape here has a token count a multiple of 8 and a row count a
+                 * multiple of 32, so the panel loop below never meets a remainder of either */
+                if (nt % 8 != 0 || rows % 32 != 0) {
+                    fprintf(stderr, "bench_peak: panel shape %lldx%lld, %lld tok is not a multiple of 8 tokens and 32 rows\n",
+                            (long long)rows, (long long)cols, (long long)nt);
+                    return 1;
+                }
+                size_t rb = tr_row_bytes(type, cols);
+                uint8_t *w = tr_alloc_aligned(rb * (size_t)rows, 64);
+                float *x = tr_alloc_aligned((size_t)(cols * nt) * sizeof(float), 64);
+                float *y_ref = tr_alloc_aligned((size_t)(rows * nt) * sizeof(float), 64);
+                float *y_panel = tr_alloc_aligned((size_t)(rows * nt) * sizeof(float), 64);
+                if (!w || !x || !y_ref || !y_panel) { fprintf(stderr, "out of memory\n"); return 1; }
+                if (pshapes[s].q4k) {
+                    unsigned q4k_seed = 777u;
+                    fill_q4_k(w, (rows * cols) / TR_Q4_K_BLOCK_ELEMS, &q4k_seed, 0);
+                } else {
+                    fill_q8_0(w, rows * cols, &seed);
+                }
+                for (int64_t i = 0; i < cols * nt; i++) x[i] = frand_state(&seed);
+                tr_mat m = {type, rows, cols, w};
+                tr_matmul(pool, &m, x, nt, y_ref); /* warm-up, and the exactness reference */
+
+                int calls = (int)(2000000000LL / (rows * cols * nt) / (n == 1 ? 8 : 1)) + 1;
+                for (int pidx = 0; pidx < 2; pidx++) {
+                    int64_t P = pidx == 0 ? 16 : 32;
+                    int64_t n_panels = rows / P;
+                    panel_job pj;
+                    memset(&pj, 0, sizeof pj);
+                    pj.type = type; pj.rows = rows; pj.cols = cols; pj.n_tokens = nt; pj.P = P;
+                    pj.w = w; pj.x = x; pj.y = y_panel;
+                    for (int wk = 0; wk < n; wk++) {
+                        pj.panel[wk] = tr_alloc_aligned((size_t)(P * cols) * sizeof(float), 64);
+                        if (!pj.panel[wk]) { fprintf(stderr, "out of memory\n"); return 1; }
+                    }
+
+                    tr_parallel_for(pool, n_panels, 1, panel_fn, &pj); /* warm-up, and the check below */
+                    if (memcmp(y_ref, y_panel, (size_t)(rows * nt) * sizeof(float)) != 0) {
+                        int64_t bad = -1;
+                        for (int64_t i = 0; i < rows * nt; i++)
+                            if (y_ref[i] != y_panel[i]) { bad = i; break; }
+                        fprintf(stderr,
+                                "bench_peak: panel P=%lld %lldx%lld, %lld tok%s not exact: first differing "
+                                "index %lld (matmul=%.9g panel=%.9g)\n",
+                                (long long)P, (long long)rows, (long long)cols, (long long)nt, tname,
+                                (long long)bad, (double)y_ref[bad], (double)y_panel[bad]);
+                        return 1;
+                    }
+
+                    double g2p[2][MAX_RUNS];
+                    for (int r = 0; r < runs; r++) {
+                        for (int v = 0; v < 2; v++) {
+                            int which = (r + v) % 2; /* 0: tr_matmul, 1: panel; the order turns every run */
+                            double a = tr_time_sec();
+                            if (which == 0) {
+                                for (int cc = 0; cc < calls; cc++) tr_matmul(pool, &m, x, nt, y_ref);
+                            } else {
+                                for (int cc = 0; cc < calls; cc++) tr_parallel_for(pool, n_panels, 1, panel_fn, &pj);
+                            }
+                            g2p[which][r] = 2.0 * (double)(rows * cols * nt) * calls / (tr_time_sec() - a) / 1e9;
+                        }
+                    }
+                    for (int v = 0; v < 2; v++) {
+                        qsort(g2p[v], (size_t)runs, sizeof g2p[v][0], cmp_double);
+                        char what[80];
+                        if (v == 0)
+                            snprintf(what, sizeof what, "matmul %lldx%lld, %lld tok%s (ab P%lld)", (long long)rows,
+                                     (long long)cols, (long long)nt, tname, (long long)P);
+                        else
+                            snprintf(what, sizeof what, "panel P=%lld %lldx%lld, %lld tok%s", (long long)P,
+                                     (long long)rows, (long long)cols, (long long)nt, tname);
+                        printf("%-8d %-26s %12.1f %6.1f%%\n", n, what, g2p[v][runs / 2],
+                               (g2p[v][runs - 1] - g2p[v][0]) / g2p[v][runs / 2] * 100);
+                        below_kernel |= peak > 0.0 && g2p[v][runs / 2] > peak * 1.02;
+                    }
+                    for (int wk = 0; wk < n; wk++) tr_free_aligned(pj.panel[wk]);
+                }
+                g_sink = y_ref[0];
+                tr_free_aligned(w); tr_free_aligned(x); tr_free_aligned(y_ref); tr_free_aligned(y_panel);
+            }
+        }
+#endif
         tr_pool_destroy(pool);
     }
     for (int w = 0; w < 64; w++) { tr_free_aligned(j.rows[w]); tr_free_aligned(j.x[w]); }
+#if HAVE_X86
+    /* the panel exactness check above must not pass vacuously: row2_x8_f32 has to have run */
+    if (cpu->avx512f && g_panel_kernel_calls == 0) {
+        fprintf(stderr, "bench_peak: row2_x8_f32 never ran: the panel exactness check passed vacuously\n");
+        return 1;
+    }
+#endif
     /* a peak below a real kernel is not a peak: the compiler merged or dropped its chains (it
      * did once, docs/LESSONS.md #161) */
     if (below_kernel) {

@@ -88,6 +88,14 @@
       "cosa": "I conti pesanti (moltiplicazioni di matrici) scritti nelle istruzioni vettoriali della CPU, con una versione per ogni famiglia e la scelta a runtime. Ogni versione dà gli stessi bit della versione scalare, e il test lo verifica.",
       "numeri": [
         {
+          "v": "decodificare i pesi una volta per riga e poi F32 su tutti i token (l'idea di ik_llama.cpp, tenuta esatta): Q8_0 1.00-1.04×, Q4_K 1.1×, chiusa; il matmul è legato al caricamento dei token, non alla decodifica",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "i kernel di llama.cpp da soli, sulle nostre stesse forme, un core: sugli esperti Q8_0 i nostri sono 1.42× più veloci (102 contro 72 GFLOP/s); sulle proiezioni dense i loro 1.6× (interi a 8 bit), sul Q4_K riordinato 1.26-2.3×",
+          "d": "2026-09-24"
+        },
+        {
           "v": "due righe di pesi contro 8 token alla volta, e la somma finale delle corsie in SIMD: il matmul su un core da 87 a 102 GFLOP/s; prefill 1.19× su Q8_0 e Q4_K_M a 16 thread, 1.30× su Q4_K_M a 8 (container, da confermare nativo), numeri identici al bit",
           "d": "2026-09-24"
         },
@@ -104,7 +112,9 @@
           "d": "2026-09-19"
         }
       ],
-      "domande": [],
+      "domande": [
+        "64: più righe di pesi per ogni caricamento di un token (4 righe × 6 token)"
+      ],
       "file": [
         "src/kernels/"
       ],
@@ -230,6 +240,10 @@
       "cosa": "L'esponenziale della libreria C costava il 30% del prompt lungo. Riscritto: più veloce e arrotondato correttamente su tutti i 4 miliardi di float, verificati uno per uno.",
       "numeri": [
         {
+          "v": "contro i riferimenti, su tutti i 2^32 float: l'exp di llama.cpp/ggml sbaglia l'arrotondamento sul 3.36% (fino a 2 ulp), quello di glibc sullo 0.004%, il nostro mai",
+          "d": "2026-09-24"
+        },
+        {
           "v": "l'exp esatto con soli float, in AVX-512 e AVX2: 0 diversi su tutti i 4 miliardi di float, 4.8× e 4.4× più veloce di tr_expf per valore; il prompt ne guadagnerebbe solo il 2-3%: resta il riferimento per la GPU",
           "d": "2026-09-24"
         },
@@ -268,6 +282,10 @@
       "stato": "in-corso",
       "cosa": "Revisione del lettore GGUF, dell'archivio degli esperti, del pool, della piattaforma e del cancello (22/09), poi del modello, dei kernel, del tokenizer e della riga di comando (23/09). Il 23: la riga di comando dimensionava i buffer da -n e -p (un trabocco vicino a 2^62) e troncava --tokens a 32 bit; tre opzioni di OLMoE non erano mai state confrontate con transformers (ora c'e' un oracolo apposta); la pressione di memoria nel VM di Docker contava come mutanti uccisi. Poi letti i sopravvissuti di tokenizer.c (75 → 43) e di main.c (334 → 43), tutti nominati: la riga di comando ha un solo parser delle opzioni, coi numeri stretti nel loro intervallo (-n abc esce con 2), e test_cli prova ogni comando. Lo strumento delle mutazioni non nasconde più sopravvissuti dietro timeout da carico e rifiuti di memoria, uccide un controllo scaduto con tutto quello che aveva lanciato (sette processi orfani avevano rallentato e falsato una campagna), ed è abbastanza veloce da girare dopo ogni modifica (CHANGED=HEAD muta solo le righe cambiate). Restano gguf.c, experts.c, threads.c e platform.c fuori da mutate_files.sh, e gli script di misura da portare alla regola nuova della macchina (il file macchina-ferma).",
       "numeri": [
+        {
+          "v": "mutazioni più veloci con gli stessi verdetti (prima un giro di copertura, ASan solo sui sopravvissuti): prof.c da 30 a 9 s; gguf.c, experts.c, threads.c, platform.c mutati per la prima volta in 20 minuti; i test C nativi del gate accanto al container",
+          "d": "2026-09-24"
+        },
         {
           "v": "make check: ~935 s prima, 335 s adesso (gruppi in parallelo, fixture sul volume, test_cleanup)",
           "d": "2026-09-22"

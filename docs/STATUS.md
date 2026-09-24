@@ -295,15 +295,11 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
 
 **Day of 2026-09-24: the long-context decode, exact** (MEASUREMENTS §Skipping cached positions
 exactly and the five sections after it; LESSONS #152–#157):
-- **skipping positions exactly: closed** before any kernel: OLMoE's attention is flat (no score 30
-  below its max in 65 M positions), an oracle skips ≤ 0.2% of the bytes. The probe (`make
-  attn-probe`, `tools/attn_skip_report.py`) checks the premise again on the next model;
-- **the decode's attention on the GPU, built** (`src/backend/gpu_attn.{h,c}`): the same bytes
-  through the engine (`tools/gpu_exact.sh`: logits of 2000 decode positions, tokens after 4000, a
-  speculative run); **decode 1.31–1.32× at 2048 and 1.54–1.58× at 4000** (A/B against 718a84c,
-  measured width; the token at 4000 44.8 → 29.8 ms). A laptop GPU sleeps between layers unless one
-  warp keeps it awake (LESSONS #153, +12–17 W while decoding), and after a prompt it starts cold
-  unless the prompt's last pass wakes it (#158);
+- **skipping positions exactly: closed** (OLMoE's attention is flat: an oracle skips ≤ 0.2% of the
+  bytes); `make attn-probe` checks the premise again on the next model;
+- **the decode's attention on the GPU, built** (`src/backend/gpu_attn.{h,c}`, the same bytes,
+  `tools/gpu_exact.sh`): **decode 1.31–1.32× at 2048, 1.54–1.58× at 4000**; one warp keeps the
+  laptop GPU awake between layers (LESSONS #153, #158);
 - CPU: **one position at a time** for a decode token: exact, kept, but not distinguishable on a
   still machine (0.96–1.05× a token, the zone −9% at 2048; the bench's 1.10–1.13× was under load,
   LESSONS #160); the KV packed in 28 bits exact, 1.13× fewer bytes, not timed yet (question 57);
@@ -327,30 +323,33 @@ exactly and the five sections after it; LESSONS #152–#157):
   the lane tree in SIMD was a tenth of every two-row call. The matmul on a core 87 → 102
   GFLOP/s (61% of the no-FMA peak); **prefill 1.19× on Q8_0 and Q4_K_M at 16 threads, 1.30× on
   Q4_K_M at 8** (container, load 3–4; the native run waits for 12 GiB free);
-- **next, one piece at a time** (CLAUDE.md; ORIGINS §Every piece): (1) close piece 1, the prompt's CPU matmul: the native confirmation, then read
-  how llama.cpp, ik_llama.cpp, ds4 and colibri do it, race them, write the row, build better; (2)
-  then the next row with a debt. Queued after: M3's dense weights on the GPU (model 1.64× at 2048,
-  1.92× at 4000), two rows on AVX2, 58's SIMD exp if Marcello reopens 39. **For Marcello, 59 and 60**: FMA
-  would give the 8-token stream 1.19× on this Zen 4 (MEASUREMENTS §The CPU's peak); 60 (an exact
-  dot) is not measured. 61 after M4.
+- **late evening: pieces 1 and 4 against the references** (MEASUREMENTS §The prompt's matmul
+  against the four references, §Softmax and exp against the references; ORIGINS rows 1, 4; LESSONS
+  #169–#170). All four references quantize the activations to int8 (colibri as an option). Their
+  kernels alone on our shapes (`tools/bench_ggml.sh`, container, loaded): **Q8_0 experts ours
+  1.42×** a core (their `mul_mat_id` runs one dot at a time), the dense projections theirs 1.6×
+  (tinyBLAS 4 × 4 int8), repacked Q4_K theirs 1.26–2.3×. Question 63 (ik's decode once per row,
+  exact) closed: Q8_0 1.00–1.04×, Q4_K 1.1×: the matmul is bound by its input rows' loads from L2.
+  The exp: ggml's rounds 3.36% of floats otherwise (≤ 2 ulp), glibc's 0.004%, ours none;
+- **next, one piece at a time**: (1) close piece 1: x8's native confirmation (`prefill_context.sh
+  change build/before-x8/...`) and the native engine race, both waiting for 12 GiB free; then
+  question 64 (4 weight rows × 6 tokens: half the input loads per op), prediction first; (2) row 2
+  (the decode's matmul), measurable with `bench_ggml.c`'s harness on one token. Queued: M3's dense
+  weights on the GPU, two rows on AVX2. **For Marcello, 59 and 60**: FMA would give the 8-token
+  stream 1.19× on this Zen 4; 60 (an exact dot) is not measured. 61 after M4.
 
-**Night of 2026-09-24** (DONE, MEASUREMENTS):
-- the gate 428 → 238 s (next: the native side beside the container, `oracle-real` under `min`);
-- **where we lose to llama.cpp** (same Q8_0, container, raced again after two weight rows per
-  input load, `dot_row2_x4`): prefill **1.41×** at 16 threads, 1.13× at 8 (was 1.8× and 1.5×; the
-  rest mostly their int8 activations, mode (c)); decode **1.12×** and 1.15× at context 2048, 1.00×
-  and 1.06× at 512. **At 2048 the gap is the KV's bytes** (MEASUREMENTS §Decode at context 2048):
-  our F32 KV is 518 MiB a token against llama.cpp's F16 259: the exact answer is the day's block;
-- **M2: Q4_K and Q6_K**, exact against their own dequantized weights (gguf-py bit for bit, the cuts
-  against transformers in `make check`). Per element: MEASUREMENTS (14 mutations of 14
-  red). Real models from our Q8_0
-  (`tools/quantize_q4k.sh [m]`): Q4_K **decode 1.5× the Q8_0**; **Q4_K_M** (Q6_K in 17 tensors) runs,
-  decode 0.93× the Q4_K, prefill the same, llama.cpp's decode on it 1.09× ours. Next: M1 with Q4_K experts.
+**Night of 2026-09-24**: the gate 428 → 238 s; against llama.cpp (Q8_0, container, before x8)
+prefill 1.41× theirs at 16 threads, decode 1.12× at context 2048 (the KV's bytes: F32 against
+F16), 1.00× at 512; **M2: Q4_K and Q6_K** exact (Q4_K decode 1.5× the Q8_0; Q4_K_M runs). DONE,
+MEASUREMENTS.
 
-**Review (Opus 5.5, 2026-09-22 and 23)**: every file read and through `tools/mutate_auto.py`
-(detail in LESSONS #102–#125, MEASUREMENTS §The gate, §Generated mutations). Open: `gguf.c`,
-`experts.c`, `threads.c`, `platform.c` are not in `mutate_files.sh` and their counts predate
-#117-#124. The native measurements follow the machine's marker (Known issues).
+**Tests and gate** (2026-09-24): `mutate_auto.py` lists the mutants no check runs (gcov) and
+runs ASan on the survivors only (`prof.c` 30 → 9 s, the same verdicts); `gguf.c`, `experts.c`,
+`threads.c`, `platform.c` mutated for the first time (MEASUREMENTS, after §Generated mutations):
+open, `gguf.c`'s 40 survivors (being killed), `threads.c`'s 22 (the spin and the pinning: speed,
+not bits), `platform.c`'s Windows half never mutated (the container compiles its POSIX half). The
+native C tests run beside the container (`tools/beside.sh`): the gate's new time not measured yet.
+Review of 2026-09-22/23: LESSONS #102–#125. The native measurements follow the machine's marker.
 
 Steps of 17–20/09 are in `docs/archive/DONE.md`, their numbers in `docs/MEASUREMENTS.md`
 (questions closed and open in §Open questions).

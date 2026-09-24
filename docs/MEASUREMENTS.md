@@ -181,6 +181,8 @@ decides | — | — |
 | 60 | **An exactly rounded dot product (Kulisch-style accumulation) as the definition?** (Marcello's decision, 2026-09-24) | the cost of an exact dot on AVX-512 VNNI with the activations' mantissas sliced in bytes, against the float lane path | a result independent of the order: any SIMD width, the GPU or a sum split across machines gives the same bits by construction, and it is more accurate; changes today's bytes once |
 | 62 | ~~The model scanned like a genome: is there exact structure nobody reads once?~~ **Closed 2026-09-24** (§The model read like a genome, §Experts read by a pass of k rows): weights **0.008% of Q8_0 blocks repeated** (220 identical rows of the output head: the tokens never learned; Q4_K 504 rows, 2 140 zero blocks), no zero blocks in Q8_0; routing co-activation strong (lift up to 67, top-3 partners 18–28% of co-firings); **the KV: only layer 0's values are token-determined** (61.6–81.6% of positions repeat), layers 1–15 and every key 0. Tools: `tools/weights_genome.py`, `tools/route_union_report.py`, `tools/kv_repeats_report.py`, to run again on the next model. (Marcello, 2026-09-24: a discovery comes from looking patiently at real data others filtered away) Approximate engines compress the weights with loss and never look for exact repeats; an exact engine can read anything that repeats exactly once, without changing a bit. Prediction, written first: trained weights hold almost no exact repeats (≤ 0.1% of Q8_0 blocks), the routing holds strong co-activation, the KV holds token-determined parts beyond layer 0 in no layer | a hash of every Q8_0 block (34 bytes) over the whole file: duplicates, all-zero blocks, rows shared between experts, per-tensor entropy (with 56); in the routing traces the pairs and groups of experts that fire together (co-activation arrays, for placement and file order); in the probe's dumps, any layer whose keys or values depend on the token alone | cheap, on real data, not done by anyone: most of it may give zero, like the exact skips; what repeats exactly is bytes saved exactly |
 | 61 | **Exactness as the asset for a frontier model locally** (after M4, 2026-09-24): a computation that gives the same bytes anywhere can be moved in time (the KV of your files computed while the machine idles, reused byte for byte), in space (several home machines splitting a model: their RAM bandwidth adds up), and checked (work done by an untrusted fast machine, verified by recomputing random spots) | a KV checkpoint to disk and back per 1000 tokens; one layer across two machines on a LAN (~28 KB a hop at 7168 dims); detection probability against spot-check cost | a 671B MoE reads ~20 GB a token at Q4 (0.35 s from RAM, 13 s from this disk): the wall moves only by adding bandwidth or by not paying the prefill at question time; approximate engines cannot do any of the three |
+| 63 | ~~Decode a panel of weight rows once, then F32 over every token?~~ **Closed 2026-09-24** (§The prompt's matmul against the four references): the same bytes, but **Q8_0 1.00–1.04×, Q4_K 1.10–1.12×** on a core (predicted 1.13–1.27×): the decode is 29% of the stream in L1, the matmul is bound by its input rows' loads from L2 | — | ik_llama.cpp's convert-then-gemm, kept exact |
+| 64 | **A tile of more weight rows per input load (4 rows × 6 tokens)?** (2026-09-24, from question 63 and the references' tiles: llama.cpp 16 × 4, tinyBLAS 4 × 4, ours 2 × 8) | `bench_peak`: a 4 × 6 stream in asm (24 accumulators, 29 zmm), then a `dot_row4_x6` in intrinsics against `tr_matmul`, byte for byte; prediction written first | half the input loads per FP op; each sum still its own `dot_row` |
 
 Reference machine: Ryzen 9 7940HX (Zen 4, 16 core / 32 thread, AVX-512 VNNI/BF16), 31 GB
 RAM (2×16 GB DDR5-5200), NVMe Micron 1 TB, GPU RTX 4070 Laptop 8 GB and Radeon 610M (not used
@@ -2381,6 +2383,24 @@ acquire, which makes that layer's units the most recent, and the margin of 2·n_
 slots leaves at least n_expert + n_used colder slots outside it: the guard never fires in this
 call order, and the store's own test of it is red).
 
+**2026-09-24: the campaign faster, the same verdicts.** Three changes to `mutate_auto.py`: a gcov
+pass first (every check once at -O0, beside the builds) lists the mutants on lines of code no
+check runs as UNCOVERED instead of building them; with `--asan` the plain build judges every
+mutant and the sanitizers only its survivors; the trees are built once and copied, mtimes kept,
+not once per job. On `prof.c` (46 mutants, 12 jobs, ASan, the container at the same load, one run
+each): **30 → 9 s, 36 killed and 10 survived in both**. The four files never mutated before, 20
+minutes for all of them (`build/mutate/<name>.txt`):
+
+| file | mutants | killed | survived | on lines no check runs | same object | timed out | s |
+|---|---|---|---|---|---|---|---|
+| `gguf.c` | 221 | 166 | 40 (the reader's error paths) | 3 | 5 | 7 | 228 |
+| `experts.c` | 167 | 138 | 18 | 3 (out of memory) | 4 | 3 | 277 |
+| `threads.c` | 84 | 45 | **22** (the spin's timing and the pinning: speed, not bits) | 0 | 9 | 7 | 391 |
+| `platform.c` | 172 | 28 | 19 | 20 (EINTR, a failed dlopen, a line reader) | **104** (the Windows branches: never compiled in the container) | 0 | 293 |
+
+`platform.c`'s Windows half is mutated nowhere: the container compiles its POSIX half only, and
+native mutants meet Smart App Control (LESSONS #12). A debt, in STATUS.
+
 ## Speed — Trochilus vs llama.cpp again (2026-09-24)
 
 The race of 2026-09-17 (above) on the binary of commit `55c31ff`: `sh tools/race_llama.sh 5`, both
@@ -3235,6 +3255,123 @@ ran a build and tests from 22:05 to 22:12, inside this run, without the marker: 
 one core Q8_0 0.0471 → 0.0415 (**1.13×**), Q4_K 0.0599 → 0.0493 (**1.21×**), Q6_K 0.0495 →
 0.0422 (**1.17×**), spreads 1.4–4.3%; the sixteen-core lines 12–90% spread, not read. Q4_K gains
 most, as predicted: its lookup (a permute per 16 weights of each row) is paid for 8 tokens.
+
+## The prompt's matmul against the four references (2026-09-24)
+
+Piece 1 of ORIGINS §Every piece, read at the pinned commits before building on it again. Where
+each reference keeps weights, activations and sums for a prompt (x86, AVX-512 VNNI, this Zen 4):
+
+| reference | tile in registers (weight rows × tokens) | activations | the weight's decode, how often | exact against F32? |
+|---|---|---|---|---|
+| llama.cpp `mul_mat`, Q8_0 (attention projections, head): llamafile `tinyBLAS_Q0_AVX` | 4 × 4, ymm, 16 accumulators | **int8**, Q8_0 per 32, quantized once per op by all threads | none: int8 × int8 → int32 (`sign` + `vpdpbusd`), one FMA per block with the two fp16 scales | no |
+| llama.cpp `mul_mat_id`, Q8_0 experts (no repack on x86) | **1 × 1**, one ymm accumulator per dot; cache blocks of 16 rows × 16 tokens | int8, Q8_0 | none, per dot | no |
+| llama.cpp `mul_mat_id`, Q4_K experts, repacked at load (`q4_K_8x8_q8_K`) | 16 rows (two interleaved 8-row blocks) × 4 tokens, zmm | int8, Q8_K per 256, 4 tokens interleaved | nibbles → int8 once per 4 tokens, then `vpdpbusd` | no |
+| ik_llama.cpp `iqk_mul_mat` | R8/R16 row-interleaved gemm | int8 | **from 32 tokens: 32 rows at a time converted on the fly to a simple int8 form (Q8_0_R8, Q8_K_R8/R16, Q8_1), then one gemm over every token**: paid once per row, not once per token group | no |
+| ds4 `matmul_q8_0_batch` | 1 × 2; threads split output rows | int8 per 32 | none | no |
+| colibri `xf_moe_run` (its own planar int4) | 1 × 1; (expert, row chunk) items keep the chunk in cache for all the expert's tokens | **F32** (default), int8 opt-in | per dot, one FMA per element | its own order, with FMA |
+| Trochilus `dot_row2_x8` | 2 × 8, zmm, 16 accumulators | F32 | once per 8 tokens | **bit for bit, scalar = SIMD** |
+
+- **Every other engine's speed is int8 activations**: all four quantize them (colibri as an
+  option); one instruction does 64 multiply-adds against our 16. That is mode (c): a declared
+  mode, never the default (CLAUDE.md, invariants).
+- **What is exact and can be taken: ik's order of work.** Decoding a weight into its F32 value
+  (`d * q` rounded, the float `dot_row` multiplies by) once per row and keeping it for every
+  token changes no bit: the same products in the same lanes, summed in the same order. Today the
+  x8 kernel decodes each weight vector once per 8 tokens (two widenings, two conversions, two
+  scale multiplies per 16 multiply-adds, on the FP pipes the arithmetic needs); an expert sees
+  ~64 tokens in a 512-token pass, so a panel decoded once pays it 8× less.
+- llama.cpp's Q8_0 experts run one dot at a time on one accumulator: an FMA chain of 4 cycles a
+  block, at most ~83 GFLOP/s a core on paper, below our 102. Its lead in the engine (1.41× at 16
+  threads before x8) would then come from the attention projections (tinyBLAS, 4 × 4 in int8) and
+  from 4× fewer activation bytes when 16 cores share L3: the isolated race below says which.
+
+**Prediction for question 63, written before the runs** (container, one core, `bench_peak`): the
+x8 stream with F32 weights loaded instead of decoded 135–150 GFLOP/s (the decoded one 119); the
+matmul by panels 115–130 on Q8_0 (1.13–1.27× today's 102), more on Q4_K (its decode is heavier: a
+permute and a shift per vector, the scales unpacked per block); the same outputs bit for bit.
+Cost: a panel of 32 rows × 2048 columns is 256 KiB a thread, in L2 (1 MiB on Zen 4).
+
+**Question 63 measured** (`bench_peak --one-core --runs 11`, container, load 4.8 before and 3.8
+after; the panel line and `tr_matmul` alternated run by run, every panel output byte for byte
+`tr_matmul`'s, red under an FMA). A first run decoded the panel with the scalar `dequant_row`, one
+weight at a time against the x8 kernel's sixteen, and lost 0.58–0.70× at 64 tokens: that priced
+a slower decode, not the premise (LESSONS #170). With the decode in AVX-512 (the same floats):
+
+| GFLOP/s, one core | `tr_matmul` | panel P = 16 | panel P = 32 | ratio |
+|---|---|---|---|---|
+| x8 stream, decoded / F32 weights loaded (L1) | 115.9 | 163.6 | | **1.41×** |
+| Q8_0 1024 × 2048, 64 tokens | 69.9 / 70.6 | 70.0 | 70.3 | 1.00× |
+| Q8_0 2048 × 1024, 64 tokens | 82.6 / 77.8 | 85.0 | 73.5 | 0.94–1.03× |
+| Q8_0 2048 × 2048, 512 tokens | 95.9 / 99.5 | 99.7 | 102.8 | 1.03–1.04× |
+| Q4_K 1024 × 2048, 64 tokens | 91.2 / 86.6 | 100.7 | 96.7 | **1.10–1.12×** |
+
+(spreads 2–35%: the 64-token Q8_0 lines are not distinguishable from 1.00×.)
+
+- **Below the prediction, and why**: the decode is 29% of the stream in L1 (1.41×), but the real
+  matmul reads its eight input rows from L2 at every step and is bound there, as §Attempts' tile
+  of 16 tokens had already found; a panel of F32 weights adds 64 bytes a vector to that traffic
+  where int8 added 16. **Closed for Q8_0**; Q4_K's heavier decode leaves 1.1×, not enough to
+  carry a panel of 128–256 KiB a thread.
+- **The next idea, from these numbers and from the references' tiles**: every input load must feed
+  more weight rows. We run 2 rows × 8 tokens (8 input loads per 32 FP ops); llama.cpp's repacked
+  Q4_K runs 16 rows × 4 tokens, tinyBLAS 4 × 4. A 4 × 6 tile (24 accumulators, 29 of 32 zmm)
+  loads 6 input vectors per 48 ops, half as many per op: question 64.
+
+**Their kernels alone, on bench_peak's shapes** (`sh tools/bench_ggml.sh`: ggml's public API
+against `ref/llama.cpp/build-trochilus`'s static libraries, their activation quantization inside
+the timing; container, median of 15, **load 7.0 before and 8.2 after**: indicative, the one-core
+lines 5–23% spread, the sixteen-core ones 7–66%). Ours: §Two rows against eight tokens (native,
+one core) and its per-type line.
+
+| GFLOP/s, one core | llama.cpp | its road | Trochilus | ratio |
+|---|---|---|---|---|
+| Q8_0 dense 1024 × 2048, 64 tokens | **162.9** | tinyBLAS 4 × 4, int8 | 102.3 | theirs 1.59× |
+| Q8_0 dense 2048 × 1024, 64 tokens | 161.5 | tinyBLAS | 101.0 | theirs 1.60× |
+| Q8_0 dense 2048 × 2048, 512 tokens | 155.9 | tinyBLAS | 93.2 | theirs 1.67× |
+| **Q8_0 experts**, 64 × (1024 × 2048), 512 tokens top-8 | **71.8** | `mul_mat_id`, one dot at a time | 102.3 (the same expert shape) | **ours 1.42×** |
+| Q4_K dense 1024 × 2048, 64 tokens | 91.7 | vec_dot, int8 | 85 | theirs 1.08× |
+| Q4_K experts | 90.4 | vec_dot | 85 | theirs 1.06× |
+| Q4_K dense, repacked (`q4_K_8x8`) | **194.2** | 16 rows × 4 tokens, int8 | 85 | theirs 2.3× |
+| Q4_K experts, repacked | 106.9 | the same through `mul_mat_id` | 85 | theirs 1.26× |
+
+- **On the experts, two thirds of OLMoE's prefill (§Prefill profile), ours is ahead on Q8_0**: 102
+  against 72 a core, as the reading predicted (one FMA chain a block, ≤ 83 on paper). The
+  sixteen-core lines agree in direction (their experts 614, ours ~950 before x8), too noisy to
+  quote as a ratio.
+- **They win where int8 meets a tile**: tinyBLAS on the dense projections (1.6×) and the repacked
+  Q4_K (2.3× dense, 1.26× on experts). In the engine that is the attention projections (~23% of
+  the prefill) and all of a Q4_K model: where the 1.41× of the race before x8 came from, and what
+  the native race (`tools/race_llama.sh`) must now split by zone.
+- Exact answers to both are the same idea: decode once (question 63), then F32 with a tile large
+  enough; the int8 road stays mode (c).
+
+## Softmax and exp against the references (2026-09-24)
+
+Piece 4 of ORIGINS §Every piece, read: llama.cpp (b49650a) computes softmax and SiLU with
+`ggml_v_expf` (vec.h, "adapted from arm limited optimized routine", declared error 1.45 + 0.5
+ulp), the softmax's sum in double after a 16-lane `reduce_add` (so its order is the tier's); its
+CPU flash attention calls the C library's `expf` once per score. ik_llama.cpp (f3d6e6e) has the
+same routine (`iqk_utils.h`). ds4 (8db1d1d) and colibri (a90bed9) call the C library's `expf`,
+one value at a time: their bits are the platform's. Ours: `tr_expf`, correctly rounded, proven on
+every float in the gate.
+
+`sh tools/bench_expf_refs.sh 8` (container; every one of the 2^32 floats against `tr_expf`; then
+one core, 4096 arguments in [-20, 0], median of 15; **a mutation campaign ran beside it**: the
+counts are exact, the times indicative):
+
+| exp | floats rounded otherwise than the exact exp | worst | ns a value |
+|---|---|---|---|
+| llama.cpp / ik `ggml_v_expf`, AVX-512 | **144 478 066 (3.364%)** | 2 ulp | **0.157** |
+| glibc `expf` (ds4, colibri, llama.cpp's flash attention on Linux) | 170 648 (0.004%) | 1 ulp | 3.20 |
+| Trochilus `tr_expf`, scalar (the engine's) | 0 | 0 | 5.42 here, 3.52 native |
+| Trochilus float-only exact exp, AVX-512 (question 58, not wired) | 0 | 0 | 0.73 native |
+
+- **Where we stand**: the only exact exp of the four; ggml's is 4.6× faster than our exact SIMD
+  one and wrong on one float in thirty. The C library's is right almost always, and "almost" is
+  the platform's: MinGW's gave other bits (question 37), which is why Windows and Linux agreed to
+  the byte only after `tr_expf`.
+- **What it is worth**: the exp is 2–3% of our prefill at 2048–4000 once in SIMD (question 58);
+  the 4.6× between exact and approximate is at most ~2% of a prompt. Nothing to take.
 
 ## Attempts
 
