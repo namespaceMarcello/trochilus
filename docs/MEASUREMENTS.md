@@ -169,6 +169,8 @@ decides | — | — |
 | 48 | **Quanto del primo prompt si nasconde dietro il tempo che l'utente impiega a scrivere?** Una fase di preparazione dichiarata (idea di Marcello, 2026-09-21): appena la sessione si apre, e prima che il prompt arrivi, il motore comincia a leggere gli esperti e lo dice («leggo il modello, 6.5 GiB»). Non elimina i 4.7 s, li mette dove non danno fastidio; costa nessun bit di precisione e non serve un processo nuovo. Da decidere: cosa leggere per primo quando ancora non si sa il prompt (l'ordine dei layer è quello giusto, il layer 0 serve per primo) | tempo fra l'apertura e il primo token, con e senza la lettura anticipata, su un prompt che arriva dopo 5, 15 e 30 secondi | è la leva più economica: nessuna struttura nuova |
 | 49 | ~~Does a process that stays up between sessions pay for what it costs?~~ **At full budget yes, at half budget little** (measured 2026-09-23, §The engine kept between commands). `trochilus serve` (built 2026-09-23, Marcello's go) keeps pool, model and store; `generate`, `logits`, `run` and `chat` run in it when its endpoint answers, byte for byte the same output (`tests/test_serve.c`). First prompt of 2048 tokens: **full budget 12.79 → 7.81 s** (the 4.98 s load gone, prefill unchanged); **half budget 13.00 → 12.04 s** (0.926×, A/A 1.020×), 139 misses fewer of 1 157. Prediction written before measuring: full loses the load (held); half gains little because the sweep evicts what the next sweep needs first, misses warm = cold (held in the mechanism, off by 12% in the misses) | where the 139 fewer misses come from (per-phase misses: prefill and decode apart); a sweep-resistant eviction at half budget (model: up to ~511 units kept, ~2.5 s) | the gap to the resident model is gone where the model fits; below budget the lever is the eviction policy |
 | 50 | **How much disk does Adaptive-K take away, and what does it change?** (Marcello's source, docs/ORIGINS.md §Sources not yet studied): a token uses fewer than 8 experts when the router is confident, the lowest-weight ones dropped until the kept ones hold a share p of the router's weight. Prediction, written first: at p = 0.9 about 5-6 experts a token, misses at half budget down 20-35%, KL against the exact mode small but not 0; the token changed in a few % of positions | route trace (`--route-trace`): per p, experts kept per token and their weight (no engine change); then a declared mode (env or flag, never the default) at half budget through `tools/ab_modes.sh` (misses, prefill, decode) and KL against the exact mode (`tools/mask_quality.sh`) | under a partial budget every expert skipped is a unit not read from disk: a lever on M1's bottleneck, if the quality holds |
+| 51 | **Can the decode's attention run on the GPU with the same bits, and what does it give at long context?** (2026-09-24, after the skip family closed, §Skipping cached positions exactly). Prediction, written first: bits identical if every float op carries an explicit `.rn` and `tr_expf` is ported whole (its double arithmetic too); per layer (16 heads) at 2048 the kernels ~150 µs (32 MiB at ~220 GB/s) and the round trip (copies of q, k, v in and the output out, launch, sync, WDDM) 30–60 µs, so 180–210 µs against the CPU's 704: the token 36.8 → ~28.7 ms (**1.28×**); at 4000 the attention 22.6 → ~5.4 ms, the token 48.1 → ~31 ms (**~1.55×**) | `tests/bench_gpu_attn.c`: the driver loaded at run time, the kernels as PTX; every query of the six dumps of `make attn-probe` against the CPU's bits, a mutation seen red; per layer at 2048 and 4000 the kernels alone, the round trip, a plain streaming read (median of ≥ 50) | the one exact lever left of the size of the KV's bytes: the same bytes read 4-5× faster, and more the longer the context |
+| 52 | ~~How many tokens does a speculative pass give at long context?~~ **Closed 2026-09-24** (§Speculation at long context): 1.04-1.13 on free prose, 1.57 rewriting code, 3.29 on repetitive code (1.66x net at 4000); a pass of ~4 rows reads ~2.8x the experts. Prediction, written first: on tasks that quote or rework the prompt (rewriting code, summarizing section by section) 1.5–2.5 tokens a pass, on free prose ~1.1; the KV bytes per token divide by it, the union of the experts of a multi-row pass eats part of the gain | `run -f <task of ~2000 and ~4000 tokens> -n 256` with and without `--spec 8`: tokens, passes, tokens identical | the engine already reads the KV once per pass (`tr_attention_group`): what it is worth where the KV is 30-46% of the token |
 
 Reference machine: Ryzen 9 7940HX (Zen 4, 16 core / 32 thread, AVX-512 VNNI/BF16), 31 GB
 RAM (2×16 GB DDR5-5200), NVMe Micron 1 TB, GPU RTX 4070 Laptop 8 GB and Radeon 610M (not used
@@ -1191,7 +1193,6 @@ davvero byte diviso banda, ma le bande **erano due**, e nessuna era 41:
 
 | contesto (a metà risposta) | misurato prima | formula a 41 GB/s | byte al secondo, prima | misurato dopo | formula a 48.2 GB/s | byte al secondo, dopo |
 |---|---|---|---|---|---|---|
-| 56 | 37.97 | 33.11 (−13%) | 47.0 GB/s | 38.91 | 38.91 | 48.2 GB/s |
 | 536 | 33.00 | 30.06 (−9%) | 45.0 | 35.48 | 35.32 (−0.5%) | 48.4 |
 | 2072 | 24.19 | 23.21 (−4%) | 42.7 | 27.50 | 27.27 (−0.8%) | 48.6 |
 | 4024 | 18.04 | 17.99 (−0.3%) | 41.1 | 20.91 | 21.15 (+1.2%) | 47.7 |
@@ -2632,6 +2633,149 @@ No code written: the lever is the KV at 16 bits, a declared mode that is not exa
 point 6, question 36, Marcello's call). With Q4_K weights (~660–730 MB per token instead of 1200)
 the KV is ~43% of the decode at 2048 and the same lever gives ~1.25×.
 
+## Skipping cached positions exactly: the premise on the real model (2026-09-24)
+
+Marcello's decision of 2026-09-24: no KV at 16 bits with rounding; the long-context decode goes
+faster only with logits identical to the byte. The exact way to read fewer KV bytes would be to
+skip the positions that cannot change a bit: where `tr_expf(s − max)` is exactly 0, or where the
+position's `e` is absorbed by its lane's running partial of the sum **and** every `a·v[d]` by the
+running output (below half an ulp, in the definition's order), with cheap upper bounds on the
+score (a norm per position, or the key's high 16 bits read for every position and the low 16 only
+where needed) to decide without reading everything. Before any kernel, the premise.
+
+How: `make attn-probe` builds a diagnostic engine (`build/probe/`, `-DTR_ATTN_PROBE`,
+`tools/attn_probe.c`, never the engine) that writes every decode token's queries, keys and
+values; `tools/attn_skip_report.py` replays the attention in float32 as `src/kernels/kernels.c`
+defines it (16-lane dot, max, exp, 16-lane sum, division, output in increasing position) and asks
+of every position whether each criterion holds; the bounds are rigorous (the bf16 high half with
+the width of what was cut, plus 12 roundings of the dot), checked against the exact scores. Six
+runs of 16 decode tokens on all 16 layers × 16 heads, native: `docs/ARCHITECTURE.md` as prose
+(prompts of 1896 and 3993 tokens), `src/models/olmoe.c` as code (1965, 3970), the benches'
+synthetic prompt (`-p 2048`, `-p 4000`); 7.8–17.4 M positions a run.
+
+| run | s − max in (−2, 0] | (−5, −2] | (−10, −5] | (−15, −10] | (−20, −15] | (−25, −20] | ≤ −25 | exp exactly 0 | oracle: bytes left |
+|---|---|---|---|---|---|---|---|---|---|
+| prose ~2000 | 7.0% | 7.8% | 63.1% | 20.3% | 1.5% | 0.2% | 0.0% | 0 | 1.000 |
+| prose ~4000 | 6.7% | 7.3% | 55.8% | 26.9% | 2.7% | 0.5% | 0.1% | 0 | 1.000 |
+| code ~2000 | 6.9% | 9.5% | 61.3% | 20.4% | 1.8% | 0.2% | 0.0% | 0 | 1.000 |
+| code ~4000 | 6.9% | 6.3% | 58.5% | 24.2% | 3.4% | 0.6% | 0.1% | 0 | 0.999 |
+| synthetic 2048 | 6.5% | 10.9% | 62.8% | 17.2% | 1.9% | 0.5% | 0.1% | 0 | 0.999 |
+| synthetic 4000 | 6.3% | 6.0% | 65.8% | 18.6% | 2.4% | 0.7% | 0.2% | 0 | 0.998 |
+
+- **No score is ever 30 below its max** (exp reaches 0 at −103.97): the QK-norm keeps OLMoE's
+  attention flat, two thirds of the positions sit between −10 and −5. Not one exact zero in
+  65 M positions.
+- **The oracle** (a position whose `e` leaves its lane's partial unchanged and whose `a·v` leaves
+  all 128 outputs unchanged, known with every value in hand) skips at most 0.2% of the bytes. It
+  bounds every scheme of the family: absorption with the largest |v| of a position (≤ 0.2%), keys
+  split in high and low halves (the high half decides nothing: 0.3–0.6% of the bytes the other
+  way), values split (the high half decides the new output for ≤ 0.6% of the positions that need
+  V), norm, block and low-rank bounds.
+- **Closed for this model, before any kernel.** A model without QK-norm, with sharper attention,
+  may differ: the probe and the report run on any model with this attention, so a new model gets
+  the same check (`docs/COMMANDS.md`).
+- **An adversarial review of the proofs** (an Opus agent, its own float32 emulation on the same
+  dumps, 4.6 M positions: oracle 0.07–0.37% of the bytes, largest gap max − s in a head median
+  13.1, p99 31, max 40.2) found the skips exact only with these conditions, the ones a kernel
+  would need if a model with sharp attention brings the idea back: a sticky non-finite flag per
+  layer and head set at KV write (a skipped position hides the reference's `0·inf = NaN`); the
+  default MXCSR asserted (under FTZ/DAZ `out` can become −0 and adding +0 is no longer the
+  identity); absorption as `fl(P + e_hi) == P` (the "≤ half an ulp" form is wrong:
+  P = 1 + 2^-23, e = 2^-24 gives 1.0000002; 0 violations of the right form in 53 M brute-force
+  pairs); the V test two-sided (one-sided fails at a power of two: 173 cases); the largest |v|
+  taken as an integer max of the bits (a `max_ps` drops a NaN depending on operand order); the
+  lane of a position its absolute `t % 16` (compacting the kept positions changes the sum); a
+  position absorbed in the sum but not in V re-reads its key's low half for the exact `a`; the
+  bound from the high half of a key widened by γ12 · Σ|q_i|·max(|H_i|, |T_i|) + 128·2^-150 and
+  `scale` rounded outward (without the margin the bound undershoots the computed score in 3.5%
+  of adversarial cases, by up to two floats), and a NaN whose payload sits in the low 16 bits
+  treated as unbounded (it truncates to ±inf). Scripts: the session's scratch `opus3/brute.py`,
+  `emu.py` (not kept: the conditions are here).
+- **A second review on the whole grid** (a Sonnet agent, 76 M query-position pairs): the largest
+  gap max − s anywhere is 44.5; a per-position norm bound certifies 2 of the 452 475 positions
+  below max − 20 (norms vary little: coefficient of variation 0.118); block min/max envelopes
+  catch 0–0.03% of them; a low-rank bound (the top-32 singular subspace of the keys plus
+  Cauchy-Schwarz on the rest; 0 violations in 76 M) catches 57% of them but costs 132 bytes a
+  position against a 25.8% break-even, and only two heads (L0H11, L8H10) skip 8–40% there — at
+  max − 20, which is not an exact threshold. The context stops at 4096 on this model
+  (`olmoe.context_length`): the 4000-token runs are its longest.
+- **Lossless compression, measured on the same dumps** (both reviews): sign and exponent carry 3.5
+  of their 9 bits of entropy per channel (the exponent given its channel 2.56–2.58 bits), the
+  mantissa none (6.97 of 7 and 7.8–7.95 of 8 bits); zlib on byte planes 13.6–13.9% on K, ~17% on
+  V (up to 83% on layer 0 of code: repeated tokens, see the per-token row below).
+  Entropy coding would take ≤ 17% and does not decode at memory speed; a fixed 28-bit layout
+  (3 bytes of sign and mantissa, a 4-bit exponent offset per channel in blocks of 64 positions,
+  code 0 for zero and subnormals, an escape for the 0.7% of block-channels whose exponents span
+  more than 15, and for inf and NaN) reads 12.5% − 0.4% of headers = **12.1% fewer KV bytes**:
+  ~1.4 ms a token at 2048, ~2.8 at 4000 (**~1.04× and ~1.06×**), if the decoding (~8 AVX2
+  instructions per 8 floats) stays under the memory time. Not built yet: the CPU-only lever,
+  after the GPU's numbers (question 51).
+
+The other ideas of the session (orchestrator's, and two agents' asked for different hints), by
+bytes first; a KV at context 2048 is 518 MiB a token:
+
+| idea | exact? | bytes or factor at 2048 | estimate | where |
+|---|---|---|---|---|
+| skip positions (every variant above) | yes | ≥ 0.998 of the bytes | none | closed above |
+| KV at 16 or 8 bits, per-head Q8 | no | 0.5, 0.25 | 1.18×, 1.25× | excluded by Marcello's decision |
+| lossless compression of K and V | yes | sign and exponent per channel only, the mantissa has no entropy: ≤ 12–17% less | ≤ 1.04–1.05× | measured below |
+| speculation from the prompt | yes (batch = token by token) | KV read once per pass: bytes ÷ tokens per pass | depends on the task | question 52 |
+| attention on the GPU (RTX 4070 Laptop, ~256 GB/s) | yes, if every float op carries `.rn` (PTX never fuses those) and `tr_expf` is ported whole | same bytes, 4-5× the bandwidth | 1.28× at 2048, ~1.55× at 4000 | question 51 |
+| a slice of the KV kept in L3 across tokens (weights streamed non-temporal) | yes | 64 MB of L3 holds ≤ 12% of the KV at 2048, and a cyclic read of 518 MiB through LRU hits nothing unless a fixed slice is pinned | ≤ 1.02–1.03× | not built |
+| attention at 48 → 53 GB/s | yes | same bytes | ≤ 3% (§Decode at context 2048) | not built |
+| self-speculation with a cheap draft (layers skipped) | yes | a draft still reads the 1200 MB of weights, a pass of k rows the union of their experts (~2.8× measured at ~4 rows, below) | a loss on an MoE | not built |
+| the dense weights (QKV, output projection, output head: ~395 MB a token) in VRAM beside the KV | yes, same `.rn` rule | ~7.7 ms a token off the RAM at 2048 | with the KV on the GPU, ~22 ms a token, **~1.6×** (agent's estimate) | M3's first piece, after question 51 |
+| the prompt lookup extended cyclically (a draft that overlaps the tail continues with its period) | yes (drafts are verified) | KV ÷ tokens per pass, in loops only | on the dumps' 87 decode steps 138 drafts accepted instead of 66, all in loops (the synthetic prompt falls into a period-2 loop by its 2nd-3rd token, prose ~4000 into a near period 4) | cost small; not built |
+| drafts from a copy pointer (the argmax of a few induction heads) | yes | same | 74 accepted instead of 66 on 87 steps, same precision: weak | not built |
+| layer 0's keys (before RoPE) and values from one row per distinct token (a pure function of the token) | yes (RoPE on the fly is the same computation) | 0.95–0.96 of the KV on prose and code (728 distinct tokens of 1896, 505 of 1965) | ~1.4% | not built |
+| a key's top 3 bytes always, the low byte on demand (graded precision) | yes | with a ≈ 1/N every product needs ~13 bits: 4–12% of elements undecided, so almost no row is | ≤ 1–2% | dead by arithmetic |
+| keys and values recomputed from the layer's input (8 KiB a position instead of 16) | yes | half the bytes, ~34 GFLOP a layer a token | a loss | dead |
+
+## The KV packed in 28 bits: the premise (2026-09-24)
+
+An agent on `tests/bench_kvpack.c` built the lossless format of §Skipping cached positions exactly
+(blocks of 64 positions: a base exponent per channel, a 4-bit code per value — 0 for zero and
+subnormals, 15 an escape to a list of raw bits —, 16 low bits and 8 of sign and high mantissa),
+decoded four positions at a time into a scratch that the tier's own `dot_f32_x4`/`axpy_f32_x4`
+then read. **Bits**: every stream of the six dumps packs and unpacks to the same bytes; 25 344
+decode queries through the packed attention give `tr_attention_group`'s bits (also under
+`TR_CPU_MAX=scalar` and `avx2`); a mutation of the decoder (base off by one) red in 4096 of 4096;
+a synthetic block with every float class unpacks exactly, 5 escapes as designed. **Bytes**:
+3.53-3.55 a value, **1.128-1.132× fewer** than F32; 0.38-0.43% of the values escape. **Time**: not
+measured — four samples on the loaded machine gave anything from 1.79× faster to 1.70× slower.
+Open: the still machine's answer, and whether decoding four positions at a time inherits the x4
+order's penalty above (the packed rows would be read one at a time too).
+
+## Speculation at long context (2026-09-24)
+
+Question 52. The verification of a speculative pass reads the KV once (`tr_attention_group`, up
+to 16 rows, `OLMOE_ATTN_QUERIES` = `TR_LOGIT_ROWS_MAX`), so tokens per pass divide the KV bytes of
+a token. Prediction, written first: 1.5–2.5 tokens a pass on tasks that quote or rework the
+prompt, ~1.1 on free prose. Measured by an agent, native, `run -n 256 -t 8 -c 4600` with and
+without `--spec 8` (one run each: the pass counts are deterministic, the tok/s were taken on a
+machine shared with other work and are noisy); every `--spec` output identical to its twin
+(`cmp`, 7 of 7). The two task prompts are the session's prompts with an instruction appended.
+
+| prompt | context | tokens / pass | drafts accepted | tok/s without → with (noisy) |
+|---|---|---|---|---|
+| prose, free continuation | 1896 | 1.04 | 10 of 48 | 26.03 → 24.94 |
+| prose, free continuation | 3993 | 1.13 | 29 of 64 | 19.38 → 20.60 |
+| prose + "summarize section by section" | 4034 | 1.08 | 18 of 57 | 18.47 → 20.56 |
+| code, free continuation | 1965 | 1.27 | 55 of 125 | 24.92 → 26.58 |
+| code + "rewrite renaming every identifier" | 2037 | 1.57 | 95 of 151 | 24.36 → 27.78 |
+| code, free continuation (repetitive loading boilerplate) | 3970 | **3.29** (3.39 with `--spec 15`) | 179 of 227 | 20.57 → **34.12** (1.66×) |
+
+- The prediction held on the rewrite (1.57) and on free prose (1.04–1.13); summarizing quotes
+  little (1.08). Where the text repeats, speculation already gives what the GPU would: 1.66× at
+  4000 on the boilerplate.
+- **The union of the experts eats the gain, not the KV**: on the clean pair (code at 4000), a pass
+  of ~3.9 rows reads the KV once but ~2.8× one token's expert weights (from the net 1.66× against
+  3.29 tokens a pass, bytes over bandwidth); `--spec 15` the same (2.76×, 1.73× net). Consistent with
+  §Adaptive draft (one more row 13.7–17.6 ms of a 31.3 ms pass). On free prose the lever is nil.
+- `--spec 16` is refused by design: a pass holds at most 16 logit rows (1 + 15 drafts).
+- The synthetic prompt of the benches falls into a period-2 loop by its 2nd–3rd decode token
+  (found on the probe's dumps): speculation measured on it measures the loop, not the lever.
+
 ## Attempts
 
 | Data | Cosa | Prima | Dopo | Spread | Esito |
@@ -2666,3 +2810,5 @@ the KV is ~43% of the decode at 2048 and the same lever gives ~1.25×.
 | 2026-09-24 | `dot_row2_x4` AVX-512 (two weight rows against four input rows, eight accumulators; Q8_0, Q4_K, Q6_K), bit-identical; `tr_matmul` takes rows in pairs | whole matrix 1024x2048, 64 tokens: Q8_0 0.0607 / 0.0084 ms per token (1 / 16 cores); engine prefill Q8_0 200.6, Q4_K_M 211.0 tok/s | 0.0491 / 0.0065; prefill 252.9 / 241.3 and 236.7 / 233.8 | A/A 4.6% and 1.2% | kept: prefill 1.20-1.26x (Q8_0), 1.11-1.12x (Q4_K_M), decode unchanged |
 | 2026-09-24 | the sixteen Q6_K scales in SIMD instead of scalar (same single rounding) | whole matrix Q6_K, 1 core: 0.0551 (two rows) / 0.0602 (x4) ms per token | 0.0523 / 0.0590 | control Q8_0 0.0491 in both sessions | kept |
 | 2026-09-24 | a row decoded once per tile of 16 tokens, then the F32 x4 kernel (not built: measured the F32 x4 kernel alone) | Q8_0 x4 43 926 / 36 771 M/s (n 2048 / 4096) | F32 x4 44 779 / 33 135 | 3% | rejected: the matmul is bound by loading the input rows, not by decoding the weights |
+| 2026-09-24 | skipping cached positions exactly (exp exactly 0; absorption in the lane sum and in the output; keys and values split in high and low 16 bits; norm, block and low-rank bounds), premise on the real model before any kernel | KV read per decode token: all of it | oracle (every value known): 0.998-1.000 of the bytes; no score 30 below its max in 65 M positions | six runs, all layers and heads | **rejected before code**: OLMoE's QK-norm keeps the attention flat (§Skipping cached positions exactly) |
+| 2026-09-24 | the KV packed in 28 bits, lossless (premise bench, `tests/bench_kvpack.c`) | 4 bytes a value | 3.53-3.55 bytes a value (1.13× fewer); 25 344 queries give the F32 attention's bits | time not measured: on the loaded machine anything from 1.79× faster to 1.70× slower | open: question 57 |

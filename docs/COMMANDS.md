@@ -36,6 +36,10 @@ build/trochilus run ... --decode-threads 8   # force decode threads (default: me
 sh tools/threads_phase.sh sweep | widths | after <binary before>   # threads per phase: -t 4/8/12/16, forced widths
 sh tools/decode_context.sh measure | widths | long | change <before>   # decode at 32/512/2048/4000 context: A/A, forced widths, bytes per zone
 tools/.venv/Scripts/python.exe tools/decode_context_report.py speed|model|zones <file>   # MEASUREMENTS tables from runs; speed counts choices and changes
+build/tests/bench_kvpack.exe roundtrip | bits | time [--run <name>|all]   # the KV packed in 28 bits, lossless: round trip, the attention's bits on the probe dumps, time against F32 (KVPACK_PROBE_DIR)
+make attn-probe   # build/probe/trochilus: a diagnostic engine that writes each decode token's q, K, V and output (tools/attn_probe.c); never the engine
+TR_PROBE_DIR=<dir> TR_PROBE_KV_AT=<prompt tokens + n> build/probe/trochilus.exe run -m <gguf> -f <prompt> -n <n> -t 8   # the dump: K and V at the last token, q and the output of every token
+tools/.venv/Scripts/python.exe tools/attn_skip_report.py <dir> [<dir> ...] [--layers 0,1] [--json f]   # which positions an exact attention could skip (s - max, exact zeros, absorption, high/low halves); first checks its replay gives the engine's bits
 sh tools/orphans.sh      # is something of ours still on? make check and measurements don't start
 sh tools/test_marker.sh | sh tools/mutate_marker.sh   # the machine's marker (~/.claude/macchina-ferma) taken, waited for, given back; its 9 mutations all red (on a copy of the library)
 sh tools/test_ab_modes.sh   # ab_modes stops on a run that measured nothing, with and without AB_WALL (in make check)

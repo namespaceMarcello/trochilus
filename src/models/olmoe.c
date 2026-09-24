@@ -22,6 +22,14 @@
 #include "../kv/kv.h"
 #include "../memory/experts.h"
 
+#ifdef TR_ATTN_PROBE
+/* A diagnostic build only (make attn-probe, tools/attn_probe.c): sees every decode token's
+ * attention, head by head. The engine is never built with it. */
+void tr_attn_probe(int64_t layer, int64_t head, const float *q, const float *keys, const float *values,
+                   int64_t n_pos, int64_t head_dim, float scale);
+void tr_attn_probe_out(int64_t layer, int64_t head, const float *out, int64_t n_pos, int64_t head_dim);
+#endif
+
 /* ---- weights ---------------------------------------------------------- */
 
 typedef struct {
@@ -925,9 +933,16 @@ static void attn_body(void *ctx_, int64_t begin, int64_t end, int worker) {
         const float *values = tr_kv_values(c->kv, c->layer, h / c->group);
         for (int64_t i = i0; i < i1; i += OLMOE_ATTN_QUERIES) {
             int64_t n_q = i1 - i < OLMOE_ATTN_QUERIES ? i1 - i : OLMOE_ATTN_QUERIES;
+#ifdef TR_ATTN_PROBE
+            if (c->n_tok == 1)
+                tr_attn_probe(c->layer, h, c->q + h * c->head_dim, keys, values, c->pos0 + 1, c->head_dim, c->scale);
+#endif
             tr_attention_group(c->q + i * c->n_qkv + h * c->head_dim, c->n_qkv, keys, values, n_q, c->pos0 + i + 1,
                                c->head_dim, c->scale, scores, c->score_stride,
                                c->out + i * c->n_qkv + h * c->head_dim, c->n_qkv);
+#ifdef TR_ATTN_PROBE
+            if (c->n_tok == 1) tr_attn_probe_out(c->layer, h, c->out + h * c->head_dim, c->pos0 + 1, c->head_dim);
+#endif
         }
         idx = h * c->n_tok + i1;
     }

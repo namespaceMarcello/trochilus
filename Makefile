@@ -59,7 +59,7 @@ ATTN_BIN := $(BUILD)/tests/bench_attn$(EXE)
 EXPF_BIN := $(BUILD)/tests/bench_expf$(EXE)
 DISK_BIN := $(BUILD)/tests/bench_disk$(EXE)
 
-.PHONY: all test check-gcc check-clang check-asan check-tsan check-tiny check-real check-cut oracle tier-check oracle-tokenizer chat-check oracle-real spec-check bench bench-mem bench-attn bench-expf bench-disk lint profile check check-linux clean-machine clean platform-guard quick
+.PHONY: all attn-probe test check-gcc check-clang check-asan check-tsan check-tiny check-real check-cut oracle tier-check oracle-tokenizer chat-check oracle-real spec-check bench bench-mem bench-attn bench-expf bench-disk lint profile check check-linux clean-machine clean platform-guard quick
 all: $(BUILD)/trochilus$(EXE)
 
 # Objects of two platforms must never share a BUILD directory: a build in the container with
@@ -162,6 +162,11 @@ EXPF_CHECK := --check
 endif
 bench-expf: $(EXPF_BIN)
 	./$(EXPF_BIN) $(EXPF_CHECK)
+
+# A diagnostic engine in its own directory that writes every decode token's queries, keys and
+# values to files (tools/attn_probe.c, read by tools/attn_skip_report.py). Never the engine.
+attn-probe:
+	$(MAKE) BUILD=$(BUILD)/probe EXTRA_CFLAGS=-DTR_ATTN_PROBE EXTRA_LDFLAGS=tools/attn_probe.c all
 
 # Scenarios with the engine profiler (bench/scenarios.json), compared with the
 # previous run on this machine. See docs/ARCHITECTURE.md §Profiling.
@@ -288,6 +293,8 @@ clean-machine:
 ifeq ($(OS),Windows_NT)
 check: clean-machine lint
 	$(MAKE) WERROR=1 all $(TEST_BIN) $(BENCH_BIN) $(MEM_BIN) $(ATTN_BIN) $(EXPF_BIN) $(DISK_BIN) $(BUILD)/tests/dump_rope$(EXE) $(BUILD)/tests/dump_dequant$(EXE)
+	@# the diagnostic probe's branch of olmoe.c (make attn-probe) still compiles, with 0 warnings
+	$(CC) $(filter-out -MMD -MP,$(CFLAGS)) -Werror -DTR_ATTN_PROBE -fsyntax-only src/models/olmoe.c tools/attn_probe.c
 	@# the models volume, when it exists, replaces models/ read over the Windows bind mount:
 	@# the real-model checks load the same file from ext4 instead of 9p (docs/LESSONS.md #41)
 	MSYS_NO_PATHCONV=1 docker run --rm --security-opt seccomp=unconfined -v "$(CURDIR):/src" \

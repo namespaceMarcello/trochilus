@@ -1016,3 +1016,16 @@ decode unchanged (MEASUREMENTS §Two weight rows). Check: `make check`; `sh tool
 `sh tools/race_llama.sh 5` on commit 2d709e0: llama.cpp's prefill is now 1.41× ours at 16 threads
 and 1.13× at 8 (was 1.8× and 1.5×), decode 1.00–1.06× at context 512 and 1.12–1.15× at 2048
 (MEASUREMENTS §Two weight rows). Check: `sh tools/race_llama.sh 5`.
+
+### 2026-09-24 — Skipping cached positions exactly: the premise measured, and closed
+Marcello's decision: the long-context decode goes faster only with logits identical to the byte.
+Before any kernel, the premise of the exact skips (positions whose exp is exactly 0, or whose
+contribution the rounding absorbs, found with cheap bounds): `make attn-probe` builds a diagnostic
+engine (`build/probe/`, `-DTR_ATTN_PROBE`, `tools/attn_probe.c`) that writes each decode token's
+queries, keys, values and outputs; `tools/attn_skip_report.py` replays the attention in float32,
+first proves its replay gives the engine's bits (8704 head outputs; two mutations red), then counts
+what each criterion would skip. On six real runs (prose, code, synthetic; ~2000 and ~4000 tokens;
+65 M positions) no score falls 30 below its max and an oracle skips at most 0.2% of the bytes: the
+whole family closed (MEASUREMENTS §Skipping cached positions exactly, LESSONS #152). The gate
+compiles the probe's branch of `olmoe.c` (0 warnings). Check: `make attn-probe`, then the two
+commands in `docs/COMMANDS.md`.
