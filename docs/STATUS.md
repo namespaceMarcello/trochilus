@@ -346,8 +346,7 @@ MEASUREMENTS.
 **Tests and gate** (2026-09-24): `mutate_auto.py` lists the mutants no check runs (gcov) and
 runs ASan on the survivors only (`prof.c` 30 → 9 s, the same verdicts); `gguf.c`, `experts.c`,
 `threads.c`, `platform.c` mutated for the first time (MEASUREMENTS, after §Generated mutations):
-open, `gguf.c`'s 40 survivors (an agent's 17 cases against them, cut short by the usage limit, in
-`build/gguf_tests_wip.diff`: 6 fail on the real code, LESSONS #172), `threads.c`'s 22 (the spin and the pinning: speed,
+open, `gguf.c`'s 40 survivors (17 cases in `build/gguf_tests_wip.diff`, 6 wrong: LESSONS #172), `threads.c`'s 22 (the spin and the pinning: speed,
 not bits), `platform.c`'s Windows half never mutated (the container compiles its POSIX half). The
 native C tests run beside the container (`tools/beside.sh`): the gate's new time not measured yet.
 Review of 2026-09-22/23: LESSONS #102–#125. The native measurements follow the machine's marker.
