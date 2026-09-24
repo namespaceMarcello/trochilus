@@ -84,6 +84,9 @@ def prompt_ids(args):
 def bench_trochilus(args, ids, threads):
     cmd = [args.trochilus, "generate", "-m", args.model, "--tokens", ",".join(map(str, ids)),
            "-n", args.gen, "-t", threads, "-c", args.prompt + args.gen]
+    if args.decode_threads != "measured":
+        # forced, never the estimator (docs/STATUS.md: no speed rests on an unvalidated estimator)
+        cmd += ["--decode-threads", threads if args.decode_threads == "same" else args.decode_threads]
     prefill, decode, tokens = [], [], None
     for i in range(args.runs + 1):
         r = run(cmd)
@@ -200,6 +203,8 @@ def main():
     ap.add_argument("--prompt", type=int, default=32)
     ap.add_argument("--gen", type=int, default=32)
     ap.add_argument("--runs", type=int, default=5)
+    ap.add_argument("--decode-threads", default="same",
+                    help="Trochilus decode width: 'same' as --threads (default), a number, or 'measured'")
     ap.add_argument("--prompt-file", default=os.path.join(ROOT, "src", "models", "olmoe.c"))
     ap.add_argument("--tok-file")
     ap.add_argument("--hf-tokenizer")

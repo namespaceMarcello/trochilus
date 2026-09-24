@@ -45,7 +45,8 @@
 
 static const char *self_arg;       /* argv[0]: synth_write puts its files beside it */
 static char bin[600];              /* the trochilus binary */
-static char dir[512];              /* where this test lives, and the files it writes */
+static char dir[512];              /* where this test lives */
+static char tmp[512];              /* where it writes its files (tr_test_tmpdir) */
 static char out_path[600], err_path[600], in_path[600];
 static char out[65536], err[65536]; /* what the last run printed on stdout, on stderr */
 static size_t out_len;
@@ -65,7 +66,7 @@ static void native_path(char *p) {
 }
 
 static void in_dir(char *path, size_t len, const char *name) {
-    snprintf(path, len, "%s/%s", dir, name);
+    snprintf(path, len, "%s/%s", tmp, name);
     native_path(path);
 }
 
@@ -738,6 +739,7 @@ int main(int argc, char **argv) {
     snprintf(bin, sizeof bin, "%s/../trochilus", dir);
 #endif
     native_path(bin);
+    tr_test_tmpdir(self, tmp, sizeof tmp);
     in_dir(out_path, sizeof out_path, "test_cli_out.txt");
     in_dir(err_path, sizeof err_path, "test_cli_err.txt");
     in_dir(in_path, sizeof in_path, "test_cli_in.txt");

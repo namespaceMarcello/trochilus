@@ -23,6 +23,7 @@ build/trochilus run ... --spec 8   # speculation from prompt (same tokens)
 sh tools/ab_spec.sh <gguf> <binary> bench/prompts/code.txt 8   # how much --spec yields, alternating runs
 sh tools/build_llamacpp.sh; tools/compare_llamacpp.py ...   # in container: llama.cpp, logits comparison
 tools/speed_compare.py ...   # in container: speed against llama.cpp and colibri (trochilus-models volume)
+sh tools/race_llama.sh [runs]   # by the native rules: Trochilus vs llama.cpp, prompts 512 and 2048, 16 and 8 threads, A B B A (~30 min)
 sh tools/ab_speed.sh <gguf> <binary A> <binary B>   # two binaries alternated run by run (LESSONS #46)
 sh tools/ab_modes.sh <rounds> "a=<command>" "b=<command>"   # modes of a binary (env, flag), round-robin order, A/A (LESSONS #66); AB_WALL=1 adds the whole run's ms (wall_ms)
 build/trochilus serve [-m <gguf>] [-t n] [--expert-budget <MiB|min>] [--idle <min>]   # the engine kept between commands (question 49): generate/logits/run/chat run in it when it answers; TR_SERVER=0: never

@@ -59,19 +59,21 @@ ATTN_BIN := $(BUILD)/tests/bench_attn$(EXE)
 EXPF_BIN := $(BUILD)/tests/bench_expf$(EXE)
 DISK_BIN := $(BUILD)/tests/bench_disk$(EXE)
 
-.PHONY: all test check-gcc check-clang check-asan check-tsan check-tiny check-real oracle tier-check oracle-tokenizer chat-check oracle-real spec-check bench bench-mem bench-attn bench-expf bench-disk lint profile check check-linux clean-machine clean platform-guard quick
+.PHONY: all test check-gcc check-clang check-asan check-tsan check-tiny check-real check-cut oracle tier-check oracle-tokenizer chat-check oracle-real spec-check bench bench-mem bench-attn bench-expf bench-disk lint profile check check-linux clean-machine clean platform-guard quick
 all: $(BUILD)/trochilus$(EXE)
 
 # Objects of two platforms must never share a BUILD directory: a build in the container with
 # the default BUILD silently overwrites the native ones and the next link mixes them
-# (docs/LESSONS.md #52). The stamp says who owns the directory.
+# (docs/LESSONS.md #52). The stamp says who owns the directory. It is written once, whole (a
+# rename): the gate's three lanes run makes on build/linux-gcc at once, and one that truncated the
+# stamp to rewrite it could make another read it empty and refuse the directory (docs/LESSONS.md #144).
 PLATFORM_TAG := $(if $(filter Windows_NT,$(OS)),windows,$(shell uname -s 2>/dev/null))-$(CC)
 platform-guard:
 	@mkdir -p $(BUILD)
 	@if [ -f $(BUILD)/.platform ] && [ "$$(cat $(BUILD)/.platform)" != "$(PLATFORM_TAG)" ]; then \
 		echo "error: $(BUILD) holds objects built by '$$(cat $(BUILD)/.platform)', this is '$(PLATFORM_TAG)'."; \
 		echo "       build elsewhere (make BUILD=build/linux-gcc ...) or run 'make clean'."; exit 1; fi
-	@echo "$(PLATFORM_TAG)" > $(BUILD)/.platform
+	@[ -f $(BUILD)/.platform ] || { echo "$(PLATFORM_TAG)" > $(BUILD)/.platform.$$$$ && mv -f $(BUILD)/.platform.$$$$ $(BUILD)/.platform; }
 
 $(BUILD)/trochilus$(EXE): $(CORE_OBJ) $(APP_OBJ)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDLIBS)
@@ -119,8 +121,13 @@ $(BUILD)/tests/test_hot$(EXE): LDLIBS += $(foreach s,$(HOT_WRAP),-Wl,--wrap=$(s)
 
 # a test that loops forever fails instead of hanging the gate (docs/LESSONS.md #35); no timeout(1): no limit
 TEST_RUN := $(shell command -v timeout >/dev/null 2>&1 && echo timeout 300)
+# TEST_TMP=<dir>: the tests write their temporary files there, not next to their binaries
+# (tests/test.h tr_test_tmpdir). The container's targets set it to its own disk: on the Windows
+# bind mount the synthetic models cost 100 s of each build's 120 (docs/LESSONS.md #142).
+TEST_TMP ?=
 test: $(TEST_BIN)
-	@set -e; for t in $(TEST_BIN); do echo "== $$t"; $(TEST_RUN) ./$$t; done; echo "== all C tests passed"
+	@set -e; $(if $(TEST_TMP),mkdir -p $(TEST_TMP); export TR_TEST_TMPDIR=$(TEST_TMP);) \
+	for t in $(TEST_BIN); do echo "== $$t"; $(TEST_RUN) ./$$t; done; echo "== all C tests passed"
 
 bench: $(BENCH_BIN)
 	./$(BENCH_BIN)
@@ -293,17 +300,19 @@ check: clean-machine lint check-linux
 endif
 
 # The four builds of the C tests own their BUILD directories and share nothing, so they run at
-# once (their tests write next to their own binaries); -Orecurse keeps each one's output in one
-# piece. The steps on the tiny and the real models follow in order: they share build/linux-gcc,
-# and the real model's memory.
+# once (their tests write in a directory of their own, TEST_TMP); -Orecurse keeps each one's
+# output in one piece. Then, on build/linux-gcc, three lanes at once: the tiny models, the whole
+# real model (chat and speculation, one run after the other: each loads 7 GB; then the tokenizer
+# oracle, 4 GB, never beside them), and the real model's 2-layer cut (its two oracles in order,
+# they build the cut; 2.3 GB). The peak stays near 10 of the Docker VM's 15 GB: a fourth lane, or
+# the tokenizer beside the whole model, could make the engine's memory estimate refuse a run.
+# What the lanes share is made first.
 NPROC := $(shell nproc 2>/dev/null || echo 4)
 check-linux:
 	$(MAKE) -j$(NPROC) -Orecurse check-gcc check-clang check-asan check-tsan
-	@# then, on build/linux-gcc: the tiny models and the tokenizer run beside the real model's steps,
-	@# which stay one after the other (each loads the model). What both sides need is made first.
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} build/linux-gcc/trochilus \
 		$(FIX)/model-f32.gguf $(FIX)/model-f16.gguf $(FIX)/model-q8_0.gguf $(TOKFIX)/vocab.gguf
-	$(MAKE) -j2 -Orecurse check-tiny check-real
+	$(MAKE) -j3 -Orecurse check-tiny check-real check-cut
 
 check-tiny:
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle
@@ -316,7 +325,6 @@ check-tiny:
 		grep -q "^experts:.*hits,.*misses"
 	@echo "== expert budget min evicts on the tiny model"
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} tier-check
-	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle-tokenizer
 	$(PY) tools/profile_suite.py --binary build/linux-gcc/trochilus$(EXE) --smoke
 	@# -c is honoured: 6 + 4 tokens fit a context of 16, and do not fit one of 8
 	build/linux-gcc/trochilus generate -m $(FIX)/model-f32.gguf -p 6 -n 4 -c 16 > /dev/null
@@ -329,25 +337,31 @@ check-tiny:
 
 check-real:
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} chat-check
+	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} spec-check
+	@# after the whole model, never beside it: the tokenizer oracle holds about 4 GB
+	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle-tokenizer
+check-cut:
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle-real
 	TR_EXPERT_BUDGET_MIB=min $(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle-real
-	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} spec-check
 
 check-gcc:
-	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 test
-	@# a race shows up once in many runs: the threaded model test runs 20 times
-	@for i in $$(seq 20); do build/linux-gcc/tests/test_hot > /dev/null || exit 1; done; echo "== test_hot 20/20"
+	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 TEST_TMP=/tmp/tr-test/gcc test
+	@# a race shows up once in many runs: the threaded model test runs 20 times, four at once (the
+	@# pools then share the cores, which moves the threads' timing more than runs one by one do),
+	@# each run with a directory of its own: they write the same synthetic model (docs/LESSONS.md #143)
+	@seq 20 | xargs -P 4 -I{} sh -c 'mkdir -p /tmp/tr-test/hot{} && TR_TEST_TMPDIR=/tmp/tr-test/hot{} \
+		build/linux-gcc/tests/test_hot > /dev/null' && echo "== test_hot 20/20"
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 build/linux-gcc/tests/bench_kernels build/linux-gcc/tests/bench_mem \
 		build/linux-gcc/tests/bench_attn build/linux-gcc/tests/bench_disk build/linux-gcc/tests/dump_rope
 	@# tr_expf is the correctly rounded exp on every float, as gcc and as clang compile it
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 bench-expf
 check-clang:
-	$(MAKE) BUILD=build/linux-clang CC=clang WERROR=1 test
+	$(MAKE) BUILD=build/linux-clang CC=clang WERROR=1 TEST_TMP=/tmp/tr-test/clang test
 	$(MAKE) BUILD=build/linux-clang CC=clang WERROR=1 bench-expf
 check-asan:
 	$(MAKE) BUILD=build/linux-asan CC=gcc WERROR=1 \
 		EXTRA_CFLAGS="-O1 -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all" \
-		EXTRA_LDFLAGS="-fsanitize=address,undefined" test
+		EXTRA_LDFLAGS="-fsanitize=address,undefined" TEST_TMP=/tmp/tr-test/asan test
 check-tsan:
 	@# ThreadSanitizer on the pool; setarch -R: TSan cannot map its shadow memory with full ASLR
 	$(MAKE) BUILD=build/linux-tsan CC=gcc WERROR=1 EXTRA_CFLAGS="-O1 -g -fsanitize=thread" \
@@ -361,7 +375,7 @@ ifeq ($(OS),Windows_NT)
 quick: lint
 	$(MAKE) WERROR=1 all $(TEST_BIN)
 	MSYS_NO_PATHCONV=1 docker run --rm --security-opt seccomp=unconfined -v "$(CURDIR):/src" \
-		-w /src $(DOCKER_IMG) make -j$(NPROC) BUILD=build/linux-gcc CC=gcc WERROR=1 test
+		-w /src $(DOCKER_IMG) make -j$(NPROC) BUILD=build/linux-gcc CC=gcc WERROR=1 TEST_TMP=/tmp/tr-test/gcc test
 	@echo "== quick passed (not the gate: make check)"
 else
 quick: lint

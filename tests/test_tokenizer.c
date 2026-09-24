@@ -604,10 +604,9 @@ static void test_round_trip(const tr_tokenizer *t) {
 }
 
 int main(int argc, char **argv) {
-    (void)argc;
-    const char *sl = strrchr(argv[0], '/'), *bs = strrchr(argv[0], '\\');
-    if (bs && (!sl || bs > sl)) sl = bs;
-    snprintf(path, sizeof path, "%.*s/%s", sl ? (int)(sl - argv[0]) : 1, sl ? argv[0] : ".", "test_tokenizer.gguf");
+    char dir[440];
+    tr_test_tmpdir(argc > 0 ? argv[0] : "", dir, sizeof dir);
+    snprintf(path, sizeof path, "%s/%ld-test_tokenizer.gguf", dir, tr_test_pid());
 
     test_refusals();
     test_accepts();

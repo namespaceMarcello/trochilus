@@ -954,3 +954,14 @@ Windows a reload of the model for the same file named with another case (#140, s
 natively). Mutants of serve.c alive: 128 -> 73 (205 killed, no timeout). `make
 quick`: lint, the native build and the C tests in Linux gcc, about 2 minutes, for use between
 edits (the gate stays `make check`). Check: `make quick`, `make check`.
+
+### 2026-09-24 — The gate in 238 s instead of 428
+The C tests write their temporary files where `TR_TEST_TMPDIR` says (`tests/test.h`
+`tr_test_tmpdir`), and the gate sets it to the container's own disk: on the Windows bind mount the
+synthetic models cost 100 s of each build's 120. Every synthetic model carries the pid in its name
+(`synth_write`), the 20 runs of `test_hot` go four at a time, the model steps run in three lanes
+(tiny; the whole real model then the tokenizer oracle; the 2-layer cut), `test_marker.sh` waits by
+polling (10 → 2.7 s), and the platform stamp is written atomically. `tools/speed_compare.py` forces
+the decode width (`--decode-threads same`) and `tools/race_llama.sh` runs the race against
+llama.cpp by the rules of a native measurement. Table in MEASUREMENTS §The gate. Check: `make
+check` ("check passed in ... s").

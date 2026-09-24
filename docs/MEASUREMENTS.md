@@ -167,6 +167,7 @@ decides | — | — |
 | 47 | ~~Il prefill sotto budget legge gli esperti una volta per prompt?~~ **Adesso sì** (ordine per layer, 2026-09-21: 6 273 MiB e 12.41 s a 2048, **1.89×**). Prima: una volta per passata (2026-09-21, §Il prefill legge il modello una volta per passata). Il prompt si elabora a blocchi di 512 token (`OLMOE_DEFAULT_BATCH`) e ogni passata percorre tutti i layer, quindi sotto budget rilegge la tabella intera: a 2048 token **22 880 MiB invece di 6 528**, 3.65×, e cresce col prompt. Con una passata sola (`-b 2048`) il prefill fa 11.27 s invece di 23.51 (**2.09×**) e l'ultima riga di logit è identica al byte | il tempo dell'ordine per layer quando ci sarà, e la stessa misura a 4000 token (otto passate) | la leva più grossa del prefill sotto budget, e non costa precisione |
 | 48 | **Quanto del primo prompt si nasconde dietro il tempo che l'utente impiega a scrivere?** Una fase di preparazione dichiarata (idea di Marcello, 2026-09-21): appena la sessione si apre, e prima che il prompt arrivi, il motore comincia a leggere gli esperti e lo dice («leggo il modello, 6.5 GiB»). Non elimina i 4.7 s, li mette dove non danno fastidio; costa nessun bit di precisione e non serve un processo nuovo. Da decidere: cosa leggere per primo quando ancora non si sa il prompt (l'ordine dei layer è quello giusto, il layer 0 serve per primo) | tempo fra l'apertura e il primo token, con e senza la lettura anticipata, su un prompt che arriva dopo 5, 15 e 30 secondi | è la leva più economica: nessuna struttura nuova |
 | 49 | ~~Does a process that stays up between sessions pay for what it costs?~~ **At full budget yes, at half budget little** (measured 2026-09-23, §The engine kept between commands). `trochilus serve` (built 2026-09-23, Marcello's go) keeps pool, model and store; `generate`, `logits`, `run` and `chat` run in it when its endpoint answers, byte for byte the same output (`tests/test_serve.c`). First prompt of 2048 tokens: **full budget 12.79 → 7.81 s** (the 4.98 s load gone, prefill unchanged); **half budget 13.00 → 12.04 s** (0.926×, A/A 1.020×), 139 misses fewer of 1 157. Prediction written before measuring: full loses the load (held); half gains little because the sweep evicts what the next sweep needs first, misses warm = cold (held in the mechanism, off by 12% in the misses) | where the 139 fewer misses come from (per-phase misses: prefill and decode apart); a sweep-resistant eviction at half budget (model: up to ~511 units kept, ~2.5 s) | the gap to the resident model is gone where the model fits; below budget the lever is the eviction policy |
+| 50 | **How much disk does Adaptive-K take away, and what does it change?** (Marcello's source, docs/ORIGINS.md §Sources not yet studied): a token uses fewer than 8 experts when the router is confident, the lowest-weight ones dropped until the kept ones hold a share p of the router's weight. Prediction, written first: at p = 0.9 about 5-6 experts a token, misses at half budget down 20-35%, KL against the exact mode small but not 0; the token changed in a few % of positions | route trace (`--route-trace`): per p, experts kept per token and their weight (no engine change); then a declared mode (env or flag, never the default) at half budget through `tools/ab_modes.sh` (misses, prefill, decode) and KL against the exact mode (`tools/mask_quality.sh`) | under a partial budget every expert skipped is a unit not read from disk: a lever on M1's bottleneck, if the quality holds |
 
 Reference machine: Ryzen 9 7940HX (Zen 4, 16 core / 32 thread, AVX-512 VNNI/BF16), 31 GB
 RAM (2×16 GB DDR5-5200), NVMe Micron 1 TB, GPU RTX 4070 Laptop 8 GB and Radeon 610M (not used
@@ -2126,6 +2127,31 @@ running its own tests the whole time (declared, not measured). Logs `build/check
 The four builds share the processors, so each is slower than alone (ASan 71 → ~100 s): the gain is
 in the overlap, not in any single step. The real model's steps stay in a row: each loads the model,
 and two at once would ask the engine's memory guard for twice the room.
+
+### 2026-09-24: 428 → 238 s
+
+Same method before and after: `make check` with the time on every line, `tools/gate_times.py`,
+nothing changed in the code between the run and the one before it (every build up to date). One
+run each: sizes, not medians. Background: the OpenEMR stack of another window, idle. Logs
+`build/check-before.log`, `build/check-after6.log`; per test, `build/pertest-*.txt`.
+
+| block | before | after | why |
+|---|---|---|---|
+| scripts' tests (cleanup, marker, ab_modes) + lint | 22 s | 13 s | `test_marker.sh`: poll of 0.2 s, the wait for the other window by its announcement instead of `sleep 3`, the caps at 0 (10 → 2.7 s, 10 branches still reached) |
+| C tests of four builds, at once | 170 s | 45 s | the tests wrote their synthetic models on the Windows bind mount: `test_model_load` 66 s → 0.4, `test_stream` 16 → 5, `test_gguf` 13 → 1, the same in every build (gcc 121 → 22 s). `TR_TEST_TMPDIR` on the container's disk (LESSONS #142); the 20 runs of `test_hot` four at a time (34 → ~8 s), each in its own directory (LESSONS #143) |
+| model steps | 210 s, two lanes (tiny ‖ real in a row) | 153 s, three lanes | tiny 32 s ‖ whole model: chat, speculation, then the tokenizer oracle ~150 s ‖ the 2-layer cut: `oracle-real` 31 s then under the smallest store 92 s |
+| native tests at the end | 22 s | 22 s | — |
+| **whole gate** | **428 s** | **238 s** (299 s when the Makefile changed and every build recompiles) | 1.8× |
+
+The longest lane now holds the whole model and then the tokenizer oracle: 34 s alone, 4.0 GB of
+peak RSS (measured), so it never runs beside the whole model (7.4 GB) — three lanes keep the peak
+near 10 of the Docker VM's 15 GB, where the engine's memory estimate never refuses. Next levers,
+not taken: the native side (scripts' tests, lint, the Windows build and its C tests, ~35 s) beside
+the container instead of before and after it; `oracle-real` under the smallest store, 92 s for a
+2-layer cut, not looked into. The `trochilus-t3` clone (a gate rewrite never verified) was read and
+deleted: it had found the same bind mount cost; taken from it, the platform stamp written
+atomically (LESSONS #144) and the tokenizer oracle's peak; its diff is in
+`build/trochilus-t3-uncommitted.diff`.
 
 ## The engine kept between commands: the first prompt (2026-09-23)
 

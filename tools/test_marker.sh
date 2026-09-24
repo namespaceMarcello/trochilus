@@ -3,7 +3,7 @@
 # give back only its own? (tools/measure_guard.lib; the rule of 2026-09-23: whoever measures
 # times writes ~/.claude/macchina-ferma, the other windows pause their work while it is there)
 #
-#   sh tools/test_marker.sh        from the repo root; part of `make check`, about 10 seconds
+#   sh tools/test_marker.sh        from the repo root; part of `make check`, about 1 second
 #
 # The branches of measure_mark, measure_end and the AB_GUARD of measure_machine, each on a marker
 # in a directory of its own (MACHINE_MARKER), never the real one:
@@ -29,7 +29,9 @@ trap finish EXIT
 trap 'exit 130' INT TERM
 # measure_machine asks Docker for the running containers: none, here
 docker() { return 0; }
-MACHINE_MARKER_POLL=1
+# a fifth of a second between tries (sleep takes fractions on GNU, BSD and Git Bash): at a poll of
+# 1 s the waits below were the poll's, 10 s of the gate
+MACHINE_MARKER_POLL=0.2
 # a marker that should be taken at once and is not ends the test here (exit 5), not in 6 hours
 MACHINE_MARKER_WAIT_MAX=8
 FAILED=0
@@ -54,7 +56,11 @@ mkdir -p "$T/foreign"
 echo "ds4: a bench" > "$MACHINE_MARKER"
 ( measure_mark foreign > "$T/foreign.log" ) &
 W=$!
-sleep 3
+# waited for by its announcement, printed before its first sleep, not by a fixed sleep
+N=0
+while ! grep -q "another window measures times" "$T/foreign.log" 2> /dev/null && [ $N -lt 50 ]; do
+  sleep 0.2; N=$((N + 1))
+done
 [ "$(head -1 "$MACHINE_MARKER")" = "ds4: a bench" ] || fail "foreign: another window's fresh marker was taken"
 grep -q "another window measures times (ds4: a bench)" "$T/foreign.log" || fail "foreign: the wait was not announced"
 kill -0 $W 2> /dev/null && reached || fail "foreign: measure_mark did not wait"
@@ -62,10 +68,11 @@ rm -f "$MACHINE_MARKER"
 wait $W || fail "foreign: measure_mark failed once the marker was gone"
 head -1 "$MACHINE_MARKER" | grep -q '^trochilus: foreign ' || fail "foreign: not taken once free"
 
-# gives up: another window's marker that stays is waited for up to the cap, then exit 5
+# gives up: another window's marker that stays is waited for up to the cap, then exit 5 (a cap
+# of 0: the loop that waits is foreign's, above; here the branch that stops)
 echo "ds4: a long bench" > "$MACHINE_MARKER"
 RC=0
-( MACHINE_MARKER_WAIT_MAX=2; measure_mark capped > "$T/capped.log" ) || RC=$?
+( MACHINE_MARKER_WAIT_MAX=0; measure_mark capped > "$T/capped.log" ) || RC=$?
 [ $RC = 5 ] && reached || fail "gives up: exit $RC after the cap, 5 expected"
 grep -q "still measures times after 0 min (ds4: a long bench): not starting" "$T/capped.log" ||
   fail "gives up: '$(tail -1 "$T/capped.log")'"
@@ -75,7 +82,7 @@ grep -q "still measures times after 0 min (ds4: a long bench): not starting" "$T
 LIVE="trochilus: decode_context (pid $$, since 2026-09-23 03:00)"
 echo "$LIVE" > "$MACHINE_MARKER"
 RC=0
-( MACHINE_MARKER_WAIT_MAX=2; measure_mark other > /dev/null ) || RC=$?
+( MACHINE_MARKER_WAIT_MAX=0; measure_mark other > /dev/null ) || RC=$?
 [ $RC = 5 ] && [ "$(head -1 "$MACHINE_MARKER")" = "$LIVE" ] && reached ||
   fail "live ours: a running measurement's marker was taken (exit $RC)"
 rm -f "$MACHINE_MARKER"

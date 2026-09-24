@@ -748,15 +748,14 @@ int main(int argc, char **argv) {
     synth_params P = {2, 32, 2, 2, 32, 4, 2, SYNTH_TOK_MIN_VOCAB, 64, TR_TYPE_F32};
     synth_with_tokenizer = 1;
     char model[600], model2[600], dot_model[620];
-    char self_abs[1300];        /* argv[0] may be relative to the directory this process left */
-    snprintf(self_abs, sizeof self_abs, "%s/test_serve", dir_abs);
     synth_params P2 = P;
     P2.layers = 1;              /* another file, and other weights: another output (a width of its own:
                                  * with the same n_embd the two share embedding and output weights and
                                  * wrote the same six tokens) */
     P2.n_embd = 64;
-    if (synth_write(&P, self_abs, "test_serve.gguf", model, sizeof model) != 0 ||
-        synth_write(&P2, self_abs, "test_serve2.gguf", model2, sizeof model2) != 0) {
+    /* beside the binary whatever TR_TEST_TMPDIR says: the paths below name them relative to it */
+    if (synth_write_in(&P, dir_abs, "test_serve.gguf", model, sizeof model) != 0 ||
+        synth_write_in(&P2, dir_abs, "test_serve2.gguf", model2, sizeof model2) != 0) {
         fprintf(stderr, "test_serve: could not write the model\n");
         return 1;
     }

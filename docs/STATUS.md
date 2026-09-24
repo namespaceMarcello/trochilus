@@ -4,6 +4,10 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
 
 ## Decisions
 
+- 2026-09-24 — **Sources to take the best from** (Marcello): besides colibri, ds4 and llama.cpp,
+  ik_llama.cpp for M2 (K-quant and IQ_K CPU kernels, read before writing Q4_K), ktransformers
+  for M3, Adaptive-K as our own non-exact experiment (question 50); ArcLight and bitnet.cpp
+  later, PCoMoE not now. First read of each and why: `docs/ORIGINS.md` §Sources not yet studied.
 - 2026-09-17 — New project, not a fork: own architecture, best pieces from colibri and ds4
   brought in by hand (Marcello's choice). Name: Trochilus. Licence Apache-2.0.
 - First model OLMoE (exists real at 4–7 GB, runs everywhere); DeepSeek V4 Flash is the M4.
@@ -280,6 +284,10 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
   containers now left up, that wait may fail more often than with `docker stop`.
 
 ## Next steps
+
+**Night of 2026-09-24**: the gate 428 → 238 s (MEASUREMENTS §The gate: the tests' files off the
+bind mount, three model lanes); next levers there: the native side beside the container (~35 s),
+`oracle-real` under the smallest store (92 s).
 
 **Review (Opus 5.5, 2026-09-22 and 23)**: reader, expert store, pool, platform, profiler, model
 (`olmoe.c`), kernels, tokenizer and command line read, every file through `tools/mutate_auto.py`

@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "test.h"
 #include "../src/format/gguf.h"
 #include "../src/kernels/kernels_internal.h"
 
@@ -342,18 +343,27 @@ static synth_buf synth_olmoe(const synth_params *P) {
     return out;
 }
 
-/* Writes the model next to the test binary (tmpfile() needs write access to the drive
- * root on Windows); path receives the file name. Returns 0 on success. */
-static int synth_write(const synth_params *P, const char *argv0, const char *file, char *path, size_t path_len) {
-    const char *sl = strrchr(argv0, '/'), *bs = strrchr(argv0, '\\');
-    if (bs && (!sl || bs > sl)) sl = bs;
-    snprintf(path, path_len, "%.*s/%s", sl ? (int)(sl - argv0) : 1, sl ? argv0 : ".", file);
+/* Writes the model as dir/file exactly; path receives the file name. Returns 0 on success. */
+static int synth_write_in(const synth_params *P, const char *dir, const char *file, char *path, size_t path_len) {
+    int w = snprintf(path, path_len, "%s/%s", dir, file);
+    if (w < 0 || (size_t)w >= path_len) return -1;
     synth_buf b = synth_olmoe(P);
     FILE *f = fopen(path, "wb");
     int ok = f != NULL && fwrite(b.data, 1, b.len, f) == b.len;
     if (f != NULL) fclose(f);
     free(b.data);
     return ok ? 0 : -1;
+}
+
+/* Writes the model in the test's temporary directory (tr_test_tmpdir, tests/test.h), its name
+ * prefixed with this process's pid: two runs of one test at once never share a file (the gate
+ * runs test_hot four at a time, docs/LESSONS.md #141, #143). path receives the file name. */
+static inline int synth_write(const synth_params *P, const char *argv0, const char *file, char *path, size_t path_len) {
+    char dir[1024], name[256];
+    tr_test_tmpdir(argv0, dir, sizeof dir);
+    int w = snprintf(name, sizeof name, "%ld-%s", tr_test_pid(), file);
+    if (w < 0 || (size_t)w >= sizeof name) return -1;
+    return synth_write_in(P, dir, name, path, path_len);
 }
 
 #endif

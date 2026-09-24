@@ -459,12 +459,9 @@ static void test_more(void) {
 }
 
 int main(int argc, char **argv) {
-    const char *self = argc > 0 ? argv[0] : "";
-    const char *slash = strrchr(self, '/');
-    const char *bslash = strrchr(self, '\\');
-    if (bslash && (!slash || bslash > slash)) slash = bslash;
-    int dir_len = slash ? (int)(slash - self) : 1;
-    snprintf(path, sizeof path, "%.*s/test_gguf_tmp.gguf", dir_len, slash ? self : ".");
+    char dir[480];
+    tr_test_tmpdir(argc > 0 ? argv[0] : "", dir, sizeof dir);
+    snprintf(path, sizeof path, "%s/test_gguf_tmp.gguf", dir);
 
     layout L;
     buf valid = build_valid(&L);
