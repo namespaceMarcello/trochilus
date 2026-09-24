@@ -683,7 +683,7 @@
       "tappa": "M2",
       "titolo": "K-quant sulla CPU",
       "stato": "in-corso",
-      "cosa": "Formati che tengono i pesi in meno byte (Q4_K, Q6_K, Q2_K, IQ2_XXS): meno disco e meno RAM, la leva che si somma a tutto M1. Primo passo fatto il 24/09: Q4_K nel motore, esatto rispetto ai suoi pesi dequantizzati (identico al bit a gguf-py, il modello vero tagliato a 2 strati contro transformers nel make check), con un kernel AVX-512 nostro: i 16 valori possibili di un sotto-blocco calcolati una volta, e ogni peso preso col suo nibble. Il modello vero in Q4_K si fa dal nostro Q8_0, senza download. Prossimi: Q6_K (Q4_K_M lo mescola), la stessa tabella su AVX2, il prefill con una riga dequantizzata una volta per blocco di token.",
+      "cosa": "Formati che tengono i pesi in meno byte (Q4_K, Q6_K, Q2_K, IQ2_XXS): meno disco e meno RAM, la leva che si somma a tutto M1. Primo passo fatto il 24/09: Q4_K nel motore, esatto rispetto ai suoi pesi dequantizzati (identico al bit a gguf-py, il modello vero tagliato a 2 strati contro transformers nel make check), con un kernel AVX-512 nostro: i 16 valori possibili di un sotto-blocco calcolati una volta, e ogni peso preso col suo nibble. Il modello vero in Q4_K si fa dal nostro Q8_0, senza download. Prossimi: Q6_K (Q4_K_M lo mescola), il prefill con una riga dequantizzata una volta per blocco di token.",
       "numeri": [
         {
           "v": "modello vero in Q4_K: decode 1.5× il Q8_0 (45.8 contro 30.1 tok/s a 16 thread), prefill uguale",
@@ -691,6 +691,10 @@
         },
         {
           "v": "kernel Q4_K contro Q8_0 per elemento: AVX-512 0.84-0.90×, AVX2 0.53-0.63×",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "la stessa tabella su AVX2: pari sulla riga, -3.5% su quattro token alla volta: respinta",
           "d": "2026-09-24"
         },
         {

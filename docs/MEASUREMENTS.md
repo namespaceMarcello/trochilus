@@ -2428,8 +2428,16 @@ the range (0.8–1.2), AVX2 below it (0.7): the conversion path costs a mask or 
 a multiply and a subtraction per element where Q8_0 has a convert and a multiply. Per byte of
 weight read, AVX-512 Q4_K goes through 15.7 G elements × 0.5625 B = 8.8 GB/s on one core, far
 above one core's share of the memory (~60 GB/s over 16): decode stays bound by memory, where Q4_K
-reads 0.53 of Q8_0's bytes. The same lookup on AVX2 (two `vpermps` of 8 and a blend by the
-nibble's fourth bit) is the next attempt for that tier.
+reads 0.53 of Q8_0's bytes.
+
+**Tried and rejected: the lookup on AVX2.** The 16 values in two registers of 8, `vpermps` on the
+index's low 3 bits and `blendv` on its fourth, the 8 quant bytes widened once for both nibbles;
+bit-identical (gcc and clang). Order conversion, lookup, lookup, conversion, in the container (the
+native copy was blocked by Smart App Control), marker held, load 2.4 before and 2.3 after; M
+elements/s at n = 1024 / 2048 / 4096: dot_row 11390–11946 conversion against 11548–12216 lookup
+(+0.5 to +1.5%, inside the conversion's own A/A of ~1%), x4 27650–28884 against 26616–27914
+(−3.5%). Two permutes and a blend cost what a convert, a multiply and a subtraction cost on Zen 4:
+the conversion stays. `build/attempts/avx2_q4k_lut_bench.txt`.
 
 **Exactness on the real model.** The Q4_K file made by `tools/quantize_q4k.sh` (llama-quantize
 `--pure --allow-requantize` from our Q8_0: 3.72 GiB of tensors, 4.51 bits per weight), cut to 2
@@ -2485,3 +2493,5 @@ System). Tokens/s, series a / b; `build/race_q4k/`.
 | 2026-09-19 | `tr_expf` in SIMD (non scritto: i numeri per decidere) | dopo lo scalare, softmax 9 / 130 / 610 ms e `expert_act` 25 / 108 / 218 ms del prefill | stima: prefill 1.01× / 1.03× / 1.04×, decode +1-2%, circa 200 righe | — | **decide Marcello** (domanda 39): lo scalare ha preso quasi tutto |
 | 2026-09-19 | rimisura a macchina pulita di thread per fase e decode a contesto lungo (quattro `yes` dimenticati sotto le misure del 18-19/09, LESSONS #84) | decode a 512, 8 contro 16 thread: 1.10×; RAM ~54 GB/s | 1.00-1.02× (non distinguibile a nessun contesto); RAM ~57 GB/s con 4-6 thread; a 512 il decode vuole 4 thread | A/A 2.5-4.6% | conclusione corretta: pochi thread sì, il «+10%» no; lo stimatore della larghezza va riscritto (domanda 31, §Rimisura a macchina pulita) |
 | 2026-09-19 | stimatore della larghezza del decode riscritto (domanda 31, LESSONS #88): margine dal rumore misurato nelle passate stesse (non più un tetto fisso), scelta a coppie (mai il rumore di una terza larghezza), estensione fino a `TR_DECODE_TUNE_ROUNDS_MAX` sui due contendenti, nuova misura ad ogni classe di contesto e dopo `TR_DECODE_TUNE_REMEASURE_KEPT` passate mantenute con un cambio in sospeso, isteresi a due voti prima di cambiare scelta | — | — | — | test C verdi (`tests/test_phase.c`, `tools/mutate_tune.sh`); **da validare sul modello vero**, di notte a macchina tranquilla: nessun numero ancora |
+| 2026-09-24 | `dot_row q4_k` AVX-512: i 16 valori di un sotto-blocco calcolati una volta, `vpermps` sul nibble; bit-identico | Q8_0 15 970-17 479 M el/s | Q4_K 13 456-15 685 M el/s (0.84-0.90x per elemento, ~1.6x per byte) | 5-30% | tenuto: attivo sulle CPU AVX-512; decode del modello vero 1.5x il Q8_0 |
+| 2026-09-24 | `dot_row q4_k` AVX2 con la stessa tabella (due `vpermps` da 8 + `blendv`) contro la conversione | riga 11 390-11 946, x4 27 650-28 884 M el/s | riga 11 548-12 216 (+0.5-1.5%), x4 26 616-27 914 (-3.5%) | ~1% A/A | respinto: pari o peggio su Zen 4; resta la conversione |

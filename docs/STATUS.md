@@ -294,7 +294,7 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
   18: now the largest gap in decode), 1.04–1.09× at context 512 (at 16 threads within the noise);
 - **M2 started: Q4_K**, exact against its own dequantized weights (gguf-py bit for bit, the cut
   against transformers in `make check`); AVX-512 kernel 0.84–0.90× Q8_0 per element, AVX2
-  0.53–0.63× (next: the 16-value lookup there too). The real model
+  0.53–0.63× (the 16-value lookup there too: tried, no gain, rejected). The real model
   in Q4_K (`tools/quantize_q4k.sh`, from our Q8_0): **decode 1.5× the Q8_0**, prefill the same,
   llama.cpp's decode on it 1.07–1.17× ours. Next in M2: Q6_K (Q4_K_M mixes it in), then the prefill
   in float with a row dequantized once per tile; and M1 with Q4_K experts (half the disk).
