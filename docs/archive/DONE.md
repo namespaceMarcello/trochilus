@@ -1060,3 +1060,26 @@ of 2000 decode positions, tokens after 4000, a speculative run: identical) and `
 Premise benches: `tests/bench_gpu_attn.c`, `tests/bench_gpu_q8.c` (MEASUREMENTS §The decode's
 attention on the GPU: the premise). Check: `make check`; `sh tools/gpu_exact.sh full`;
 `build/trochilus run -m <gguf> -f prompt.txt -n 200` (the `gpu:` line).
+
+### 2026-09-24 — The premises of questions 53-57 and 62 measured: the project read like a genome
+Tools to measure a premise again on the next model or machine, no engine change.
+`tools/draft_agreement.sh` + `tools/draft_agreement_report.py` (question 53): three real texts of
+the repo, the exact model's greedy 512 tokens, the logits of every position of the exact model and
+of each draft (Q4_K, Q4_K_M), top-1 agreement, KL, tokens a pass of k drafts; the report fails if
+`generate` and `logits -b 1` disagree on a greedy token (seen red with one token changed).
+`tools/route_union_report.py` (54, 62): the experts of k consecutive tokens against chance, and the
+pairs of experts that fire together, from route traces. `tools/weights_genome.py` (56, 62): every
+block of a GGUF once: code entropy three ways, scale entropy, zero blocks, repeated blocks and rows.
+`tools/kv_repeats_report.py` (62): which layers' keys and values repeat exactly, on the probe's dumps.
+`tests/bench_peak.c` (55, 59): the no-FMA and FMA peaks in inline assembly, the prefill kernel's
+instruction stream in assembly with 4 and 8 tokens a weight, `dot_row2_x4` and `tr_matmul` on
+OLMoE's shapes, 1 and 16 threads; fails if a kernel runs faster than the peak (mutant
+`-DBENCH_PEAK_MUTATE`, seen red). `tests/bench_expf32.c` (58): the float-only exp's fma variant as
+AVX-512 and AVX2 tiers, checked on all 2^32 floats beside the scalar ones and timed per value
+(mutation 7 skips the slow path, seen red). `tools/bench_native.sh <bench> [args]`: any premise bench under
+the native rules (marker, still machine, load declared, a copy one byte longer). Numbers in
+MEASUREMENTS (§A Q4 draft, §Experts read by a pass of k rows, §The model read like a genome, §The
+CPU's peak, §The KV packed in 28 bits). Check: `make check`; `sh tools/bench_native.sh bench_peak`;
+`sh tools/bench_native.sh bench_kvpack time --run all`; `tools/.venv/Scripts/python.exe
+tools/weights_genome.py models/<file>.gguf`; `tools/.venv/Scripts/python.exe
+tools/route_union_report.py build/route/*.bin`; the container line in `tools/draft_agreement.sh`.

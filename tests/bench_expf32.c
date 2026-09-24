@@ -59,7 +59,10 @@
  * Mutations (tests seen red): -DEXPF32_MUTATE=n, 1 th[77] one ulp up, 2 D = 2^-45, 3 tl[77] one
  * ulp up (every result stays correctly rounded: only the constants check sees it), 4 the 1/6!
  * term of the slow path dropped, 5 the subnormal grid one binade off, 6 pl dropped (th rh no
- * longer exact). */
+ * longer exact), 7 the SIMD tiers skip the slow path (the unsettled lanes keep the fast guess).
+ *
+ * The fma variant also runs as SIMD tiers (AVX-512, AVX2: question 58), checked on every float like
+ * the scalar ones and timed per element. */
 #include <float.h>
 #include <math.h>
 #include <stdint.h>
@@ -587,13 +590,174 @@ static float expf32_slow_only(float x) {
     return u2f(expf32_slow(x, &unproven));
 }
 
+/* ---- the fma variant in SIMD (question 58) ------------------------------------------------------- *
+ * 16 (AVX-512) or 8 (AVX2) arguments at a time, lane by lane the operations of core_fma, finish32
+ * and expf32_special in the same order, so the same bits; the table read by gathers; the lanes the
+ * rounding test does not settle (about 1 in 33 000) through expf32_slow, one by one. Each tier
+ * returns how many lanes took the slow path and counts the special ones: the exhaustive check wants
+ * both branches taken. */
+#if defined(__x86_64__) || defined(__i386__)
+#define HAVE_EXPF32_SIMD 1
+#include <immintrin.h>
+
+static float simd_tab[512]; /* hi, lo pairs, read through tab_hi and tab_lo: mutations reach it */
+
+static void simd_tab_init(void) {
+    for (int32_t j = 0; j < 256; j++) {
+        simd_tab[2 * j] = tab_hi(j);
+        simd_tab[2 * j + 1] = tab_lo(j);
+    }
+}
+
+/* the lanes whose bit in bad is set, through the slow path */
+static int64_t simd_slow_lanes(const float *x, float *y, unsigned bad) {
+    int64_t n = 0;
+#if EXPF32_MUTATE == 7
+    bad = 0; /* mutation: the unsettled lanes keep the fast path's guess */
+#endif
+    while (bad) {
+        int l = __builtin_ctz(bad);
+        int unproven;
+        y[l] = u2f(expf32_slow(x[l], &unproven));
+        bad &= bad - 1;
+        n++;
+    }
+    return n;
+}
+
+__attribute__((target("avx512f,fma"))) static int64_t expf32_avx512(const float *x, float *y, int64_t n,
+                                                                    int64_t *n_special) {
+    const __m512 invl = _mm512_set1_ps(EXPF32_INVL), shift = _mm512_set1_ps(EXPF32_SHIFT);
+    const __m512 lh = _mm512_set1_ps(EXPF32_LH), nll = _mm512_set1_ps(EXPF32_NLL);
+    const __m512 c2 = _mm512_set1_ps(EXPF32_C2), c3 = _mm512_set1_ps(EXPF32_C3), d = _mm512_set1_ps(EXPF32_D);
+    const __m512 xnorm = _mm512_set1_ps(EXPF32_X_NORM), xovf = _mm512_set1_ps(EXPF32_X_OVF);
+    const __m512 xuf = _mm512_set1_ps(EXPF32_X_UF), g22 = _mm512_set1_ps(0x1p-22f);
+    int64_t slow = 0;
+    for (int64_t i = 0; i + 16 <= n; i += 16) {
+        __m512 vx = _mm512_loadu_ps(x + i);
+        __m512 kf = _mm512_sub_ps(_mm512_fmadd_ps(vx, invl, shift), shift);
+        __m512i k = _mm512_cvttps_epi32(kf);
+        __m512i j2 = _mm512_slli_epi32(_mm512_and_si512(k, _mm512_set1_epi32(255)), 1);
+        __m512 rh = _mm512_fnmadd_ps(kf, lh, vx);
+        __m512 rl = _mm512_mul_ps(kf, nll);
+        __m512 rs = _mm512_add_ps(rh, rl);
+        __m512 s = _mm512_fmadd_ps(_mm512_mul_ps(rs, rs), _mm512_fmadd_ps(c3, rs, c2), rl);
+        __m512 th = _mm512_i32gather_ps(j2, simd_tab, 4);
+        __m512 tl = _mm512_i32gather_ps(_mm512_add_epi32(j2, _mm512_set1_epi32(1)), simd_tab, 4);
+        __m512 ph = _mm512_mul_ps(th, rh);
+        __m512 pl = _mm512_fmsub_ps(th, rh, ph);
+#if EXPF32_MUTATE == 6
+        pl = _mm512_setzero_ps();
+#endif
+        __m512 yh = _mm512_add_ps(th, ph);
+        __m512 e = _mm512_add_ps(_mm512_sub_ps(th, yh), ph);
+        __m512 a = _mm512_add_ps(_mm512_add_ps(_mm512_fmadd_ps(tl, rs, tl), pl), e);
+        __m512 yl = _mm512_fmadd_ps(th, s, a);
+        __m512i ee = _mm512_srai_epi32(k, 8);
+        __m512 u1 = _mm512_add_ps(yh, _mm512_sub_ps(yl, d)), u2 = _mm512_add_ps(yh, _mm512_add_ps(yl, d));
+        __m512i bits = _mm512_add_epi32(_mm512_castps_si512(u1), _mm512_slli_epi32(ee, 23));
+        __mmask16 ok = _mm512_cmp_ps_mask(u1, u2, _CMP_EQ_OQ);
+        __mmask16 sub = _mm512_cmp_ps_mask(vx, xnorm, _CMP_LT_OQ);
+        if (sub) {
+#if EXPF32_MUTATE == 5
+            __m512i mb = _mm512_slli_epi32(_mm512_sub_epi32(_mm512_set1_epi32(2), ee), 23);
+#else
+            __m512i mb = _mm512_slli_epi32(_mm512_sub_epi32(_mm512_set1_epi32(1), ee), 23);
+#endif
+            __m512 m = _mm512_castsi512_ps(mb);
+            __m512 g = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_sub_epi32(_mm512_set1_epi32(-22), ee), 23));
+            __m512 s2 = _mm512_add_ps(m, yh);
+            __m512 v = _mm512_add_ps(_mm512_add_ps(_mm512_sub_ps(m, s2), yh), yl);
+            __m512 d2 = _mm512_add_ps(_mm512_mul_ps(g, g22), d);
+            __m512 w1 = _mm512_add_ps(s2, _mm512_sub_ps(v, d2)), w2 = _mm512_add_ps(s2, _mm512_add_ps(v, d2));
+            bits = _mm512_mask_mov_epi32(bits, sub, _mm512_sub_epi32(_mm512_castps_si512(w1), mb));
+            ok = (__mmask16)((ok & ~sub) | (_mm512_cmp_ps_mask(w1, w2, _CMP_EQ_OQ) & sub));
+        }
+        __mmask16 nan = _mm512_cmp_ps_mask(vx, vx, _CMP_UNORD_Q);
+        __mmask16 ovf = _mm512_cmp_ps_mask(vx, xovf, _CMP_GT_OQ);
+        __mmask16 uf = _mm512_cmp_ps_mask(vx, xuf, _CMP_LT_OQ);
+        bits = _mm512_mask_mov_epi32(bits, ovf, _mm512_set1_epi32(0x7F800000));
+        bits = _mm512_mask_mov_epi32(bits, uf, _mm512_setzero_si512());
+        bits = _mm512_mask_mov_epi32(bits, nan, _mm512_castps_si512(_mm512_add_ps(vx, vx)));
+        __mmask16 spec = (__mmask16)(nan | ovf | uf);
+        _mm512_storeu_si512((void *)(y + i), bits);
+        *n_special += __builtin_popcount(spec);
+        slow += simd_slow_lanes(x + i, y + i, (unsigned)(uint16_t)~(ok | spec));
+    }
+    return slow;
+}
+
+__attribute__((target("avx2,fma"))) static int64_t expf32_avx2(const float *x, float *y, int64_t n,
+                                                              int64_t *n_special) {
+    const __m256 invl = _mm256_set1_ps(EXPF32_INVL), shift = _mm256_set1_ps(EXPF32_SHIFT);
+    const __m256 lh = _mm256_set1_ps(EXPF32_LH), nll = _mm256_set1_ps(EXPF32_NLL);
+    const __m256 c2 = _mm256_set1_ps(EXPF32_C2), c3 = _mm256_set1_ps(EXPF32_C3), d = _mm256_set1_ps(EXPF32_D);
+    const __m256 xnorm = _mm256_set1_ps(EXPF32_X_NORM), xovf = _mm256_set1_ps(EXPF32_X_OVF);
+    const __m256 xuf = _mm256_set1_ps(EXPF32_X_UF), g22 = _mm256_set1_ps(0x1p-22f);
+    int64_t slow = 0;
+    for (int64_t i = 0; i + 8 <= n; i += 8) {
+        __m256 vx = _mm256_loadu_ps(x + i);
+        __m256 kf = _mm256_sub_ps(_mm256_fmadd_ps(vx, invl, shift), shift);
+        __m256i k = _mm256_cvttps_epi32(kf);
+        __m256i j2 = _mm256_slli_epi32(_mm256_and_si256(k, _mm256_set1_epi32(255)), 1);
+        __m256 rh = _mm256_fnmadd_ps(kf, lh, vx);
+        __m256 rl = _mm256_mul_ps(kf, nll);
+        __m256 rs = _mm256_add_ps(rh, rl);
+        __m256 s = _mm256_fmadd_ps(_mm256_mul_ps(rs, rs), _mm256_fmadd_ps(c3, rs, c2), rl);
+        __m256 th = _mm256_i32gather_ps(simd_tab, j2, 4);
+        __m256 tl = _mm256_i32gather_ps(simd_tab + 1, j2, 4);
+        __m256 ph = _mm256_mul_ps(th, rh);
+        __m256 pl = _mm256_fmsub_ps(th, rh, ph);
+#if EXPF32_MUTATE == 6
+        pl = _mm256_setzero_ps();
+#endif
+        __m256 yh = _mm256_add_ps(th, ph);
+        __m256 e = _mm256_add_ps(_mm256_sub_ps(th, yh), ph);
+        __m256 a = _mm256_add_ps(_mm256_add_ps(_mm256_fmadd_ps(tl, rs, tl), pl), e);
+        __m256 yl = _mm256_fmadd_ps(th, s, a);
+        __m256i ee = _mm256_srai_epi32(k, 8);
+        __m256 u1 = _mm256_add_ps(yh, _mm256_sub_ps(yl, d)), u2 = _mm256_add_ps(yh, _mm256_add_ps(yl, d));
+        __m256i bits = _mm256_add_epi32(_mm256_castps_si256(u1), _mm256_slli_epi32(ee, 23));
+        __m256 ok = _mm256_cmp_ps(u1, u2, _CMP_EQ_OQ);
+        __m256 sub = _mm256_cmp_ps(vx, xnorm, _CMP_LT_OQ);
+        if (_mm256_movemask_ps(sub)) {
+#if EXPF32_MUTATE == 5
+            __m256i mb = _mm256_slli_epi32(_mm256_sub_epi32(_mm256_set1_epi32(2), ee), 23);
+#else
+            __m256i mb = _mm256_slli_epi32(_mm256_sub_epi32(_mm256_set1_epi32(1), ee), 23);
+#endif
+            __m256 m = _mm256_castsi256_ps(mb);
+            __m256 g = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_sub_epi32(_mm256_set1_epi32(-22), ee), 23));
+            __m256 s2 = _mm256_add_ps(m, yh);
+            __m256 v = _mm256_add_ps(_mm256_add_ps(_mm256_sub_ps(m, s2), yh), yl);
+            __m256 d2 = _mm256_add_ps(_mm256_mul_ps(g, g22), d);
+            __m256 w1 = _mm256_add_ps(s2, _mm256_sub_ps(v, d2)), w2 = _mm256_add_ps(s2, _mm256_add_ps(v, d2));
+            __m256i sbits = _mm256_sub_epi32(_mm256_castps_si256(w1), mb);
+            bits = _mm256_blendv_epi8(bits, sbits, _mm256_castps_si256(sub));
+            ok = _mm256_blendv_ps(ok, _mm256_cmp_ps(w1, w2, _CMP_EQ_OQ), sub);
+        }
+        __m256 nan = _mm256_cmp_ps(vx, vx, _CMP_UNORD_Q);
+        __m256 ovf = _mm256_cmp_ps(vx, xovf, _CMP_GT_OQ);
+        __m256 uf = _mm256_cmp_ps(vx, xuf, _CMP_LT_OQ);
+        bits = _mm256_blendv_epi8(bits, _mm256_set1_epi32(0x7F800000), _mm256_castps_si256(ovf));
+        bits = _mm256_blendv_epi8(bits, _mm256_setzero_si256(), _mm256_castps_si256(uf));
+        bits = _mm256_blendv_epi8(bits, _mm256_castps_si256(_mm256_add_ps(vx, vx)), _mm256_castps_si256(nan));
+        unsigned spec = (unsigned)_mm256_movemask_ps(_mm256_or_ps(nan, _mm256_or_ps(ovf, uf)));
+        _mm256_storeu_si256((__m256i *)(void *)(y + i), bits);
+        *n_special += __builtin_popcount(spec);
+        slow += simd_slow_lanes(x + i, y + i, ~((unsigned)_mm256_movemask_ps(ok) | spec) & 0xFFu);
+    }
+    return slow;
+}
+#endif
+
 /* ---- every float --------------------------------------------------------------------------------- */
 
 #define MAX_WORKERS 8
 #define BLOCK_BITS 16
 
 typedef struct {
-    int have_fma, slow_all, error, quick;
+    int have_fma, have_avx512, have_avx2, slow_all, error, quick;
     int64_t first, count; /* the blocks of 2^16 floats to run: [first, first + count) */
 } run_opts;
 
@@ -606,8 +770,13 @@ typedef struct {
     double err[2]; /* largest |yh + yl - y| */
     float err_x[2];
     uint64_t rh_inexact[2];
+    uint64_t simd_wrong[2], simd_slow[2], simd_spec[2]; /* [0] AVX-512, [1] AVX2 */
+    uint32_t simd_wrong_x[2];
 } tally32;
 static tally32 tallies[MAX_WORKERS];
+#if HAVE_EXPF32_SIMD
+static float simd_x[MAX_WORKERS][1 << BLOCK_BITS], simd_y[2][MAX_WORKERS][1 << BLOCK_BITS];
+#endif
 
 static void measure(float x, double y_ref, core32 c, double *err, float *err_x, uint64_t *rh_inexact) {
     double y = y_ref * ldexp(1.0, -c.e);
@@ -625,10 +794,27 @@ static void bits_body(void *ctx, int64_t begin, int64_t end, int worker) {
     memset(&t, 0, sizeof t);
     for (int64_t b = o->first + begin; b < o->first + end; b++) {
         if (o->quick && (b & 63) != 0) continue;
+#if HAVE_EXPF32_SIMD
+        const float *ys[2] = {simd_y[0][worker], simd_y[1][worker]};
+        if (o->have_avx512 || o->have_avx2) {
+            for (uint32_t i = 0; i < (1u << BLOCK_BITS); i++) simd_x[worker][i] = u2f(((uint32_t)b << BLOCK_BITS) | i);
+            if (o->have_avx512)
+                t.simd_slow[0] += (uint64_t)expf32_avx512(simd_x[worker], simd_y[0][worker], 1 << BLOCK_BITS,
+                                                          (int64_t *)&t.simd_spec[0]);
+            if (o->have_avx2)
+                t.simd_slow[1] += (uint64_t)expf32_avx2(simd_x[worker], simd_y[1][worker], 1 << BLOCK_BITS,
+                                                        (int64_t *)&t.simd_spec[1]);
+        }
+#endif
         for (uint32_t i = 0; i < (1u << BLOCK_BITS); i++) {
             uint32_t xb = ((uint32_t)b << BLOCK_BITS) | i;
             float x = u2f(xb);
             uint32_t want = f2u(tr_expf(x));
+#if HAVE_EXPF32_SIMD
+            for (int v = 0; v < 2; v++)
+                if ((v == 0 ? o->have_avx512 : o->have_avx2) && f2u(ys[v][i]) != want && t.simd_wrong[v]++ == 0)
+                    t.simd_wrong_x[v] = xb;
+#endif
             int path;
             uint32_t got = f2u(expf32_nofma_path(x, &path));
             if (path == P_SLOW_SUB && t.path[0][path] < 4) t.sub_x[0][t.path[0][path]] = xb;
@@ -667,6 +853,10 @@ static void bits_body(void *ctx, int64_t begin, int64_t end, int worker) {
             mine->err_x[v] = t.err_x[v];
         }
         mine->rh_inexact[v] += t.rh_inexact[v];
+        if (t.simd_wrong[v] && !mine->simd_wrong[v]) mine->simd_wrong_x[v] = t.simd_wrong_x[v];
+        mine->simd_wrong[v] += t.simd_wrong[v];
+        mine->simd_slow[v] += t.simd_slow[v];
+        mine->simd_spec[v] += t.simd_spec[v];
     }
     if (t.slow_wrong && !mine->slow_wrong) mine->slow_wrong_x = t.slow_wrong_x;
     mine->slow_n += t.slow_n;
@@ -742,7 +932,27 @@ static int check_constants(void) {
     return bad;
 }
 
-static void timing(int have_fma) {
+#if HAVE_EXPF32_SIMD
+/* ns per element of a SIMD tier over an array, one thread, best of 7 */
+static double cost_simd_ns(int64_t (*fn)(const float *, float *, int64_t, int64_t *), const float *xs, int n,
+                           float *sum) {
+    enum { REPS = 64 };
+    static float out[1 << 16];
+    double best = 1e30;
+    int64_t sp = 0;
+    for (int r = 0; r < 7; r++) {
+        double t0 = tr_time_sec();
+        for (int k = 0; k < REPS; k++) fn(xs, out, n, &sp);
+        double dt = tr_time_sec() - t0;
+        *sum += out[n / 2];
+        if (dt < best) best = dt;
+    }
+    return best * 1e9 / ((double)n * REPS);
+}
+#endif
+
+static void timing(const run_opts *o) {
+    int have_fma = o->have_fma;
     enum { N = 1 << 16 };
     static float soft[N], wide[N];
     for (int i = 0; i < N; i++) {
@@ -765,11 +975,17 @@ static void timing(int have_fma) {
         printf("cost, x in %s: tr_expf %.2f ns, expf32 %.2f ns without fma, %.2f with fma, slow path alone "
                "%.1f; %d of %d arguments take the slow path (sum %.1f)\n",
                set_name[s], ref, nf, fm, sl, slow, N, (double)sum);
+#if HAVE_EXPF32_SIMD
+        double v512 = o->have_avx512 ? cost_simd_ns(expf32_avx512, sets[s], N, &sum) : 0.0;
+        double v256 = o->have_avx2 ? cost_simd_ns(expf32_avx2, sets[s], N, &sum) : 0.0;
+        printf("  SIMD, fma variant, a value: AVX-512 %.3f ns (%.1fx tr_expf), AVX2 %.3f ns (%.1fx) (sum %.1f)\n", v512,
+               v512 > 0 ? ref / v512 : 0.0, v256, v256 > 0 ? ref / v256 : 0.0, (double)sum);
+#endif
     }
 }
 
 int main(int argc, char **argv) {
-    run_opts o = {0, 0, 0, 0, 0, (int64_t)1 << (32 - BLOCK_BITS)};
+    run_opts o = {.first = 0, .count = (int64_t)1 << (32 - BLOCK_BITS)};
     int threads = 4, no_timing = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) threads = atoi(argv[++i]);
@@ -804,12 +1020,17 @@ int main(int argc, char **argv) {
     printf("bench_expf32, built %s %s, mutation %d, %d threads\n%s\n", __DATE__, __TIME__, EXPF32_MUTATE, threads,
            cpu_line);
     if (!o.have_fma) printf("no fma on this CPU: the fma variant is not run\n");
+#if HAVE_EXPF32_SIMD
+    simd_tab_init();
+    o.have_avx512 = o.have_fma && tr_cpu()->avx512f;
+    o.have_avx2 = o.have_fma && tr_cpu()->avx2;
+#endif
 
     int bad_constants = check_constants();
     printf("constants: %d differ from their definitions (the table, the reduction, the polynomial, the "
            "borders, the slow path)\n", bad_constants);
     TR_CHECK(bad_constants == 0);
-    if (!no_timing) timing(o.have_fma);
+    if (!no_timing) timing(&o);
 
     tr_pool *pool = tr_pool_create(threads);
     if (pool == NULL) return 1;
@@ -831,6 +1052,10 @@ int main(int argc, char **argv) {
                 sum.err_x[v] = tallies[w].err_x[v];
             }
             sum.rh_inexact[v] += tallies[w].rh_inexact[v];
+            if (tallies[w].simd_wrong[v] && !sum.simd_wrong[v]) sum.simd_wrong_x[v] = tallies[w].simd_wrong_x[v];
+            sum.simd_wrong[v] += tallies[w].simd_wrong[v];
+            sum.simd_slow[v] += tallies[w].simd_slow[v];
+            sum.simd_spec[v] += tallies[w].simd_spec[v];
         }
         if (tallies[w].slow_wrong && !sum.slow_wrong) sum.slow_wrong_x = tallies[w].slow_wrong_x;
         sum.slow_n += tallies[w].slow_n;
@@ -855,8 +1080,26 @@ int main(int argc, char **argv) {
                (unsigned long long)sum.rh_inexact[v], v, (unsigned)sum.sub_x[v][0], (unsigned)sum.sub_x[v][1],
                (unsigned)sum.sub_x[v][2], (unsigned)sum.sub_x[v][3]);
     }
-    printf(" sn=%llu sw=%llu swx=%08x su=%llu\n", (unsigned long long)sum.slow_n, (unsigned long long)sum.slow_wrong,
+    printf(" sn=%llu sw=%llu swx=%08x su=%llu", (unsigned long long)sum.slow_n, (unsigned long long)sum.slow_wrong,
            (unsigned)sum.slow_wrong_x, (unsigned long long)sum.slow_unproven);
+    printf(" vw=%llu,%llu vs=%llu,%llu vp=%llu,%llu\n", (unsigned long long)sum.simd_wrong[0],
+           (unsigned long long)sum.simd_wrong[1], (unsigned long long)sum.simd_slow[0],
+           (unsigned long long)sum.simd_slow[1], (unsigned long long)sum.simd_spec[0],
+           (unsigned long long)sum.simd_spec[1]);
+    const char *tier_name[2] = {"AVX-512", "AVX2"};
+    for (int v = 0; v < 2; v++) {
+        if (!(v == 0 ? o.have_avx512 : o.have_avx2)) continue;
+        printf("expf32 SIMD %s (fma variant): %llu results differ from tr_expf", tier_name[v],
+               (unsigned long long)sum.simd_wrong[v]);
+        if (sum.simd_wrong[v]) printf(" (the first: x bits %08x)", (unsigned)sum.simd_wrong_x[v]);
+        printf("; %llu lanes through the slow path, %llu special\n", (unsigned long long)sum.simd_slow[v],
+               (unsigned long long)sum.simd_spec[v]);
+        TR_CHECK(sum.simd_wrong[v] == 0);
+        if (whole) { /* both of the tier's own branches taken */
+            TR_CHECK(sum.simd_slow[v] > 0);
+            TR_CHECK(sum.simd_spec[v] > 0);
+        }
+    }
     for (int v = 0; v < 2; v++) {
         if (v == 1 && !o.have_fma) continue;
         printf("expf32 %s: %llu results differ from tr_expf", var_name[v], (unsigned long long)sum.wrong[v]);

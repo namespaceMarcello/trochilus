@@ -309,22 +309,35 @@ exactly and the five sections after it; LESSONS #152–#157):
   LESSONS #160); the KV packed in 28 bits exact, 1.13× fewer bytes, not timed yet (question 57);
 - speculation at long context (question 52): nil on prose, 1.57 tokens a pass rewriting code,
   1.66× net on repetitive code; a pass of ~4 rows reads ~2.8× the experts;
-- **next** (no agents, Marcello): first the premises of questions 53-58 in one session (the Q4/Q8
-  agreement for a GPU draft with exact verification, the experts of a k-row pass, the prefill's
-  distance from the peak for assembly, the weights' entropy, the packed KV's time, the SIMD exact
-  exp); then M3 by their numbers: the dense weights on the GPU (Q8_0 GEMV exact at 97% of VRAM
-  bandwidth; model 1.64× at 2048, 1.92× at 4000), the Q4 model whole on the GPU (fast, and 53's
-  draft), the verification pipeline; 59-60 are Marcello's decisions, 61 comes after M4.
+- **evening: the premises measured** (the project read like a genome, CLAUDE.md; MEASUREMENTS §A Q4
+  draft, §Experts read by a pass of k rows, §The model read like a genome, §The CPU's peak, §The
+  KV packed in 28 bits; LESSONS #161–#164). **53**: the Q4_K picks the Q8_0's token 88.7 / 94.7 /
+  90.6% of the time (prose, code, Italian; Q4_K_M 90.4 / 93.6 / 92.8), under the 95% threshold, but
+  **54**'s union is small (a pass of k rows reads 1.55 / 2.33 / 3.34 / 4.42× one token's experts at
+  k = 2 / 4 / 8 / 16, chance 1.88 / 3.31 / 5.25 / 7.06): a pass of 8 drafts is **~2.0× fewer bytes
+  a token** on prose, ~1.3× serial and ~1.9× overlapped once the GPU draft is paid. **55**: the
+  matmul at 49–53% of the no-FMA peak on one core (87 of 166.5 GFLOP/s); the kernel's stream in
+  asm with 8 tokens a weight 119.4, **1.34×**; on Zen 4 the order of independent ops is worth 20%.
+  **56**: codes at 7.59–7.69 bits of 8 (Q4_K 3.83–3.87 of 4): ~7% / ~4% lossless, closed. **62**:
+  0.008% of blocks repeat (the output head's 220 rows of never-learned tokens); only layer 0's
+  values are token-determined; co-activation grows with depth. **57**: the packed KV 0.97–1.05×,
+  closed as no. **58**: the float-only exact exp in AVX-512 and AVX2, 0 of 2^32 differ, 4.8× / 4.4×
+  `tr_expf` a value; the prefill ~1.02–1.03× (question 39's range): the GPU's reference, not wired;
+- **next**, by these numbers: (1) a `dot_row2_x8` microkernel in assembly (the stream's 1.34× on a
+  core, prefill ~1.15–1.25×), measured in more than one order; (2) M3: the dense weights on the GPU
+  (model 1.64× at 2048, 1.92× at 4000), then the Q4 whole on the GPU as 53's draft (~2× bytes);
+  (3) wiring 58's SIMD exp if Marcello reopens 39 (~1.02–1.03×). **For Marcello, 59 and 60**: on
+  this Zen 4 FMA's peak equals mul+add's (FMA only on the mul pipes), and the 8-token stream with
+  FMA runs 1.19× the one without (MEASUREMENTS §The CPU's peak); 60 (an exact dot) is not measured.
+  61 after M4.
 
 **Night of 2026-09-24** (DONE, MEASUREMENTS):
 - the gate 428 → 238 s (next: the native side beside the container, `oracle-real` under `min`);
 - **where we lose to llama.cpp** (same Q8_0, container, raced again after two weight rows per
   input load, `dot_row2_x4`): prefill **1.41×** at 16 threads, 1.13× at 8 (was 1.8× and 1.5×; the
   rest mostly their int8 activations, mode (c)); decode **1.12×** and 1.15× at context 2048, 1.00×
-  and 1.06× at 512. **At 2048 the whole
-  gap is the KV's bytes** (profile by zone, MEASUREMENTS §Decode at context 2048): every zone reads
-  memory at 38–51 GB/s, and our F32 KV is 518 MiB per token against llama.cpp's F16 259; halving it
-  gives 1.18× (~1.25× on Q4_K weights): the exact answer is the day's block above;
+  and 1.06× at 512. **At 2048 the gap is the KV's bytes** (MEASUREMENTS §Decode at context 2048):
+  our F32 KV is 518 MiB a token against llama.cpp's F16 259: the exact answer is the day's block;
 - **M2: Q4_K and Q6_K**, exact against their own dequantized weights (gguf-py bit for bit, the cuts
   against transformers in `make check`). Per element against Q8_0: Q4_K AVX-512 0.84–0.90×, AVX2
   0.53–0.63× (a lookup there: rejected); Q6_K AVX-512 0.85×, AVX2 0.85× (256 quants unpacked once,
@@ -333,20 +346,10 @@ exactly and the five sections after it; LESSONS #152–#157):
   decode 0.93× the Q4_K, prefill the same, llama.cpp's decode on it 1.09× ours. A row decoded once per tile:
   rejected (decoding does not bound the matmul). Next: two rows on AVX2, M1 with Q4_K experts.
 
-**Review (Opus 5.5, 2026-09-22 and 23)**: reader, expert store, pool, platform, profiler, model
-(`olmoe.c`), kernels, tokenizer and command line read, every file through `tools/mutate_auto.py`
-(LESSONS #102–#116; `docs/MEASUREMENTS.md` §The gate, §Generated mutations). Found on the 23rd: the
-command line sized its buffers from `-n`/`-p` (a heap overflow near 2^62) and cast `--tokens` to
-int32; three OLMoE options had never met transformers (now `fixtures/tiny-olmoe-opts` in `make
-oracle`); memory pressure in the Docker VM had counted as mutants killed (a kill now repeats,
-`tools/mutate_files.sh` sizes its jobs to memory). `tokenizer.c` read (75 → 43) and `main.c`
-(334 → 43), survivors named in `docs/MEASUREMENTS.md` §Generated mutations (one option parser,
-strict numbers: #120, #121). `mutate_auto.py` no longer hides survivors behind timeouts or memory
-refusals (#117, #119, #123), kills a timed-out check with what it started (#122), and runs after a
-change (#124: `CHANGED=HEAD` mutates only the changed lines); every file of `mutate_files.sh` ran
-again (#125).
-Open: `gguf.c`, `experts.c`, `threads.c`, `platform.c` are not in `mutate_files.sh` and their
-counts predate #117-#124. The native measurements follow the machine's marker (Known issues).
+**Review (Opus 5.5, 2026-09-22 and 23)**: every file read and through `tools/mutate_auto.py`
+(detail in LESSONS #102–#125, MEASUREMENTS §The gate, §Generated mutations). Open: `gguf.c`,
+`experts.c`, `threads.c`, `platform.c` are not in `mutate_files.sh` and their counts predate
+#117-#124. The native measurements follow the machine's marker (Known issues).
 
 Steps of 17–20/09 are in `docs/archive/DONE.md`, their numbers in `docs/MEASUREMENTS.md`
 (questions closed and open in §Open questions).

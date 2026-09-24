@@ -59,7 +59,7 @@ ATTN_BIN := $(BUILD)/tests/bench_attn$(EXE)
 EXPF_BIN := $(BUILD)/tests/bench_expf$(EXE)
 DISK_BIN := $(BUILD)/tests/bench_disk$(EXE)
 # premise benches of 2026-09-24 (docs/MEASUREMENTS.md): built by the gate so they do not rot, run by hand
-RESEARCH_BIN := $(foreach b,bench_gpu_attn bench_gpu_q8 bench_attn_bw bench_kvpack bench_expf32,$(BUILD)/tests/$(b)$(EXE))
+RESEARCH_BIN := $(foreach b,bench_gpu_attn bench_gpu_q8 bench_attn_bw bench_kvpack bench_expf32 bench_peak,$(BUILD)/tests/$(b)$(EXE))
 
 .PHONY: all attn-probe test check-gcc check-clang check-asan check-tsan check-tiny check-real check-cut oracle tier-check oracle-tokenizer chat-check oracle-real spec-check bench bench-mem bench-attn bench-expf bench-disk lint profile check check-linux clean-machine clean platform-guard quick
 all: $(BUILD)/trochilus$(EXE)

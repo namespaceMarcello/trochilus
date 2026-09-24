@@ -171,15 +171,15 @@ decides | — | — |
 | 50 | **How much disk does Adaptive-K take away, and what does it change?** (Marcello's source, docs/ORIGINS.md §Sources not yet studied): a token uses fewer than 8 experts when the router is confident, the lowest-weight ones dropped until the kept ones hold a share p of the router's weight. Prediction, written first: at p = 0.9 about 5-6 experts a token, misses at half budget down 20-35%, KL against the exact mode small but not 0; the token changed in a few % of positions | route trace (`--route-trace`): per p, experts kept per token and their weight (no engine change); then a declared mode (env or flag, never the default) at half budget through `tools/ab_modes.sh` (misses, prefill, decode) and KL against the exact mode (`tools/mask_quality.sh`) | under a partial budget every expert skipped is a unit not read from disk: a lever on M1's bottleneck, if the quality holds |
 | 51 | ~~Can the decode's attention run on the GPU with the same bits, and what does it give at long context?~~ **Premise measured 2026-09-24** (§The decode's attention on the GPU: the premise): 0 of 25 344 head outputs differ; 185 µs a layer at 2048 and 319 at 4000 with keep-warm and zero copy (CPU 704 and 1415), 1.29× and 1.57× projected; **in the engine 1.31–1.32× at 2048 and 1.54–1.58× at 4000** with the measured width (§The decode's attention on the GPU, in the engine). (2026-09-24, after the skip family closed, §Skipping cached positions exactly). Prediction, written first: bits identical if every float op carries an explicit `.rn` and `tr_expf` is ported whole (its double arithmetic too); per layer (16 heads) at 2048 the kernels ~150 µs (32 MiB at ~220 GB/s) and the round trip (copies of q, k, v in and the output out, launch, sync, WDDM) 30–60 µs, so 180–210 µs against the CPU's 704: the token 36.8 → ~28.7 ms (**1.28×**); at 4000 the attention 22.6 → ~5.4 ms, the token 48.1 → ~31 ms (**~1.55×**) | `tests/bench_gpu_attn.c`: the driver loaded at run time, the kernels as PTX; every query of the six dumps of `make attn-probe` against the CPU's bits, a mutation seen red; per layer at 2048 and 4000 the kernels alone, the round trip, a plain streaming read (median of ≥ 50) | the one exact lever left of the size of the KV's bytes: the same bytes read 4-5× faster, and more the longer the context |
 | 52 | ~~How many tokens does a speculative pass give at long context?~~ **Closed 2026-09-24** (§Speculation at long context): 1.04-1.13 on free prose, 1.57 rewriting code, 3.29 on repetitive code (1.66x net at 4000); a pass of ~4 rows reads ~2.8x the experts. Prediction, written first: on tasks that quote or rework the prompt (rewriting code, summarizing section by section) 1.5–2.5 tokens a pass, on free prose ~1.1; the KV bytes per token divide by it, the union of the experts of a multi-row pass eats part of the gain | `run -f <task of ~2000 and ~4000 tokens> -n 256` with and without `--spec 8`: tokens, passes, tokens identical | the engine already reads the KV once per pass (`tr_attention_group`): what it is worth where the KV is 30-46% of the token |
-| 53 | **Draft on the GPU, exact verification: how often do the Q4_K and the Q8_0 of the same model pick the same token?** (2026-09-24) A Q4 copy of the model on the GPU drafts 8 tokens, the exact engine checks them in one pass (batch = token by token: the accepted tokens have exact logits). Prediction, written first: top-1 agreement 95–98% on prose and 97–99% on code (llama.cpp's int8 activations sit at KL 9e-3 from us; 4.5-bit weights move more), so 6–7.5 tokens accepted a pass of 8 on prose, 7–8 on code | teacher-forced on real text (the session's prose and code prompts, `tools/quantize_q4k.sh` makes the Q4_K): feed the Q8_0's greedy tokens to both, count top-1 agreement per position; then accepted tokens per pass of 8 | at ≥ ~95% agreement, ~600 MB read a token instead of 1200 at 2048 (dense weights and KV once per pass, experts ~5×): **~2×** on top of the GPU attention, exact by construction; the draft needs M3's Q4 model whole on the GPU |
-| 54 | **How many experts does a pass of k rows read?** (2026-09-24) Prediction, written first: against one token's experts, 1.7–1.8× at k = 2, 2.8× at 4 (measured), 4.2–5× at 8, 5.5–6.5× at 16 (it saturates at 64 / 8 = 8×) | from `--route-trace` on real text: the union of the experts of k consecutive tokens, per layer, k = 1..16 | measured 2.8× at ~4 rows (§Speculation at long context); it sets the cost of 53's verification and of speculation on any MoE, and fine-grained MoEs (256 experts) may overlap less |
-| 55 | **How close is the prefill's matmul to the CPU's peak?** (2026-09-24) Prediction, written first: 35–50% of the no-FMA peak (0.7–1.0 of ~2 TFLOP/s on 16 cores) | FLOP/s of `tr_matmul` on the real shapes (`bench_kernels`' whole-matrix lines) against the no-FMA peak of this Zen 4 (2 FMUL + 2 FADD pipes) | estimated 40-50% (~0.75 of ~2 TFLOP/s): room for a hand-written AVX-512 assembly microkernel using all 32 zmm (M2's assembly workshop; gcc spills, LESSONS #45); near the peak, none |
-| 56 | **How far does lossless compression shrink the real weights?** (2026-09-24) Prediction, written first: Q8_0's codes carry 6.3–7.0 bits of their 8 (12–20% of the code bytes), Q4_K's 3.5–3.8 of their 4 (5–12%) | entropy of the codes of Q8_0 and Q4_K per block and per tensor (and FP8/BF16 when such a model arrives); a layout that decodes at memory speed (fixed width, or block ANS) | bytes are the wall at every level (RAM, disk, PCIe) while compute idles in decode; guess ~8-12% on Q4, more on FP8/BF16 (~30% on BF16 elsewhere); for a model streamed from disk the gain is proportional |
-| 57 | **Does the KV packed in 28 bits pay on a still machine?** (2026-09-24) Prediction, written first: 1.00–1.08× on the attention zone at 2048 and 4000: the four positions decoded at a time come in the x4 order that cost 10% (§The decode's attention, one position at a time), and may eat most of the 1.13× in bytes | `build/tests/bench_kvpack.exe time --run all`, native, marker held | exact, 1.13× fewer bytes (§The KV packed in 28 bits): ~1.04× at 2048, ~1.06× at 4000 for a CPU-only machine, if decoding hides under the memory time (four positions at a time may inherit the x4 order's penalty) |
-| 58 | **The float-only exact exp in SIMD: what does it give the prefill?** (2026-09-24) Prediction, written first: the softmax and SiLU zones 3–8× faster, the prefill 1.03–1.06× at 2048–4000 | an AVX-512 and an AVX2 tier of `tests/bench_expf32.c`'s algorithm, exhaustively proven like `tr_expf`, then the prefill's softmax and SiLU zones | 3-6% of the prefill at 2048-4000; the GPU prefill needs it anyway (FP64 at 1/64 rate) |
-| 59 | **FMA in the definition?** (Marcello's decision, 2026-09-24) | the prefill's matmul with and without FMA on an ARM (Apple) and an Intel machine | about free on this Zen 4 (separate FADD pipes), up to half the peak compute on ARM and some Intel; C99 `fmaf`, FMA3, NEON and CUDA `fma.rn` keep every tier identical; changes today's bytes once |
+| 53 | ~~Draft on the GPU, exact verification: how often do the Q4_K and the Q8_0 of the same model pick the same token?~~ **Closed 2026-09-24** (§A Q4 draft against the exact Q8_0): **88.7 / 94.7 / 90.6%** on the Q8_0's greedy trajectory (prose, code, Italian; Q4_K_M 90.4 / 93.6 / 92.8%), 83–91% on real text, KL 3.4–5.8e-2; 5.5 / 7.2 / 6.4 tokens a pass of 8. Below the threshold, but with 54's union a pass of 9 rows reads ~2.7× a token's bytes: **~2.0× fewer bytes a token** on prose, ~1.3–1.9× in time once the draft's own GPU time is paid. (2026-09-24) A Q4 copy of the model on the GPU drafts 8 tokens, the exact engine checks them in one pass (batch = token by token: the accepted tokens have exact logits). Prediction, written first: top-1 agreement 95–98% on prose and 97–99% on code (llama.cpp's int8 activations sit at KL 9e-3 from us; 4.5-bit weights move more), so 6–7.5 tokens accepted a pass of 8 on prose, 7–8 on code | teacher-forced on real text (the session's prose and code prompts, `tools/quantize_q4k.sh` makes the Q4_K): feed the Q8_0's greedy tokens to both, count top-1 agreement per position; then accepted tokens per pass of 8 | at ≥ ~95% agreement, ~600 MB read a token instead of 1200 at 2048 (dense weights and KV once per pass, experts ~5×): **~2×** on top of the GPU attention, exact by construction; the draft needs M3's Q4 model whole on the GPU |
+| 54 | ~~How many experts does a pass of k rows read?~~ **Closed 2026-09-24** (§Experts read by a pass of k rows): **1.55× at k = 2, 2.33× at 4, 3.34× at 8, 4.42× at 16** (random subsets: 1.88 / 3.31 / 5.25 / 7.06), below the prediction at every k; code overlaps more than prose. Co-activation grows with depth (17–21% of pairs above lift 2 at layers 8–15). (2026-09-24) Prediction, written first: against one token's experts, 1.7–1.8× at k = 2, 2.8× at 4 (measured), 4.2–5× at 8, 5.5–6.5× at 16 (it saturates at 64 / 8 = 8×) | from `--route-trace` on real text: the union of the experts of k consecutive tokens, per layer, k = 1..16 | measured 2.8× at ~4 rows (§Speculation at long context); it sets the cost of 53's verification and of speculation on any MoE, and fine-grained MoEs (256 experts) may overlap less |
+| 55 | ~~How close is the prefill's matmul to the CPU's peak?~~ **Closed 2026-09-24** (§The CPU's peak): **49–53% of the no-FMA peak on one core** (87 of 166.5 GFLOP/s), ~40–45% on 16 (noisy); the kernel's own stream in asm with 8 tokens a weight reaches 119.4, **1.34× today's matmul**: the microkernel has margin. (2026-09-24) Prediction, written first: 35–50% of the no-FMA peak (0.7–1.0 of ~2 TFLOP/s on 16 cores) | FLOP/s of `tr_matmul` on the real shapes (`bench_kernels`' whole-matrix lines) against the no-FMA peak of this Zen 4 (2 FMUL + 2 FADD pipes) | estimated 40-50% (~0.75 of ~2 TFLOP/s): room for a hand-written AVX-512 assembly microkernel using all 32 zmm (M2's assembly workshop; gcc spills, LESSONS #45); near the peak, none |
+| 56 | ~~How far does lossless compression shrink the real weights?~~ **Closed as no 2026-09-24** (§The model read like a genome): Q8_0's codes carry **7.59–7.69 bits of 8**, Q4_K's **3.83–3.87 of 4**; a lossless coder gives ~7% of a Q8_0 file (half of it the scales) and ~4% of a Q4_K, nothing beyond order 0 in the experts. (2026-09-24) Prediction, written first: Q8_0's codes carry 6.3–7.0 bits of their 8 (12–20% of the code bytes), Q4_K's 3.5–3.8 of their 4 (5–12%) | entropy of the codes of Q8_0 and Q4_K per block and per tensor (and FP8/BF16 when such a model arrives); a layout that decodes at memory speed (fixed width, or block ANS) | bytes are the wall at every level (RAM, disk, PCIe) while compute idles in decode; guess ~8-12% on Q4, more on FP8/BF16 (~30% on BF16 elsewhere); for a model streamed from disk the gain is proportional |
+| 57 | ~~Does the KV packed in 28 bits pay on a still machine?~~ **Closed as no 2026-09-24** (§The KV packed in 28 bits): **0.97–1.05×** the F32 attention on the six dumps; decoding eats the 1.13× in bytes (44–45 GB/s against 49–51). (2026-09-24) Prediction, written first: 1.00–1.08× on the attention zone at 2048 and 4000: the four positions decoded at a time come in the x4 order that cost 10% (§The decode's attention, one position at a time), and may eat most of the 1.13× in bytes | `build/tests/bench_kvpack.exe time --run all`, native, marker held | exact, 1.13× fewer bytes (§The KV packed in 28 bits): ~1.04× at 2048, ~1.06× at 4000 for a CPU-only machine, if decoding hides under the memory time (four positions at a time may inherit the x4 order's penalty) |
+| 58 | ~~The float-only exact exp in SIMD: what does it give the prefill?~~ **Closed 2026-09-24** (§An exact exp in float32 only): AVX-512 and AVX2 tiers, **0 of 2^32 differ**, **0.73 / 0.80 ns a value against `tr_expf`'s 3.52 (4.8× / 4.4×)**; the zones ~2.4× (softmax) and ~1.7× (SiLU), **the prefill ~1.02–1.03×**: question 39's range, not wired into the CPU engine; the GPU prefill's reference. (2026-09-24) Prediction, written first: the softmax and SiLU zones 3–8× faster, the prefill 1.03–1.06× at 2048–4000 | an AVX-512 and an AVX2 tier of `tests/bench_expf32.c`'s algorithm, exhaustively proven like `tr_expf`, then the prefill's softmax and SiLU zones | 3-6% of the prefill at 2048-4000; the GPU prefill needs it anyway (FP64 at 1/64 rate) |
+| 59 | **FMA in the definition?** (Marcello's decision, 2026-09-24) **Numbers on this Zen 4** (§The CPU's peak): FMA's peak = mul + add's (166 GFLOP/s a core); the prefill kernel's 8-token stream with FMA **1.19×** the one without (141.1 / 118.8), 1.17× on 16 cores | the prefill's matmul with and without FMA on an ARM (Apple) and an Intel machine | about free on this Zen 4 (separate FADD pipes), up to half the peak compute on ARM and some Intel; C99 `fmaf`, FMA3, NEON and CUDA `fma.rn` keep every tier identical; changes today's bytes once |
 | 60 | **An exactly rounded dot product (Kulisch-style accumulation) as the definition?** (Marcello's decision, 2026-09-24) | the cost of an exact dot on AVX-512 VNNI with the activations' mantissas sliced in bytes, against the float lane path | a result independent of the order: any SIMD width, the GPU or a sum split across machines gives the same bits by construction, and it is more accurate; changes today's bytes once |
-| 62 | **The model scanned like a genome: is there exact structure nobody reads once?** (Marcello, 2026-09-24: a discovery comes from looking patiently at real data others filtered away) Approximate engines compress the weights with loss and never look for exact repeats; an exact engine can read anything that repeats exactly once, without changing a bit. Prediction, written first: trained weights hold almost no exact repeats (≤ 0.1% of Q8_0 blocks), the routing holds strong co-activation, the KV holds token-determined parts beyond layer 0 in no layer | a hash of every Q8_0 block (34 bytes) over the whole file: duplicates, all-zero blocks, rows shared between experts, per-tensor entropy (with 56); in the routing traces the pairs and groups of experts that fire together (co-activation arrays, for placement and file order); in the probe's dumps, any layer whose keys or values depend on the token alone | cheap, on real data, not done by anyone: most of it may give zero, like the exact skips; what repeats exactly is bytes saved exactly |
+| 62 | ~~The model scanned like a genome: is there exact structure nobody reads once?~~ **Closed 2026-09-24** (§The model read like a genome, §Experts read by a pass of k rows): weights **0.008% of Q8_0 blocks repeated** (220 identical rows of the output head: the tokens never learned; Q4_K 504 rows, 2 140 zero blocks), no zero blocks in Q8_0; routing co-activation strong (lift up to 67, top-3 partners 18–28% of co-firings); **the KV: only layer 0's values are token-determined** (61.6–81.6% of positions repeat), layers 1–15 and every key 0. Tools: `tools/weights_genome.py`, `tools/route_union_report.py`, `tools/kv_repeats_report.py`, to run again on the next model. (Marcello, 2026-09-24: a discovery comes from looking patiently at real data others filtered away) Approximate engines compress the weights with loss and never look for exact repeats; an exact engine can read anything that repeats exactly once, without changing a bit. Prediction, written first: trained weights hold almost no exact repeats (≤ 0.1% of Q8_0 blocks), the routing holds strong co-activation, the KV holds token-determined parts beyond layer 0 in no layer | a hash of every Q8_0 block (34 bytes) over the whole file: duplicates, all-zero blocks, rows shared between experts, per-tensor entropy (with 56); in the routing traces the pairs and groups of experts that fire together (co-activation arrays, for placement and file order); in the probe's dumps, any layer whose keys or values depend on the token alone | cheap, on real data, not done by anyone: most of it may give zero, like the exact skips; what repeats exactly is bytes saved exactly |
 | 61 | **Exactness as the asset for a frontier model locally** (after M4, 2026-09-24): a computation that gives the same bytes anywhere can be moved in time (the KV of your files computed while the machine idles, reused byte for byte), in space (several home machines splitting a model: their RAM bandwidth adds up), and checked (work done by an untrusted fast machine, verified by recomputing random spots) | a KV checkpoint to disk and back per 1000 tokens; one layer across two machines on a LAN (~28 KB a hop at 7168 dims); detection probability against spot-check cost | a 671B MoE reads ~20 GB a token at Q4 (0.35 s from RAM, 13 s from this disk): the wall moves only by adding bandwidth or by not paying the prefill at question time; approximate engines cannot do any of the three |
 
 Reference machine: Ryzen 9 7940HX (Zen 4, 16 core / 32 thread, AVX-512 VNNI/BF16), 31 GB
@@ -2925,10 +2925,13 @@ then read. **Bits**: every stream of the six dumps packs and unpacks to the same
 decode queries through the packed attention give `tr_attention_group`'s bits (also under
 `TR_CPU_MAX=scalar` and `avx2`); a mutation of the decoder (base off by one) red in 4096 of 4096;
 a synthetic block with every float class unpacks exactly, 5 escapes as designed. **Bytes**:
-3.53-3.55 a value, **1.128-1.132× fewer** than F32; 0.38-0.43% of the values escape. **Time**: not
-measured — four samples on the loaded machine gave anything from 1.79× faster to 1.70× slower.
-Open: the still machine's answer, and whether decoding four positions at a time inherits the x4
-order's penalty above (the packed rows would be read one at a time too).
+3.53-3.55 a value, **1.128-1.132× fewer** than F32; 0.38-0.43% of the values escape. **Time, on a
+still machine** (question 57, `sh tools/bench_native.sh bench_kvpack time --run all`, 8 threads,
+marker held, load 2.0–2.4 logical processors): one decode token's attention over all 16 layers,
+packed against F32, **0.97–1.05×** (prose 1.00 / 0.97, code 1.03 / 1.05, synthetic 1.01 / 1.02 at
+~2000 / ~4000 positions; spreads 7–64%). The packed layout reads 44–45 GB/s where F32 reads 49–51:
+decoding eats the 1.13× in bytes. Prediction (1.00–1.08×) held at its low end. **Closed as no** on
+the CPU; the GPU does the decode's attention anyway.
 
 ## An exact exp in float32 only, for the GPU (2026-09-24)
 
@@ -2957,6 +2960,19 @@ fixed point on 32-bit limbs (Taylor of degree 9, margin 8 units of 2^-62 against
 - Not in the engine: the GPU prefill will use it (with `fma.rn`, the table in shared memory; NaN
   payloads differ between x86 and NVIDIA). The gate builds the bench; its exhaustive run
   (`--no-timing --slow-all --error`, ~40 s on 8 threads) enters the gate with its first user.
+- **In SIMD (question 58, 2026-09-24)**: the fma variant as an AVX-512 tier (16 lanes) and an AVX2
+  tier (8), lane by lane the scalar operations in the same order, the table by gathers, the
+  unsettled lanes through the scalar slow path. **All 2^32 floats: 0 differ from `tr_expf` in
+  both tiers**; 21 119 lanes through the slow path (the scalar fma variant's 21 114 + 5 below
+  2^-126: the same decisions). Mutations seen red: the slow path skipped (7: 492 wrong on 1/64 of
+  the floats), a table entry one ulp up (1: 8 871 wrong). **Cost on a still machine, one thread,
+  softmax arguments (−12..0): AVX-512 0.733 ns a value, AVX2 0.802, against `tr_expf`'s 3.52
+  (4.8× and 4.4×)**; over −104..88.7 1.62 and 1.73 ns (the subnormal branch and the special lanes).
+  Prediction (the softmax and SiLU zones 3–8× faster, the prefill 1.03–1.06×) fell: with question
+  39's zone times, the exponentials take ~74% of the softmax zone and ~54% of the SiLU zone, so the
+  zones would run 2.4× and 1.7× faster, and **the prefill ~1.02× at 2048 and ~1.03× at 4000** —
+  the range Marcello closed question 39 on. Kept in the bench as the GPU's reference; not wired
+  into the CPU engine.
 
 ## Speculation at long context (2026-09-24)
 
@@ -2987,6 +3003,152 @@ machine shared with other work and are noisy); every `--spec` output identical t
 - `--spec 16` is refused by design: a pass holds at most 16 logit rows (1 + 15 drafts).
 - The synthetic prompt of the benches falls into a period-2 loop by its 2nd–3rd decode token
   (found on the probe's dumps): speculation measured on it measures the loop, not the lever.
+
+## A Q4 draft against the exact Q8_0: how often the same token (2026-09-24)
+
+Question 53: a Q4 copy of the model drafts, the exact engine verifies a pass (the accepted tokens
+are exact by construction). Prediction, written first: top-1 agreement 95–98% on prose, 97–99% on
+code; 6–7.5 tokens a pass of 8 on prose. `tools/draft_agreement.sh` (container, correctness only):
+three real texts of this repo (prose: `docs/ARCHITECTURE.md`; code: `src/models/olmoe.c`; Italian
+prose: MEASUREMENTS lines 1633–1760), the first 1024 tokens as prompt, the Q8_0's greedy 512
+after it, then the logits of all 1536 positions (`logits -b 1`) of the Q8_0, the Q4_K and the
+Q4_K_M; `tools/draft_agreement_report.py` compares them. The Q8_0's greedy through `logits -b 1`
+is `generate`'s token for token (the report fails otherwise).
+
+| draft | text | agreement: real text / Q8_0 trajectory | KL(Q8_0‖draft), trajectory | tokens a pass of 8 (trajectory / real text) |
+|---|---|---|---|---|
+| Q4_K | prose | 84.2% / **88.7%** | 5.2e-2 | 5.52 / 5.04 |
+| Q4_K | code | 88.5% / **94.7%** | 4.3e-2 | 7.23 / 5.79 |
+| Q4_K | Italian | 82.8% / **90.6%** | 5.8e-2 | 6.40 / 4.69 |
+| Q4_K_M | prose | 86.8% / 90.4% | 4.0e-2 | 6.04 / 5.33 |
+| Q4_K_M | code | 90.7% / 93.6% | 3.4e-2 | 6.92 / 6.36 |
+| Q4_K_M | Italian | 84.3% / 92.8% | 4.3e-2 | 6.74 / 4.85 |
+
+- **The prediction fell**: 88.7–94.7% on the trajectory, 83–91% on real text; KL 3.4–5.8e-2,
+  4–6× llama.cpp's int8 activations (9e-3): 4.5-bit weights move a distribution much more than
+  8-bit activations. The Q4 is not worse, it chooses differently where the Q8_0 is unsure: next-
+  token accuracy on the real text is the same (Q8_0 35.7 / 54.5 / 38.6%, Q4_K 36.0 / 54.5 / 38.7%);
+  agreement is 35–58% where the Q8_0's top-2 margin is under 0.1 nats, 54–65% at 0.1–0.5, 99.6–100%
+  above 2 nats. The code trajectory repeats itself (66.6% of its 4-grams seen before; prose 8.6%,
+  Italian 18%): its 7.23 is inflated.
+- Cutting the draft where its own margin falls (τ = 0.5 / 1 / 2 nats) trades tokens for rows at
+  about the same ratio: prose 4.28 tokens in 5.03 rows, 3.35 in 3.78; it does not pay in bytes
+  below.
+- **The lever survives the missed threshold**, because a pass's experts overlap more than predicted
+  (§Experts read by a pass of k rows: 9 rows read 3.52× one token's experts, not ~5×). A token reads
+  ~1.26 GB (experts 855 MB, attention 285, output 109); a verification pass of 9 rows ~0.40 + 0.855
+  × 3.52 = 3.41 GB: at 5.52 tokens a pass **0.62 GB a token, 2.0× fewer bytes** on prose (2.4×
+  Italian, 2.7× code). The draft costs its own time: the Q4 whole on the GPU (3.9 GB), 8 serial
+  draft tokens ~30–40 ms against a ~80 ms pass (28 ms + 2.52 × 21 ms of experts, §Adaptive draft):
+  ~1.3× serial, up to ~1.9× with the next draft overlapped with the verification.
+
+## Experts read by a pass of k rows, and which fire together (2026-09-24)
+
+Questions 54 and 62 (routing). `tools/route_union_report.py` on the six real-text route traces of
+question 44 (`build/route/`: C ×2, Python, shell, English and Italian prose; 6 770 tokens). Union
+of the experts of k consecutive tokens per layer, in units of one token's 8, mean over windows and
+layers; prediction, written first: 1.7–1.8× at k = 2, 2.8× at 4, 4.2–5× at 8, 5.5–6.5× at 16.
+
+| k | 1 | 2 | 3 | 4 | 6 | 8 | 9 | 12 | 16 |
+|---|---|---|---|---|---|---|---|---|---|
+| union (mean of 6 traces) | 1.00 | **1.55** | 1.97 | **2.33** | 2.89 | **3.34** | 3.52 | 3.97 | **4.42** |
+| range over the traces | | 1.50–1.62 | | 2.18–2.59 | | 3.09–3.86 | | | 4.00–5.11 |
+| k random 8-subsets of 64 | 1.00 | 1.88 | 2.64 | 3.31 | 4.41 | 5.25 | 5.59 | 6.39 | 7.06 |
+
+- **Below the prediction at every k** (3.34× at 8 against 4.2–5): consecutive tokens reuse experts
+  far more than chance, code more than prose (C 3.09–3.24 at 8, English prose 3.86). The 2.8× at ~4
+  rows of §Speculation at long context was a time ratio, not a count: it carries the rows' compute.
+  A pass of k rows costs ~0.4 GB + 0.855 GB × union(k) in bytes: this table is the cost side of
+  every speculative or batched decode on this model.
+- **Co-activation is strong and grows with depth**: per layer, the pairs that fire together more
+  than twice as often as independence gives are 6–8% at layers 0–1 and 17–21% at 8–15; 18–50% of
+  pairs fire together under half as often; an expert's top-3 partners hold 18–28% of its
+  co-firings (uniform 4.8%); the strongest pair's lift 6 at layer 0, 17–67 at layers 8–15. Ground
+  for placement and file order (M1 point 4, mbolt): experts that fire together read together.
+
+## The model read like a genome: weights, KV, routing (2026-09-24)
+
+Questions 56 and 62. `tools/weights_genome.py` reads every block of a GGUF once: entropy of the
+codes (order 0 per tensor; given a per-block context: Q8_0's 16 magnitude classes with their own
+cost, Q4_K's 6-bit sub-block scale; given the input column, one table per column, table not
+counted), entropy of the f16 scales, all-zero blocks, blocks repeated (whole, codes only, codes up
+to sign, anywhere in the file), rows repeated. Predictions, written first: Q8_0's codes 6.3–7.0
+bits of 8 (12–20% of the code bytes), Q4_K's 3.5–3.8 of 4 (5–12%); ≤ 0.1% of blocks repeated.
+
+| | OLMoE Q8_0 (7 009 MiB scanned) | OLMoE Q4_K (3 711 MiB) |
+|---|---|---|
+| code bits, order 0, per tensor | **7.59–7.69 of 8** | **3.83–3.87 of 4** |
+| gain of the per-column table | experts ≤ 0.015 bits; attention 0.10–0.30, layer 0's `attn_q` 1.01 | experts ≤ 0.01; layer 0's `attn_q` 0.70 |
+| gain of the per-block context | none (the class costs more than it saves) | 0.005 |
+| scale bits (f16) | 7.1–8.9 of 16 | 8.8–11.9 of 16 (d and dmin) |
+| whole file at these entropies | **93.1%** (codes 96.0%) | **96.1%** (codes 96.6%) |
+| all-zero code blocks | 0 | 2 140 (token_embd 1 976, layer 0 gate and up 82 each) |
+| blocks repeated anywhere | 16 686 (0.008%): `output` 16 086, token_embd 88, `attn_q`/`attn_k` of layers 5, 9, 11–14 up to 242 | 4 174 (0.015%) |
+| rows repeated | **220, all in `output`** | 504: `output` 244, token_embd 246, layer 0 gate and up 7 each |
+
+- **Both predictions fell on the entropy**: the quantizers already spend their code space almost
+  whole (a Q8_0 block's scale puts its largest weight at ±127, so 32 roughly Gaussian weights fill
+  the range: ~7.7 bits; Q4_K fits a min and a scale per 32 weights). Lossless coding gives **~7%**
+  of a Q8_0 file (half of it the scales) and **~4%** of a Q4_K, the experts (94% of the bytes)
+  nothing beyond order 0. At memory speed that needs an entropy decoder faster than ~57 GB/s on
+  16 cores: not worth a format. Closed.
+- **The structure that exists is in the vocabulary and in a few attention columns**: 220 rows of
+  the output head are byte-identical to another row (Q4_K: 244, and 246 embedding rows whose
+  codes are all zero): the tokens the model never learned, whose logits come out identical; a few
+  attention `q`/`k` blocks repeat, and layer 0's `attn_q` carries 1 bit a code of per-column
+  structure (a handful of input dimensions dominate). In Q4_K, 7 rows of layer 0's experts' gate
+  and up are constant (dead rows). Repeats prediction (≤ 0.1%) held. Worth ≤ 0.5% of the head:
+  closed, noted for the next model.
+
+- **The KV** (`tools/kv_repeats_report.py` on the six probe dumps, 16 layers × 16 heads): layer 0's
+  values repeat exactly wherever the token repeats (61.6–81.6% of positions on real text, 0.8–1.1%
+  on the synthetic prompt), in every head at once: they depend on the token alone, as the
+  architecture says. **Layers 1–15: 0 repeated rows in every run; keys 0 everywhere** (RoPE).
+  Prediction held. What it would give: layer 0's values are 1/32 of the KV; storing them once per
+  distinct token saves ≤ 2.5% of the KV bytes, and summing by token instead of by position changes
+  the order of the output's sum (not the definition's bytes). Closed.
+
+## The CPU's peak, and how far the prefill's matmul is from it (2026-09-24)
+
+Question 55, the premise of an assembly microkernel. `tests/bench_peak.c` through
+`tools/bench_native.sh bench_peak --runs 15` (marker held, load 2.0–2.5 logical processors,
+Defender and the WSL VM; median of 15). Prediction, written first: the matmul at 35–50% of the
+no-FMA peak (0.7–1.0 of ~2 TFLOP/s).
+
+| GFLOP/s | 1 thread | 16 threads |
+|---|---|---|
+| peak, zmm multiplies and adds (inline assembly, 12 chains) | **166.5** (= 32 FLOP/cycle at 5.2 GHz) | 2 309 (spread 26%) |
+| peak, ymm | 166.0 | 1 730 (21%) |
+| the kernel's instruction stream in asm, L1, 2 rows × 4 tokens (as `dot_row2_x4` today) | 106.6 (64%) | 1 484 (8.5%) |
+| the same, 2 rows × **8** tokens (16 accumulators, 26 zmm) | **119.4 (72%)** | 1 674 (11%) |
+| `dot_row2_x4` Q8_0 on 2048 columns (L2) | 89.0 | 1 016 (12%) |
+| `tr_matmul` 1024 × 2048, 64 tokens (an expert's gate/up) | **87.4 (52%)** | 949 (51%) |
+| `tr_matmul` 2048 × 1024, 64 tokens (down) | 82.4 (49%) | 932 (19%) |
+| `tr_matmul` 2048 × 2048, 512 tokens (attention) | 87.5 (53%) | 1 027 (38%) |
+| peak with FMA (question 59; a later run, load 1.6–1.8) | 166.1 | 2 500 (16%) |
+| the 2 × 8 stream with FMA instead of mul + add (q. 59) | **141.1** (the same run's without: 118.8) | 2 005 (5.5%; without: 1 710) |
+
+- **The prediction held**: 49–53% of the no-FMA peak on one core, ~40–45% on 16 (those lines are
+  noisy: every run of four put them at 0.80–1.20 TFLOP/s; the one-core lines are clean, 1.3–3%).
+- **The margin is real and measured**: today's kernel runs at 82–84% of its own instruction
+  stream's ceiling (89 of 106.6); **the same stream with 8 tokens a weight instead of 4 reaches
+  119.4, 1.34× today's matmul on one core** (1.6–1.8× on 16 cores, where the matmul loses more to
+  memory than the stream does). The widened codes and the scale multiply are paid once for 8
+  tokens instead of 4. Every output stays its own `dot_row` sum in the same order, so exact. The
+  next step: a `dot_row2_x8` microkernel in assembly (26 zmm, no spills), prefill ~1.15–1.25×
+  (the matmul is 56–77% of it, question 37).
+- **Order matters on Zen 4, even between independent ops**: the peak's 12 ops strictly
+  alternating (mul, add, mul, add…) run at 139 GFLOP/s, grouped (6 mul, then 6 add, or gcc's own
+  order) at 167; the same on every repeat (LESSONS #162). The microkernel is measured in more than
+  one order.
+- **For question 59 (Marcello's decision), on this Zen 4**: FMA raises no peak (166.1 against
+  165.9: FMA runs only on the two multiply pipes), but the kernel's stream with FMA is **1.19×** the
+  one without on a core (141.1 / 118.8) and 1.17× on 16: the multiply pipes are the bottleneck, and
+  a fused op takes one slot where mul + add took a multiply slot and an add slot. On a CPU whose
+  pipes all do FMA (Intel since Haswell, Apple) the ratio should be larger; not measured here.
+- The peak loop is inline assembly: written in C, gcc merged its twelve chains into two, and the
+  "peak" came out 2× too high (LESSONS #161). A mutant with dependent chains (`-DBENCH_PEAK_MUTATE`)
+  makes the bench fail: a peak below a real kernel is not a peak.
 
 ## Attempts
 
@@ -3023,7 +3185,7 @@ machine shared with other work and are noisy); every `--spec` output identical t
 | 2026-09-24 | the sixteen Q6_K scales in SIMD instead of scalar (same single rounding) | whole matrix Q6_K, 1 core: 0.0551 (two rows) / 0.0602 (x4) ms per token | 0.0523 / 0.0590 | control Q8_0 0.0491 in both sessions | kept |
 | 2026-09-24 | a row decoded once per tile of 16 tokens, then the F32 x4 kernel (not built: measured the F32 x4 kernel alone) | Q8_0 x4 43 926 / 36 771 M/s (n 2048 / 4096) | F32 x4 44 779 / 33 135 | 3% | rejected: the matmul is bound by loading the input rows, not by decoding the weights |
 | 2026-09-24 | skipping cached positions exactly (exp exactly 0; absorption in the lane sum and in the output; keys and values split in high and low 16 bits; norm, block and low-rank bounds), premise on the real model before any kernel | KV read per decode token: all of it | oracle (every value known): 0.998-1.000 of the bytes; no score 30 below its max in 65 M positions | six runs, all layers and heads | **rejected before code**: OLMoE's QK-norm keeps the attention flat (§Skipping cached positions exactly) |
-| 2026-09-24 | the KV packed in 28 bits, lossless (premise bench, `tests/bench_kvpack.c`) | 4 bytes a value | 3.53-3.55 bytes a value (1.13× fewer); 25 344 queries give the F32 attention's bits | time not measured: on the loaded machine anything from 1.79× faster to 1.70× slower | open: question 57 |
+| 2026-09-24 | the KV packed in 28 bits, lossless (premise bench, `tests/bench_kvpack.c`) | 4 bytes a value | 3.53-3.55 bytes a value (1.13× fewer); 25 344 queries give the F32 attention's bits | still machine (2026-09-24): 0.97–1.05× the F32 attention, spreads 7–64% | **rejected on the CPU** (question 57): decoding eats the bytes |
 | 2026-09-24 | the decode's attention on the GPU (`src/backend/gpu_attn`, the same bytes; keep-warm between layers, warm-up in the prompt's last pass) | decode at 8 threads, 512 / 2048 / 4000: 35.0 / 29.1 / 22.1 tok/s | 37.4 / 34.8 / 33.4 | A/A ≤ 4.0% | **kept, on by default when there is a GPU**: 1.04-1.07× / 1.20-1.28× / 1.43-1.51× (measured width: 1.31-1.32× at 2048, 1.54-1.58× at 4000) |
-| 2026-09-24 | an exact exp with float32 and int32 only, to run on the GPU at full rate (`tests/bench_expf32.c`, premise) | `tr_expf` 3.59-3.60 ns (double) | 3.10-3.22 ns with fma, 5.6 without; 0 of 2^32 differ | one thread, loaded machine | open: question 58 |
+| 2026-09-24 | an exact exp with float32 and int32 only, to run on the GPU at full rate (`tests/bench_expf32.c`, premise) | `tr_expf` 3.59-3.60 ns (double) | 3.10-3.22 ns with fma, 5.6 without; 0 of 2^32 differ; in SIMD (2026-09-24, still machine) AVX-512 0.733 ns, AVX2 0.802 (tr_expf 3.52), 0 of 2^32 differ | one thread | **not wired into the CPU engine** (question 58): prefill ~1.02-1.03×, question 39's range; the GPU prefill's reference |
 | 2026-09-24 | the decode's attention one position at a time (`tr_attention_group` with one query runs `tr_attention_head`), the same bits | decode at 8 threads, 512 / 2048 / 4000: 35.5 / 28.3 / 22.6 tok/s; the attention zone at 2048 11.00 ms | 36.1 / 27.9 / 22.2; the zone 10.02 ms | A/A 2.9% | kept, but **not distinguishable** on a still machine (0.96-1.05×); the bench's 1.10-1.13× was measured under load (LESSONS #160) |

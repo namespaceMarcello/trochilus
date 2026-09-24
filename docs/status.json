@@ -154,6 +154,14 @@
       "cosa": "La memoria del contesto messa in modo che la CPU la legga di seguito invece che a salti. Il contesto lungo era il caso peggiore: adesso legge alla velocità della RAM.",
       "numeri": [
         {
+          "v": "KV compressa a 28 bit, a macchina ferma: 0.97-1.05× l'attenzione F32; la decodifica si mangia i byte risparmiati (44-45 GB/s contro 49-51): no sulla CPU",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "nella KV solo i valori del layer 0 dipendono dal solo token (si ripetono nel 62-82% delle posizioni); layer 1-15 e tutte le chiavi: 0 ripetizioni",
+          "d": "2026-09-24"
+        },
+        {
           "v": "saltare posizioni in modo esatto: chiuso prima di scrivere un kernel, l'attenzione di OLMoE è piatta e anche un oracolo salta al più lo 0.2% dei byte",
           "d": "2026-09-24"
         },
@@ -170,9 +178,7 @@
           "d": "2026-09-19"
         }
       ],
-      "domande": [
-        "la KV compressa a 28 bit, esatta, 1.13× meno byte: quanto rende a macchina ferma, su una macchina senza GPU?"
-      ],
+      "domande": [],
       "file": [
         "src/kv/kv.c"
       ],
@@ -220,6 +226,10 @@
       "cosa": "L'esponenziale della libreria C costava il 30% del prompt lungo. Riscritto: più veloce e arrotondato correttamente su tutti i 4 miliardi di float, verificati uno per uno.",
       "numeri": [
         {
+          "v": "l'exp esatto con soli float, in AVX-512 e AVX2: 0 diversi su tutti i 4 miliardi di float, 4.8× e 4.4× più veloce di tr_expf per valore; il prompt ne guadagnerebbe solo il 2-3%: resta il riferimento per la GPU",
+          "d": "2026-09-24"
+        },
+        {
           "v": "prefill 1.03-1.31× secondo la lunghezza; Windows e Linux ora danno gli stessi byte",
           "d": "2026-09-19"
         }
@@ -229,6 +239,11 @@
           "n": 39,
           "stato": "chiusa",
           "testo": "versione SIMD: no, lo scalare ha già preso quasi tutto"
+        },
+        {
+          "n": 58,
+          "stato": "chiusa",
+          "testo": "l'exp esatto a soli float in SIMD: 4.8× per valore, prompt ~1.02-1.03×, non collegato al motore"
         }
       ],
       "file": [
@@ -323,6 +338,50 @@
       "dipende": [
         "nucleo",
         "m1-diretta"
+      ]
+    },
+    {
+      "id": "genoma",
+      "tappa": "M0",
+      "titolo": "Il modello letto come un genoma",
+      "stato": "fatto",
+      "cosa": "Guardare ogni byte del modello, della memoria del contesto e delle scelte degli esperti, per trovare struttura esatta che nessuno legge: ripetizioni, zeri, parti prevedibili. Dove c'è, si risparmia senza cambiare un bit; dove non c'è, lo sappiamo e non ci si torna.",
+      "numeri": [
+        {
+          "v": "i pesi quantizzati sono quasi incomprimibili: i codici Q8_0 portano 7.6-7.7 bit su 8, i Q4_K 3.83-3.87 su 4 (compressione senza perdita ~7% e ~4%): chiuso",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "blocchi ripetuti 0.008%: le 220 righe identiche della testa d'uscita sono i token che il modello non ha mai imparato",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "strumenti pronti per il prossimo modello: tools/weights_genome.py, route_union_report.py, kv_repeats_report.py, draft_agreement.sh",
+          "d": "2026-09-24"
+        }
+      ],
+      "domande": [
+        {
+          "n": 56,
+          "stato": "chiusa",
+          "testo": "quanto si comprimono i pesi senza perdita? ~7% Q8_0, ~4% Q4_K: non vale un formato"
+        },
+        {
+          "n": 62,
+          "stato": "chiusa",
+          "testo": "c'è struttura esatta nel modello? solo nel vocabolario morto e nei valori del layer 0"
+        }
+      ],
+      "file": [
+        "tools/weights_genome.py",
+        "tools/kv_repeats_report.py",
+        "tools/route_union_report.py"
+      ],
+      "comandi": [
+        "tools/.venv/Scripts/python.exe tools/weights_genome.py models/<file>.gguf"
+      ],
+      "dipende": [
+        "nucleo"
       ]
     },
     {
@@ -649,6 +708,10 @@
       "cosa": "Riscrivere il GGUF mettendo vicini gli esperti che si accendono insieme (l'idea di mbolt, MIT). Sul nostro disco e con i nostri esperti grossi vale poco: il loro README stesso dice che il guadagno si spegne sopra i 4 MB per pezzo, e i nostri sono 6.4.",
       "numeri": [
         {
+          "v": "la co-attivazione c'è e cresce con la profondità: ai layer 8-15 il 17-21% delle coppie si accende insieme più del doppio del caso; i 3 compagni più frequenti di un esperto fanno il 18-28% delle sue accensioni in coppia (caso: 4.8%)",
+          "d": "2026-09-24"
+        },
+        {
           "v": "tetto ≤ 1.15× qui (dal nostro banco del disco), contro il 2.23× che dichiarano sulle loro letture",
           "d": "2026-09-21"
         }
@@ -656,7 +719,8 @@
       "domande": [],
       "file": [],
       "comandi": [
-        "make bench-disk"
+        "make bench-disk",
+        "tools/.venv/Scripts/python.exe tools/route_union_report.py build/route/*.bin"
       ],
       "dipende": [
         "m1-misure"
@@ -776,18 +840,40 @@
       "id": "m2-assembly",
       "tappa": "M2",
       "titolo": "Laboratorio assembly",
-      "stato": "aperto",
+      "stato": "prossimo",
       "cosa": "Riscrivere in assembly i kernel più caldi, uno alla volta. Resta solo se il test lo trova identico al C e il banco lo trova più veloce; il C resta come riserva per le altre CPU.",
-      "numeri": [],
+      "numeri": [
+        {
+          "v": "il matmul del prefill fa il 49-53% del picco senza FMA su un core (87 di 166.5 GFLOP/s); lo stesso flusso di istruzioni in assembly con 8 token per peso invece di 4 arriva a 119.4: 1.34× (prefill stimato 1.15-1.25×)",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "su Zen 4 l'ordine di istruzioni indipendenti vale il 20%: mul e add alternati uno a uno 139 GFLOP/s, raggruppati 167",
+          "d": "2026-09-24"
+        }
+      ],
       "domande": [
+        {
+          "n": 55,
+          "stato": "chiusa",
+          "testo": "quanto margine c'è sotto il picco? 1.34× su un core col microkernel a 8 token"
+        },
+        {
+          "n": 59,
+          "stato": "aperta",
+          "testo": "FMA nella definizione? (decisione di Marcello) Su questo Zen 4 il picco FMA è uguale a mul+add; il flusso a 8 token con FMA va 1.19×"
+        },
         {
           "n": 10,
           "stato": "aperta",
           "testo": "più corsie (32 o 64) sbloccano la catena delle somme su un thread?"
         }
       ],
-      "file": [],
+      "file": [
+        "tests/bench_peak.c"
+      ],
       "comandi": [
+        "sh tools/bench_native.sh bench_peak",
         "make bench"
       ],
       "dipende": [
@@ -843,6 +929,10 @@
         },
         {
           "v": "modello: 1.64× a 2048, 1.92× a 4000 insieme all'attenzione",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "dopo: il Q4 intero sulla GPU come bozza, verificata esatta dal motore. Il Q4_K sceglie il token del Q8_0 nell'88.7 / 94.7 / 90.6% dei casi (prosa, codice, italiano): sotto il 95% sperato, ma una passata di 9 righe legge solo 3.52× gli esperti di un token, quindi ~2× meno byte a token",
           "d": "2026-09-24"
         }
       ],
@@ -903,6 +993,10 @@
       "stato": "fatto",
       "cosa": "Indovinare più token in una volta riusando pezzi del prompt, e verificarli tutti insieme. Gli stessi token di prima, solo più in fretta quando il testo si ripete — come succede nel codice.",
       "numeri": [
+        {
+          "v": "una passata di k righe legge 1.55 / 2.33 / 3.34 / 4.42× gli esperti di un token a k = 2 / 4 / 8 / 16 (a caso sarebbero 1.88 / 3.31 / 5.25 / 7.06): i token vicini riusano gli stessi esperti",
+          "d": "2026-09-24"
+        },
         {
           "v": "a contesto lungo: nulla sulla prosa (1.04-1.13 token a passata), 1.57 riscrivendo codice, 1.66× netto sul codice ripetitivo; una passata di ~4 righe legge ~2.8× gli esperti",
           "d": "2026-09-24"
