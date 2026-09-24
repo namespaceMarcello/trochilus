@@ -35,6 +35,12 @@ else
 fi
 measure_declare "after" >> $OUT/load.txt
 tail -1 $OUT/load.txt
+# a line whose spread is above 10% is not a number to conclude on: named here, not left to the eye
+# (docs/LESSONS.md #150: a ratio of 0.74-0.80 drawn from lines at 19-56%, 0.84-0.86 remeasured)
+awk '/%$/ { s = $NF; sub("%", "", s); if (s + 0 > 10) { n++; print "  noisy (spread " $NF "): " $0 } }
+     END { if (n) print "bench_kernels: " n " lines above 10% spread: remeasure before concluding on them" }' \
+    $OUT/bench.txt > $OUT/noisy.txt
+cat $OUT/noisy.txt
 echo "bench_kernels: done, $OUT/bench.txt"
 }
 main "$@"; exit

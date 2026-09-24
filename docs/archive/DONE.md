@@ -998,3 +998,16 @@ Q4_K_M from our Q8_0 (17 tensors Q6_K: output, and attn_v and ffn_down_exps in 8
 MEASUREMENTS §Q6_K on the CPU. Check: `make check`; `sh tools/mutate_q6k.sh` (container);
 `sh tools/bench_kernels.sh`; `sh tools/race_q4k.sh 5 m`; `build/trochilus run -m
 models/OLMoE-1B-7B-0125-Instruct-Q4_K_M.gguf -f prompt.txt`.
+
+### 2026-09-24 — Two weight rows at a time in the prefill, measured again
+The kernels measured again (the AVX2 ratios of the first series were noise; `tools/bench_kernels.sh`
+now names every line above 10% spread) and the whole matrix measured per type: Q8_0, Q4_K and Q6_K
+cost the same through `tr_matmul`, bound by loading the input rows, not by decoding the weights.
+So `dot_row2_x4` (`src/kernels/kernels.h`): two weight rows against the same four input rows, each
+input vector loaded once for eight products, AVX-512 for Q8_0, Q4_K and Q6_K, used by `tr_matmul`
+on pairs of rows; every sum still its own `dot_row` bit for bit. The sixteen Q6_K scales now in SIMD.
+Tests: every tier's two-row kernel against two scalar x4, a wrong one per type that must be seen,
+`test_tier_used` counting its products and requiring every pair of rows through it;
+`tools/mutate_row2.sh`, 11 mutations, all red. Prefill 1.20–1.26× on Q8_0, 1.11–1.12× on Q4_K_M,
+decode unchanged (MEASUREMENTS §Two weight rows). Check: `make check`; `sh tools/bench_kernels.sh`;
+`sh tools/mutate_row2.sh` (container); `build/trochilus generate -m <gguf> -p 512 -n 16`.

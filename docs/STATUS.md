@@ -285,11 +285,11 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
 
 ## Next steps
 
-**Night of 2026-09-24** (DONE, MEASUREMENTS §The gate, §Speed — again, §Q4_K on the CPU):
-- the gate 428 → 238 s; next: the native side beside the container (~35 s), `oracle-real` under
-  the smallest store (92 s);
+**Night of 2026-09-24** (DONE, MEASUREMENTS):
+- the gate 428 → 238 s (next: the native side beside the container, `oracle-real` under `min`);
 - **where we lose to llama.cpp** (same Q8_0, container): prefill **1.8×** at 16 threads, 1.5× at 8
-  (was 13×; what is left is mostly their int8 activations, our declared int8 mode (c)); decode
+  (was 13×; mostly their int8 activations, mode (c)), **~1.5× since two weight rows per input load**
+  (`dot_row2_x4`: prefill 1.20–1.26× Q8_0, 1.11× Q4_K_M; not raced again); decode
   **1.16×** at 16 threads and 1.26× at 8 at context 2048, 1.04–1.09× at 512. **At 2048 the whole
   gap is the KV's bytes** (profile by zone, MEASUREMENTS §Decode at context 2048): every zone reads
   memory at 38–51 GB/s, and our F32 KV is 518 MiB per token against llama.cpp's F16 259; halving it
@@ -297,11 +297,11 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
   Marcello's call;
 - **M2: Q4_K and Q6_K**, exact against their own dequantized weights (gguf-py bit for bit, the cuts
   against transformers in `make check`). Per element against Q8_0: Q4_K AVX-512 0.84–0.90×, AVX2
-  0.53–0.63× (a lookup there: rejected); Q6_K AVX-512 0.85×, AVX2 0.74–0.80× (a block's 256 quants
-  unpacked once, then Q8_0's path; 14 mutations of 14 red). Real models from our Q8_0
+  0.53–0.63× (a lookup there: rejected); Q6_K AVX-512 0.85×, AVX2 0.85× (256 quants unpacked once,
+  then Q8_0's path; 14 mutations of 14 red). Real models from our Q8_0
   (`tools/quantize_q4k.sh [m]`): Q4_K **decode 1.5× the Q8_0**; **Q4_K_M** (Q6_K in 17 tensors) runs,
-  decode 0.93× the Q4_K, prefill the same, llama.cpp's decode on it 1.09× ours. Next in M2: the
-  prefill in float with a row dequantized once per tile; and M1 with Q4_K experts (half the disk).
+  decode 0.93× the Q4_K, prefill the same, llama.cpp's decode on it 1.09× ours. A row decoded once per tile:
+  rejected (decoding does not bound the matmul). Next: two rows on AVX2, M1 with Q4_K experts.
 
 **Review (Opus 5.5, 2026-09-22 and 23)**: reader, expert store, pool, platform, profiler, model
 (`olmoe.c`), kernels, tokenizer and command line read, every file through `tools/mutate_auto.py`
@@ -390,7 +390,7 @@ software, question 41) and untouched: factory state of target PCs, M1 designed o
   4. **file reordering for co-activation** (mbolt, MIT): ≤ 1.15× on this disk with these
      experts, costs our format. Later.
 - **Then**: questions 42 (layer 0), 43 (from which disk up prefetch pays), 46 (fixed cost of decode).
-  Three matrices in one read: **no**, in GGUF three tensors are separate (docs/ORIGINS.md
+  Three matrices in one read: **no**, three separate GGUF tensors (docs/ORIGINS.md
   §The expert store).
 
 - **Question 44, closed 2026-09-20** (`docs/MEASUREMENTS.md` §Is code behavior a small,

@@ -2496,7 +2496,8 @@ of 200 ms; one core; rows in cache). Millions of elements per second, n = 2048 /
 | avx512 | 21399 / 21711 | 17336 / 17902 | 18130 / 18527 | **0.85** | 44234 / 37448 | 37455 / 36934 | 39342 / 37436 | **0.89–1.00** |
 
 Spread under 1.2% on the AVX-512 lines, 19–56% on AVX2's (a ratio there holds to ±20%). Against the
-prediction: AVX-512 in the range (0.85–1.0), AVX2 a little below it on the single row (0.74–0.80:
+prediction: AVX-512 in the range (0.85–1.0), AVX2 a little below it on the single row (0.74–0.80,
+**noise: remeasured 0.84–0.86**, §Two weight rows, LESSONS #150;
 the 256-byte unpack, stored and reloaded, weighs on a row that has only one input to spread it
 over; on x4 it is spread over four, 0.88–0.96), scalar below it (0.30–0.33: the bit picking per
 element costs more than guessed; scalar is the definition, not a path any x86-64 CPU runs). Q6_K is
@@ -2527,6 +2528,64 @@ Tokens/s, series a / b; `build/race_q4km/`.
 - prefill 0.97–0.99× at 16 threads, 1.00–1.02× at 8: the same, as predicted;
 - against llama.cpp on the same Q4_K_M: their decode 1.09–1.10× ours at 16 threads, 1.11–1.16× at 8
   (on the Q4_K it was 1.07× and 1.17×), their prefill 2.0× and 1.7× (their 8-bit activations).
+
+## Two weight rows at a time in the prefill's matmul (2026-09-24)
+
+Marcello asked to measure again, reread the code and look for optimizations. What came out:
+
+**The kernels measured again** (`sh tools/bench_kernels.sh`, second series, same rules; declared
+load 2.5 before and 3.0 after): every AVX-512 line within 3% of the first series (the A/A). The
+AVX2 dot_row lines of the first series were noise (spread 19–56%, now ≤ 2%): **Q6_K on AVX2 is
+0.84–0.86× Q8_0 on the single row** (17089 / 17476 against 20142 / 20416 M elements/s), not
+0.74–0.80×; x4 0.86–0.97×.
+
+**The whole matrix** (new lines of `bench_kernels`: 1024 × 2048, 64 tokens through `tr_matmul`,
+ms per token): Q8_0 0.0626, Q4_K 0.0629, Q6_K 0.0618 on one core. Three kernels 0.85–1.0× apart
+in the microbenchmark cost the same in the matmul: decoding the weights is not what bounds the
+prefill's matmul. What does: each `dot_row_x4` loads its four input rows (32 KB at 2048 columns)
+for one weight row, 5 vector loads per 16 elements for 4 products each; the input comes from L2.
+
+- **Rejected without building: a row decoded once per tile, then the F32 x4 kernel.** The F32 x4
+  kernel itself (a new line of the microbenchmark) runs at 44779 / 33135 M/s at n = 2048 / 4096,
+  Q8_0's x4 at 43926 / 36771: the decoding saved is worth nothing where the loads bound.
+- **Kept: the sixteen Q6_K scales in SIMD** (one widen, convert and multiply instead of sixteen
+  scalar ones; the same single rounding). Whole matrix, Q6_K on one core: 0.0551 → 0.0523 ms per
+  token on the two-row path below, 0.0602 → 0.0590 on x4; Q8_0, untouched, the same 0.0491 in both
+  sessions (the control).
+- **Kept: two weight rows against the same four input rows** (`dot_row2_x4`, AVX-512, Q8_0, Q4_K,
+  Q6_K; `tr_matmul` takes rows in pairs): each input vector loaded once for eight products, each
+  sum still its own `dot_row` bit for bit. A/B in the container, the same binary with the kernel
+  on and off (a switch that existed only for this measurement), order on off off on twice, marker
+  held, declared load 2.7 before and 2.6 after; medians of 4, ms per token (the session before,
+  without the SIMD scales, gave Q8_0 1.23× and 1.26×):
+
+  | type | 1 core off | 1 core on | ratio | 16 cores off | 16 cores on | ratio |
+  |---|---|---|---|---|---|---|
+  | Q8_0 | 0.0607 | 0.0491 | **1.24×** | 0.0084 | 0.0065 | **1.29×** |
+  | Q6_K | 0.0590 | 0.0523 | 1.13× | 0.0084 | 0.0071 | 1.18× |
+  | Q4_K | 0.0625 | 0.0606 | 1.03× | 0.0081 | 0.0075 | 1.08× |
+
+  Q4_K gains least: its 16-value lookup costs a permute per 16 weights of each row, and with two
+  rows the permutes, not the loads, are what is left.
+
+**Prediction for the engine, written before measuring.** The matmuls are ~85% of the prefill
+(§Decode at context 2048, prefill zones); Q8_0 prefill 1.15–1.22× at 16 threads, Q4_K_M
+1.04–1.08×; decode unchanged (one token takes `dot_row`).
+
+**The engine** (`tools/ab_modes.sh 6`, in the container, `generate -p 512 -n 16 -t 16`, the new
+binary against the one of commit e113d4f built in a worktree, the new one twice as A/A, first
+mode rotating; marker held, declared load 2.6 before and 2.5 after; `build/ab_row2_engine/`):
+
+| model | prefill new / new (A/A) | prefill old | ratio | decode new / old |
+|---|---|---|---|---|
+| Q8_0 | 252.9 / 241.3 tok/s | 200.6 | **1.20–1.26×** | 30.75 / 30.70 |
+| Q4_K_M | 236.7 / 233.8 | 211.0 | **1.11–1.12×** | 41.9 / 41.4 |
+
+Q8_0 at the top of the prediction, Q4_K_M above it (its Q6_K tensors, `ffn_down` of half the
+layers and the output, gain 1.18×); decode the same, as predicted. Against llama.cpp's Q8_0 prefill
+(415.8 at 16 threads in the container, §Speed — again) the gap goes from 1.8× to ~1.5× (not raced
+again). Open: the same kernel on AVX2 (16 registers: eight accumulators leave no room, it would take
+the lanes in two passes), and four rows at a time on AVX-512.
 
 ## Decode at context 2048: where the gap with llama.cpp is (2026-09-24)
 
@@ -2586,3 +2645,6 @@ the KV is ~43% of the decode at 2048 and the same lever gives ~1.25×.
 | 2026-09-19 | stimatore della larghezza del decode riscritto (domanda 31, LESSONS #88): margine dal rumore misurato nelle passate stesse (non più un tetto fisso), scelta a coppie (mai il rumore di una terza larghezza), estensione fino a `TR_DECODE_TUNE_ROUNDS_MAX` sui due contendenti, nuova misura ad ogni classe di contesto e dopo `TR_DECODE_TUNE_REMEASURE_KEPT` passate mantenute con un cambio in sospeso, isteresi a due voti prima di cambiare scelta | — | — | — | test C verdi (`tests/test_phase.c`, `tools/mutate_tune.sh`); **da validare sul modello vero**, di notte a macchina tranquilla: nessun numero ancora |
 | 2026-09-24 | `dot_row q4_k` AVX-512: i 16 valori di un sotto-blocco calcolati una volta, `vpermps` sul nibble; bit-identico | Q8_0 15 970-17 479 M el/s | Q4_K 13 456-15 685 M el/s (0.84-0.90x per elemento, ~1.6x per byte) | 5-30% | tenuto: attivo sulle CPU AVX-512; decode del modello vero 1.5x il Q8_0 |
 | 2026-09-24 | `dot_row q4_k` AVX2 con la stessa tabella (due `vpermps` da 8 + `blendv`) contro la conversione | riga 11 390-11 946, x4 27 650-28 884 M el/s | riga 11 548-12 216 (+0.5-1.5%), x4 26 616-27 914 (-3.5%) | ~1% A/A | respinto: pari o peggio su Zen 4; resta la conversione |
+| 2026-09-24 | `dot_row2_x4` AVX-512 (two weight rows against four input rows, eight accumulators; Q8_0, Q4_K, Q6_K), bit-identical; `tr_matmul` takes rows in pairs | whole matrix 1024x2048, 64 tokens: Q8_0 0.0607 / 0.0084 ms per token (1 / 16 cores); engine prefill Q8_0 200.6, Q4_K_M 211.0 tok/s | 0.0491 / 0.0065; prefill 252.9 / 241.3 and 236.7 / 233.8 | A/A 4.6% and 1.2% | kept: prefill 1.20-1.26x (Q8_0), 1.11-1.12x (Q4_K_M), decode unchanged |
+| 2026-09-24 | the sixteen Q6_K scales in SIMD instead of scalar (same single rounding) | whole matrix Q6_K, 1 core: 0.0551 (two rows) / 0.0602 (x4) ms per token | 0.0523 / 0.0590 | control Q8_0 0.0491 in both sessions | kept |
+| 2026-09-24 | a row decoded once per tile of 16 tokens, then the F32 x4 kernel (not built: measured the F32 x4 kernel alone) | Q8_0 x4 43 926 / 36 771 M/s (n 2048 / 4096) | F32 x4 44 779 / 33 135 | 3% | rejected: the matmul is bound by loading the input rows, not by decoding the weights |

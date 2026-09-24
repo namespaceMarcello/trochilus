@@ -377,11 +377,25 @@ static void fill_f16(unsigned char *row, int64_t n, unsigned *seed, int special)
     }
 }
 
+/* Two rows against the same four input rows: each sum the scalar x4 of its own row, bit for bit
+ * (the scalar table has no dot_row2_x4: two dot_row_x4 are its definition). */
+static void row2_diffs(const tr_kernels *K, const tr_kernels *S, tr_type type, const unsigned char *r0,
+                       const unsigned char *r1, const float *x, int64_t n, int *bad) {
+    float o[2 * TR_DOT_TOKENS], s0[TR_DOT_TOKENS], s1[TR_DOT_TOKENS];
+    K->dot_row2_x4[type](r0, r1, x, n + 3, n, o);
+    S->dot_row_x4[type](r0, x, n + 3, n, s0);
+    S->dot_row_x4[type](r1, x, n + 3, n, s1);
+    for (int t = 0; t < TR_DOT_TOKENS; t++) {
+        if (!same_float(o[t], s0[t])) (*bad)++;
+        if (!same_float(o[TR_DOT_TOKENS + t], s1[t])) (*bad)++;
+    }
+}
+
 /* Runs K and S on the same inputs; counts the calls whose results differ. */
 static void count_diffs(const tr_kernels *K, const tr_kernels *S, unsigned seed, int *bad_dot, int *bad_row,
                         int *bad_axpy, int *bad_x4) {
     static float a[CMP_MAX_N], b[CMP_MAX_N], yk[CMP_MAX_N], ys[CMP_MAX_N], y4[CMP_MAX_N];
-    static unsigned char row[(4096 / 32) * 34], hrow[2 * CMP_MAX_N];
+    static unsigned char row[(4096 / 32) * 34], row2[(4096 / 32) * 34], hrow[2 * CMP_MAX_N];
     static const int64_t big[] = {255, 256, 257, 1000, 2048, 4096};
 
     *bad_dot = *bad_row = *bad_axpy = *bad_x4 = 0;
@@ -458,6 +472,10 @@ static void count_diffs(const tr_kernels *K, const tr_kernels *S, unsigned seed,
             if (!same_float(K->dot_row[TR_TYPE_Q8_0](row, b, n), S->dot_row[TR_TYPE_Q8_0](row, b, n))) (*bad_row)++;
             /* the same row against 4 consecutive input rows: same as the tier's own
              * dot_row on each of them, and as scalar's (4 * n floats must fit in b) */
+            if (K->dot_row2_x4[TR_TYPE_Q8_0] != NULL && 4 * (n + 3) <= CMP_MAX_N) {
+                fill_q8_0(row2, nb, &seed, round % 2);
+                row2_diffs(K, S, TR_TYPE_Q8_0, row, row2, b, n, bad_row);
+            }
             if (K->dot_row_x4[TR_TYPE_Q8_0] != NULL && 4 * n <= CMP_MAX_N) {
                 float xk[TR_DOT_TOKENS], xs[TR_DOT_TOKENS];
                 K->dot_row_x4[TR_TYPE_Q8_0](row, b, n, n, xk);
@@ -473,6 +491,10 @@ static void count_diffs(const tr_kernels *K, const tr_kernels *S, unsigned seed,
             fill_q4_k(row, nb, &seed, round % 2);
             int64_t n = nb * 256;
             if (!same_float(K->dot_row[TR_TYPE_Q4_K](row, b, n), S->dot_row[TR_TYPE_Q4_K](row, b, n))) (*bad_row)++;
+            if (K->dot_row2_x4[TR_TYPE_Q4_K] != NULL && 4 * (n + 3) <= CMP_MAX_N) {
+                fill_q4_k(row2, nb, &seed, round % 2);
+                row2_diffs(K, S, TR_TYPE_Q4_K, row, row2, b, n, bad_row);
+            }
             if (K->dot_row_x4[TR_TYPE_Q4_K] != NULL && 4 * n <= CMP_MAX_N) {
                 float xk[TR_DOT_TOKENS], xs[TR_DOT_TOKENS];
                 K->dot_row_x4[TR_TYPE_Q4_K](row, b, n, n, xk);
@@ -488,6 +510,10 @@ static void count_diffs(const tr_kernels *K, const tr_kernels *S, unsigned seed,
             fill_q6_k(row, nb, &seed, round % 2);
             int64_t n = nb * 256;
             if (!same_float(K->dot_row[TR_TYPE_Q6_K](row, b, n), S->dot_row[TR_TYPE_Q6_K](row, b, n))) (*bad_row)++;
+            if (K->dot_row2_x4[TR_TYPE_Q6_K] != NULL && 4 * (n + 3) <= CMP_MAX_N) {
+                fill_q6_k(row2, nb, &seed, round % 2);
+                row2_diffs(K, S, TR_TYPE_Q6_K, row, row2, b, n, bad_row);
+            }
             if (K->dot_row_x4[TR_TYPE_Q6_K] != NULL && 4 * n <= CMP_MAX_N) {
                 float xk[TR_DOT_TOKENS], xs[TR_DOT_TOKENS];
                 K->dot_row_x4[TR_TYPE_Q6_K](row, b, n, n, xk);
@@ -534,6 +560,19 @@ static float wrong_dot_row_q6_k(const void *row, const float *x, int64_t n) {
     tr_kernels_tier("scalar")->dequant_row[TR_TYPE_Q6_K](row, w, n);
     return wrong_dot_f32(w, x, n);
 }
+
+/* Two rows, each through the wrong dot of its type: count_diffs must see a wrong dot_row2_x4 */
+#define WRONG_ROW2(name) \
+    static void wrong_row2_##name(const void *r0, const void *r1, const float *x, int64_t stride, int64_t n, \
+                                  float *out) { \
+        for (int t = 0; t < TR_DOT_TOKENS; t++) { \
+            out[t] = wrong_dot_row_##name(r0, x + t * stride, n); \
+            out[TR_DOT_TOKENS + t] = wrong_dot_row_##name(r1, x + t * stride, n); \
+        } \
+    }
+WRONG_ROW2(q8_0)
+WRONG_ROW2(q4_k)
+WRONG_ROW2(q6_k)
 
 static float wrong_dot_row_f16(const void *row, const float *x, int64_t n) {
     static float w[CMP_MAX_N];
@@ -593,6 +632,18 @@ static void test_tiers_match_scalar(void) {
     count_diffs(&wrong, S, 7u, &bad_dot, &bad_row, &bad_axpy, &bad_x4);
     TR_CHECK_EQ_INT(bad_dot + bad_axpy + bad_x4, 0);
     TR_CHECK(bad_row > 0);
+    /* and a wrong two-row kernel of each quantized type alone: the scalar table has none, so
+     * these are the only calls of dot_row2_x4 the wrong table makes */
+    void (*const wrong_row2[3])(const void *, const void *, const float *, int64_t, int64_t, float *) = {
+        wrong_row2_q8_0, wrong_row2_q4_k, wrong_row2_q6_k};
+    static const tr_type row2_types[3] = {TR_TYPE_Q8_0, TR_TYPE_Q4_K, TR_TYPE_Q6_K};
+    for (int i = 0; i < 3; i++) {
+        wrong = *S;
+        wrong.dot_row2_x4[row2_types[i]] = wrong_row2[i];
+        count_diffs(&wrong, S, 7u, &bad_dot, &bad_row, &bad_axpy, &bad_x4);
+        TR_CHECK_EQ_INT(bad_dot + bad_axpy + bad_x4, 0);
+        TR_CHECK(bad_row > 0);
+    }
 
     for (size_t t = 0; t < sizeof tiers / sizeof tiers[0]; t++) {
         const tr_kernels *K = tr_kernels_tier(tiers[t]);
@@ -607,7 +658,7 @@ static void test_tiers_match_scalar(void) {
         TR_CHECK_EQ_INT(bad_row, 0);
         TR_CHECK_EQ_INT(bad_axpy, 0);
         TR_CHECK_EQ_INT(bad_x4, 0);
-        printf("  tier %-8s dot_f32, axpy_f32, their x4, dot_row and dot_row_x4 of f32, f16, q8_0, q4_k and q6_k %s\n", K->tier,
+        printf("  tier %-8s dot_f32, axpy_f32, their x4, dot_row, dot_row_x4 and dot_row2_x4 of f32, f16, q8_0, q4_k and q6_k %s\n", K->tier,
                bad_dot == 0 && bad_row == 0 && bad_axpy == 0 && bad_x4 == 0 ? "identical to scalar"
                                                                             : "DIFFER from scalar");
     }

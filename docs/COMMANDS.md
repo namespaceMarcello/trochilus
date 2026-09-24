@@ -42,13 +42,14 @@ sh tools/test_ab_modes.sh   # ab_modes stops on a run that measured nothing, wit
 sh tools/mutate_bar.sh   # in container: the progress bar's mutations (physics, render, decision, clearing, the load's progress), about 6 min
 sh tools/mutate_prefetch.sh   # in container: the read ahead's mutations (store, thread API, prompt), gcc and ASan
 sh tools/mutate_q6k.sh   # in container: Q6_K's 14 mutations (scalar, unpack, AVX2, AVX-512, tables, engine, reader), all red; about 5 min
+sh tools/mutate_row2.sh   # in container: the two-row kernel's 11 mutations (kernels, SIMD scales, table, tr_matmul's pairs), all red; about 5 min
 SET=prefetch sh tools/prefill_overlap.sh [rounds]   # native: the prompt at half budget with and without reading the next layer ahead (TR_PREFETCH=0), 512 and 2048, A/A
 TR_BAR=0 build/trochilus run ...   # no progress bar while the model loads (it is drawn only when stderr is a terminal, and not with NO_COLOR or TERM=dumb)
 sh tools/busy_machine.sh <n> <command>   # the ONLY way to load the machine: generators die with the script
 sh tools/machine_still.sh [limit] [wait] [window]   # occupied processors (who: tools/background_load.ps1): guard for every measurement
 sh tools/test_cleanup.sh   # a stopped script loses its children; without cleanup.lib trap the child stays
 make bench               # microbenchmark of kernels (median + noise)
-sh tools/bench_kernels.sh   # the same by the native rules (marker, still machine, load declared), a one-byte-longer copy; CONTAINER=1 in trochilus-dev; build/bench_kernels/
+sh tools/bench_kernels.sh   # the same by the native rules (marker, still machine, load declared), a one-byte-longer copy; CONTAINER=1 in trochilus-dev; build/bench_kernels/; lines above 10% spread named in noisy.txt; bench_kernels --matrix: the whole-matrix tables only
 make bench-mem           # RAM bandwidth (sequential, sparse), engine matmul, attention on both layouts
 make bench-disk          # disk for who reads experts, no system cache (DISK_FILE=<file>)
 build/trochilus run ... --route-trace <file>   # routing trace: experts picked and predicted

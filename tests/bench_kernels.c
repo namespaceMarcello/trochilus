@@ -502,13 +502,14 @@ static void measure_dispatch(tr_pool *pool, int runs, int calls, double *us_medi
 }
 
 int main(int argc, char **argv) {
-    int runs = 7, threads = 0;
+    int runs = 7, threads = 0, only_matrix = 0;
     double run_ms = 150;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--runs") == 0 && i + 1 < argc) runs = atoi(argv[++i]);
         else if (strcmp(argv[i], "--ms") == 0 && i + 1 < argc) run_ms = atof(argv[++i]);
         else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) threads = atoi(argv[++i]);
-        else { fprintf(stderr, "usage: bench_kernels [--runs N] [--ms M] [--threads T]\n"); return 2; }
+        else if (strcmp(argv[i], "--matrix") == 0) only_matrix = 1;
+        else { fprintf(stderr, "usage: bench_kernels [--runs N] [--ms M] [--threads T] [--matrix]\n"); return 2; }
     }
     if (runs < 3) runs = 3;
     if (runs > MAX_RUNS) runs = MAX_RUNS;
@@ -533,6 +534,7 @@ int main(int argc, char **argv) {
     uint8_t *row = tr_alloc_aligned((size_t)max_n * 4, 64);
     if (!a || !x || !row) { fprintf(stderr, "out of memory\n"); return 1; }
     for (int64_t i = 0; i < max_n; i++) { a[i] = frand(); x[i] = frand(); }
+    if (only_matrix) goto matrix;   /* --matrix: the whole-matrix tables only */
 
     printf("%-12s %-14s %6s %12s %12s %8s\n", "tier", "kernel", "n", "ns/call", "M elem/s", "spread");
     for (size_t t = 0; t < sizeof tiers / sizeof tiers[0]; t++) {
@@ -561,7 +563,7 @@ int main(int argc, char **argv) {
     for (int64_t i = 0; i < max_n * TR_DOT_TOKENS; i++) x4[i] = frand();
     static const struct { const char *name; tr_type type; } kinds4[] = {
         {"dot_row q8_0 x4", TR_TYPE_Q8_0}, {"dot_row q4_k x4", TR_TYPE_Q4_K},
-        {"dot_row q6_k x4", TR_TYPE_Q6_K},
+        {"dot_row q6_k x4", TR_TYPE_Q6_K}, {"dot_row f32 x4", TR_TYPE_F32},
     };
     for (size_t t = 0; t < sizeof tiers / sizeof tiers[0]; t++) {
         const tr_kernels *k = tr_kernels_tier(tiers[t]);
@@ -674,6 +676,7 @@ int main(int argc, char **argv) {
     }
 #endif
 
+matrix:;
     /* One whole matrix through tr_matmul with the active tier: 1024 x 2048 q8_0,
      * the shape of an OLMoE expert projection. */
     int64_t rows = 1024, cols = 2048;
@@ -708,6 +711,28 @@ int main(int argc, char **argv) {
                s2 * 100.0, msb / (double)bench_tokens, s3 * 100.0);
         tr_pool_destroy(pool);
     }
+
+    /* The same shape in every quantized type, the prefill's block path (64 tokens): ms per
+     * token of the whole matrix, on one core and on every physical core. */
+    printf("\n%-8s %-6s %25s %7s\n", "threads", "type", "1024x2048 64 tokens/tok", "spread");
+    static const tr_type mtypes[] = {TR_TYPE_Q8_0, TR_TYPE_Q4_K, TR_TYPE_Q6_K};
+    uint8_t *wq = tr_alloc_aligned(tr_row_bytes(TR_TYPE_Q8_0, cols) * (size_t)rows, 64);
+    if (!wq) { fprintf(stderr, "out of memory\n"); return 1; }
+    int mcounts[2] = {1, n_phys};
+    for (int c = 0; c < 2; c++) {
+        tr_pool *pool = tr_pool_create(mcounts[c]);
+        for (size_t t = 0; t < sizeof mtypes / sizeof mtypes[0]; t++) {
+            size_t rbt = tr_row_bytes(mtypes[t], cols);
+            for (int64_t r = 0; r < rows; r++) fill_row(mtypes[t], wq + rbt * (size_t)r, cols);
+            mat_job mt = {{mtypes[t], rows, cols, wq}, xb, yb};
+            double msb, s3;
+            measure_matmul(pool, &mt, runs, 5, bench_tokens, &msb, &s3);
+            printf("%-8d %-6s %22.4f ms %6.1f%%\n", mcounts[c], tr_type_get((uint32_t)mtypes[t])->name,
+                   msb / (double)bench_tokens, s3 * 100.0);
+        }
+        tr_pool_destroy(pool);
+    }
+    tr_free_aligned(wq);
 
     tr_free_aligned(a); tr_free_aligned(x); tr_free_aligned(row); tr_free_aligned(w); tr_free_aligned(y);
     tr_free_aligned(xb); tr_free_aligned(yb);
