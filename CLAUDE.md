@@ -35,6 +35,12 @@ next. Pioneer: what nobody has measured is where to look first.
   where). Then one line per item, no jargon (or a gloss in two words), at most 2–3 numbers, ≤ ~10
   lines. Two points: what was done, how to try it. The why and the detail go in `docs/STATUS.md`.
 - Logic and kernels: choose, build, deliver. Questions are asked up front, not halfway through.
+- **One piece at a time, to the end, against the three references** (Marcello, 2026-09-24, asked
+  more than once): before building on a piece of the engine, read how colibri, ds4 and llama.cpp
+  (with ik_llama.cpp) do it in `ref/`, measure theirs against ours where it runs, write it in the
+  piece's row of `docs/ORIGINS.md` §Every piece against the references; then build something
+  better, measure, compare again. A piece closes only with its row read and measured; the next
+  piece starts after, never beside it.
 - **Marcello asks for the commit.** Prepare everything (tests green, documents written) and stop.
 - **Public repository** `namespaceMarcello/trochilus` (since 2026-09-22): everything committed is
   visible to anyone. Pushes and visibility are Marcello's call.
@@ -95,7 +101,8 @@ by" column): no mistake should reach Marcello if a test could have caught it fir
 | what has already been done | `docs/archive/DONE.md` |
 | the command to do something (benches, measurements, mutations, reports) | `docs/COMMANDS.md` |
 | where we stand, as a picture (milestones, dependencies, state) | `docs/status.json` → `tools/status_html.py` → artifact `6mx3NS4KtQrBFPRLkAYupr`; updated together with `docs/STATUS.md` |
-| how colibri or ds4 do something | `ref/colibri`, `ref/ds4` (read-only worktrees, commits in ORIGINS) |
+| how colibri, ds4, llama.cpp or ik_llama.cpp do something | `ref/colibri`, `ref/ds4`, `ref/llama.cpp`, `ref/ik_llama.cpp` (read-only, commits in ORIGINS) |
+| which piece has been read and measured against the three references, which is owed | `docs/ORIGINS.md` §Every piece against the references |
 
 ---
 

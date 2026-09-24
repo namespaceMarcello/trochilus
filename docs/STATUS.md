@@ -323,14 +323,14 @@ exactly and the five sections after it; LESSONS #152–#157):
   closed as no. **58**: the float-only exact exp in AVX-512 and AVX2, 0 of 2^32 differ, 4.8× / 4.4×
   `tr_expf` a value; the prefill ~1.02–1.03× (question 39's range): the GPU's reference, not wired;
 - **two rows against eight tokens, built** (`dot_row2_x8`, AVX-512, Q8_0/Q4_K/Q6_K, the same bits;
-  MEASUREMENTS §Two rows against eight tokens, LESSONS #165–#167): intrinsics were enough (no
-  spill); the lane tree in SIMD was a tenth of every two-row call. The matmul on a core 87 → 102
+  MEASUREMENTS §Two rows against eight tokens, LESSONS #165–#167): intrinsics were enough;
+  the lane tree in SIMD was a tenth of every two-row call. The matmul on a core 87 → 102
   GFLOP/s (61% of the no-FMA peak); **prefill 1.19× on Q8_0 and Q4_K_M at 16 threads, 1.30× on
-  Q4_K_M at 8** (container, load 3–4: the native `prefill_context.sh change` waits for 12 GiB free);
-- **next**, by these numbers: (1) the native confirmation, then the same for AVX2 (two rows, x8
-  needs 16 of its 16 ymm: measure the spill) and the one-row kernels' lane tree; (2) M3: the dense weights on the GPU
-  (model 1.64× at 2048, 1.92× at 4000), then the Q4 whole on the GPU as 53's draft (~2× bytes);
-  (3) wiring 58's SIMD exp if Marcello reopens 39 (~1.02–1.03×). **For Marcello, 59 and 60**: FMA
+  Q4_K_M at 8** (container, load 3–4; the native run waits for 12 GiB free);
+- **next, one piece at a time** (CLAUDE.md; ORIGINS §Every piece): (1) close piece 1, the prompt's CPU matmul: the native confirmation, then read
+  how llama.cpp, ik_llama.cpp, ds4 and colibri do it, race them, write the row, build better; (2)
+  then the next row with a debt. Queued after: M3's dense weights on the GPU (model 1.64× at 2048,
+  1.92× at 4000), two rows on AVX2, 58's SIMD exp if Marcello reopens 39. **For Marcello, 59 and 60**: FMA
   would give the 8-token stream 1.19× on this Zen 4 (MEASUREMENTS §The CPU's peak); 60 (an exact
   dot) is not measured. 61 after M4.
 

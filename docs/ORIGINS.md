@@ -157,6 +157,28 @@ ik_llama.cpp `f3d6e6e` (`ggml/src/iqk/iqk_gemm_kquants.cpp` `DequantizerQ6K`, AV
 | decoding the weights in SIMD | masks and shifts on bytes, int8 products | **the 6-bit values assembled on bytes, 32 at a time: low nibbles OR (high bits shifted into 0x30)** (`DequantizerQ6K::prepare`) | taken: a block's 256 quants assembled that way once, minus 32, into int8 on the stack; then Q8_0's path per element (widen, convert, multiply by the sub-block's scale) | the byte form makes 32 quants in ~5 instructions; a lookup like Q4_K's AVX-512 one does not pay here (64 values per 16 weights) |
 | several weight rows per activation load | `block_q4_Kx8`, `block_q8_0x8`: 8 rows interleaved at load, then a gemm over them | `Q4_K_R4` and friends: 4 rows interleaved | **our own, without repacking: `dot_row2_x4`** takes two rows of the file as they are against four input rows (eight float accumulators, AVX-512) | the same idea, register blocking over rows, where it pays for us: the prefill's matmul is bound by loading its inputs (MEASUREMENTS §Two weight rows, prefill 1.20–1.26× on Q8_0); no repack, so the expert store still reads the file's bytes |
 
+## Every piece against the references (2026-09-24)
+
+The method (CLAUDE.md, How to work): one piece at a time, to the end. Before building on a piece,
+its row is read in the three references (`ref/colibri`, `ref/ds4`, `ref/llama.cpp` with
+`ref/ik_llama.cpp`), theirs is measured against ours where it runs, and only then the better
+solution is built. "not read" means nobody here has read that code for that piece yet: it is the
+debt, and the next piece is the first row with one. Measured = a number in MEASUREMENTS.
+
+| # | Piece | colibri | ds4 | llama.cpp / ik_llama.cpp | Measured against ours | State |
+|---|---|---|---|---|---|---|
+| 1 | CPU matmul, the prompt (Q8_0, K-quants) | row × all tokens (read 09-17) | one row against 2 tokens in registers (read 09-17) | 16 × 16 blocks (read 09-17); int8 activations, the repacked layouts, llamafile's sgemm and ik's `iqk_mul_mat`: **not read** | llama.cpp's prefill 1.41× ours at 16 threads before x8 (race, 09-24); K-quant kernels per element | **debt**: x8 (09-24) was built from our own peak measurement, not from reading theirs first |
+| 2 | CPU matmul, the decode (one token, memory-bound) | not read | not read | not read | decode 1.00× at context 512, 1.12× at 2048 (race) | debt |
+| 3 | Attention, prompt and decode, and the KV layout | K and V of the batch, then (head, token) in parallel (read 09-17) | read 09-17 (optional variant) | not read | decode at 2048: the gap was the KV's bytes (F32 against F16) | partly read |
+| 4 | Softmax and exp | not read | not read | not read | ours correctly rounded, exhaustively proven | debt |
+| 5 | Thread pool, placement, widths per phase | physical cores (read) | persistent pool (read) | pinning calls (read) | prefill +30% with physical cores | read (09-17/18) |
+| 6 | MoE routing and grouping by expert | not read | counting sort by expert (read) | index map in `mul_mat_id` (read) | — | read, not measured against them |
+| 7 | Experts from disk: store, budget, read ahead | slots, `pread` (read 09-20) | not read | mmap, no budget: nothing to take | colibri not raced under a budget | partly read |
+| 8 | Speculation | n-gram draft (read) | not read | `examples/lookup` (read) | — | read, not measured against them |
+| 9 | Quantized formats (Q4_K, Q6_K, next Q2_K, IQ2) | — | — | ggml's and ik's kernels (read 09-24, this file §Q4_K, §Q6_K) | llama.cpp on our Q4_K: decode 1.07× ours, prefill 2.1× (int8 activations) | read and measured |
+| 10 | GPU: the decode's attention, then the dense weights, then the experts | not read | GPU execution model (noted 09-17, not read in detail) | CUDA backend: not read | none | **debt**, before M3's next piece |
+| 11 | GGUF reader and tokenizer | pretokenizer in C (read) | vocab from metadata (read) | type table (ported) | tokenizer 22 MB/s; not raced | read |
+
 ## Sources not yet studied (2026-09-24)
 
 Proposed by Marcello to improve and evolve Trochilus; my first read of each, from what they declare

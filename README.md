@@ -11,8 +11,9 @@ and the operating system's threads, nothing else. Kernels are chosen at runtime,
 serves every CPU; the experts live on disk when they don't fit in RAM; and the result is **exact
 to the token**, verified against `transformers` in the gate.
 
-> **Status: pre-alpha, under active development.** One model family works end to end (OLMoE);
-> milestone M1, experts streamed from disk, is in progress.
+> **Status: pre-alpha, under active development.** One model family works end to end (OLMoE), in
+> Q8_0, Q4_K and Q4_K_M; experts can be streamed from disk under a RAM budget (M1), and the
+> decode's attention runs on an NVIDIA GPU with the CPU's exact bytes (M3, first piece).
 >
 > **This README is a first iteration too.** It will be refined, adjusted and recalibrated as the
 > project grows — including cutting whatever turns out to be redundant here, or beside the point
@@ -47,10 +48,16 @@ to that:
 Working today, end to end:
 
 - **OLMoE-1B-7B** and any GGUF v3 file of the same family, loaded straight from Hugging Face with
-  no conversion step. F32, F16 and Q8_0 weights.
+  no conversion step. F32, F16, Q8_0, **Q4_K and Q6_K** weights (so the Q4_K_M files people
+  download), each exact against its own dequantized weights.
 - CPU kernels dispatched at runtime — scalar, AVX2, AVX-512, AVX-512+VNNI — each variant
   **bit-identical** to the scalar one, with a test that enforces it and another that proves the
-  tier you think is running is the one that ran.
+  tier you think is running is the one that ran. On AVX-512 the prompt's matrix products take two
+  weight rows against eight tokens at a time.
+- **The decode's attention on an NVIDIA GPU**, loaded at runtime (no CUDA toolkit needed to build
+  or run): the same bytes as the CPU, checked through the engine; without a GPU nothing changes.
+- `trochilus serve`, which keeps the model loaded between commands; `run`, `chat` and `generate`
+  go through it by themselves when it is there, with the same output byte for byte.
 - A byte-level BPE tokenizer built from the GGUF metadata, with NFC and Unicode classes: the same
   tokens as Hugging Face `tokenizers`, at 22 MB/s.
 - `run` (text in, greedy generation out) and `chat` (the model's own chat template, written in C
@@ -90,6 +97,14 @@ the ones that did not pay are written down too, in `docs/MEASUREMENTS.md`, with 
 | Attention in groups of 16 tokens, single-token work spread on the pool | prefill 1.11-1.14x at 4000 |
 | Our own `expf` in place of the C library's | prefill 1.29-1.31x at 4000, attention 2.3-2.6x shorter |
 | Layer-major prefill under a partial expert budget | 1.89x at 2048 tokens, 6 273 MiB read instead of 22 880 |
+| Disk reads of the next layer's experts overlapped with compute | prompt 1.22x at 2048 tokens, half budget |
+| The decode's attention on the GPU, same bytes | decode 1.31x at 2048 tokens, 1.54-1.58x at 4000 |
+| Two weight rows per load of the activations | prefill 1.20-1.26x (Q8_0) |
+| Two weight rows against eight tokens, the lane sums in SIMD | matmul 87 → 102 GFLOP/s on a core; prefill 1.19x (Q8_0, Q4_K_M; container, native run pending) |
+| Q4_K weights instead of Q8_0 | decode 1.5x |
+
+The context table above predates the GPU attention and the two-row kernels; it will be measured
+again as a whole.
 
 ### What we are proud of
 
@@ -124,17 +139,18 @@ no allocation, no strings, no I/O.
 | Milestone | Content | State |
 |---|---|---|
 | **M0** | base, GGUF v3, converter (F32/F16/Q8_0), CPU backend with runtime dispatch, OLMoE graph, greedy, CLI, tokenizer, chat template | **done** — exact against `transformers` on Windows and Linux; the real OLMoE-1B-7B answers |
-| **M1** | experts from disk under a RAM budget: slot store, O(1) LRU, on-demand unbuffered reads, automatic plan | **in progress** — the store, the budget and layer-major prefill are done and measured; what remains is the cost of the first prompt and overlapping disk with compute |
-| M2 | K-quants (Q4_K, Q6_K, Q2_K, IQ2_XXS) on CPU, assembly lab | next |
-| M3 | CUDA module, hot experts in VRAM, a plan over VRAM + RAM + disk | — |
+| **M1** | experts from disk under a RAM budget: slot store, O(1) LRU, on-demand unbuffered reads, automatic plan | **in progress** — the store, the budget, layer-major prefill and reads overlapped with compute are done and measured; what remains is the cost of the first prompt |
+| **M2** | K-quants (Q4_K, Q6_K, Q2_K, IQ2_XXS) on CPU, kernels to the hardware's limit | **in progress** — Q4_K and Q6_K done (Q4_K_M runs); the prompt's kernel at 61% of the CPU's peak |
+| **M3** | CUDA module, hot experts in VRAM, a plan over VRAM + RAM + disk | **in progress** — the decode's attention done, exact; the dense weights next |
 | M4 | a model of hundreds of gigabytes on the reference laptop | — |
-| M5 | KV checkpoints on disk, a server (OpenAI and Anthropic APIs), speculative decoding with a draft model | — |
+| M5 | KV checkpoints on disk, a server (OpenAI and Anthropic APIs), speculative decoding with a draft model | speculation from the prompt done; `serve` keeps the model loaded, no API yet |
 | M6 | Vulkan and Metal modules, so the GPU path is not only NVIDIA | — |
 
-The immediate steps, in order: finish M1 (make the first prompt cheap, then overlap disk reads
-with compute), bring in a second model family — Qwen3-Coder-30B-A3B, which makes long prompts and
-re-read files the thing to optimise — then K-quants, which is what puts 4-bit models within reach
-of a 16 GB machine.
+How we work, one piece of the engine at a time and to the end: first read how
+[colibri](https://github.com/JustVugg/colibri), [ds4](https://github.com/antirez/ds4) and
+[llama.cpp](https://github.com/ggml-org/llama.cpp) (with ik_llama.cpp) solve that piece, measure
+theirs against ours, then build something better and measure again. The table of every piece
+against the three is in `docs/ORIGINS.md`; the next piece is the first one still unread.
 
 We only climb a step when the one below is exact and measured: tiny OLMoE (done) →
 **OLMoE-1B-7B (here)** → Qwen3-Coder-30B-A3B → a MoE larger than RAM → a frontier-size MoE.
@@ -164,12 +180,14 @@ The honest list, so nobody has to find out by running it:
 - **One model family.** The OLMoE graph only. The tokenizer accepts the `olmo` pretokenizer
   family and refuses anything else — a family is admitted only after an oracle on its
   `tokenizer.json` — and there is one chat template.
-- **No GPU yet.** The backend interface is designed for it; no CUDA, Vulkan or Metal module
-  exists.
-- **F32, F16 and Q8_0 only.** No K-quants, so no 4-bit models yet.
+- **The GPU does one thing, on NVIDIA only.** The decode's attention runs there; the weights, the
+  prompt and the experts are still on the CPU, and there is no Vulkan or Metal module.
+- **Q4_K and Q6_K are the lowest formats.** No Q2_K or IQ2 yet, so no 2-bit models; AVX2 lacks the
+  two-row kernels AVX-512 has.
 - **arm64 detection exists, NEON kernels do not.** On ARM the engine would take the scalar path.
 - **Greedy only** — no sampling, no server, no API, nothing beyond the CLI.
-- **A model larger than RAM does not run yet**; the memory guard refuses it until M1 is finished.
+- **A model larger than RAM has not been run yet.** The experts stream from disk under a budget,
+  measured on a model that fits; the first one that does not fit is still ahead.
 - **Measured on one machine.** All the numbers above come from a single laptop. Hybrid P/E cores
   and multi-group Windows machines are handled in code and have never been tested on real
   hardware.
@@ -197,21 +215,23 @@ The engineering log lives in `docs/`:
 | `docs/STATUS.md` | where the project stands, the decisions taken, the next step |
 | `docs/MEASUREMENTS.md` | every measurement, including the optimisations that were rejected |
 | `docs/LESSONS.md` | every mistake and discovery, with the check that now prevents it |
-| `docs/ORIGINS.md` | where each borrowed idea or file comes from, commit by commit |
+| `docs/ORIGINS.md` | where each borrowed idea or file comes from, commit by commit; every piece of the engine against colibri, ds4 and llama.cpp |
 | `docs/COMMANDS.md` | the commands: benchmarks, measurements, mutations, reports |
 
 ## What we read
 
-Trochilus is written from scratch, but almost nothing in it was invented here. Three engines are
+Trochilus is written from scratch, but almost nothing in it was invented here. Four engines are
 pinned at a commit in `ref/` and read as primary sources; every idea taken from one of them is
 recorded in `docs/ORIGINS.md` with the file and function it came from, so that whoever improves
-that piece next knows where to look first.
+that piece next knows where to look first, and a table there says, piece by piece, which of them
+has been read and measured against ours and which is still owed.
 
 | Project | Some of what we learned from it |
 |---|---|
 | [colibri](https://github.com/JustVugg/colibri) — Apache-2.0 | threads on **physical** cores rather than logical ones; weights read with `pread` instead of `mmap`; the pretokenizer regex replayed in C over codepoints; oracles built on tiny generated models; a draft taken from the text already in the prompt; expert index → slot, one expert in one slot |
 | [ds4](https://github.com/antirez/ds4) — MIT | a persistent thread pool instead of OpenMP; the vocabulary read from GGUF metadata; (token, expert) pairs sorted by expert with a counting sort; one weight row against several tokens held in registers; the GGUF type table; the GPU execution model for later |
-| [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) — MIT | the prompt processed in passes of at most 512 tokens; a weight row against a block of tokens; the two system calls that pin a thread to a processor; truncating the cache index to undo a rejected draft |
+| [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) — MIT | the prompt processed in passes of at most 512 tokens; a weight row against a block of tokens; the two system calls that pin a thread to a processor; truncating the cache index to undo a rejected draft; the K-quant block layouts; the engine we race |
+| [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) — MIT | its K-quant CPU kernels (`iqk_gemm_kquants.cpp`), read before we wrote ours; its repacked row layouts, weighed and not taken yet |
 
 And the ones that are not engines: **`transformers`** and Hugging Face **`tokenizers`** are the
 definition of a correct result here — every oracle in the gate compares against them — and the
