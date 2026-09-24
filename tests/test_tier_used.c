@@ -78,6 +78,13 @@ static void test_table(void) {
                     missing++;
                 }
             }
+            /* and against eight tokens at a time */
+            for (size_t i = 0; i < sizeof row2 / sizeof row2[0]; i++) {
+                if (K->dot_row2_x8[row2[i]] == NULL) {
+                    printf("  tier avx512: dot_row2_x8 of weight type %d is missing\n", (int)row2[i]);
+                    missing++;
+                }
+            }
         }
         TR_CHECK(strcmp(K->tier, tiers[t]) == 0); /* asked for one tier, handed another */
         TR_CHECK(types >= 3); /* F32, F16, Q8_0 today: a loop over nothing proves nothing */
@@ -149,7 +156,7 @@ static void test_ops(void) {
 /* ---- the engine ------------------------------------------------------------------------- */
 
 static const tr_kernels *g_real;                                       /* the tier under the counters */
-static atomic_ullong n_row[TR_TYPE_COUNT], n_x4[TR_TYPE_COUNT], n_r2[TR_TYPE_COUNT]; /* calls, by weight type */
+static atomic_ullong n_row[TR_TYPE_COUNT], n_x4[TR_TYPE_COUNT], n_r2[TR_TYPE_COUNT], n_r8[TR_TYPE_COUNT]; /* calls, by type */
 static atomic_ullong n_dot_x4, n_axpy_x4;
 
 #define COUNTED(type, name) \
@@ -164,6 +171,10 @@ static atomic_ullong n_dot_x4, n_axpy_x4;
     static void r2_##name(const void *row0, const void *row1, const float *x, int64_t stride, int64_t n, float *out) { \
         atomic_fetch_add(&n_r2[type], 1); \
         g_real->dot_row2_x4[type](row0, row1, x, stride, n, out); \
+    } \
+    static void r8_##name(const void *row0, const void *row1, const float *x, int64_t stride, int64_t n, float *out) { \
+        atomic_fetch_add(&n_r8[type], 1); \
+        g_real->dot_row2_x8[type](row0, row1, x, stride, n, out); \
     }
 COUNTED(TR_TYPE_F32, f32)
 COUNTED(TR_TYPE_F16, f16)
@@ -183,7 +194,9 @@ static void counted_axpy_f32_x4(float *y, const float *x, int64_t stride, const 
 
 /* 2 layers, n_embd 64, 4 heads (2 kv), n_ff 64, 8 experts (3 used), vocab 48, context 32 */
 enum { LAYERS = 2, N_EMBD = 64, N_HEAD = 4, N_HEAD_KV = 2, N_FF = 64, N_EXPERT = 8, N_USED = 3, VOCAB = 48, CTX = 32 };
-enum { N_PROMPT = 11, N_SINGLE = 2 }; /* a pass of 11 tokens (x4 and a tail of 3), then one token a pass */
+/* a pass of 29 tokens (three threads' chunks of ~9.7 whole tokens: 8 at a time, then fewer), then
+ * one token a pass */
+enum { N_PROMPT = 29, N_SINGLE = 2 };
 
 static void test_engine(const char *argv0, tr_type type, const char *name, long long n_embd, long long n_ff) {
     static tr_kernels counting;
@@ -204,12 +217,18 @@ static void test_engine(const char *argv0, tr_type type, const char *name, long 
     if (g_real->dot_row2_x4[TR_TYPE_Q8_0] != NULL) counting.dot_row2_x4[TR_TYPE_Q8_0] = r2_q8_0;
     if (g_real->dot_row2_x4[TR_TYPE_Q4_K] != NULL) counting.dot_row2_x4[TR_TYPE_Q4_K] = r2_q4_k;
     if (g_real->dot_row2_x4[TR_TYPE_Q6_K] != NULL) counting.dot_row2_x4[TR_TYPE_Q6_K] = r2_q6_k;
+    if (g_real->dot_row2_x8[TR_TYPE_F32] != NULL) counting.dot_row2_x8[TR_TYPE_F32] = r8_f32;
+    if (g_real->dot_row2_x8[TR_TYPE_F16] != NULL) counting.dot_row2_x8[TR_TYPE_F16] = r8_f16;
+    if (g_real->dot_row2_x8[TR_TYPE_Q8_0] != NULL) counting.dot_row2_x8[TR_TYPE_Q8_0] = r8_q8_0;
+    if (g_real->dot_row2_x8[TR_TYPE_Q4_K] != NULL) counting.dot_row2_x8[TR_TYPE_Q4_K] = r8_q4_k;
+    if (g_real->dot_row2_x8[TR_TYPE_Q6_K] != NULL) counting.dot_row2_x8[TR_TYPE_Q6_K] = r8_q6_k;
     counting.dot_f32_x4 = counted_dot_f32_x4;
     counting.axpy_f32_x4 = counted_axpy_f32_x4;
     for (int i = 0; i < TR_TYPE_COUNT; i++) {
         atomic_store(&n_row[i], 0);
         atomic_store(&n_x4[i], 0);
         atomic_store(&n_r2[i], 0);
+        atomic_store(&n_r8[i], 0);
     }
     atomic_store(&n_dot_x4, 0);
     atomic_store(&n_axpy_x4, 0);
@@ -240,13 +259,17 @@ static void test_engine(const char *argv0, tr_type type, const char *name, long 
         for (int i = 0; i < TR_TYPE_COUNT; i++) {
             long long want = (i == (int)type ? of_type : 0) + (i == TR_TYPE_F32 ? of_router : 0);
             long long got = (long long)atomic_load(&n_row[i]) + 4 * (long long)atomic_load(&n_x4[i]) +
-                            8 * (long long)atomic_load(&n_r2[i]);
+                            8 * (long long)atomic_load(&n_r2[i]) + 16 * (long long)atomic_load(&n_r8[i]);
             TR_CHECK_EQ_INT(got, want);
             if (got != want) printf("  %s model, weight type %d: %lld products through the active table, %lld wanted\n",
                                     name, i, got, want);
         }
         /* a pass of 11 tokens must take the widest road the tier has (two rows at once, else x4),
          * and so must attention; every matrix of these models has an even number of rows */
+        if (g_real->dot_row2_x8[type] != NULL) TR_CHECK(atomic_load(&n_r8[type]) > 0);
+        printf("  %-5s model: %llu calls of 2 rows x 8 tokens, %llu of 2 x 4, %llu of 1 x 4, %llu dots\n", name,
+               (unsigned long long)atomic_load(&n_r8[type]), (unsigned long long)atomic_load(&n_r2[type]),
+               (unsigned long long)atomic_load(&n_x4[type]), (unsigned long long)atomic_load(&n_row[type]));
         if (g_real->dot_row2_x4[type] != NULL) {
             TR_CHECK(atomic_load(&n_r2[type]) > 0);
             TR_CHECK_EQ_INT(atomic_load(&n_x4[type]), 0); /* no pair of rows left to the one-row road */

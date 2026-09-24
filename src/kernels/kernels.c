@@ -345,6 +345,7 @@ typedef struct {
     float (*dot_row)(const void *row, const float *x, int64_t n);
     void (*dot_row_x4)(const void *row, const float *x, int64_t stride, int64_t n, float *out);
     void (*dot_row2_x4)(const void *row0, const void *row1, const float *x, int64_t stride, int64_t n, float *out);
+    void (*dot_row2_x8)(const void *row0, const void *row1, const float *x, int64_t stride, int64_t n, float *out);
     size_t row_bytes;
 } matmul_ctx;
 
@@ -382,12 +383,22 @@ static void matmul_tiled(const matmul_ctx *c, int64_t p0, int64_t p1) {
             int64_t b_end = b + TR_MATMUL_TILE < run_end ? b + TR_MATMUL_TILE : run_end;
             int64_t r = 0;
             /* two rows at a time where the tier has the kernel: each input element loaded once
-             * for both; the tokens past the last whole group go one dot at a time */
+             * for both; eight tokens a call where it has that one too, then four; the tokens past
+             * the last whole group go one dot at a time */
             if (c->dot_row2_x4 != NULL) {
                 for (; r + 2 <= c->rows; r += 2) {
                     const void *row0 = base + (size_t)r * c->row_bytes, *row1 = base + (size_t)(r + 1) * c->row_bytes;
                     int64_t q = b;
-                    float out[2 * TR_DOT_TOKENS];
+                    float out[2 * TR_DOT_TOKENS_WIDE];
+                    if (c->dot_row2_x8 != NULL) {
+                        for (; q + TR_DOT_TOKENS_WIDE <= b_end; q += TR_DOT_TOKENS_WIDE) {
+                            c->dot_row2_x8(row0, row1, c->x + q * c->cols, c->cols, c->cols, out);
+                            for (int j = 0; j < TR_DOT_TOKENS_WIDE; j++) {
+                                c->y[(q + j) * c->rows + r] = out[j];
+                                c->y[(q + j) * c->rows + r + 1] = out[TR_DOT_TOKENS_WIDE + j];
+                            }
+                        }
+                    }
                     for (; q + TR_DOT_TOKENS <= b_end; q += TR_DOT_TOKENS) {
                         c->dot_row2_x4(row0, row1, c->x + q * c->cols, c->cols, c->cols, out);
                         for (int j = 0; j < TR_DOT_TOKENS; j++) {
@@ -453,6 +464,7 @@ void tr_matmul_grouped(tr_pool *pool, const tr_mat *w, const int64_t *offsets, i
     ctx.dot_row = k->dot_row[w[0].type];
     ctx.dot_row_x4 = k->dot_row_x4[w[0].type];
     ctx.dot_row2_x4 = k->dot_row2_x4[w[0].type];
+    ctx.dot_row2_x8 = k->dot_row2_x8[w[0].type];
     ctx.row_bytes = tr_row_bytes(w[0].type, w[0].cols);
 
     int64_t n = offsets[n_groups] * ctx.rows;

@@ -38,6 +38,8 @@
 #endif
 /* Input rows a dot_row_x4 kernel handles in one pass over the weight row. */
 #define TR_DOT_TOKENS 4
+/* Input rows a dot_row2_x8 kernel handles in one pass over its two weight rows. */
+#define TR_DOT_TOKENS_WIDE 8
 /* Cache positions a dot_f32_x4 or axpy_f32_x4 kernel handles per load of the query or the output. */
 #define TR_ATTN_X 4
 /* Cache positions per block in tr_attention_group: a block of keys (then of values) stays in the
@@ -85,6 +87,11 @@ typedef struct {
      * element loaded once for both rows (half the loads of two dot_row_x4). NULL: the caller
      * uses dot_row_x4. */
     void (*dot_row2_x4[TR_TYPE_COUNT])(const void *row0, const void *row1, const float *x, int64_t stride, int64_t n,
+                                       float *out);
+    /* The same against TR_DOT_TOKENS_WIDE input rows: out[j] = dot_row(row0, x + j*stride, n) and
+     * out[TR_DOT_TOKENS_WIDE + j] = dot_row(row1, x + j*stride, n), each weight decoded once for all
+     * of them. NULL: the caller uses dot_row2_x4. */
+    void (*dot_row2_x8[TR_TYPE_COUNT])(const void *row0, const void *row1, const float *x, int64_t stride, int64_t n,
                                        float *out);
     /* decode one row of n elements to f32 */
     void (*dequant_row[TR_TYPE_COUNT])(const void *row, float *out, int64_t n);

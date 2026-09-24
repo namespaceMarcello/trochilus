@@ -6,6 +6,7 @@
 #include "test.h"
 
 #include "../src/kernels/kernels.h"
+#include "../src/kernels/kernels_internal.h"
 #include "../src/base/threads.h"
 
 #include <math.h>
@@ -391,6 +392,23 @@ static void row2_diffs(const tr_kernels *K, const tr_kernels *S, tr_type type, c
     }
 }
 
+/* Two rows against the same eight input rows (x8, a stride of n + 3 floats): each sum scalar's
+ * dot_row of its own row and input row, bit for bit. Counts its calls: a tier whose x8 is never
+ * compared proves nothing (docs/LESSONS.md #43). */
+enum { X8_MAX_N = 4096 };
+static float g_x8_in[TR_DOT_TOKENS_WIDE * (X8_MAX_N + 3)];
+static long g_x8_compared;
+static void row2x8_diffs(const tr_kernels *K, const tr_kernels *S, tr_type type, const unsigned char *r0,
+                         const unsigned char *r1, int64_t n, int *bad) {
+    float o[2 * TR_DOT_TOKENS_WIDE];
+    K->dot_row2_x8[type](r0, r1, g_x8_in, n + 3, n, o);
+    for (int t = 0; t < TR_DOT_TOKENS_WIDE; t++) {
+        if (!same_float(o[t], S->dot_row[type](r0, g_x8_in + t * (n + 3), n))) (*bad)++;
+        if (!same_float(o[TR_DOT_TOKENS_WIDE + t], S->dot_row[type](r1, g_x8_in + t * (n + 3), n))) (*bad)++;
+    }
+    g_x8_compared++;
+}
+
 /* Runs K and S on the same inputs; counts the calls whose results differ. */
 static void count_diffs(const tr_kernels *K, const tr_kernels *S, unsigned seed, int *bad_dot, int *bad_row,
                         int *bad_axpy, int *bad_x4) {
@@ -404,6 +422,7 @@ static void count_diffs(const tr_kernels *K, const tr_kernels *S, unsigned seed,
             a[i] = rand_special(&seed, round % 2);
             b[i] = rand_special(&seed, round % 2);
         }
+        for (size_t i = 0; i < sizeof g_x8_in / sizeof g_x8_in[0]; i++) g_x8_in[i] = rand_special(&seed, round % 2);
         fill_f16(hrow, CMP_MAX_N, &seed, round % 2);
         /* every length up to 200 (all tails), then large rows, from two offsets */
         for (int64_t n = 0; n <= 200 + (int64_t)(sizeof big / sizeof big[0]); n++) {
@@ -476,6 +495,10 @@ static void count_diffs(const tr_kernels *K, const tr_kernels *S, unsigned seed,
                 fill_q8_0(row2, nb, &seed, round % 2);
                 row2_diffs(K, S, TR_TYPE_Q8_0, row, row2, b, n, bad_row);
             }
+            if (K->dot_row2_x8[TR_TYPE_Q8_0] != NULL) {
+                fill_q8_0(row2, nb, &seed, round % 2);
+                row2x8_diffs(K, S, TR_TYPE_Q8_0, row, row2, n, bad_row);
+            }
             if (K->dot_row_x4[TR_TYPE_Q8_0] != NULL && 4 * n <= CMP_MAX_N) {
                 float xk[TR_DOT_TOKENS], xs[TR_DOT_TOKENS];
                 K->dot_row_x4[TR_TYPE_Q8_0](row, b, n, n, xk);
@@ -495,6 +518,10 @@ static void count_diffs(const tr_kernels *K, const tr_kernels *S, unsigned seed,
                 fill_q4_k(row2, nb, &seed, round % 2);
                 row2_diffs(K, S, TR_TYPE_Q4_K, row, row2, b, n, bad_row);
             }
+            if (K->dot_row2_x8[TR_TYPE_Q4_K] != NULL) {
+                fill_q4_k(row2, nb, &seed, round % 2);
+                row2x8_diffs(K, S, TR_TYPE_Q4_K, row, row2, n, bad_row);
+            }
             if (K->dot_row_x4[TR_TYPE_Q4_K] != NULL && 4 * n <= CMP_MAX_N) {
                 float xk[TR_DOT_TOKENS], xs[TR_DOT_TOKENS];
                 K->dot_row_x4[TR_TYPE_Q4_K](row, b, n, n, xk);
@@ -513,6 +540,10 @@ static void count_diffs(const tr_kernels *K, const tr_kernels *S, unsigned seed,
             if (K->dot_row2_x4[TR_TYPE_Q6_K] != NULL && 4 * (n + 3) <= CMP_MAX_N) {
                 fill_q6_k(row2, nb, &seed, round % 2);
                 row2_diffs(K, S, TR_TYPE_Q6_K, row, row2, b, n, bad_row);
+            }
+            if (K->dot_row2_x8[TR_TYPE_Q6_K] != NULL) {
+                fill_q6_k(row2, nb, &seed, round % 2);
+                row2x8_diffs(K, S, TR_TYPE_Q6_K, row, row2, n, bad_row);
             }
             if (K->dot_row_x4[TR_TYPE_Q6_K] != NULL && 4 * n <= CMP_MAX_N) {
                 float xk[TR_DOT_TOKENS], xs[TR_DOT_TOKENS];
@@ -573,6 +604,19 @@ static float wrong_dot_row_q6_k(const void *row, const float *x, int64_t n) {
 WRONG_ROW2(q8_0)
 WRONG_ROW2(q4_k)
 WRONG_ROW2(q6_k)
+
+/* the same against eight input rows: count_diffs must see a wrong dot_row2_x8 */
+#define WRONG_ROW2X8(name) \
+    static void wrong_row2x8_##name(const void *r0, const void *r1, const float *x, int64_t stride, int64_t n, \
+                                    float *out) { \
+        for (int t = 0; t < TR_DOT_TOKENS_WIDE; t++) { \
+            out[t] = wrong_dot_row_##name(r0, x + t * stride, n); \
+            out[TR_DOT_TOKENS_WIDE + t] = wrong_dot_row_##name(r1, x + t * stride, n); \
+        } \
+    }
+WRONG_ROW2X8(q8_0)
+WRONG_ROW2X8(q4_k)
+WRONG_ROW2X8(q6_k)
 
 static float wrong_dot_row_f16(const void *row, const float *x, int64_t n) {
     static float w[CMP_MAX_N];
@@ -644,6 +688,16 @@ static void test_tiers_match_scalar(void) {
         TR_CHECK_EQ_INT(bad_dot + bad_axpy + bad_x4, 0);
         TR_CHECK(bad_row > 0);
     }
+    /* and a wrong eight-token kernel of each quantized type alone (the scalar table has none either) */
+    void (*const wrong_row2x8[3])(const void *, const void *, const float *, int64_t, int64_t, float *) = {
+        wrong_row2x8_q8_0, wrong_row2x8_q4_k, wrong_row2x8_q6_k};
+    for (int i = 0; i < 3; i++) {
+        wrong = *S;
+        wrong.dot_row2_x8[row2_types[i]] = wrong_row2x8[i];
+        count_diffs(&wrong, S, 7u, &bad_dot, &bad_row, &bad_axpy, &bad_x4);
+        TR_CHECK_EQ_INT(bad_dot + bad_axpy + bad_x4, 0);
+        TR_CHECK(bad_row > 0);
+    }
 
     for (size_t t = 0; t < sizeof tiers / sizeof tiers[0]; t++) {
         const tr_kernels *K = tr_kernels_tier(tiers[t]);
@@ -653,12 +707,19 @@ static void test_tiers_match_scalar(void) {
         }
         /* same numbers says nothing on WHICH function ran: that the tier's entries are its own,
          * and that the engine goes through them, is tests/test_tier_used.c */
+        g_x8_compared = 0;
         count_diffs(K, S, 2026u + (unsigned)t, &bad_dot, &bad_row, &bad_axpy, &bad_x4);
         TR_CHECK_EQ_INT(bad_dot, 0);
         TR_CHECK_EQ_INT(bad_row, 0);
         TR_CHECK_EQ_INT(bad_axpy, 0);
         TR_CHECK_EQ_INT(bad_x4, 0);
-        printf("  tier %-8s dot_f32, axpy_f32, their x4, dot_row, dot_row_x4 and dot_row2_x4 of f32, f16, q8_0, q4_k and q6_k %s\n", K->tier,
+        /* the tier's x8 kernels were compared, if it has any */
+        int has_x8 = 0;
+        for (int type = 0; type < TR_TYPE_COUNT; type++) has_x8 |= K->dot_row2_x8[type] != NULL;
+        if (has_x8) TR_CHECK(g_x8_compared > 0);
+        printf("  tier %-8s dot_f32, axpy_f32, their x4, dot_row, dot_row_x4, dot_row2_x4 and dot_row2_x8 (%ld calls) "
+               "of f32, f16, q8_0, q4_k and q6_k %s\n",
+               K->tier, g_x8_compared,
                bad_dot == 0 && bad_row == 0 && bad_axpy == 0 && bad_x4 == 0 ? "identical to scalar"
                                                                             : "DIFFER from scalar");
     }
@@ -888,11 +949,34 @@ static void test_matmul_thread_determinism(void) {
 
 /* ---- tr_matmul_grouped: each element is one dot_row of its own group -------- */
 
+/* The roads of the tiled matmul, counted on the single-thread call: two rows against 8 tokens,
+ * against 4, one row against 4, one dot. Equal results do not say which road ran (LESSONS #43). */
+static const tr_kernels *g_mm_real;
+static long g_mm_x8, g_mm_r2, g_mm_x4, g_mm_row;
+static void mm_x8(const void *r0, const void *r1, const float *x, int64_t stride, int64_t n, float *out) {
+    g_mm_x8++;
+    g_mm_real->dot_row2_x8[TR_TYPE_Q8_0](r0, r1, x, stride, n, out);
+}
+static void mm_r2(const void *r0, const void *r1, const float *x, int64_t stride, int64_t n, float *out) {
+    g_mm_r2++;
+    g_mm_real->dot_row2_x4[TR_TYPE_Q8_0](r0, r1, x, stride, n, out);
+}
+static void mm_x4(const void *row, const float *x, int64_t stride, int64_t n, float *out) {
+    g_mm_x4++;
+    g_mm_real->dot_row_x4[TR_TYPE_Q8_0](row, x, stride, n, out);
+}
+static float mm_row(const void *row, const float *x, int64_t n) {
+    g_mm_row++;
+    return g_mm_real->dot_row[TR_TYPE_Q8_0](row, x, n);
+}
+
 static void test_matmul_grouped(void) {
-    enum { G = 6, ROWS = 21, COLS = 64, N = 45 };
+    enum { G = 6, ROWS = 21, COLS = 64, N = 50 };
     /* empty groups first, in the middle and last; a one-row group; runs longer than
-     * TR_MATMUL_TILE; ROWS odd, so thread chunks start and end inside input rows */
-    static const int64_t offsets[G + 1] = {0, 0, 1, 20, 20, 45, 45};
+     * TR_MATMUL_TILE; ROWS odd, so thread chunks start and end inside input rows. The run of 29
+     * is a tile of 16 then one of 13 (8 + 4 + 1 tokens), the run of 20 a tile of 16 then one of 4:
+     * every road of the tiled matmul */
+    static const int64_t offsets[G + 1] = {0, 0, 1, 30, 30, 50, 50};
     static const tr_type types[2] = {TR_TYPE_F32, TR_TYPE_Q8_0};
     static const int threads[4] = {1, 2, 3, 7};
     const tr_kernels *K = tr_kernels_get();
@@ -940,8 +1024,34 @@ static void test_matmul_grouped(void) {
         }
 
         memset(y, 0, (size_t)N * ROWS * sizeof(float));
+        static tr_kernels counting;
+        g_mm_real = K;
+        counting = *K;
+        if (K->dot_row2_x8[TR_TYPE_Q8_0] != NULL) counting.dot_row2_x8[TR_TYPE_Q8_0] = mm_x8;
+        if (K->dot_row2_x4[TR_TYPE_Q8_0] != NULL) counting.dot_row2_x4[TR_TYPE_Q8_0] = mm_r2;
+        if (K->dot_row_x4[TR_TYPE_Q8_0] != NULL) counting.dot_row_x4[TR_TYPE_Q8_0] = mm_x4;
+        counting.dot_row[TR_TYPE_Q8_0] = mm_row;
+        g_mm_x8 = g_mm_r2 = g_mm_x4 = g_mm_row = 0;
+        tr_kernels_set_active(&counting);
         tr_matmul_grouped(NULL, w, offsets, G, x, y);
+        tr_kernels_set_active(NULL);
         TR_CHECK(memcmp(y, ref, (size_t)N * ROWS * sizeof(float)) == 0);
+        if (type == TR_TYPE_Q8_0) {
+            /* every road the tier has was taken; one dot always (a tile's last token). With both
+             * two-row kernels the count is exact, per pair of rows: 8 + 8 and 8 + 4 + 1 tokens in
+             * the run of 29, 8 + 8 and 4 in the run of 20 (five calls of x8, two of x4) */
+            if (K->dot_row2_x8[type] != NULL && K->dot_row2_x4[type] != NULL) {
+                TR_CHECK_EQ_INT(g_mm_x8, 5 * (ROWS / 2));
+                TR_CHECK_EQ_INT(g_mm_r2, 2 * (ROWS / 2));
+            }
+            if (K->dot_row2_x8[type] != NULL) TR_CHECK(g_mm_x8 > 0);
+            if (K->dot_row2_x4[type] != NULL) TR_CHECK(g_mm_r2 > 0);
+            if (K->dot_row_x4[type] != NULL) TR_CHECK(g_mm_x4 > 0);
+            TR_CHECK(g_mm_row > 0);
+            TR_CHECK_EQ_INT(16 * g_mm_x8 + 8 * g_mm_r2 + 4 * g_mm_x4 + g_mm_row, N * ROWS);
+            printf("  matmul q8_0 on tier %s: %ld calls of 2 rows x 8 tokens, %ld of 2 x 4, %ld of 1 x 4, %ld dots\n",
+                   K->tier, g_mm_x8, g_mm_r2, g_mm_x4, g_mm_row);
+        }
         for (int t = 0; t < 4; t++) {
             tr_pool *pool = tr_pool_create(threads[t]);
             TR_CHECK(pool != NULL);
@@ -951,8 +1061,8 @@ static void test_matmul_grouped(void) {
             TR_CHECK(memcmp(y, ref, (size_t)N * ROWS * sizeof(float)) == 0);
             /* one group alone through tr_matmul */
             memset(y, 0, (size_t)N * ROWS * sizeof(float));
-            tr_matmul(pool, &w[4], x + 20 * COLS, 25, y);
-            TR_CHECK(memcmp(y, ref + 20 * ROWS, 25 * ROWS * sizeof(float)) == 0);
+            tr_matmul(pool, &w[4], x + 30 * COLS, 20, y);
+            TR_CHECK(memcmp(y, ref + 30 * ROWS, 20 * ROWS * sizeof(float)) == 0);
             tr_pool_destroy(pool);
         }
         free(wdata);

@@ -33,8 +33,9 @@ def check_line_endings():
     """#95: an agent rewrote four source files with Windows line endings; with core.autocrlf off
     git then shows the whole file as changed and every later text replacement on LF misses."""
     suffixes = {".c", ".h", ".py", ".sh", ".lib", ".awk", ".json", ".txt", ".ps1", ".md", ".cjs"}
-    files = [ROOT / "Makefile"]
-    for top in ("src", "tests", "tools", "bench", ".claude"):
+    files = [ROOT / "Makefile", ROOT / "CLAUDE.md"]
+    # docs too: #168, a Python edit turned three documents to CRLF and only the size of STATUS saw it
+    for top in ("src", "tests", "tools", "bench", ".claude", "docs"):
         files += [f for f in sorted((ROOT / top).rglob("*")) if f.is_file() and f.suffix in suffixes
                   and ".venv" not in f.parts and "results" not in f.parts]  # bench/results: run output
     for f in files:

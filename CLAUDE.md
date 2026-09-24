@@ -19,15 +19,21 @@ next. Pioneer: what nobody has measured is where to look first.
 
 ## How to work
 
-- At every session start: `/caveman ultra`, then `docs/STATUS.md`.
+- At every session start, without being asked: read `build/prompt-next.md`
+  (the task Marcello left for this session: do it), then `docs/STATUS.md`.
+- When a piece of work ends, without being asked: write the next session's prompt in
+  `build/prompt-next.md` (what to read, the state, the task, how to measure it, how to report),
+  so Marcello can `/clear` and start again.
 - Agents: **never Fable**. Sonnet on closed briefs (one piece with its interface and its test),
   Haiku for mechanical work; design, interfaces and invariants belong to the orchestrator. One
   agent at a time, or in parallel only on disjoint files. Few agents: usage is the limit.
 - **Agents speak English to each other**, in briefs and in reports. With Marcello, Italian.
 - A brief is **short and complete**: goal, constraints, files to touch, shape of the answer, when
   it is done. An agent's report: what it did, files touched, what is still open.
-- Report to Marcello in **two points**: what was implemented, how to try it. The why goes in
-  `docs/STATUS.md`.
+- Report to Marcello: **schematic, short, foolproof** (Marcello, 2026-09-24: "the way you explain
+  things, I don't follow them"). First line: the "so what?" in plain words (did we gain? how much,
+  where). Then one line per item, no jargon (or a gloss in two words), at most 2–3 numbers, ≤ ~10
+  lines. Two points: what was done, how to try it. The why and the detail go in `docs/STATUS.md`.
 - Logic and kernels: choose, build, deliver. Questions are asked up front, not halfway through.
 - **Marcello asks for the commit.** Prepare everything (tests green, documents written) and stop.
 - **Public repository** `namespaceMarcello/trochilus` (since 2026-09-22): everything committed is

@@ -316,20 +316,23 @@ exactly and the five sections after it; LESSONS #152–#157):
   **54**'s union is small (a pass of k rows reads 1.55 / 2.33 / 3.34 / 4.42× one token's experts at
   k = 2 / 4 / 8 / 16, chance 1.88 / 3.31 / 5.25 / 7.06): a pass of 8 drafts is **~2.0× fewer bytes
   a token** on prose, ~1.3× serial and ~1.9× overlapped once the GPU draft is paid. **55**: the
-  matmul at 49–53% of the no-FMA peak on one core (87 of 166.5 GFLOP/s); the kernel's stream in
-  asm with 8 tokens a weight 119.4, **1.34×**; on Zen 4 the order of independent ops is worth 20%.
+  matmul at 49–53% of the no-FMA peak, the stream with 8 tokens 1.34× (built: below).
   **56**: codes at 7.59–7.69 bits of 8 (Q4_K 3.83–3.87 of 4): ~7% / ~4% lossless, closed. **62**:
   0.008% of blocks repeat (the output head's 220 rows of never-learned tokens); only layer 0's
   values are token-determined; co-activation grows with depth. **57**: the packed KV 0.97–1.05×,
   closed as no. **58**: the float-only exact exp in AVX-512 and AVX2, 0 of 2^32 differ, 4.8× / 4.4×
   `tr_expf` a value; the prefill ~1.02–1.03× (question 39's range): the GPU's reference, not wired;
-- **next**, by these numbers: (1) a `dot_row2_x8` microkernel in assembly (the stream's 1.34× on a
-  core, prefill ~1.15–1.25×), measured in more than one order; (2) M3: the dense weights on the GPU
+- **two rows against eight tokens, built** (`dot_row2_x8`, AVX-512, Q8_0/Q4_K/Q6_K, the same bits;
+  MEASUREMENTS §Two rows against eight tokens, LESSONS #165–#167): intrinsics were enough (no
+  spill); the lane tree in SIMD was a tenth of every two-row call. The matmul on a core 87 → 102
+  GFLOP/s (61% of the no-FMA peak); **prefill 1.19× on Q8_0 and Q4_K_M at 16 threads, 1.30× on
+  Q4_K_M at 8** (container, load 3–4: the native `prefill_context.sh change` waits for 12 GiB free);
+- **next**, by these numbers: (1) the native confirmation, then the same for AVX2 (two rows, x8
+  needs 16 of its 16 ymm: measure the spill) and the one-row kernels' lane tree; (2) M3: the dense weights on the GPU
   (model 1.64× at 2048, 1.92× at 4000), then the Q4 whole on the GPU as 53's draft (~2× bytes);
-  (3) wiring 58's SIMD exp if Marcello reopens 39 (~1.02–1.03×). **For Marcello, 59 and 60**: on
-  this Zen 4 FMA's peak equals mul+add's (FMA only on the mul pipes), and the 8-token stream with
-  FMA runs 1.19× the one without (MEASUREMENTS §The CPU's peak); 60 (an exact dot) is not measured.
-  61 after M4.
+  (3) wiring 58's SIMD exp if Marcello reopens 39 (~1.02–1.03×). **For Marcello, 59 and 60**: FMA
+  would give the 8-token stream 1.19× on this Zen 4 (MEASUREMENTS §The CPU's peak); 60 (an exact
+  dot) is not measured. 61 after M4.
 
 **Night of 2026-09-24** (DONE, MEASUREMENTS):
 - the gate 428 → 238 s (next: the native side beside the container, `oracle-real` under `min`);
@@ -339,12 +342,10 @@ exactly and the five sections after it; LESSONS #152–#157):
   and 1.06× at 512. **At 2048 the gap is the KV's bytes** (MEASUREMENTS §Decode at context 2048):
   our F32 KV is 518 MiB a token against llama.cpp's F16 259: the exact answer is the day's block;
 - **M2: Q4_K and Q6_K**, exact against their own dequantized weights (gguf-py bit for bit, the cuts
-  against transformers in `make check`). Per element against Q8_0: Q4_K AVX-512 0.84–0.90×, AVX2
-  0.53–0.63× (a lookup there: rejected); Q6_K AVX-512 0.85×, AVX2 0.85× (256 quants unpacked once,
-  then Q8_0's path; 14 mutations of 14 red). Real models from our Q8_0
+  against transformers in `make check`). Per element: MEASUREMENTS (14 mutations of 14
+  red). Real models from our Q8_0
   (`tools/quantize_q4k.sh [m]`): Q4_K **decode 1.5× the Q8_0**; **Q4_K_M** (Q6_K in 17 tensors) runs,
-  decode 0.93× the Q4_K, prefill the same, llama.cpp's decode on it 1.09× ours. A row decoded once per tile:
-  rejected (decoding does not bound the matmul). Next: two rows on AVX2, M1 with Q4_K experts.
+  decode 0.93× the Q4_K, prefill the same, llama.cpp's decode on it 1.09× ours. Next: M1 with Q4_K experts.
 
 **Review (Opus 5.5, 2026-09-22 and 23)**: every file read and through `tools/mutate_auto.py`
 (detail in LESSONS #102–#125, MEASUREMENTS §The gate, §Generated mutations). Open: `gguf.c`,

@@ -1083,3 +1083,16 @@ CPU's peak, §The KV packed in 28 bits). Check: `make check`; `sh tools/bench_na
 `sh tools/bench_native.sh bench_kvpack time --run all`; `tools/.venv/Scripts/python.exe
 tools/weights_genome.py models/<file>.gguf`; `tools/.venv/Scripts/python.exe
 tools/route_union_report.py build/route/*.bin`; the container line in `tools/draft_agreement.sh`.
+
+### 2026-09-24 — Two weight rows against eight tokens, and the lane tree in SIMD
+`dot_row2_x8` (kernels.h, AVX-512, Q8_0, Q4_K, Q6_K): two weight rows against eight input rows,
+sixteen accumulators, each sum its own `dot_row` bit for bit; `tr_matmul` takes eight tokens a call,
+then four, then one. The lane contract's tree for many sums at once (`avx512_pair_sums`): the x8
+kernels end in one store, the x4 two-row kernels too. Tests: the x8 kernels against scalar's
+`dot_row` (special values, a counter of the calls compared), a wrong x8 table seen red, the tiled
+matmul's roads counted exactly (`test_matmul_grouped`), the engine's 29-token pass through every road
+(`test_tier_used`); `tools/mutate_row2.sh` 23 mutations, all red. Benches: `bench_peak` (row2_x8
+lines, every matmul with and without x8), `bench_kernels --matrix` (each type with and without x8).
+Numbers in MEASUREMENTS §Two rows against eight tokens. Check: `make check`; `sh tools/mutate_row2.sh`
+in the container; `sh tools/bench_native.sh bench_peak --runs 15`; `sh tools/prefill_context.sh
+change <binary before>`.

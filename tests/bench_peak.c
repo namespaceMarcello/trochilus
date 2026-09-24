@@ -6,10 +6,13 @@
  *              and as ymm (AVX2): the no-FMA peak at the clock the cores hold under this load;
  *   row2 L1    the active tier's dot_row2_x4 on Q8_0 (the prefill's inner kernel: two rows'
  *              codes widened, converted, scaled, then 8 multiplies and 8 adds into 8
- *              accumulators) over rows and inputs that stay in L1 (512 columns) or in L2 (2048);
+ *              accumulators) over rows and inputs that stay in L1 (512 columns) or in L2 (2048),
+ *              and its dot_row2_x8 (the same against 8 input rows, 16 accumulators);
  *   matmul     tr_matmul on OLMoE's shapes: an expert's gate/up (1024 x 2048) and down
  *              (2048 x 1024) with the 64 tokens an expert sees in a 512-token pass, and an
- *              attention projection (2048 x 2048) with 512 tokens.
+ *              attention projection (2048 x 2048) with 512 tokens; where the tier has
+ *              dot_row2_x8, also without it ("-x8": a copy of the table made active), the two
+ *              run by run in turn.
  * FLOPs are the matmul's useful ones, 2 per weight and token (the scale multiply not counted).
  *
  *   build/tests/bench_peak.exe [--runs N]      native, still machine (tools/measure_guard.lib)
@@ -22,6 +25,7 @@
 #include "../src/base/platform.h"
 #include "../src/base/threads.h"
 #include "../src/kernels/kernels.h"
+#include "../src/kernels/kernels_internal.h"
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
@@ -188,11 +192,12 @@ __attribute__((target("avx512f"))) static void mix_x8(int64_t iters, const uint8
 #endif
 
 typedef struct {
-    int kind;          /* 0: peak512, 1: peak256, 2: row2, 3: mix_x4, 4: mix_x8, 5: peak_fma, 6: mix_x8_fma */
+    int kind;          /* 0: peak512, 1: peak256, 2: row2, 3: mix_x4, 4: mix_x8, 5: peak_fma, 6: mix_x8_fma,
+                        * 7: row2_x8 */
     int64_t iters;     /* loop iterations (peak) or calls (row2) per thread */
     int64_t cols;
     uint8_t *rows[64]; /* per worker: two Q8_0 rows */
-    float *x[64];      /* per worker: 4 input rows */
+    float *x[64];      /* per worker: 8 input rows */
 } peak_job;
 
 static void peak_fn(void *ctx, int64_t begin, int64_t end, int worker) {
@@ -212,6 +217,17 @@ static void peak_fn(void *ctx, int64_t begin, int64_t end, int worker) {
             float out[8], acc = 0.0f;
             for (int64_t c = 0; c < j->iters; c++) {
                 k->dot_row2_x4[TR_TYPE_Q8_0](j->rows[worker], j->rows[worker] + rb, j->x[worker], j->cols, j->cols,
+                                             out);
+                acc += out[0];
+            }
+            g_sink = acc;
+        }
+        if (j->kind == 7) {
+            const tr_kernels *k = tr_kernels_get();
+            size_t rb = tr_row_bytes(TR_TYPE_Q8_0, j->cols);
+            float out[16], acc = 0.0f;
+            for (int64_t c = 0; c < j->iters; c++) {
+                k->dot_row2_x8[TR_TYPE_Q8_0](j->rows[worker], j->rows[worker] + rb, j->x[worker], j->cols, j->cols,
                                              out);
                 acc += out[0];
             }
@@ -268,7 +284,7 @@ int main(int argc, char **argv) {
     memset(&j, 0, sizeof j);
     for (int w = 0; w < 64; w++) {
         j.rows[w] = tr_alloc_aligned(2 * tr_row_bytes(TR_TYPE_Q8_0, 2048), 64);
-        j.x[w] = tr_alloc_aligned(4 * 2048 * sizeof(float), 64);
+        j.x[w] = tr_alloc_aligned(8 * 2048 * sizeof(float), 64);
         if (j.rows[w] == NULL || j.x[w] == NULL) { fprintf(stderr, "out of memory\n"); return 1; }
     }
     printf("\n%-8s %-26s %12s %7s\n", "threads", "what", "GFLOP/s", "spread");
@@ -318,12 +334,18 @@ int main(int argc, char **argv) {
                 j.kind = 2; j.cols = colss[s];
                 for (int w = 0; w < n; w++) {
                     fill_q8_0(j.rows[w], 2 * j.cols, &seed);
-                    for (int64_t i = 0; i < 4 * j.cols; i++) j.x[w][i] = frand_state(&seed);
+                    for (int64_t i = 0; i < 8 * j.cols; i++) j.x[w][i] = frand_state(&seed);
                 }
                 j.iters = 40000000 / j.cols;
                 g = run_job(pool, n, &j, (double)j.iters * 16.0 * (double)j.cols, runs, &sp);
                 char what[64];
                 snprintf(what, sizeof what, "row2_x4 q8_0, %lld cols", (long long)j.cols);
+                printf("%-8d %-26s %12.1f %6.1f%%\n", n, what, g, sp * 100);
+                below_kernel |= peak > 0.0 && g > peak * 1.02;
+                if (tr_kernels_get()->dot_row2_x8[TR_TYPE_Q8_0] == NULL) continue;
+                j.kind = 7; j.iters = 20000000 / j.cols;
+                g = run_job(pool, n, &j, (double)j.iters * 32.0 * (double)j.cols, runs, &sp);
+                snprintf(what, sizeof what, "row2_x8 q8_0, %lld cols", (long long)j.cols);
                 printf("%-8d %-26s %12.1f %6.1f%%\n", n, what, g, sp * 100);
                 below_kernel |= peak > 0.0 && g > peak * 1.02;
             }
@@ -340,18 +362,32 @@ int main(int argc, char **argv) {
             for (int64_t i = 0; i < cols * nt; i++) x[i] = frand_state(&seed);
             tr_mat m = {TR_TYPE_Q8_0, rows, cols, w};
             int calls = (int)(2000000000LL / (rows * cols * nt) / (n == 1 ? 8 : 1)) + 1;
-            double g2[MAX_RUNS];
+            /* the tier as it is, and (where it has one) without its eight-token kernel */
+            static tr_kernels no_x8;
+            no_x8 = *tr_kernels_get();
+            no_x8.dot_row2_x8[TR_TYPE_Q8_0] = NULL;
+            int ab = tr_kernels_get()->dot_row2_x8[TR_TYPE_Q8_0] != NULL ? 2 : 1;
+            double g2[2][MAX_RUNS];
             tr_matmul(pool, &m, x, nt, y);
             for (int r = 0; r < runs; r++) {
-                double a = tr_time_sec();
-                for (int k = 0; k < calls; k++) tr_matmul(pool, &m, x, nt, y);
-                g2[r] = 2.0 * (double)(rows * cols * nt) * calls / (tr_time_sec() - a) / 1e9;
+                for (int v = 0; v < ab; v++) {
+                    int which = ab == 1 ? 0 : (r + v) % 2; /* the order turns every run */
+                    tr_kernels_set_active(which == 1 ? &no_x8 : NULL);
+                    double a = tr_time_sec();
+                    for (int k = 0; k < calls; k++) tr_matmul(pool, &m, x, nt, y);
+                    g2[which][r] = 2.0 * (double)(rows * cols * nt) * calls / (tr_time_sec() - a) / 1e9;
+                }
             }
-            qsort(g2, (size_t)runs, sizeof g2[0], cmp_double);
-            char what[64];
-            snprintf(what, sizeof what, "matmul %lldx%lld, %lld tok", (long long)rows, (long long)cols, (long long)nt);
-            printf("%-8d %-26s %12.1f %6.1f%%\n", n, what, g2[runs / 2], (g2[runs - 1] - g2[0]) / g2[runs / 2] * 100);
-            below_kernel |= peak > 0.0 && g2[runs / 2] > peak * 1.02;
+            tr_kernels_set_active(NULL);
+            for (int v = 0; v < ab; v++) {
+                qsort(g2[v], (size_t)runs, sizeof g2[v][0], cmp_double);
+                char what[64];
+                snprintf(what, sizeof what, "matmul %lldx%lld, %lld tok%s", (long long)rows, (long long)cols,
+                         (long long)nt, v == 1 ? " -x8" : "");
+                printf("%-8d %-26s %12.1f %6.1f%%\n", n, what, g2[v][runs / 2],
+                       (g2[v][runs - 1] - g2[v][0]) / g2[v][runs / 2] * 100);
+                below_kernel |= peak > 0.0 && g2[v][runs / 2] > peak * 1.02;
+            }
             g_sink = y[0];
             tr_free_aligned(w); tr_free_aligned(x); tr_free_aligned(y);
         }

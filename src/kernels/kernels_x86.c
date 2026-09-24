@@ -858,18 +858,26 @@ static void avx512_dot_row_x4_q6_k(const void *row, const float *x, int64_t stri
  * and multiplied into both rows' (kernels.h, dot_row2_x4), so a matmul reads its activations half
  * as often. Each sum is still its own dot_row, bit for bit: the same weights, the same order. */
 
-/* the eight sums, row 0's four then row 1's (named registers, never an array) */
+/* One level of the lane contract's tree (tr_lane_combine) for many sums at once: lanes 0..7 of
+ * the result are a's adjacent pairs, 8..15 b's, each even lane plus the odd one after it, the even
+ * on the left as in the scalar tree. Four levels take sixteen accumulators to their sixteen sums in
+ * leaf order, each the tr_lane_combine of its own accumulator bit for bit: 45 vector instructions
+ * instead of sixteen stores and 240 scalar adds, which cost a two-row call 10-20% at 1024-2048
+ * columns (docs/MEASUREMENTS.md §Two rows against eight tokens). */
+TR_TARGET_AVX512
+static inline __m512 avx512_pair_sums(__m512 a, __m512 b) {
+    const __m512i even = _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30);
+    const __m512i odd = _mm512_setr_epi32(1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31);
+    return _mm512_add_ps(_mm512_permutex2var_ps(a, even, b), _mm512_permutex2var_ps(a, odd, b));
+}
+
+/* the eight sums, row 0's four then row 1's (named registers, never an array); the last level
+ * pairs the vector with itself and keeps its low half */
 #define TR_ROW2_OUT(out, a0, a1, a2, a3, b0, b1, b2, b3) \
     do { \
-        float lane_[TR_LANES]; \
-        _mm512_storeu_ps(lane_, a0); (out)[0] = tr_lane_combine(lane_); \
-        _mm512_storeu_ps(lane_, a1); (out)[1] = tr_lane_combine(lane_); \
-        _mm512_storeu_ps(lane_, a2); (out)[2] = tr_lane_combine(lane_); \
-        _mm512_storeu_ps(lane_, a3); (out)[3] = tr_lane_combine(lane_); \
-        _mm512_storeu_ps(lane_, b0); (out)[4] = tr_lane_combine(lane_); \
-        _mm512_storeu_ps(lane_, b1); (out)[5] = tr_lane_combine(lane_); \
-        _mm512_storeu_ps(lane_, b2); (out)[6] = tr_lane_combine(lane_); \
-        _mm512_storeu_ps(lane_, b3); (out)[7] = tr_lane_combine(lane_); \
+        __m512 h_ = avx512_pair_sums(avx512_pair_sums(avx512_pair_sums(a0, a1), avx512_pair_sums(a2, a3)), \
+                                     avx512_pair_sums(avx512_pair_sums(b0, b1), avx512_pair_sums(b2, b3))); \
+        _mm256_storeu_ps(out, _mm512_castps512_ps256(avx512_pair_sums(h_, h_))); \
     } while (0)
 
 /* 16 elements at offset e of the four input rows, times row 0's w and row 1's u */
@@ -967,6 +975,126 @@ static void avx512_dot_row2_x4_q6_k(const void *row0, const void *row1, const fl
     TR_ROW2_OUT(out, a0, a1, a2, a3, b0, b1, b2, b3);
 }
 
+/* ---- two weight rows against the same eight input rows -------------------------------- */
+/* Sixteen accumulators, row 0's and row 1's for each input row (kernels.h, dot_row2_x8): each
+ * weight vector decoded once for eight tokens instead of four, 26 of the 32 zmm, no spill (gcc,
+ * checked in the disassembly). Each sum is still its own dot_row, bit for bit. Two instruction
+ * orders measured the same (per token, or two tokens' loads, then four multiplies, then four adds:
+ * docs/MEASUREMENTS.md §Two rows against eight tokens), so the compiler keeps its own. */
+
+/* the sixteen sums, row 0's eight then row 1's, in one store */
+#define TR_ROW2X8_OUT(out) \
+    do { \
+        __m512 s0_ = avx512_pair_sums(avx512_pair_sums(avx512_pair_sums(a0, a1), avx512_pair_sums(a2, a3)), \
+                                      avx512_pair_sums(avx512_pair_sums(a4, a5), avx512_pair_sums(a6, a7))); \
+        __m512 s1_ = avx512_pair_sums(avx512_pair_sums(avx512_pair_sums(b0, b1), avx512_pair_sums(b2, b3)), \
+                                      avx512_pair_sums(avx512_pair_sums(b4, b5), avx512_pair_sums(b6, b7))); \
+        _mm512_storeu_ps(out, avx512_pair_sums(s0_, s1_)); \
+    } while (0)
+
+/* 16 elements at offset e of input row xr, times row 0's w into A and row 1's u into B */
+#define TR_ROW2_PAIR(xr, e, w, u, A, B) \
+    do { \
+        __m512 v_ = _mm512_loadu_ps((xr) + (e)); \
+        A = _mm512_add_ps(A, _mm512_mul_ps(w, v_)); \
+        B = _mm512_add_ps(B, _mm512_mul_ps(u, v_)); \
+    } while (0)
+
+/* 16 elements at offset e of the eight input rows x, x1 .. x7 */
+#define TR_ROW2X8_STEP(e, w, u) \
+    do { \
+        __m512 w_ = (w), u_ = (u); \
+        TR_ROW2_PAIR(x, e, w_, u_, a0, b0); \
+        TR_ROW2_PAIR(x1, e, w_, u_, a1, b1); \
+        TR_ROW2_PAIR(x2, e, w_, u_, a2, b2); \
+        TR_ROW2_PAIR(x3, e, w_, u_, a3, b3); \
+        TR_ROW2_PAIR(x4, e, w_, u_, a4, b4); \
+        TR_ROW2_PAIR(x5, e, w_, u_, a5, b5); \
+        TR_ROW2_PAIR(x6, e, w_, u_, a6, b6); \
+        TR_ROW2_PAIR(x7, e, w_, u_, a7, b7); \
+    } while (0)
+
+/* the sixteen accumulators and the eight input rows */
+#define TR_ROW2X8_BEGIN \
+    __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps(), a2 = _mm512_setzero_ps(), a3 = _mm512_setzero_ps(); \
+    __m512 a4 = _mm512_setzero_ps(), a5 = _mm512_setzero_ps(), a6 = _mm512_setzero_ps(), a7 = _mm512_setzero_ps(); \
+    __m512 b0 = _mm512_setzero_ps(), b1 = _mm512_setzero_ps(), b2 = _mm512_setzero_ps(), b3 = _mm512_setzero_ps(); \
+    __m512 b4 = _mm512_setzero_ps(), b5 = _mm512_setzero_ps(), b6 = _mm512_setzero_ps(), b7 = _mm512_setzero_ps(); \
+    const float *x1 = x + stride, *x2 = x1 + stride, *x3 = x2 + stride, *x4 = x3 + stride, *x5 = x4 + stride, \
+                *x6 = x5 + stride, *x7 = x6 + stride
+
+TR_TARGET_AVX512
+static void avx512_dot_row2_x8_q8_0(const void *row0, const void *row1, const float *x, int64_t stride, int64_t n,
+                                    float *out) {
+    const unsigned char *p0 = (const unsigned char *)row0, *p1 = (const unsigned char *)row1;
+    int64_t nb = n / TR_Q8_0_BLOCK_ELEMS;
+    TR_ROW2X8_BEGIN;
+    for (int64_t b = 0; b < nb; b++) {
+        const unsigned char *k0 = p0 + (size_t)b * TR_Q8_0_BLOCK_BYTES, *k1 = p1 + (size_t)b * TR_Q8_0_BLOCK_BYTES;
+        int64_t o = b * TR_Q8_0_BLOCK_ELEMS;
+        /* the scalar conversion runs on the integer units, beside the FP pipes that bound this loop:
+         * converted ahead, by vcvtph2ps or a gather, the scales cost 1-12% (MEASUREMENTS) */
+        __m512 d0 = _mm512_set1_ps(tr_q8_0_block_scale(k0)), d1 = _mm512_set1_ps(tr_q8_0_block_scale(k1));
+        for (int j = 0; j < TR_Q8_0_BLOCK_ELEMS; j += TR_LANES)
+            TR_ROW2X8_STEP(o + j, _mm512_mul_ps(d0, avx512_i8_to_ps(k0 + TR_Q8_0_SCALE_BYTES + j)),
+                           _mm512_mul_ps(d1, avx512_i8_to_ps(k1 + TR_Q8_0_SCALE_BYTES + j)));
+    }
+    TR_ROW2X8_OUT(out);
+}
+
+TR_TARGET_AVX512
+static void avx512_dot_row2_x8_q4_k(const void *row0, const void *row1, const float *x, int64_t stride, int64_t n,
+                                    float *out) {
+    const unsigned char *p0 = (const unsigned char *)row0, *p1 = (const unsigned char *)row1;
+    int64_t nb = n / TR_Q4_K_BLOCK_ELEMS;
+    TR_ROW2X8_BEGIN;
+    for (int64_t b = 0; b < nb; b++) {
+        const unsigned char *k0 = p0 + (size_t)b * TR_Q4_K_BLOCK_BYTES, *k1 = p1 + (size_t)b * TR_Q4_K_BLOCK_BYTES;
+        const unsigned char *qs0 = k0 + TR_Q4_K_QS_OFFSET, *qs1 = k1 + TR_Q4_K_QS_OFFSET;
+        float s0[8], m0[8], s1[8], m1[8];
+        tr_q4_k_scales(k0, s0, m0);
+        tr_q4_k_scales(k1, s1, m1);
+        for (int c = 0; c < 4; c++) {
+            __m512 vlo0 = avx512_q4_k_values(s0[2 * c], m0[2 * c]), vhi0 = avx512_q4_k_values(s0[2 * c + 1], m0[2 * c + 1]);
+            __m512 vlo1 = avx512_q4_k_values(s1[2 * c], m1[2 * c]), vhi1 = avx512_q4_k_values(s1[2 * c + 1], m1[2 * c + 1]);
+            __m512i q00 = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(const void *)(qs0 + 32 * c)));
+            __m512i q01 = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(const void *)(qs0 + 32 * c + 16)));
+            __m512i q10 = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(const void *)(qs1 + 32 * c)));
+            __m512i q11 = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(const void *)(qs1 + 32 * c + 16)));
+            int64_t o = b * TR_Q4_K_BLOCK_ELEMS + 64 * c;
+            TR_ROW2X8_STEP(o, _mm512_permutexvar_ps(q00, vlo0), _mm512_permutexvar_ps(q10, vlo1));
+            TR_ROW2X8_STEP(o + 16, _mm512_permutexvar_ps(q01, vlo0), _mm512_permutexvar_ps(q11, vlo1));
+            TR_ROW2X8_STEP(o + 32, _mm512_permutexvar_ps(_mm512_srli_epi32(q00, 4), vhi0),
+                           _mm512_permutexvar_ps(_mm512_srli_epi32(q10, 4), vhi1));
+            TR_ROW2X8_STEP(o + 48, _mm512_permutexvar_ps(_mm512_srli_epi32(q01, 4), vhi0),
+                           _mm512_permutexvar_ps(_mm512_srli_epi32(q11, 4), vhi1));
+        }
+    }
+    TR_ROW2X8_OUT(out);
+}
+
+TR_TARGET_AVX512
+static void avx512_dot_row2_x8_q6_k(const void *row0, const void *row1, const float *x, int64_t stride, int64_t n,
+                                    float *out) {
+    const unsigned char *p0 = (const unsigned char *)row0, *p1 = (const unsigned char *)row1;
+    int64_t nb = n / TR_Q6_K_BLOCK_ELEMS;
+    TR_ROW2X8_BEGIN;
+    for (int64_t b = 0; b < nb; b++) {
+        const unsigned char *k0 = p0 + (size_t)b * TR_Q6_K_BLOCK_BYTES, *k1 = p1 + (size_t)b * TR_Q6_K_BLOCK_BYTES;
+        int64_t o = b * TR_Q6_K_BLOCK_ELEMS;
+        unsigned char q0[TR_Q6_K_BLOCK_ELEMS], q1[TR_Q6_K_BLOCK_ELEMS];
+        float s0[16], s1[16];
+        avx2_q6_k_unpack(k0, q0);
+        avx2_q6_k_unpack(k1, q1);
+        avx512_q6_k_scales(k0, s0);
+        avx512_q6_k_scales(k1, s1);
+        for (int j = 0; j < 16; j++)
+            TR_ROW2X8_STEP(o + 16 * j, _mm512_mul_ps(_mm512_set1_ps(s0[j]), avx512_i8_to_ps(q0 + 16 * j)),
+                           _mm512_mul_ps(_mm512_set1_ps(s1[j]), avx512_i8_to_ps(q1 + 16 * j)));
+    }
+    TR_ROW2X8_OUT(out);
+}
+
 /* hot: end */
 
 /* ---- tables --------------------------------------------------------------- */
@@ -1019,6 +1147,9 @@ const tr_kernels *tr_kernels_x86_tier(const char *tier) {
             g_avx512.dot_row2_x4[TR_TYPE_Q8_0] = avx512_dot_row2_x4_q8_0;
             g_avx512.dot_row2_x4[TR_TYPE_Q4_K] = avx512_dot_row2_x4_q4_k;
             g_avx512.dot_row2_x4[TR_TYPE_Q6_K] = avx512_dot_row2_x4_q6_k;
+            g_avx512.dot_row2_x8[TR_TYPE_Q8_0] = avx512_dot_row2_x8_q8_0;
+            g_avx512.dot_row2_x8[TR_TYPE_Q4_K] = avx512_dot_row2_x8_q4_k;
+            g_avx512.dot_row2_x8[TR_TYPE_Q6_K] = avx512_dot_row2_x8_q6_k;
             g_avx512.dot_row[TR_TYPE_Q4_K] = avx512_dot_row_q4_k;
             g_avx512.dot_row_x4[TR_TYPE_Q4_K] = avx512_dot_row_x4_q4_k;
             g_avx512.dot_row[TR_TYPE_Q6_K] = avx512_dot_row_q6_k;

@@ -88,6 +88,10 @@
       "cosa": "I conti pesanti (moltiplicazioni di matrici) scritti nelle istruzioni vettoriali della CPU, con una versione per ogni famiglia e la scelta a runtime. Ogni versione dà gli stessi bit della versione scalare, e il test lo verifica.",
       "numeri": [
         {
+          "v": "due righe di pesi contro 8 token alla volta, e la somma finale delle corsie in SIMD: il matmul su un core da 87 a 102 GFLOP/s; prefill 1.19× su Q8_0 e Q4_K_M a 16 thread, 1.30× su Q4_K_M a 8 (container, da confermare nativo), numeri identici al bit",
+          "d": "2026-09-24"
+        },
+        {
           "v": "due righe di pesi per ogni caricamento delle attivazioni: prefill 1.20-1.26× (Q8_0), 1.11× (Q4_K_M), generazione uguale, numeri identici al bit",
           "d": "2026-09-24"
         },
@@ -844,6 +848,10 @@
       "cosa": "Riscrivere in assembly i kernel più caldi, uno alla volta. Resta solo se il test lo trova identico al C e il banco lo trova più veloce; il C resta come riserva per le altre CPU.",
       "numeri": [
         {
+          "v": "il microkernel a 8 token non ha avuto bisogno dell'assembly: in C con intrinsics gcc tiene tutto nei registri; il matmul ora al 61% del picco senza FMA (102 di 166), il kernel all'87% del suo flusso ideale",
+          "d": "2026-09-24"
+        },
+        {
           "v": "il matmul del prefill fa il 49-53% del picco senza FMA su un core (87 di 166.5 GFLOP/s); lo stesso flusso di istruzioni in assembly con 8 token per peso invece di 4 arriva a 119.4: 1.34× (prefill stimato 1.15-1.25×)",
           "d": "2026-09-24"
         },
@@ -856,7 +864,7 @@
         {
           "n": 55,
           "stato": "chiusa",
-          "testo": "quanto margine c'è sotto il picco? 1.34× su un core col microkernel a 8 token"
+          "testo": "quanto margine c'è sotto il picco? 1.34× col microkernel a 8 token: costruito, 1.17-1.23× sul matmul, prefill 1.19-1.30×"
         },
         {
           "n": 59,

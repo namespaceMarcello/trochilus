@@ -3150,6 +3150,92 @@ no-FMA peak (0.7–1.0 of ~2 TFLOP/s).
   "peak" came out 2× too high (LESSONS #161). A mutant with dependent chains (`-DBENCH_PEAK_MUTATE`)
   makes the bench fail: a peak below a real kernel is not a peak.
 
+## Two rows against eight tokens (2026-09-24)
+
+The step question 55 pointed to: `dot_row2_x8` (two weight rows against eight input rows, sixteen
+accumulators, AVX-512; Q8_0, Q4_K, Q6_K), each sum still its own `dot_row`. **Prediction, written
+before the native runs**: the matmul 1.15–1.22× on one core (the container's numbers below),
+1.1–1.3× on 16; the engine's prefill 1.08–1.15× on Q8_0 (the matmul is 56–77% of it), more on
+Q4_K_M (its permute paid once for 8 tokens); the decode unchanged (one token takes no block road).
+
+**Taken apart in the container first** (`bench_peak`'s new lines, one core, median of 5, every
+variant against the same binary's `-x8` line, two rounds; the 16-core lines of the container are
+not this machine's, a WSL VM):
+
+| variant of the x8 kernel, Q8_0 | kernel, 2048 cols (GFLOP/s) | matmul 1024 × 2048, 64 tokens | its `-x8` |
+|---|---|---|---|
+| first cut: intrinsics, scalar lane tree (16 stores, 240 scalar adds) | 97–99 | 94–97 | 86–88 |
+| the lane tree in SIMD (`avx512_pair_sums`, 45 instructions) | **100–105** | **97–102** | 84–88 |
+| + scales by vcvtph2ps (on the FP pipes) | −1% | −1% | |
+| + scales converted ahead, 16 blocks at a time, scalar | 89 | 87 | |
+| + the same by a gather and vcvtph2ps | 92–94 | 91 | |
+| + the next block's scale through memory (broadcast load) | 100–101 | 95–99 | |
+| + two tokens' loads, then 4 multiplies, then 4 adds (bench_peak's order) | 102–104 | 99–100 | |
+| timing only: every block with block 0's scale (no conversion) | 99 | 97 | |
+
+- **The lane tree was a tenth of the call**: sixteen `tr_lane_combine` per call (a store, sixteen
+  scalar loads, fifteen adds each) against 128 vector steps at 2048 columns, twice that share at
+  1024. In SIMD every level adds each even lane to the odd one after it, the even on the left as
+  the scalar tree does: the same adds, the same bits (1 920 x8 calls compared with scalar's, special
+  values included). The x4 kernels (`TR_ROW2_OUT`) now end the same way.
+- **The scale's conversion is free where it is**: its scalar code runs on the integer units beside
+  the FP pipes that bound the loop; every way of moving it (vcvtph2ps, ahead in a loop of its own, a
+  gather, a ring in memory) was equal or slower. The order of independent ops, unlike the peak's
+  (LESSONS #162), moved nothing here (two orders, within the A/A).
+- **An experiment the compiler changed**: the first "no conversion" run used a scale of 1.0f, gcc
+  dropped the multiplies by one, and the kernel read 119 (the stream's ceiling), a 15% "cost" that
+  was not the scale's. With a scale it cannot fold, 99 (LESSONS #165).
+- gcc keeps the sixteen accumulators and both weight vectors in registers, no spill (disassembly:
+  the Q6_K kernel's two stack stores are its scale arrays); no inline assembly needed.
+
+**Native** (`sh tools/bench_native.sh bench_peak --runs 15`, marker held, load 2.9 before and 1.9
+after; the `-x8` lines are the same binary with x4 two-row kernels that already end in the SIMD
+tree; "this morning" is §The CPU's peak's run):
+
+| GFLOP/s, one core | x8 | `-x8` | ratio | this morning | ratio |
+|---|---|---|---|---|---|
+| two-row kernel, 512 columns (L1) | 102.0 | 87.8 (x4) | 1.16× | 77.6 (x4) | 1.31× |
+| two-row kernel, 2048 columns (L2) | 103.3 | 91.8 (x4) | 1.13× | 89.0 (x4) | 1.16× |
+| `tr_matmul` 1024 × 2048, 64 tokens | **102.3** | 90.1 | 1.14× | 87.4 | **1.17×** |
+| `tr_matmul` 2048 × 1024, 64 tokens | **101.0** | 88.6 (spread 11%) | 1.14× | 82.4 | **1.23×** |
+| `tr_matmul` 2048 × 2048, 512 tokens | 93.2 (spread 19%) | 84.0 (16%) | 1.11× | 87.5 | 1.07× |
+
+- **The prediction held on one core**: 1.14× against x4 with the new tree, 1.17–1.23× against this
+  morning on the expert shapes; the matmul now at 61% of the no-FMA peak (102 of 166), the kernel at
+  87% of its own stream (103 of 118.4). The attention shape's lines are noisy (16–19%).
+- The sixteen-core lines are not readable: spread 38–81% on every kernel and matmul line of this
+  run (four earlier runs put them anywhere in 0.8–1.2 TFLOP/s, §The CPU's peak). The engine's
+  prefill below is the measurement for many cores.
+
+**The engine** (container, `tools/ab_speed.sh` before = 59e0af8 against after, runs alternated,
+prompt 512, round 0 dropped; declared load 3.2 before and 4.4 after, so the ratios are indicative:
+`tools/prefill_context.sh change` could not start natively, 10 GiB free of the 12 it wants while the
+other windows' containers ran). First the bits: the real models' logits **identical byte for
+byte** before and after, Q8_0 and Q4_K_M, 600 positions one token a pass and in passes of 64, 2000
+in passes of 512 and of 100.
+
+| tok/s, medians | before | after | ratio |
+|---|---|---|---|
+| Q8_0 prefill, 16 threads (n = 6) | 217.5 | 258.5 | **1.19×** |
+| Q4_K_M prefill, 16 threads (n = 6) | 215.4 | 256.0 | **1.19×** |
+| Q4_K_M prefill, 8 threads (n = 4) | 140.3 | 182.3 | **1.30×** |
+| decode, both models, 16 and 8 threads | 28.97 / 39.86 / 38.36 | 28.74 / 39.99 / 38.63 | 1.00× |
+
+- **Above the prediction** (1.08–1.15× on Q8_0): the x4 kernels' new tree and the x8 kernel add
+  up, and at 16 threads the matmul loses less to memory with half the activation loads per weight
+  decode. Q4_K_M gains as much as Q8_0 now: its permute is paid once for 8 tokens (the morning's
+  two-row kernel gave it only 1.03–1.08×). The Q8_0 8-thread cell did not finish (the script's
+  tail cut it); not rerun.
+- Next measurement, when the RAM allows: the same `prefill_context.sh change` natively, at 512,
+  2048 and 4000.
+
+**Per type** (`sh tools/bench_native.sh bench_kernels --matrix --runs 9`, 1024 × 2048, 64 tokens,
+ms per token, each type with and without x8 in turn; declared load 2.4 / 2.1, but another window
+ran a build and tests from 22:05 to 22:12, inside this run, without the marker: indicative):
+one core Q8_0 0.0471 → 0.0415 (**1.13×**), Q4_K 0.0599 → 0.0493 (**1.21×**), Q6_K 0.0495 →
+0.0422 (**1.17×**), spreads 1.4–4.3%; the sixteen-core lines 12–90% spread, not read. Q4_K gains
+most, as predicted: its lookup (a permute per 16 weights of each row) is paid for 8 tokens.
+
 ## Attempts
 
 | Data | Cosa | Prima | Dopo | Spread | Esito |
@@ -3189,3 +3275,7 @@ no-FMA peak (0.7–1.0 of ~2 TFLOP/s).
 | 2026-09-24 | the decode's attention on the GPU (`src/backend/gpu_attn`, the same bytes; keep-warm between layers, warm-up in the prompt's last pass) | decode at 8 threads, 512 / 2048 / 4000: 35.0 / 29.1 / 22.1 tok/s | 37.4 / 34.8 / 33.4 | A/A ≤ 4.0% | **kept, on by default when there is a GPU**: 1.04-1.07× / 1.20-1.28× / 1.43-1.51× (measured width: 1.31-1.32× at 2048, 1.54-1.58× at 4000) |
 | 2026-09-24 | an exact exp with float32 and int32 only, to run on the GPU at full rate (`tests/bench_expf32.c`, premise) | `tr_expf` 3.59-3.60 ns (double) | 3.10-3.22 ns with fma, 5.6 without; 0 of 2^32 differ; in SIMD (2026-09-24, still machine) AVX-512 0.733 ns, AVX2 0.802 (tr_expf 3.52), 0 of 2^32 differ | one thread | **not wired into the CPU engine** (question 58): prefill ~1.02-1.03×, question 39's range; the GPU prefill's reference |
 | 2026-09-24 | the decode's attention one position at a time (`tr_attention_group` with one query runs `tr_attention_head`), the same bits | decode at 8 threads, 512 / 2048 / 4000: 35.5 / 28.3 / 22.6 tok/s; the attention zone at 2048 11.00 ms | 36.1 / 27.9 / 22.2; the zone 10.02 ms | A/A 2.9% | kept, but **not distinguishable** on a still machine (0.96-1.05×); the bench's 1.10-1.13× was measured under load (LESSONS #160) |
+| 2026-09-24 | `dot_row2_x8` AVX-512 (two weight rows against eight input rows, sixteen accumulators; Q8_0, Q4_K, Q6_K) and the lane tree in SIMD (`avx512_pair_sums`, the x4 two-row kernels too), bit-identical | matmul 1024x2048, 64 tokens, one core: 87.4 GFLOP/s; engine prefill at 16 threads, container: Q8_0 217.5, Q4_K_M 215.4 tok/s | 102.3 GFLOP/s (1.17x); prefill 258.5 and 256.0 (1.19x), Q4_K_M at 8 threads 1.30x | kernel lines 1-3%; engine min-max 181-272 under load 3.2-4.4 | kept, on by default on AVX-512; native prefill_context to confirm (RAM) |
+| 2026-09-24 | the Q8_0 scale by vcvtph2ps in `dot_row2_x8` (three instructions instead of a scalar conversion) | x8 kernel 2048 cols 98.6-98.8 GFLOP/s (container) | 97.3-97.6 | 0.4-4.7% | rejected: the conversion moves onto the FP pipes that bound the loop (LESSONS #167) |
+| 2026-09-24 | the Q8_0 scales converted ahead, 16 blocks at a time (scalar, or a gather and vcvtph2ps), read back by broadcast loads; and a ring of the next block's scale in memory | x8 kernel 2048 cols 100-104 (container) | ahead scalar 89, gather 92-94, ring 100-101 | 0.2-3.9% | rejected: the interleaved scalar conversion is free on the integer units |
+| 2026-09-24 | the x8 step in bench_peak's order (two tokens' loads, then four multiplies, then four adds) against per token | 100-104 (container) | 102-104 | 0.2-3.1% | not distinguishable: the compiler's order kept (LESSONS #162's 20% is the peak loop's, not this one's) |

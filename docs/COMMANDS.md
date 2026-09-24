@@ -44,7 +44,7 @@ build/tests/bench_attn_bw.exe 2048 --runs 19 [variant...]   # why the CPU's deco
 build/tests/bench_expf32.exe --slow-all --error --threads 8   # the exact exp in float32 only (for the GPU) against tr_expf on all 2^32 floats, both variants and the AVX-512 / AVX2 tiers, ~40 s; --no-timing for the check alone; sh tools/bench_native.sh bench_expf32 --quick for the ns a value
 build/tests/bench_kvpack.exe roundtrip | bits | time [--run <name>|all]   # the KV packed in 28 bits, lossless: round trip, the attention's bits on the probe dumps, time against F32 (KVPACK_PROBE_DIR)
 sh tools/bench_native.sh <bench> [args]   # any premise bench of build/tests under the native rules (marker, still machine, load declared, a copy one byte longer); build/bench_native/<bench>/
-sh tools/bench_native.sh bench_peak [--runs N]   # the no-FMA and FMA peaks (inline asm), the prefill kernel's stream in asm with 4 and 8 tokens, dot_row2_x4 and tr_matmul on OLMoE's shapes, 1 and 16 threads (question 55)
+sh tools/bench_native.sh bench_peak [--runs N]   # the no-FMA and FMA peaks (inline asm), the prefill kernel's stream in asm with 4 and 8 tokens, dot_row2_x4 and dot_row2_x8, tr_matmul on OLMoE's shapes with and without x8 (-x8), 1 and 16 threads (question 55)
 MSYS_NO_PATHCONV=1 docker run --rm -v "$PWD:/src" -v trochilus-models:/src/models -w /src trochilus-dev:local sh tools/draft_agreement.sh   # a Q4 draft against the exact model, logits of every position on three real texts (question 53); then tools/draft_agreement_report.py models/draft q4_k
 tools/.venv/Scripts/python.exe tools/route_union_report.py build/route/*.bin   # experts of k consecutive tokens against chance, and co-activation per layer (questions 54, 62)
 tools/.venv/Scripts/python.exe tools/weights_genome.py <model.gguf> [--tensors <regex>]   # every block once: code and scale entropy, zero blocks, repeated blocks and rows (questions 56, 62; ~25 min on 7 GB)
@@ -58,14 +58,14 @@ sh tools/test_ab_modes.sh   # ab_modes stops on a run that measured nothing, wit
 sh tools/mutate_bar.sh   # in container: the progress bar's mutations (physics, render, decision, clearing, the load's progress), about 6 min
 sh tools/mutate_prefetch.sh   # in container: the read ahead's mutations (store, thread API, prompt), gcc and ASan
 sh tools/mutate_q6k.sh   # in container: Q6_K's 14 mutations (scalar, unpack, AVX2, AVX-512, tables, engine, reader), all red; about 5 min
-sh tools/mutate_row2.sh   # in container: the two-row kernel's 11 mutations (kernels, SIMD scales, table, tr_matmul's pairs), all red; about 5 min
+sh tools/mutate_row2.sh   # in container: the two-row kernels' 23 mutations (x4 and x8, the SIMD lane tree, SIMD scales, table, tr_matmul's roads), all red; about 10 min
 SET=prefetch sh tools/prefill_overlap.sh [rounds]   # native: the prompt at half budget with and without reading the next layer ahead (TR_PREFETCH=0), 512 and 2048, A/A
 TR_BAR=0 build/trochilus run ...   # no progress bar while the model loads (it is drawn only when stderr is a terminal, and not with NO_COLOR or TERM=dumb)
 sh tools/busy_machine.sh <n> <command>   # the ONLY way to load the machine: generators die with the script
 sh tools/machine_still.sh [limit] [wait] [window]   # occupied processors (who: tools/background_load.ps1): guard for every measurement
 sh tools/test_cleanup.sh   # a stopped script loses its children; without cleanup.lib trap the child stays
 make bench               # microbenchmark of kernels (median + noise)
-sh tools/bench_kernels.sh   # the same by the native rules (marker, still machine, load declared), a one-byte-longer copy; CONTAINER=1 in trochilus-dev; build/bench_kernels/; lines above 10% spread named in noisy.txt; bench_kernels --matrix: the whole-matrix tables only
+sh tools/bench_kernels.sh   # the same by the native rules (marker, still machine, load declared), a one-byte-longer copy; CONTAINER=1 in trochilus-dev; build/bench_kernels/; lines above 10% spread named in noisy.txt; bench_kernels --matrix: the whole-matrix tables only (each type with an x8 kernel also without it, -x8, in turn)
 make bench-mem           # RAM bandwidth (sequential, sparse), engine matmul, attention on both layouts
 make bench-disk          # disk for who reads experts, no system cache (DISK_FILE=<file>)
 build/trochilus run ... --route-trace <file>   # routing trace: experts picked and predicted

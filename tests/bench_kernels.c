@@ -481,6 +481,32 @@ static void measure_matmul(tr_pool *pool, mat_job *m, int runs, int calls, int64
     *spread = (ms[runs - 1] - ms[0]) / ms[runs / 2];
 }
 
+/* The same with the active tier as it is and without its eight-token kernel for the matrix's type
+ * (a copy of the table made active), run by run in turn, the order turning every run. */
+static void measure_matmul_x8(tr_pool *pool, mat_job *m, int runs, int calls, int64_t n_tokens, double ms_median[2],
+                              double spread[2]) {
+    static tr_kernels no_x8;
+    no_x8 = *tr_kernels_get();
+    no_x8.dot_row2_x8[m->w.type] = NULL;
+    double ms[2][MAX_RUNS];
+    tr_matmul(pool, &m->w, m->x, n_tokens, m->y);
+    for (int r = 0; r < runs; r++) {
+        for (int v = 0; v < 2; v++) {
+            int which = (r + v) % 2;
+            tr_kernels_set_active(which == 1 ? &no_x8 : NULL);
+            double a = tr_time_sec();
+            for (int c = 0; c < calls; c++) tr_matmul(pool, &m->w, m->x, n_tokens, m->y);
+            ms[which][r] = (tr_time_sec() - a) * 1e3 / calls;
+        }
+    }
+    tr_kernels_set_active(NULL);
+    for (int v = 0; v < 2; v++) {
+        qsort(ms[v], (size_t)runs, sizeof ms[v][0], cmp_double);
+        ms_median[v] = ms[v][runs / 2];
+        spread[v] = (ms[v][runs - 1] - ms[v][0]) / ms[v][runs / 2];
+    }
+}
+
 static void empty_body(void *ctx, int64_t begin, int64_t end, int worker) {
     (void)ctx; (void)begin; (void)end; (void)worker;
 }
@@ -713,7 +739,8 @@ matrix:;
     }
 
     /* The same shape in every quantized type, the prefill's block path (64 tokens): ms per
-     * token of the whole matrix, on one core and on every physical core. */
+     * token of the whole matrix, on one core and on every physical core; where the tier has an
+     * eight-token kernel for the type, a "-x8" line without it, measured in turn with the first. */
     printf("\n%-8s %-6s %25s %7s\n", "threads", "type", "1024x2048 64 tokens/tok", "spread");
     static const tr_type mtypes[] = {TR_TYPE_Q8_0, TR_TYPE_Q4_K, TR_TYPE_Q6_K};
     uint8_t *wq = tr_alloc_aligned(tr_row_bytes(TR_TYPE_Q8_0, cols) * (size_t)rows, 64);
@@ -725,10 +752,18 @@ matrix:;
             size_t rbt = tr_row_bytes(mtypes[t], cols);
             for (int64_t r = 0; r < rows; r++) fill_row(mtypes[t], wq + rbt * (size_t)r, cols);
             mat_job mt = {{mtypes[t], rows, cols, wq}, xb, yb};
+            const char *tname = tr_type_get((uint32_t)mtypes[t])->name;
+            if (tr_kernels_get()->dot_row2_x8[mtypes[t]] != NULL) {
+                double ms2[2], s2[2];
+                measure_matmul_x8(pool, &mt, runs, 5, bench_tokens, ms2, s2);
+                printf("%-8d %-6s %22.4f ms %6.1f%%\n", mcounts[c], tname, ms2[0] / (double)bench_tokens, s2[0] * 100.0);
+                printf("%-8d %-6s %22.4f ms (-x8, %.2fx) %6.1f%%\n", mcounts[c], tname, ms2[1] / (double)bench_tokens,
+                       ms2[1] / ms2[0], s2[1] * 100.0);
+                continue;
+            }
             double msb, s3;
             measure_matmul(pool, &mt, runs, 5, bench_tokens, &msb, &s3);
-            printf("%-8d %-6s %22.4f ms %6.1f%%\n", mcounts[c], tr_type_get((uint32_t)mtypes[t])->name,
-                   msb / (double)bench_tokens, s3 * 100.0);
+            printf("%-8d %-6s %22.4f ms %6.1f%%\n", mcounts[c], tname, msb / (double)bench_tokens, s3 * 100.0);
         }
         tr_pool_destroy(pool);
     }
