@@ -291,6 +291,10 @@
         {
           "v": "gara con llama.cpp sullo stesso Q8_0: prefill loro 1.8× (era 13×), decode loro 1.04× a contesto 512 e 1.16× a 2048",
           "d": "2026-09-24"
+        },
+        {
+          "v": "gara con llama.cpp rifatta dopo le due righe per caricamento: prefill loro 1.41× (era 1.8×) a 16 thread e 1.13× a 8; decode 1.00× a contesto 512, 1.12× a 2048",
+          "d": "2026-09-24"
         }
       ],
       "domande": [],

@@ -287,10 +287,10 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
 
 **Night of 2026-09-24** (DONE, MEASUREMENTS):
 - the gate 428 → 238 s (next: the native side beside the container, `oracle-real` under `min`);
-- **where we lose to llama.cpp** (same Q8_0, container): prefill **1.8×** at 16 threads, 1.5× at 8
-  (was 13×; mostly their int8 activations, mode (c)), **~1.5× since two weight rows per input load**
-  (`dot_row2_x4`: prefill 1.20–1.26× Q8_0, 1.11× Q4_K_M; not raced again); decode
-  **1.16×** at 16 threads and 1.26× at 8 at context 2048, 1.04–1.09× at 512. **At 2048 the whole
+- **where we lose to llama.cpp** (same Q8_0, container, raced again after two weight rows per
+  input load, `dot_row2_x4`): prefill **1.41×** at 16 threads, 1.13× at 8 (was 1.8× and 1.5×; the
+  rest mostly their int8 activations, mode (c)); decode **1.12×** and 1.15× at context 2048, 1.00×
+  and 1.06× at 512. **At 2048 the whole
   gap is the KV's bytes** (profile by zone, MEASUREMENTS §Decode at context 2048): every zone reads
   memory at 38–51 GB/s, and our F32 KV is 518 MiB per token against llama.cpp's F16 259; halving it
   gives 1.18× (~1.25× on Q4_K weights). No exact lever left (≤ 3%): KV at 16 bits, point 6, is

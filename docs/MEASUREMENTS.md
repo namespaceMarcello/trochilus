@@ -2587,6 +2587,24 @@ layers and the output, gain 1.18×); decode the same, as predicted. Against llam
 again). Open: the same kernel on AVX2 (16 registers: eight accumulators leave no room, it would take
 the lanes in two passes), and four rows at a time on AVX-512.
 
+**The race with llama.cpp again** (`sh tools/race_llama.sh 5` on commit 2d709e0, the same rules as
+§Speed — again; declared load 2.3 before and 2.6 after; `build/race_llama/`, the morning's series in
+`build/race_llama-prev/`). Tokens/s, series a / b:
+
+| prompt | threads | Trochilus prefill | llama.cpp prefill | Trochilus decode | llama.cpp decode |
+|---|---|---|---|---|---|
+| 512 | 16 | 252.5 / 255.2 | 365.1 / 348.9 | 31.0 / 31.6 | 31.9 / 30.8 |
+| 512 | 8 | 223.9 / 210.1 | 244.8 / 247.5 | 30.6 / 29.9 | 32.4 / 32.1 |
+| 2048 | 16 | 232.0 / 232.5 | 342.9 / 340.6 | 24.9 / 24.5 | 27.8 / 27.5 |
+| 2048 | 8 | 196.9 / 198.3 | 242.5 / 239.4 | 23.3 / 23.9 | 27.5 / 26.8 |
+
+llama.cpp over Trochilus (means of the two series; A/A at most 6.4%, Trochilus's prefill at 8
+threads and 512): **prefill 1.41× at 16 threads and 1.13× at 8 with a 512 prompt, 1.47× and 1.22×
+with 2048** (this morning 1.8× and 1.5×; our prefill 1.26–1.28× the morning's at 16 threads, a
+little more than the engine A/B above: the morning's series ran on a busier machine); decode 1.00×
+and 1.06× at context 512, 1.12× and 1.15× at 2048 (this morning 1.04–1.09× and 1.16–1.26×; the
+long-context gap is the KV's bytes, §Decode at context 2048).
+
 ## Decode at context 2048: where the gap with llama.cpp is (2026-09-24)
 
 Question 18, before writing any code: llama.cpp decodes 1.16× faster than us at 16 threads and 1.26×

@@ -1011,3 +1011,8 @@ Tests: every tier's two-row kernel against two scalar x4, a wrong one per type t
 `tools/mutate_row2.sh`, 11 mutations, all red. Prefill 1.20–1.26× on Q8_0, 1.11–1.12× on Q4_K_M,
 decode unchanged (MEASUREMENTS §Two weight rows). Check: `make check`; `sh tools/bench_kernels.sh`;
 `sh tools/mutate_row2.sh` (container); `build/trochilus generate -m <gguf> -p 512 -n 16`.
+
+### 2026-09-24 — The race with llama.cpp again
+`sh tools/race_llama.sh 5` on commit 2d709e0: llama.cpp's prefill is now 1.41× ours at 16 threads
+and 1.13× at 8 (was 1.8× and 1.5×), decode 1.00–1.06× at context 512 and 1.12–1.15× at 2048
+(MEASUREMENTS §Two weight rows). Check: `sh tools/race_llama.sh 5`.
