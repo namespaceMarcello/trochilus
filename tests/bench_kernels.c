@@ -60,6 +60,18 @@ static void fill_row(tr_type type, uint8_t *row, int64_t n) {
             for (int i = 0; i < 32; i++) blk[2 + i] = (uint8_t)(int8_t)(frand() * 127.0f);
         }
         break;
+    case TR_TYPE_Q4_K:
+        for (int64_t b = 0; b < n / 256; b++) {
+            uint8_t *blk = row + 144 * b;
+            uint16_t d = 0x2C00 | (uint16_t)((rng_state >> 30) & 0x3FF);     /* small positive scales */
+            frand();
+            uint16_t dmin = 0x2800 | (uint16_t)((rng_state >> 30) & 0x3FF);
+            frand();
+            memcpy(blk, &d, 2);
+            memcpy(blk + 2, &dmin, 2);
+            for (int i = 4; i < 144; i++) blk[i] = (uint8_t)((frand() + 1.0f) * 127.9f);
+        }
+        break;
     default:
         break;
     }
@@ -305,13 +317,13 @@ static void measure(dot_job *j, int runs, double run_ms, double *ns_median, doub
 
 /* Same row against TR_DOT_TOKENS input rows (the block path of tr_matmul): ns per call
  * covers TR_DOT_TOKENS * n elements. */
-static void measure_x4(const tr_kernels *k, const uint8_t *row, const float *x, int64_t n, int runs, double run_ms,
-                        double *ns_median, double *spread) {
+static void measure_x4(const tr_kernels *k, tr_type type, const uint8_t *row, const float *x, int64_t n, int runs,
+                       double run_ms, double *ns_median, double *spread) {
     float out[TR_DOT_TOKENS];
     long calls = 1;
     double t0 = tr_time_sec();
     while (tr_time_sec() - t0 < 0.02) {
-        for (long c = 0; c < calls; c++) k->dot_row_x4[TR_TYPE_Q8_0](row, x, n, n, out);
+        for (long c = 0; c < calls; c++) k->dot_row_x4[type](row, x, n, n, out);
         calls *= 2;
     }
     double per_call = (tr_time_sec() - t0) / (double)(calls - 1);
@@ -321,7 +333,7 @@ static void measure_x4(const tr_kernels *k, const uint8_t *row, const float *x, 
     double ns[MAX_RUNS];
     for (int r = 0; r < runs; r++) {
         double a = tr_time_sec();
-        for (long c = 0; c < calls; c++) k->dot_row_x4[TR_TYPE_Q8_0](row, x, n, n, out);
+        for (long c = 0; c < calls; c++) k->dot_row_x4[type](row, x, n, n, out);
         ns[r] = (tr_time_sec() - a) * 1e9 / (double)calls;
     }
     qsort(ns, (size_t)runs, sizeof ns[0], cmp_double);
@@ -503,6 +515,7 @@ int main(int argc, char **argv) {
     static const int64_t sizes[] = {64, 1024, 2048, 4096};
     static const struct { const char *name; tr_type type; } kinds[] = {
         {"dot_f32", TR_TYPE_COUNT}, {"dot_row f16", TR_TYPE_F16}, {"dot_row q8_0", TR_TYPE_Q8_0},
+        {"dot_row q4_k", TR_TYPE_Q4_K},
     };
 
     int64_t max_n = 4096;
@@ -521,6 +534,7 @@ int main(int argc, char **argv) {
             if (type != TR_TYPE_COUNT && k->dot_row[type] == NULL) continue;
             for (size_t s = 0; s < sizeof sizes / sizeof sizes[0]; s++) {
                 int64_t n = sizes[s];
+                if (type != TR_TYPE_COUNT && n % (int64_t)tr_type_get((uint32_t)type)->block_elems != 0) continue;
                 if (type != TR_TYPE_COUNT) fill_row(type, row, n);
                 dot_job j = {k, type, row, a, x, n, 0};
                 double ns, spread;
@@ -536,16 +550,24 @@ int main(int argc, char **argv) {
     float *x4 = tr_alloc_aligned((size_t)max_n * TR_DOT_TOKENS * sizeof(float), 64);
     if (!x4) { fprintf(stderr, "out of memory\n"); return 1; }
     for (int64_t i = 0; i < max_n * TR_DOT_TOKENS; i++) x4[i] = frand();
+    static const struct { const char *name; tr_type type; } kinds4[] = {
+        {"dot_row q8_0 x4", TR_TYPE_Q8_0}, {"dot_row q4_k x4", TR_TYPE_Q4_K},
+    };
     for (size_t t = 0; t < sizeof tiers / sizeof tiers[0]; t++) {
         const tr_kernels *k = tr_kernels_tier(tiers[t]);
-        if (k == NULL || k->dot_row_x4[TR_TYPE_Q8_0] == NULL) continue;
-        for (size_t s = 0; s < sizeof sizes / sizeof sizes[0]; s++) {
-            int64_t n = sizes[s];
-            fill_row(TR_TYPE_Q8_0, row, n);
-            double ns, spread;
-            measure_x4(k, row, x4, n, runs, run_ms, &ns, &spread);
-            printf("%-12s %-14s %6lld %12.1f %12.1f %7.1f%%\n", k->tier, "dot_row q8_0 x4", (long long)n, ns,
-                   (double)n * TR_DOT_TOKENS / ns * 1e3, spread * 100.0);
+        if (k == NULL) continue;
+        for (size_t kind = 0; kind < sizeof kinds4 / sizeof kinds4[0]; kind++) {
+            tr_type type = kinds4[kind].type;
+            if (k->dot_row_x4[type] == NULL) continue;
+            for (size_t s = 0; s < sizeof sizes / sizeof sizes[0]; s++) {
+                int64_t n = sizes[s];
+                if (n % (int64_t)tr_type_get((uint32_t)type)->block_elems != 0) continue;
+                fill_row(type, row, n);
+                double ns, spread;
+                measure_x4(k, type, row, x4, n, runs, run_ms, &ns, &spread);
+                printf("%-12s %-14s %6lld %12.1f %12.1f %7.1f%%\n", k->tier, kinds4[kind].name, (long long)n, ns,
+                       (double)n * TR_DOT_TOKENS / ns * 1e3, spread * 100.0);
+            }
         }
     }
     tr_free_aligned(x4);

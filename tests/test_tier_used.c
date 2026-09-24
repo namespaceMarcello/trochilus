@@ -153,6 +153,7 @@ static atomic_ullong n_dot_x4, n_axpy_x4;
 COUNTED(TR_TYPE_F32, f32)
 COUNTED(TR_TYPE_F16, f16)
 COUNTED(TR_TYPE_Q8_0, q8_0)
+COUNTED(TR_TYPE_Q4_K, q4_k)
 
 static void counted_dot_f32_x4(const float *a, const float *b, int64_t stride, int64_t n, float *out) {
     atomic_fetch_add(&n_dot_x4, 1);
@@ -168,16 +169,18 @@ static void counted_axpy_f32_x4(float *y, const float *x, int64_t stride, const 
 enum { LAYERS = 2, N_EMBD = 64, N_HEAD = 4, N_HEAD_KV = 2, N_FF = 64, N_EXPERT = 8, N_USED = 3, VOCAB = 48, CTX = 32 };
 enum { N_PROMPT = 11, N_SINGLE = 2 }; /* a pass of 11 tokens (x4 and a tail of 3), then one token a pass */
 
-static void test_engine(const char *argv0, tr_type type, const char *name) {
+static void test_engine(const char *argv0, tr_type type, const char *name, long long n_embd, long long n_ff) {
     static tr_kernels counting;
     g_real = tr_kernels_get();
     counting = *g_real;
     counting.dot_row[TR_TYPE_F32] = row_f32;
     counting.dot_row[TR_TYPE_F16] = row_f16;
     counting.dot_row[TR_TYPE_Q8_0] = row_q8_0;
+    counting.dot_row[TR_TYPE_Q4_K] = row_q4_k;
     if (g_real->dot_row_x4[TR_TYPE_F32] != NULL) counting.dot_row_x4[TR_TYPE_F32] = x4_f32;
     if (g_real->dot_row_x4[TR_TYPE_F16] != NULL) counting.dot_row_x4[TR_TYPE_F16] = x4_f16;
     if (g_real->dot_row_x4[TR_TYPE_Q8_0] != NULL) counting.dot_row_x4[TR_TYPE_Q8_0] = x4_q8_0;
+    if (g_real->dot_row_x4[TR_TYPE_Q4_K] != NULL) counting.dot_row_x4[TR_TYPE_Q4_K] = x4_q4_k;
     counting.dot_f32_x4 = counted_dot_f32_x4;
     counting.axpy_f32_x4 = counted_axpy_f32_x4;
     for (int i = 0; i < TR_TYPE_COUNT; i++) {
@@ -187,7 +190,7 @@ static void test_engine(const char *argv0, tr_type type, const char *name) {
     atomic_store(&n_dot_x4, 0);
     atomic_store(&n_axpy_x4, 0);
 
-    const synth_params P = {LAYERS, N_EMBD, N_HEAD, N_HEAD_KV, N_FF, N_EXPERT, N_USED, VOCAB, CTX, type};
+    const synth_params P = {LAYERS, (uint32_t)n_embd, N_HEAD, N_HEAD_KV, (uint32_t)n_ff, N_EXPERT, N_USED, VOCAB, CTX, type};
     char path[512], err[256];
     synth_f32_router = 1;
     TR_CHECK(synth_write(&P, argv0, "test_tier_used_tmp.gguf", path, sizeof path) == 0);
@@ -207,8 +210,8 @@ static void test_engine(const char *argv0, tr_type type, const char *name) {
          * projection, and gate, up and down of each expert it uses; the router's are F32; the
          * logits are one row of the vocabulary per call */
         long long tokens = N_PROMPT + N_SINGLE, evals = 1 + N_SINGLE;
-        long long n_kv = (long long)N_HEAD_KV * (N_EMBD / N_HEAD);
-        long long of_type = tokens * LAYERS * (N_EMBD + 2 * n_kv + N_EMBD + N_USED * (2 * N_FF + N_EMBD)) + evals * VOCAB;
+        long long n_kv = (long long)N_HEAD_KV * (n_embd / N_HEAD);
+        long long of_type = tokens * LAYERS * (n_embd + 2 * n_kv + n_embd + N_USED * (2 * n_ff + n_embd)) + evals * VOCAB;
         long long of_router = tokens * LAYERS * N_EXPERT;
         for (int i = 0; i < TR_TYPE_COUNT; i++) {
             long long want = (i == (int)type ? of_type : 0) + (i == TR_TYPE_F32 ? of_router : 0);
@@ -219,7 +222,9 @@ static void test_engine(const char *argv0, tr_type type, const char *name) {
         }
         /* a pass of 11 tokens must take the x4 road where the tier has one, and so must attention */
         if (g_real->dot_row_x4[type] != NULL) TR_CHECK(atomic_load(&n_x4[type]) > 0);
-        if (g_real->dot_row_x4[TR_TYPE_F32] != NULL) TR_CHECK(atomic_load(&n_x4[TR_TYPE_F32]) > 0);
+        /* the router's x4 road at n_embd 64 only: at 256 tr_matmul_grouped's chunks (4096 / cols + 1
+         * products) hold fewer than 4 whole tokens of its 8 rows, and every product goes one dot at a time */
+        if (g_real->dot_row_x4[TR_TYPE_F32] != NULL && n_embd == N_EMBD) TR_CHECK(atomic_load(&n_x4[TR_TYPE_F32]) > 0);
         TR_CHECK(atomic_load(&n_dot_x4) > 0);
         TR_CHECK(atomic_load(&n_axpy_x4) > 0);
         printf("  %-5s model on tier %-7s %lld products of its type and %lld of the F32 router, all through the "
@@ -239,8 +244,9 @@ int main(int argc, char **argv) {
     const char *argv0 = argc > 0 ? argv[0] : "";
     test_table();
     test_ops();
-    test_engine(argv0, TR_TYPE_F32, "f32");
-    test_engine(argv0, TR_TYPE_F16, "f16");
-    test_engine(argv0, TR_TYPE_Q8_0, "q8_0");
+    test_engine(argv0, TR_TYPE_F32, "f32", N_EMBD, N_FF);
+    test_engine(argv0, TR_TYPE_F16, "f16", N_EMBD, N_FF);
+    test_engine(argv0, TR_TYPE_Q8_0, "q8_0", N_EMBD, N_FF);
+    test_engine(argv0, TR_TYPE_Q4_K, "q4_k", 256, 256);   /* rows of whole 256-element blocks */
     TR_TEST_EXIT();
 }

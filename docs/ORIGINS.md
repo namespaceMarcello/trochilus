@@ -11,6 +11,7 @@ Updated in the same commit that brings the code.
 | colibri (`JustVugg/colibri`, branch `dev`) | Apache-2.0 | `a90bed9` (2026-09-17) | `ref/colibri` | `Desktop\colibri` |
 | ds4 (`antirez/ds4`, branch `main`) | MIT (contains ggml code, MIT) | `8db1d1d` (2026-09-16) | `ref/ds4` | `Desktop\ds4` |
 | llama.cpp (`ggml-org/llama.cpp`, `master`) — reference for comparison and source of ideas, no code ported | MIT | `b49650a` (2026-09-17) | `ref/llama.cpp` (shallow clone; build in `build-trochilus/` with `tools/build_llamacpp.sh`) | — |
+| ik_llama.cpp (`ikawrakow/ik_llama.cpp`, `main`) — source of ideas for the K-quant kernels, no code ported | MIT | `f3d6e6e` (2026-09-23) | `ref/ik_llama.cpp` (shallow clone, 150 MB) | — |
 
 To move a reference: `git -C <clone> fetch`, then `git -C ref/<project> checkout --detach <commit>`,
 and update the table. Files already ported remain tied to the commit written in their row.
@@ -122,6 +123,25 @@ of questions 13–16 in front (`docs/MEASUREMENTS.md` §M1). Three bugs found in
 | a read error | `exit(1)` inside `st_pread_full` (`st.h:268`), even for optional preload | eval returns -1 and session stays as it was | an engine in a library cannot close the process |
 | where to read from | own format converted (`model-*.safetensors`, `st.h`) | standard GGUF, at tensor positions | decision 2026-09-17: Hugging Face files open without conversion |
 
+### Q4_K on the CPU: what was taken from llama.cpp and ik_llama.cpp (2026-09-24)
+
+`src/kernels` Q4_K (scalar in `kernels.c`, AVX2 and AVX-512 in `kernels_x86.c`) is new code, written
+after reading llama.cpp `b49650a` (`ggml-common.h` `block_q4_K`, `ggml-quants.c`
+`dequantize_row_q4_K` and `get_scale_min_k4`, `ggml-cpu/arch/x86/quants.c`
+`ggml_vec_dot_q4_K_q8_K`, `ggml-cpu/repack.cpp` `block_q4_Kx8`, `gguf-py/gguf/quants.py` `Q4_K`) and
+ik_llama.cpp `f3d6e6e` (`ggml/src/iqk/iqk_gemm_kquants.cpp` `DequantizerQ4K`, `Scales8K`;
+`iqk_common.h` `make_q4_scales`; `iqk_quantize.cpp` `repack_q4_k`).
+
+| Choice | llama.cpp | ik_llama.cpp | Trochilus | Why |
+|---|---|---|---|---|
+| the block and its weights | `block_q4_K`: f16 d and dmin, 12 bytes of 6-bit scales and mins, 128 of nibbles; weight `d*sc*q - dmin*m` | the same block | read as it is in the file; the weight `(d*sc)*q - (dmin*m)`, each product rounded to float | taken: the file format, and gguf-py's order of operations, so a dequantized row is gguf-py's bit for bit (`tools/check_dequant.py` in the gate) |
+| the activations | quantized to Q8_K (8 bits, blocks of 256 with their sums), integer dot | Q8_K, Q8_K32, Q8_1_X4, integer `madd` | float, never quantized | rejected as for Q8_0 (question 21): 8-bit activations are another number, not exact |
+| the min term | `dmin*m * sum(y)` per sub-block, from the sums stored with the Q8_K activations | the same (`accum_mins`) | inside each weight, element by element | the dot of the dequantized weight is the definition: bit for bit dequantize-then-dot, the closest to transformers' float matmul; the factored form rounds otherwise |
+| decoding the weights in SIMD | nibble masks, then int8 products | the same, 8 scales unpacked at once with 32-bit masks (`make_q4_scales`) | AVX2: nibbles to float, `scale*q - min`; **AVX-512: the 16 values a sub-block can take computed once, `vpermps` picks each weight by its nibble**: no conversion and no mask per element | ours: float activations make a weight a lookup among 16 floats, and one AVX-512 register holds exactly 16. The 32-bit unpack of the scales was not needed: it runs once per 256 elements |
+| rows repacked at load | `block_q4_Kx8`: 8 rows interleaved, `gemv`/`gemm` over them | `-rtr`, `Q4_K_R4`: 4 rows interleaved | not taken | the expert store reads the file's bytes into its slots (M1): a repack would be a transform on every read. What it buys, one activation load for several rows, matters little in decode (the activations sit in L1); a question for later |
+| large prompts | 8-bit GEMM | Q4_K converted to 8-bit rows (`iqk_convert_q4_k_q8_1_r8`), then 8-bit GEMM | not taken (8 bits) | the float form of the idea, a row dequantized once per tile of tokens and the F32 kernel on it, is to be measured |
+| IQ_K types | — | its own types (IQ2_K … IQ6_K), better quality per bit | not now | not among the GGUF types of llama.cpp that our reader follows; such files come only from ik's quantizer |
+
 ## Sources not yet studied (2026-09-24)
 
 Proposed by Marcello to improve and evolve Trochilus; my first read of each, from what they declare
@@ -131,7 +151,6 @@ When one is studied, its row moves to the tables above (ported, or ideas taken) 
 
 | Project | What it is | What we would take | When | First read |
 |---|---|---|---|---|
-| ik_llama.cpp (fork of llama.cpp, MIT) | CPU-first fork: K-quant and IQ_K kernels, fused MoE ops, weights repacked at load (`-rtr`) | how its K-quant and IQ_K kernels lay out blocks and registers; the repacking at load; what it fuses in the MoE layer | **M2, first step** (Q4_K): read beside llama.cpp's `ggml-cpu` before writing the kernels | yes. Their activations are 8-bit (not exact, discarded as for Q8_0); the weight layouts and the repacking are what count. A shallow clone in `ref/`, size announced, commit fixed here |
 | ktransformers (kvcache-ai) | MoE inference on consumer hardware, CPU and GPU together: hot experts on the GPU, the rest on the CPU with its own kernels | the CPU/GPU split of the experts and how it decides what goes where; its CPU MoE kernels | **M3** (CUDA module, hot experts in VRAM): it is M3 almost to the letter | yes, at M3; little to take before |
 | Adaptive-K routing | fewer than top-k experts for a token when the router is confident (its entropy); declared 24-33% less compute, perplexity within 0.5% (Mixtral, Qwen-MoE) | the idea, as our own experiment: a declared, non-exact mode | M1/M2, as a question (MEASUREMENTS question 50) | interesting here more than for them: under a partial budget every expert skipped is a unit not read from disk, and the disk is our bottleneck. Our tools measure it (expert mask, route trace, KL). Caution from our data: switching off the least-used experts overall changed the token in 6-19% of positions (§Route trace); dropping the lowest-weight ones per token should cost far less |
 | ArcLight | an architecture for many-core CPUs and NUMA: memory placement and thread scheduling against cross-NUMA access; declared up to +46% throughput | pool and memory placement per NUMA node | when Trochilus targets servers | later: the reference laptop has one NUMA node, nothing to gain here today. Not known to me first-hand: verify it exists as described before counting on it |

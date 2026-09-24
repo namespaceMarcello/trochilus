@@ -2368,6 +2368,94 @@ acquire, which makes that layer's units the most recent, and the margin of 2·n_
 slots leaves at least n_expert + n_used colder slots outside it: the guard never fires in this
 call order, and the store's own test of it is red).
 
+## Speed — Trochilus vs llama.cpp again (2026-09-24)
+
+The race of 2026-09-17 (above) on the binary of commit `55c31ff`: `sh tools/race_llama.sh 5`, both
+engines in the trochilus-dev container on the same OLMoE-1B-7B Q8_0 all in RAM (volume
+`trochilus-models`), llama.cpp `b49650a` (`llama-bench`, `-d` = prompt for the decode), Trochilus
+`generate` with the decode width forced to its thread count. Median of 5 runs after one warm-up,
+per series; order A B B A per prompt, so each engine has two series (its A/A). The machine's
+marker held throughout; a still machine before every series (below 3.5 busy processors); declared
+background load 4.1 before and 4.5 after, of 32 logical processors, ~1 of them the kernel's System
+process (as always here, LESSONS #85), the rest an idle OpenEMR stack and a browser of another
+window. Tokens/s, series a / b; results in `build/race_llama/`.
+
+| prompt | threads | Trochilus prefill | llama.cpp prefill | Trochilus decode | llama.cpp decode |
+|---|---|---|---|---|---|
+| 512 | 16 | 199.6 / 196.0 | 349.6 / 356.2 | 30.9 / 29.6 | 32.4 / 30.7 |
+| 512 | 8 | 171.5 / 166.2 | 253.5 / 247.6 | 29.9 / 29.0 | 32.2 / 32.0 |
+| 2048 | 16 | 183.5 / 185.0 | 331.5 / 327.0 | 23.6 / 24.3 | 28.4 / 27.0 |
+| 2048 | 8 | 161.8 / 143.9 | 229.2 / 233.3 | 22.3 / 20.1 | 26.6 / 26.8 |
+
+Where we lose, llama.cpp over Trochilus (means of the two series; the A/A gap in brackets, the
+largest of the two engines):
+- **prefill 1.8× at 16 threads, 1.5× at 8**, the same at 512 and at 2048 (A/A 2–12%). On
+  2026-09-17 it was 13× at 512: the block prefill and the grouped attention closed most of it. What
+  is left is mostly the int8 activations (VNNI) llama.cpp uses there, which are not exact: the
+  declared int8 mode of Marcello's order (c).
+- **decode at context 512: 1.04× at 16 threads, 1.09× at 8** (A/A 4–5%): at 16 threads within the
+  noise. On 2026-09-17 it was 1.19× and 1.15×.
+- **decode at context 2048: 1.16× at 16 threads, 1.26× at 8** (A/A 5–10%): the cost of a long
+  context is still ours (question 18, the attention over the KV), and it is now the largest gap in
+  decode.
+
+## Q4_K on the CPU (2026-09-24)
+
+M2's first step: Q4_K weights against float activations, exact (the dequantized weight in every
+product), scalar as the definition and AVX2 and AVX-512 bit for bit the same (what was taken from
+llama.cpp and ik_llama.cpp: docs/ORIGINS.md §Q4_K on the CPU).
+
+**Prediction, written before measuring.** Microbenchmark (rows in cache, compute only): AVX-512
+Q4_K 0.8–1.2× Q8_0's elements per second (the 16-value lookup saves the conversion to float, the
+shift and the scales cost); AVX2 Q4_K ~0.7× Q8_0 (a mask or a shift and a subtraction more per
+element). Real model: the Q4_K file is ~3.9 GB against 7.0, and decode reads every weight it
+uses once per token, so decode 1.3–1.5× Q8_0 if the kernel keeps up with the memory; prefill,
+where compute counts, 0.8–1.0×.
+
+**Microbenchmark** (`bench_kernels`, native, a copy of the binary one byte longer: LESSONS #12;
+the machine's marker, still machine; declared load 2.9 before, 4.1 after, ~0.9 of it System;
+median of 7 runs of 200 ms; one core; rows in cache). Millions of elements per second, n = 2048 /
+4096; `build/bench_q4k.txt`.
+
+| tier | dot_row Q8_0 | dot_row Q4_K | Q4_K / Q8_0 | x4 Q8_0 | x4 Q4_K | Q4_K / Q8_0 |
+|---|---|---|---|---|---|---|
+| scalar | 1748 / 1848 | 853 / 848 | 0.46–0.49 | 2279 / 2050 | 1562 / 1557 | 0.69–0.76 |
+| avx2 | 16097 / 17076 | 10157 / 9101 | 0.53–0.63 | 28905 / 32473 | 22274 / 21978 | 0.68–0.77 |
+| avx512 | 15970 / 17479 | 13456 / 15685 | **0.84–0.90** | 34872 / 32613 | 31880 / 28312 | **0.87–0.91** |
+
+Spread 5–35% per line (the machine), so a ratio holds to ±10%. Against the prediction: AVX-512 in
+the range (0.8–1.2), AVX2 below it (0.7): the conversion path costs a mask or a shift, a convert,
+a multiply and a subtraction per element where Q8_0 has a convert and a multiply. Per byte of
+weight read, AVX-512 Q4_K goes through 15.7 G elements × 0.5625 B = 8.8 GB/s on one core, far
+above one core's share of the memory (~60 GB/s over 16): decode stays bound by memory, where Q4_K
+reads 0.53 of Q8_0's bytes. The same lookup on AVX2 (two `vpermps` of 8 and a blend by the
+nibble's fourth bit) is the next attempt for that tier.
+
+**Exactness on the real model.** The Q4_K file made by `tools/quantize_q4k.sh` (llama-quantize
+`--pure --allow-requantize` from our Q8_0: 3.72 GiB of tensors, 4.51 bits per weight), cut to 2
+layers, against transformers on its own dequantized weights (`make oracle-real` with
+`REAL_MODEL_Q4K`, in `make check`): 27 + 32 and 1024 + 32 tokens, greedy 32/32 on both, logits
+within 1.5e-5 and 1.9e-4 (tolerance 1e-3), argmax 1056/1056, every batch size bit-identical to one
+token per pass. The whole model writes the same first 24 tokens as the Q8_0 on "The capital of
+France is".
+
+**Real model, Q4_K against Q8_0** (`sh tools/race_q4k.sh 5`: container, all in RAM, prompt 512, 128
+generated, median of 5 after a warm-up, order Q4_K Q8_0 Q8_0 Q4_K, then llama.cpp on the Q4_K;
+marker held, still machine before each series, declared load 3.6 before and 4.8 after, ~0.9 of it
+System). Tokens/s, series a / b; `build/race_q4k/`.
+
+| threads | Q4_K prefill | Q8_0 prefill | Q4_K decode | Q8_0 decode | llama.cpp Q4_K prefill | llama.cpp Q4_K decode |
+|---|---|---|---|---|---|---|
+| 16 | 203.8 / 200.4 | 202.4 / 195.1 | **45.6 / 46.0** | 29.5 / 30.6 | 415.8 | 48.8 |
+| 8 | 171.1 / 175.4 | 152.4 / 148.4 | **43.5 / 42.6** | 29.6 / 27.7 | 309.2 | 50.3 |
+
+- **decode 1.52× at 16 threads, 1.50× at 8** (A/A ≤ 7%): at the top of the prediction (1.3–1.5×),
+  the bytes read per token nearly halved and the kernel keeping up with them;
+- prefill 1.01× at 16 threads, 1.15× at 8 (A/A up to 3%; the 8-thread Q8_0 series is the noisy
+  one): no loss, where 0.8–1.0× was predicted, the dequantization hidden behind the x4 kernel;
+- against llama.cpp on the same Q4_K file: their decode 1.07× ours at 16 threads, 1.17× at 8 (one
+  series each), their prefill 2.1× and 1.8× (their 8-bit activations).
+
 ## Attempts
 
 | Data | Cosa | Prima | Dopo | Spread | Esito |

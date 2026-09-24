@@ -1,6 +1,6 @@
 /* synth_olmoe.h — writes a synthetic OLMoE GGUF (deterministic weights) of any size, so
- * model tests need no external fixture or Python tool. Norms are f32; matrices are f32 or
- * Q8_0 (then every matrix row length, n_embd and n_ff, must be a multiple of 32). */
+ * model tests need no external fixture or Python tool. Norms are f32; matrices are f32, f16,
+ * Q8_0 (then every matrix row length, n_embd and n_ff, must be a multiple of 32) or Q4_K (of 256). */
 #ifndef TR_TEST_SYNTH_OLMOE_H
 #define TR_TEST_SYNTH_OLMOE_H
 
@@ -15,7 +15,7 @@
 
 typedef struct {
     uint32_t layers, n_embd, n_head, n_head_kv, n_ff, n_expert, n_used, vocab, ctx;
-    tr_type type; /* of the 2-D and 3-D tensors: TR_TYPE_F32, TR_TYPE_F16 or TR_TYPE_Q8_0 */
+    tr_type type; /* of the 2-D and 3-D tensors: TR_TYPE_F32, TR_TYPE_F16, TR_TYPE_Q8_0 or TR_TYPE_Q4_K */
 } synth_params;
 
 /* Set to 1 before synth_write: the router's matrix is F32 whatever `type` is, as in every real
@@ -205,6 +205,27 @@ static void synth_tensor(synth_buf *hdr, synth_buf *data, const char *name, int 
     }
     synth_u32(hdr, (uint32_t)type);
     synth_u64(hdr, data->len);
+    if (type == TR_TYPE_Q4_K) {
+        /* d and dmin in [2^-12, 2^-11) (exponent bits 3), every other byte random: weights
+         * d*sc*q - dmin*m below about 0.23 */
+        for (uint64_t b = 0; b < n / 256; b++) {
+            uint16_t dd[2] = {0, 0};
+            for (int h = 0; h < 2 && !zero; h++) {
+                seed = seed * 1103515245u + 12345u;
+                dd[h] = (uint16_t)((3u << 10) | ((seed >> 16) & 0x3FFu));
+            }
+            synth_put(data, dd, sizeof dd);
+            for (int k = 0; k < 140; k++) {
+                uint8_t v = 0;
+                if (!zero) {
+                    seed = seed * 1103515245u + 12345u;
+                    v = (uint8_t)(seed >> 16);
+                }
+                synth_put(data, &v, 1);
+            }
+        }
+        return;
+    }
     if (type != TR_TYPE_F32 && type != TR_TYPE_F16 && type != TR_TYPE_Q8_0) {
         const tr_type_info *ti = tr_type_get((uint32_t)type);
         uint8_t z = 0;

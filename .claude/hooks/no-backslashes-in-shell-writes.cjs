@@ -8,7 +8,8 @@ process.stdin.on('data', (c) => (dati += c))
 process.stdin.on('end', () => {
   let cmd = ''
   try { cmd = JSON.parse(dati || '{}').tool_input?.command || '' } catch { process.exit(0) }
-  const scrive = /write_text\(|\.write\(|open\([^)]*['"][wa]b?['"]/.test(cmd)
+  // sed -i too: a replacement holding barra+n left the two characters in the Makefile (LESSONS #145)
+  const scrive = /write_text\(|\.write\(|open\([^)]*['"][wa]b?['"]|\bsed\s+(-[a-zA-Z]*i|--in-place)/.test(cmd)
   if (!scrive) process.exit(0)
   const barra = String.fromCharCode(92)
   const escape = new RegExp(barra + barra + '[ntr"\'' + barra + barra + ']')

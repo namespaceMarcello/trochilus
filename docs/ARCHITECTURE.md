@@ -255,7 +255,7 @@ per token. The directions that attack that division, one at a time, under the ru
 |---|---|---|
 | **M0** | base, GGUF, converter (F32/F16/Q8_0), CPU backend scalar + AVX2 + AVX-512 with dispatch, OLMoE graph, greedy, CLI | tiny oracle exact on Windows and Linux; true OLMoE-1B-7B answers |
 | M1 | experts from disk with RAM budget: slot-based store, LRU O(1), reads on demand; **auto plan** (measures RAM, picks budget); then, on fast disks, I/O threads and preloading | small forced budget → byte-identical logits; no option necessary |
-| M2 | K-quant (Q4_K, Q6_K, Q2_K, IQ2_XXS) on CPU, assembly workshop | bit-identical kernels, microbenchmarks |
+| M2 | K-quant on CPU — **Q4_K in** (2026-09-24: scalar, AVX2, AVX-512 bit-identical, gguf-py bit for bit, real model decode 1.5× Q8_0), then Q6_K, Q2_K, IQ2_XXS; assembly workshop | bit-identical kernels, microbenchmarks |
 | M3 | CUDA module (mmq from ggml via ds4), hot experts in VRAM, VRAM + RAM + disk plan | same tokens as CPU; a model larger than RAM runs on reference PC |
 | M4 | DeepSeek V4 Flash | tiny oracle exact; runs on reference PC |
 | M5 | KV checkpoint to disk, server, speculative decode | — |

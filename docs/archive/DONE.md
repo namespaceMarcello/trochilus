@@ -965,3 +965,19 @@ polling (10 → 2.7 s), and the platform stamp is written atomically. `tools/spe
 the decode width (`--decode-threads same`) and `tools/race_llama.sh` runs the race against
 llama.cpp by the rules of a native measurement. Table in MEASUREMENTS §The gate. Check: `make
 check` ("check passed in ... s").
+
+### 2026-09-24 — Q4_K on the CPU, and the race against llama.cpp again
+The engine reads Q4_K weights (M2, first step): scalar dequantization and dot row in
+`src/kernels/kernels.c` (the definition: gguf-py's order of operations, the dequantized weight in
+every product), AVX2 and AVX-512 bit for bit the same in `kernels_x86.c`, where AVX-512 computes
+the 16 values a sub-block can take once and picks each weight with `vpermps` (our own, from reading
+llama.cpp and ik_llama.cpp: ORIGINS §Q4_K on the CPU). Tests: a block packed as ggml packs it,
+dot = dot of the dequantized row, every tier against scalar with a wrong kernel that must be seen,
+the reader's Q4_K sizes, a synthetic Q4_K model through the active table in every tier, and
+`tools/check_dequant.py` (every float bit for bit gguf-py's, Q8_0 too, in `make check`). The real
+OLMoE in Q4_K comes from our Q8_0 by `tools/quantize_q4k.sh` (llama-quantize, no download), and its
+2-layer cut meets transformers in `make check` (32/32 tokens, logits within 2e-4). The race against
+llama.cpp redone on the current binary: prefill 1.8× theirs at 16 threads (was 13×), decode 1.04× at
+context 512, 1.16× at 2048 (MEASUREMENTS §Speed — again). Check: `make check`; `make bench`;
+`sh tools/race_q4k.sh`; `build/trochilus run -m models/OLMoE-1B-7B-0125-Instruct-Q4_K.gguf -f
+prompt.txt`.

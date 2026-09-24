@@ -233,6 +233,9 @@ chat-check: $(BUILD)/trochilus$(EXE) $(TOKFIX)/tokenizer.json
 # the smallest expert store takes 57 s instead of 306 s over the Windows bind mount (LESSONS #109).
 REALFIX := models/olmoe-2layer
 REAL_MODEL := models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf
+# the same model quantized to Q4_K from the Q8_0 by llama-quantize (tools/quantize_q4k.sh)
+REALFIX_Q4K := models/olmoe-2layer-q4k
+REAL_MODEL_Q4K := models/OLMoE-1B-7B-0125-Instruct-Q4_K.gguf
 $(REALFIX)/model.gguf: $(REAL_MODEL) tools/make_olmoe_2layer_gguf.py
 	$(PY) tools/make_olmoe_2layer_gguf.py $(REAL_MODEL) $@
 $(REALFIX)/ref.json: $(REALFIX)/model.gguf tools/make_olmoe_2layer_ref.py
@@ -281,7 +284,7 @@ clean-machine:
 	sh tools/test_ab_modes.sh
 ifeq ($(OS),Windows_NT)
 check: clean-machine lint
-	$(MAKE) WERROR=1 all $(TEST_BIN) $(BENCH_BIN) $(MEM_BIN) $(ATTN_BIN) $(EXPF_BIN) $(DISK_BIN) $(BUILD)/tests/dump_rope$(EXE)
+	$(MAKE) WERROR=1 all $(TEST_BIN) $(BENCH_BIN) $(MEM_BIN) $(ATTN_BIN) $(EXPF_BIN) $(DISK_BIN) $(BUILD)/tests/dump_rope$(EXE) $(BUILD)/tests/dump_dequant$(EXE)
 	@# the models volume, when it exists, replaces models/ read over the Windows bind mount:
 	@# the real-model checks load the same file from ext4 instead of 9p (docs/LESSONS.md #41)
 	MSYS_NO_PATHCONV=1 docker run --rm --security-opt seccomp=unconfined -v "$(CURDIR):/src" \
@@ -315,6 +318,8 @@ check-linux:
 	$(MAKE) -j3 -Orecurse check-tiny check-real check-cut
 
 check-tiny:
+	@# every dequantization the engine has, bit for bit gguf-py's (the reader of our oracles)
+	$(PY) tools/check_dequant.py --binary build/linux-gcc/tests/dump_dequant
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle
 	@# the same tiny models again, with a store too small to hold every expert (Esperti M1):
 	@# TR_EXPERT_BUDGET_MIB=min forces the smallest store that can run, so this exercises eviction
@@ -343,6 +348,9 @@ check-real:
 check-cut:
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle-real
 	TR_EXPERT_BUDGET_MIB=min $(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle-real
+	@# the same cut of the real model quantized to Q4_K (tools/quantize_q4k.sh; skipped without it)
+	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} oracle-real \
+		REAL_MODEL=$(REAL_MODEL_Q4K) REALFIX=$(REALFIX_Q4K)
 
 check-gcc:
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 TEST_TMP=/tmp/tr-test/gcc test
@@ -352,7 +360,8 @@ check-gcc:
 	@seq 20 | xargs -P 4 -I{} sh -c 'mkdir -p /tmp/tr-test/hot{} && TR_TEST_TMPDIR=/tmp/tr-test/hot{} \
 		build/linux-gcc/tests/test_hot > /dev/null' && echo "== test_hot 20/20"
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 build/linux-gcc/tests/bench_kernels build/linux-gcc/tests/bench_mem \
-		build/linux-gcc/tests/bench_attn build/linux-gcc/tests/bench_disk build/linux-gcc/tests/dump_rope
+		build/linux-gcc/tests/bench_attn build/linux-gcc/tests/bench_disk build/linux-gcc/tests/dump_rope \
+		build/linux-gcc/tests/dump_dequant
 	@# tr_expf is the correctly rounded exp on every float, as gcc and as clang compile it
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 bench-expf
 check-clang:

@@ -24,6 +24,9 @@ sh tools/ab_spec.sh <gguf> <binary> bench/prompts/code.txt 8   # how much --spec
 sh tools/build_llamacpp.sh; tools/compare_llamacpp.py ...   # in container: llama.cpp, logits comparison
 tools/speed_compare.py ...   # in container: speed against llama.cpp and colibri (trochilus-models volume)
 sh tools/race_llama.sh [runs]   # by the native rules: Trochilus vs llama.cpp, prompts 512 and 2048, 16 and 8 threads, A B B A (~30 min)
+sh tools/race_q4k.sh [runs]     # by the native rules: the real model in Q4_K against Q8_0, and llama.cpp on the Q4_K (~20 min)
+MSYS_NO_PATHCONV=1 docker run --rm -v "$PWD:/src" -v trochilus-models:/src/models -w /src trochilus-dev:local sh tools/quantize_q4k.sh   # models/...-Q4_K.gguf from our Q8_0
+tools/.venv/Scripts/python.exe tools/check_dequant.py --binary build/tests/dump_dequant.exe   # every dequantization bit for bit gguf-py's (in make check)
 sh tools/ab_speed.sh <gguf> <binary A> <binary B>   # two binaries alternated run by run (LESSONS #46)
 sh tools/ab_modes.sh <rounds> "a=<command>" "b=<command>"   # modes of a binary (env, flag), round-robin order, A/A (LESSONS #66); AB_WALL=1 adds the whole run's ms (wall_ms)
 build/trochilus serve [-m <gguf>] [-t n] [--expert-budget <MiB|min>] [--idle <min>]   # the engine kept between commands (question 49): generate/logits/run/chat run in it when it answers; TR_SERVER=0: never

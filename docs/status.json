@@ -1,7 +1,7 @@
 {
   "progetto": "Trochilus",
   "sottotitolo": "motore di inferenza per modelli MoE in C, senza dipendenze",
-  "aggiornato": "2026-09-23",
+  "aggiornato": "2026-09-24",
   "stati": {
     "fatto": "finito e provato: test verdi in make check",
     "in-corso": "ci stiamo lavorando adesso",
@@ -28,7 +28,7 @@
       "id": "M2",
       "titolo": "K-quant e assembly",
       "sommario": "meno byte per peso: Q4_K, Q6_K, Q2_K, IQ2_XXS",
-      "stato": "aperto",
+      "stato": "in-corso",
       "criterio": "kernel bit-identici allo scalare, microbenchmark"
     },
     {
@@ -273,6 +273,14 @@
         {
           "v": "make check verde in 405 s (test_cli nativo su Windows: 19 controlli rossi per i fine riga, corretti)",
           "d": "2026-09-23"
+        },
+        {
+          "v": "make check: 428 s → 238 s (i file dei test fuori dal bind mount di Windows, tre corsie per i modelli)",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "gara con llama.cpp sullo stesso Q8_0: prefill loro 1.8× (era 13×), decode loro 1.04× a contesto 512 e 1.16× a 2048",
+          "d": "2026-09-24"
         }
       ],
       "domande": [],
@@ -674,17 +682,41 @@
       "id": "m2-kquant",
       "tappa": "M2",
       "titolo": "K-quant sulla CPU",
-      "stato": "aperto",
-      "cosa": "Formati che tengono i pesi in meno byte (Q4_K, Q6_K, Q2_K, IQ2_XXS). Meno byte vuol dire meno disco e meno RAM: è la leva che si somma a tutto M1. Non sono esatti come Q8_0, quindi diventano un modo dichiarato, non il default.",
+      "stato": "in-corso",
+      "cosa": "Formati che tengono i pesi in meno byte (Q4_K, Q6_K, Q2_K, IQ2_XXS): meno disco e meno RAM, la leva che si somma a tutto M1. Primo passo fatto il 24/09: Q4_K nel motore, esatto rispetto ai suoi pesi dequantizzati (identico al bit a gguf-py, il modello vero tagliato a 2 strati contro transformers nel make check), con un kernel AVX-512 nostro: i 16 valori possibili di un sotto-blocco calcolati una volta, e ogni peso preso col suo nibble. Il modello vero in Q4_K si fa dal nostro Q8_0, senza download. Prossimi: Q6_K (Q4_K_M lo mescola), la stessa tabella su AVX2, il prefill con una riga dequantizzata una volta per blocco di token.",
       "numeri": [
+        {
+          "v": "modello vero in Q4_K: decode 1.5× il Q8_0 (45.8 contro 30.1 tok/s a 16 thread), prefill uguale",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "kernel Q4_K contro Q8_0 per elemento: AVX-512 0.84-0.90×, AVX2 0.53-0.63×",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "oracolo sul taglio a 2 strati in Q4_K: 32/32 token, logit entro 1.9e-4",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "llama.cpp sullo stesso Q4_K: decode 1.07× il nostro a 16 thread, prefill 2.1× (attivazioni a 8 bit)",
+          "d": "2026-09-24"
+        },
         {
           "v": "gli esperti in Q4 dimezzerebbero il disco del prompt (3.3 GiB invece di 6.5)",
           "d": "2026-09-21"
         }
       ],
       "domande": [],
-      "file": [],
-      "comandi": [],
+      "file": [
+        "src/kernels/kernels.c",
+        "src/kernels/kernels_x86.c",
+        "tools/check_dequant.py",
+        "tools/quantize_q4k.sh"
+      ],
+      "comandi": [
+        "make bench",
+        "sh tools/race_q4k.sh"
+      ],
       "dipende": [
         "m1-ordine-layer"
       ]

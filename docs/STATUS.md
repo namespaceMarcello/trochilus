@@ -285,9 +285,19 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
 
 ## Next steps
 
-**Night of 2026-09-24**: the gate 428 → 238 s (MEASUREMENTS §The gate: the tests' files off the
-bind mount, three model lanes); next levers there: the native side beside the container (~35 s),
-`oracle-real` under the smallest store (92 s).
+**Night of 2026-09-24** (DONE, MEASUREMENTS §The gate, §Speed — again, §Q4_K on the CPU):
+- the gate 428 → 238 s; next: the native side beside the container (~35 s), `oracle-real` under
+  the smallest store (92 s);
+- **where we lose to llama.cpp** (same Q8_0, container): prefill **1.8×** at 16 threads, 1.5× at 8
+  (was 13×; what is left is mostly their int8 activations, our declared int8 mode (c)); decode
+  **1.16×** at 16 threads and 1.26× at 8 at context 2048 (the attention over a long KV, question
+  18: now the largest gap in decode), 1.04–1.09× at context 512 (at 16 threads within the noise);
+- **M2 started: Q4_K**, exact against its own dequantized weights (gguf-py bit for bit, the cut
+  against transformers in `make check`); AVX-512 kernel 0.84–0.90× Q8_0 per element, AVX2
+  0.53–0.63× (next: the 16-value lookup there too). The real model
+  in Q4_K (`tools/quantize_q4k.sh`, from our Q8_0): **decode 1.5× the Q8_0**, prefill the same,
+  llama.cpp's decode on it 1.07–1.17× ours. Next in M2: Q6_K (Q4_K_M mixes it in), then the prefill
+  in float with a row dequantized once per tile; and M1 with Q4_K experts (half the disk).
 
 **Review (Opus 5.5, 2026-09-22 and 23)**: reader, expert store, pool, platform, profiler, model
 (`olmoe.c`), kernels, tokenizer and command line read, every file through `tools/mutate_auto.py`
@@ -306,15 +316,8 @@ mutates only the changed lines): every file of `mutate_files.sh` ran again, 42 m
 Open: `gguf.c`, `experts.c`, `threads.c`, `platform.c` are not in `mutate_files.sh` and their
 counts predate #117-#124. The native measurements follow the machine's marker (Known issues).
 
-Steps of 17–19/09 (block prefill, `--spec`, thread pinning, adaptive draft, adversarial revision,
-remeasure with A/A, threads per phase; decode at long context and KV per head, prefill on long
-prompts, scalar `tr_expf`, script cleanup) are in `docs/archive/DONE.md`, their numbers in
-`docs/MEASUREMENTS.md`; closed questions 4, 7, 18, 29, 30, 37, 40, open 34, 35, 36, 38, 39.
-
-Done evening 2026-09-19 and 20 (`docs/MEASUREMENTS.md` §M1, before writing code; LESSONS #91–#94):
-width estimator rewritten, and first piece of M1 — routing trace and disk bench (measurements 13–16).
-Closed questions 13–16 and, as «no», 5, 34, 39; open 41, 42, 43. Token waits of those simulations
-later contradicted by measurement (question 14, LESSONS #98).
+Steps of 17–20/09 are in `docs/archive/DONE.md`, their numbers in `docs/MEASUREMENTS.md`
+(questions closed and open in §Open questions).
 
 **M1 in progress** (project in `docs/ARCHITECTURE.md` §Execution «Experts (M1)», from numbers above):
 expert store with slots allocated at load, index and LRU O(1), not pin from use (LESSONS #93);
