@@ -15,6 +15,19 @@ the numbers; push every lever to the limit the hardware allows (the peak FLOP/s,
 exact bytes), not to "good enough". A premise that gives zero is a discovery too: written, closed,
 next. Pioneer: what nobody has measured is where to look first.
 
+**The method for any speed work, in this order** (Marcello, 2026-09-25, "decisive, we use it": it
+took the Q4_K decode level with llama.cpp, MEASUREMENTS §The Q4_K decode dot sequenced):
+1. **measure before changing, one piece removed at a time**: the deletion series and each
+   instruction's cost on this CPU (`tests/bench_q4k_genome.c` is the pattern); a limit is claimed
+   only from that series, never inferred from failed attempts (LESSONS #176, #178, #179);
+2. **remove the largest piece found**: work done one at a time done in bulk, and ready one step
+   ahead so nothing waits for it (a value read right after its store waits for the store, #180);
+3. **give the core independent work to alternate**: two chains where one waits on itself;
+4. **bring the data before it is needed** (prefetch, early reads), every idea timed alone in cache,
+   then from RAM, then in the engine, then in the race (#181);
+5. **prove the result did not move**: bit for bit against scalar, and mutations the tests must see.
+The prediction is written before the run; the report to Marcello follows the same five steps.
+
 ---
 
 ## How to work
