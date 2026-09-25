@@ -136,8 +136,14 @@ static int reject_leaves_no_trace(tr_model *model, const int32_t *seq, int64_t n
 static int generate_with_batch(tr_model *model, const int32_t *prompt, int64_t vocab, int64_t n_draft,
                                tr_draft_policy policy, int64_t n_want, int64_t n_batch, int32_t *out,
                                int32_t *hist, int64_t *n_hist, float *last, tr_greedy *g_out) {
-    tr_session *s = tr_session_create(model, CTX, n_batch, NULL, 0);
-    if (s == NULL) return -1;
+    /* the refusal says why: a gate beside other windows' containers once failed every case here
+     * with "tokens differ" and no word of the session the memory guard had refused (LESSONS #175) */
+    char err[256] = "";
+    tr_session *s = tr_session_create(model, CTX, n_batch, err, sizeof err);
+    if (s == NULL) {
+        printf("  session not created: %s\n", err[0] ? err : "(no message)");
+        return -1;
+    }
     memcpy(hist, prompt, N_PROMPT * sizeof(int32_t));
     int rc = tr_session_eval(s, prompt, N_PROMPT);
     tr_greedy g;
@@ -149,6 +155,7 @@ static int generate_with_batch(tr_model *model, const int32_t *prompt, int64_t v
         if (got < 0) { rc = -1; break; }
         for (int64_t j = 0; j < got && produced < n_want; j++) out[produced++] = step[j];
     }
+    if (rc != 0) printf("  generation failed after %lld of %lld tokens\n", (long long)produced, (long long)n_want);
     if (rc == 0) {
         memcpy(last, tr_session_logits(s), VOCAB * sizeof(float));
         *n_hist = g.n_hist;

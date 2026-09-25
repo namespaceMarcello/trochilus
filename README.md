@@ -100,7 +100,7 @@ the ones that did not pay are written down too, in `docs/MEASUREMENTS.md`, with 
 | Disk reads of the next layer's experts overlapped with compute | prompt 1.22x at 2048 tokens, half budget |
 | The decode's attention on the GPU, same bytes | decode 1.31x at 2048 tokens, 1.54-1.58x at 4000 |
 | Two weight rows per load of the activations | prefill 1.20-1.26x (Q8_0) |
-| Two weight rows against eight tokens, the lane sums in SIMD | matmul 87 → 102 GFLOP/s on a core; prefill 1.19x (Q8_0, Q4_K_M; container, native run pending) |
+| Two weight rows against eight tokens, the lane sums in SIMD | matmul 87 → 102 GFLOP/s on a core; prefill 1.13-1.19x (Q8_0, native, 512 to 4000 tokens) |
 | Q4_K weights instead of Q8_0 | decode 1.5x |
 
 The context table above predates the GPU attention and the two-row kernels; it will be measured
@@ -114,6 +114,10 @@ kernels called alone through ggml, on our shapes, one core (indicative: a loaded
 | MoE experts, Q8_0 (two thirds of OLMoE's prompt) | 72 GFLOP/s | **102 GFLOP/s** |
 | Dense projections, Q8_0 | **163 GFLOP/s** (8-bit activations) | 102 GFLOP/s, exact |
 | `exp` on all 2^32 floats | rounds 3.4% of them otherwise | correctly rounded, every one |
+
+The whole engine against llama.cpp on the same OLMoE-1B-7B Q8_0 (2026-09-25, both in the same
+container, a still machine): the prompt **level at 8 threads**, theirs 1.30-1.35x at 16 (their
+8-bit activations); the decode theirs 1.04x at 512 tokens of context, 1.13x at 2048.
 
 ### What we are proud of
 

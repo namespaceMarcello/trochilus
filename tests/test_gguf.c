@@ -40,6 +40,7 @@ typedef struct {
     size_t key0_len, kv_type_u8, kv_bool_value, align_value, arr_elem_type, arr_len, arch_value_str;
     size_t ta_name, ta_ndims, ta_ne0, ta_type, ta_offset;
     size_t tb_name, tb_ne0, flag_key;
+    size_t header_end, data_start;  /* where the tensor infos end, and the aligned data begins */
 } layout;
 
 /* A valid file: 6 metadata entries, tensor "a" (f32, 4 elements) and tensor "b"
@@ -97,7 +98,9 @@ static buf build_valid(layout *L) {
     put_u32(&b, TR_TYPE_Q8_0);
     put_u64(&b, 32);
 
+    L->header_end = b.len;
     pad_to(&b, 32);
+    L->data_start = b.len;
     float a[4] = {1.0f, -2.5f, 3.25f, 0.0f};
     put(&b, a, sizeof a);
     pad_to(&b, 32);
@@ -237,17 +240,48 @@ static void test_k_quant(tr_type type, const char *refusal, int bb) {
     TR_CHECK_EQ_INT(checked, 2);
 }
 
-static void test_truncated(const buf *b) {
+/* Every prefix of the valid file is rejected, and with a message of the part it ends in. Inside
+ * the header every count, length and dimension is legitimate, so running out of bytes is the only
+ * way it can fail: "unexpected end of file" from a read, or the checks that compare a length with
+ * the bytes left before reading ("string length ... out of range", "array longer than file"). In
+ * the header's padding "data section starts past end of file", inside the data "outside the file".
+ * fail() keeps the last message, so a swallowed read failure shows when the garbage it leaves trips
+ * some other check (a value type, a dimension): a wrong message, not just opened != 0 (mutate_auto:
+ * several ignored "return -1"s only cascade to a different rejection). */
+static void test_truncated(const buf *b, const layout *L) {
+    static const char *header_msgs[3] = {"unexpected end of file", "out of range", "array longer than file"};
     char err[256];
-    int opened = 0;
+    int opened = 0, right_msg = 0, seen[3] = {0, 0, 0}, in_pad = 0, in_data = 0;
     for (size_t n = 0; n < b->len; n++) {
         TR_CHECK(write_file(b->data, n) == 0);
+        err[0] = 0;
         if (open_and_touch(err, sizeof err)) {
             fprintf(stderr, "truncated to %zu of %zu bytes and still opened\n", n, b->len);
             opened++;
+            continue;
         }
+        TR_CHECK(err[0] != 0);
+        int right = 0;
+        if (n < L->header_end) {
+            for (int m = 0; m < 3; m++)
+                if (strstr(err, header_msgs[m]) != NULL) { seen[m]++; right = 1; }
+        } else if (n < L->data_start) {
+            right = strstr(err, "data section starts past end of file") != NULL;
+            in_pad += right;
+        } else {
+            right = strstr(err, "outside the file") != NULL;
+            in_data += right;
+        }
+        /* 4 bytes, the magic alone: read whole (n == file_size), the file fails on the version
+         * after it (gguf.c's rd: a bound off by one would fail on the magic, at @0) */
+        if (n == 4 && strstr(err, "gguf @4: unexpected end of file") == NULL) right = 0;
+        right_msg += right;
+        if (!right) fprintf(stderr, "truncated to %zu of %zu bytes: rejected with '%s'\n", n, b->len, err);
     }
     TR_CHECK_EQ_INT(opened, 0);
+    TR_CHECK_EQ_INT(right_msg, (int)b->len);
+    /* every message above was met: the header's three, the padding, the data */
+    TR_CHECK(seen[0] > 0 && seen[1] > 0 && seen[2] > 0 && in_pad > 0 && in_data > 0);
 }
 
 typedef void (*corrupt_fn)(buf *b, const layout *L);
@@ -503,6 +537,461 @@ static void test_more(void) {
     free(e.data);
 }
 
+/* ------------------------------------------------------------ mutant-driven cases (2026-09-24)
+ * Each case below kills one surviving mutant from tools/mutate_auto.py on src/format/gguf.c that
+ * test_corrupted's whole-valid-file corruptions did not: patching one field of the full valid file
+ * often leaves the *other* disjunct of an `||`, or a later size check, to reject the file anyway
+ * (same NULL, different reason) -- a weakened check never gets exercised alone. These build
+ * minimal, purpose-built files instead, so exactly one condition is ever true, or a truncation
+ * lands exactly on a read with no redundant check behind it. Rejections whose real message
+ * necessarily differs from the mutant's are checked by message (expect_reject_msg), not just by
+ * NULL, for the same reason. */
+
+static void expect_reject_msg(const buf *b, const char *must_contain, const char *what) {
+    TR_CHECK(write_file(b->data, b->len) == 0);
+    char err[256] = {0};
+    tr_gguf *g = tr_gguf_open(path, err, sizeof err);
+    if (g != NULL) {
+        fprintf(stderr, "%s: accepted, expected a message containing '%s'\n", what, must_contain);
+        tr_gguf_close(g);
+        TR_TEST_FAILED();
+        return;
+    }
+    if (strstr(err, must_contain) == NULL) {
+        fprintf(stderr, "%s: rejected with '%s', expected it to contain '%s'\n", what, err, must_contain);
+        TR_TEST_FAILED();
+    }
+}
+
+/* err given with err_len 0, or err_len given with err NULL: fail()'s and tr_gguf_open's own
+ * "err && err_len" guards must both hold before either is touched (gguf.c:121,315). */
+static void test_err_buffer(void) {
+    buf b = {0};
+    put_u32(&b, 0x46554746u);   /* bad magic: guaranteed to reach fail() */
+    put_u32(&b, 3); put_u64(&b, 0); put_u64(&b, 0);
+    TR_CHECK(write_file(b.data, b.len) == 0);
+    tr_gguf *g = tr_gguf_open(path, NULL, 100);   /* err_len > 0 but err == NULL */
+    TR_CHECK(g == NULL);
+    tr_gguf_close(g);
+    free(b.data);
+}
+
+/* An empty file: size 0, not negative -- the real rejection is running out of bytes reading the
+ * magic, never "cannot get file size" (gguf.c:335). */
+static void test_empty_file(void) {
+    TR_CHECK(write_file(NULL, 0) == 0);
+    char err[256] = {0};
+    tr_gguf *g = tr_gguf_open(path, err, sizeof err);
+    TR_CHECK(g == NULL);
+    TR_CHECK(strstr(err, "cannot get file size") == NULL);
+    TR_CHECK(strstr(err, "unexpected end of file") != NULL);
+    tr_gguf_close(g);
+}
+
+/* n_kv/n_tensors exactly at the limit: allowed by the count check, so the real rejection (the
+ * file has no room for even the first entry) always says "unexpected end of file", never
+ * "... entries"/"... tensors" (gguf.c:345,346). */
+static void test_count_limits(void) {
+    buf b = {0};
+    put_u32(&b, 0x46554747u); put_u32(&b, 3);
+    put_u64(&b, 0);            /* n_tensors */
+    put_u64(&b, 1ull << 20);   /* n_kv == MAX_KV exactly */
+    expect_reject_msg(&b, "unexpected end of file", "n_kv == MAX_KV alone");
+    free(b.data);
+
+    buf t = {0};
+    put_u32(&t, 0x46554747u); put_u32(&t, 3);
+    put_u64(&t, 1ull << 20);   /* n_tensors == MAX_TENSORS exactly */
+    put_u64(&t, 0);            /* n_kv */
+    expect_reject_msg(&t, "unexpected end of file", "n_tensors == MAX_TENSORS alone");
+    free(t.data);
+}
+
+/* is_signed's four types, each alone (gguf.c:439), and its ">= 0" boundary at exactly 0
+ * (gguf.c:446); get_u32's boundary at exactly UINT32_MAX (gguf.c:452). */
+static void test_int_types(void) {
+    buf b = {0};
+    put_u32(&b, 0x46554747u); put_u32(&b, 3);
+    put_u64(&b, 0);
+    size_t n_kv_at = put_u64(&b, 0);
+    uint64_t n_kv = 0;
+    int8_t i8 = 0;
+    put_str(&b, "t.i8"); put_u32(&b, TR_GGUF_INT8); put(&b, &i8, 1); n_kv++;
+    int64_t i64 = 9;
+    put_str(&b, "t.i64"); put_u32(&b, TR_GGUF_INT64); put(&b, &i64, 8); n_kv++;
+    uint64_t u32max = 0xFFFFFFFFull;
+    put_str(&b, "t.u32max"); put_u32(&b, TR_GGUF_UINT64); put(&b, &u32max, 8); n_kv++;
+    patch_u64(&b, n_kv_at, n_kv);
+    pad_to(&b, 32);
+    TR_CHECK(write_file(b.data, b.len) == 0);
+    char err[256];
+    tr_gguf *g = tr_gguf_open(path, err, sizeof err);
+    TR_CHECK(g != NULL);
+    if (g == NULL) fprintf(stderr, "test_int_types: rejected: %s\n", err);
+    if (g != NULL) {
+        uint64_t u = 12345;
+        TR_CHECK(tr_gguf_get_u64(g, "t.i8", &u) == 0 && u == 0);
+        u = 12345;
+        TR_CHECK(tr_gguf_get_u64(g, "t.i64", &u) == 0 && u == 9);
+        uint32_t u32 = 0;
+        TR_CHECK(tr_gguf_get_u32(g, "t.u32max", &u32) == 0 && u32 == 0xFFFFFFFFu);
+        tr_gguf_close(g);
+    }
+    free(b.data);
+}
+
+/* A nested array (element type ARRAY) alone, length 0: no bytes to mis-consume either way, so a
+ * weakened `||` (gguf.c:218) would accept it outright instead of the file cascading into some
+ * unrelated error. */
+static void test_nested_array_alone(void) {
+    buf b = {0};
+    put_u32(&b, 0x46554747u); put_u32(&b, 3);
+    put_u64(&b, 0); put_u64(&b, 1);
+    put_str(&b, "w");
+    put_u32(&b, TR_GGUF_ARRAY);
+    put_u32(&b, TR_GGUF_ARRAY);   /* element type: itself an array */
+    put_u64(&b, 0);               /* length 0 */
+    pad_to(&b, 32);
+    open_expect(&b, 0, "nested array alone, length 0");
+    free(b.data);
+}
+
+/* MAX_ARRAY's exact boundary (gguf.c:219), told apart by the message, in a file of a few bytes: a
+ * uint8 array of exactly MAX_ARRAY elements passes the length check and is refused by the next one
+ * (its bytes are not in the file), one more element is refused by the length check itself. An
+ * accepted MAX_ARRAY array would need 256 MiB on disk and in the arena for the same answer. */
+#define MAX_ARRAY_LEN (1ull << 28)
+
+static void test_max_array_boundary(void) {
+    for (int over = 0; over < 2; over++) {
+        buf b = {0};
+        put_u32(&b, 0x46554747u); put_u32(&b, 3);
+        put_u64(&b, 0); put_u64(&b, 1);
+        put_str(&b, "w");
+        put_u32(&b, TR_GGUF_ARRAY);
+        put_u32(&b, TR_GGUF_UINT8);
+        put_u64(&b, MAX_ARRAY_LEN + (uint64_t)over);
+        pad_to(&b, 32);
+        if (over) expect_reject_msg(&b, "array length", "uint8 array of MAX_ARRAY + 1");
+        else expect_reject_msg(&b, "array longer than file", "uint8 array of MAX_ARRAY (past the length check)");
+        free(b.data);
+    }
+}
+
+/* MAX_STRING's exact boundary and one past it (gguf.c:166): both need real, NUL-free content, so
+ * the string read either succeeds (boundary) or would have to be attempted at all (one past) --
+ * a sparse/zero-filled file would trip the "string contains NUL" check for either mutant and
+ * original alike, hiding the difference this is meant to show. */
+#define MAX_STRING_LEN (64ull << 20)
+
+static buf build_one_string_file(uint64_t len) {
+    buf b = {0};
+    put_u32(&b, 0x46554747u); put_u32(&b, 3);
+    put_u64(&b, 0); put_u64(&b, 1);
+    put_str(&b, "w");
+    put_u32(&b, TR_GGUF_STRING);
+    put_u64(&b, len);
+    size_t at = b.len;
+    if (b.len + len > b.cap) { b.cap = b.len + len; b.data = realloc(b.data, b.cap); TR_CHECK(b.data != NULL); }
+    memset(b.data + at, 'a', (size_t)len);
+    b.len += (size_t)len;
+    return b;
+}
+
+static void test_max_string_boundary(void) {
+    buf ok = build_one_string_file(MAX_STRING_LEN);
+    pad_to(&ok, 32);
+    TR_CHECK(write_file(ok.data, ok.len) == 0);
+    char err[256] = {0};
+    tr_gguf *g = tr_gguf_open(path, err, sizeof err);
+    TR_CHECK(g != NULL);
+    if (g == NULL) fprintf(stderr, "test_max_string_boundary: len==MAX_STRING rejected: %s\n", err);
+    if (g != NULL) {
+        const char *s = NULL;
+        TR_CHECK(tr_gguf_get_str(g, "w", &s) == 0 && s != NULL && strlen(s) == MAX_STRING_LEN);
+        tr_gguf_close(g);
+    }
+    free(ok.data);
+
+    buf over = build_one_string_file(MAX_STRING_LEN + 1);
+    pad_to(&over, 32);
+    open_expect(&over, 0, "len == MAX_STRING + 1");
+    free(over.data);
+}
+
+/* The array-longer-than-file boundary, exactly enough room: a string array whose per-element
+ * minimum (8 bytes) exactly divides the remaining file (gguf.c:223), and a scalar array whose
+ * byte size exactly equals the remaining file (gguf.c:232). One byte short of either is already
+ * covered by test_corrupted/test_truncated; this is the other edge. The 16-byte key ends the
+ * array's length field at byte 64, so 32 bytes of items end the file on the 32-byte alignment:
+ * no padding after them, nothing left over for the check to round away. */
+static void test_array_len_boundary(void) {
+    buf b = {0};
+    put_u32(&b, 0x46554747u); put_u32(&b, 3);
+    put_u64(&b, 0); put_u64(&b, 1);
+    char key16[17]; memset(key16, 'w', 16); key16[16] = 0;
+    put_str(&b, key16);
+    put_u32(&b, TR_GGUF_ARRAY);
+    put_u32(&b, TR_GGUF_STRING);
+    put_u64(&b, 4);
+    TR_CHECK_EQ_INT(b.len, 64);
+    for (int i = 0; i < 4; i++) put_u64(&b, 0);   /* 4 empty strings, 8 bytes each */
+    TR_CHECK_EQ_INT(b.len, 96);   /* remaining at the check 96 - 64 = 32, exactly 4 x 8 */
+    open_expect(&b, 1, "4 empty strings, exactly enough room");
+    free(b.data);
+
+    buf s = {0};
+    put_u32(&s, 0x46554747u); put_u32(&s, 3);
+    put_u64(&s, 0); put_u64(&s, 1);
+    put_str(&s, key16);
+    put_u32(&s, TR_GGUF_ARRAY);
+    put_u32(&s, TR_GGUF_UINT8);
+    put_u64(&s, 32);
+    for (int i = 0; i < 32; i++) { uint8_t z = (uint8_t)i; put(&s, &z, 1); }
+    TR_CHECK_EQ_INT(s.len, 96);   /* remaining at the check 96 - 64 = 32, exactly the array's bytes */
+    open_expect(&s, 1, "32 uint8 elements, exactly enough room");
+    free(s.data);
+}
+
+/* An array's element read fails with the file ending exactly at the array's own length field
+ * (gguf.c:227,235): its item slots stay whatever the arena gave them (uninitialised for the
+ * string array's pointers, unset for the scalar array's bytes) -- a swallowed failure must not
+ * let the file complete anyway. The 16-byte key lands the truncation point on the default
+ * 32-byte alignment, so nothing else is left for the reader to reject the file on. */
+static void test_array_item_truncated(void) {
+    char key16[17]; memset(key16, 'w', 16); key16[16] = 0;
+
+    buf b = {0};
+    put_u32(&b, 0x46554747u); put_u32(&b, 3);
+    put_u64(&b, 0); put_u64(&b, 1);
+    put_str(&b, key16);
+    put_u32(&b, TR_GGUF_ARRAY);
+    put_u32(&b, TR_GGUF_STRING);
+    put_u64(&b, 2);
+    TR_CHECK_EQ_INT(b.len, 64);
+    open_expect(&b, 0, "string array, items truncated");
+    free(b.data);
+
+    buf s = {0};
+    put_u32(&s, 0x46554747u); put_u32(&s, 3);
+    put_u64(&s, 0); put_u64(&s, 1);
+    put_str(&s, key16);
+    put_u32(&s, TR_GGUF_ARRAY);
+    put_u32(&s, TR_GGUF_UINT8);
+    put_u64(&s, 5);
+    TR_CHECK_EQ_INT(s.len, 64);
+    open_expect(&s, 0, "scalar array, bytes truncated");
+    free(s.data);
+}
+
+/* A scalar value's byte is missing entirely (gguf.c:189): rd_scalar's local buffer is
+ * zero-initialised, so a swallowed failure reads deterministically as 0 -- the file must still be
+ * refused, not accepted with a bogus value. The 28-byte key lands the missing byte exactly on the
+ * default alignment, so nothing else is left to reject the file on. */
+static void test_scalar_value_truncated(void) {
+    buf b = {0};
+    put_u32(&b, 0x46554747u); put_u32(&b, 3);
+    put_u64(&b, 0); put_u64(&b, 1);
+    char key28[29]; memset(key28, 'w', 28); key28[28] = 0;
+    put_str(&b, key28);
+    put_u32(&b, TR_GGUF_UINT8);
+    TR_CHECK_EQ_INT(b.len, 64);
+    open_expect(&b, 0, "scalar value byte missing");
+    free(b.data);
+}
+
+/* n_dims == 0 alone, and n_dims > MAX_DIMS alone (gguf.c:291): purpose-built one-tensor files
+ * laid out exactly as the reader would consume them if the check did not fire, so a weakened `||`
+ * accepts the file instead of the layout drifting into an unrelated rejection. */
+static void test_ndims_alone(void) {
+    buf z = {0};
+    put_u32(&z, 0x46554747u); put_u32(&z, 3);
+    put_u64(&z, 1); put_u64(&z, 0);
+    put_str(&z, "t");
+    put_u32(&z, 0);              /* n_dims = 0: alone, not > MAX_DIMS */
+    put_u32(&z, TR_TYPE_F32);
+    put_u64(&z, 0);
+    pad_to(&z, 32);
+    float v = 1.0f; put(&z, &v, 4);
+    open_expect(&z, 0, "tensor with 0 dims, alone");
+    free(z.data);
+
+    buf o = {0};
+    put_u32(&o, 0x46554747u); put_u32(&o, 3);
+    put_u64(&o, 1); put_u64(&o, 0);
+    put_str(&o, "t");
+    put_u32(&o, 5);              /* n_dims = 5: alone, not == 0 */
+    put_u64(&o, 2); put_u64(&o, 1); put_u64(&o, 1); put_u64(&o, 1);  /* only 4 are ever read */
+    put_u32(&o, TR_TYPE_F32);
+    put_u64(&o, 0);
+    pad_to(&o, 32);
+    float vv[2] = {1.0f, 2.0f}; put(&o, vv, 8);
+    open_expect(&o, 0, "tensor with 5 dims, alone");
+    free(o.data);
+}
+
+/* A dimension of 0, alone (gguf.c:297): the real code refuses it before the element-count
+ * overflow check that follows would divide by it. */
+static void test_ne_zero_alone(void) {
+    buf b = {0};
+    put_u32(&b, 0x46554747u); put_u32(&b, 3);
+    put_u64(&b, 1); put_u64(&b, 0);
+    put_str(&b, "t");
+    put_u32(&b, 1);
+    put_u64(&b, 0);              /* ne[0] = 0: alone, not > the per-dimension limit */
+    put_u32(&b, TR_TYPE_F32);
+    put_u64(&b, 0);
+    pad_to(&b, 32);
+    open_expect(&b, 0, "tensor dim 0 == 0, alone");
+    free(b.data);
+}
+
+/* A dimension over the per-dimension limit, alone (gguf.c:297): the real message names the huge
+ * dimension; a weakened `||` would only reject the file later, when its (equally huge) declared
+ * byte size cannot fit the file -- a different message. */
+static void test_ne_huge_alone(void) {
+    buf b = {0};
+    put_u32(&b, 0x46554747u); put_u32(&b, 3);
+    put_u64(&b, 1); put_u64(&b, 0);
+    put_str(&b, "t");
+    put_u32(&b, 1);
+    put_u64(&b, (1ull << 40) + 1);   /* one past the limit: alone, not == 0 */
+    put_u32(&b, TR_TYPE_F32);
+    put_u64(&b, 0);
+    pad_to(&b, 32);
+    expect_reject_msg(&b, "dim 0 =", "tensor dim 0 over the limit, alone");
+    free(b.data);
+}
+
+/* The element-count overflow check's exact boundary (gguf.c:298): ne[0] chosen so the running
+ * product lands exactly on floor(UINT64_MAX / ne[1]) -- the real code does not overflow multiplying
+ * them, and rejects on the next check, the byte size (2^64 - 2^40 elements of 4 bytes); a check
+ * weakened to >= would say "element count overflows". */
+static void test_elem_count_boundary(void) {
+    buf b = {0};
+    put_u32(&b, 0x46554747u); put_u32(&b, 3);
+    put_u64(&b, 1); put_u64(&b, 0);
+    put_str(&b, "t");
+    put_u32(&b, 2);
+    put_u64(&b, 16777215ull);      /* ne[0] == floor(UINT64_MAX / ne[1]) */
+    put_u64(&b, 1ull << 40);       /* ne[1]: the largest a single dimension may be */
+    put_u32(&b, TR_TYPE_F32);
+    put_u64(&b, 0);
+    pad_to(&b, 32);
+    expect_reject_msg(&b, "byte size overflows", "element count boundary (the element count must not overflow)");
+    free(b.data);
+}
+
+/* The byte-size overflow check's exact boundary (gguf.c:309): ne[0] * ne[1] == 2^62 - 1, so
+ * blocks lands exactly on floor(UINT64_MAX / block_bytes) for f32 (block_bytes 4). The real code
+ * does not overflow computing n_bytes, and only rejects later because 2^64-ish bytes cannot fit
+ * this tiny file; a check weakened to >= would say "byte size overflows". */
+static void test_byte_size_boundary(void) {
+    buf b = {0};
+    put_u32(&b, 0x46554747u); put_u32(&b, 3);
+    put_u64(&b, 1); put_u64(&b, 0);
+    put_str(&b, "t");
+    put_u32(&b, 2);
+    put_u64(&b, 2147483647ull);    /* (2^31-1) * (2^31+1) == 2^62-1 == floor(UINT64_MAX/4) */
+    put_u64(&b, 2147483649ull);
+    put_u32(&b, TR_TYPE_F32);
+    put_u64(&b, 0);
+    pad_to(&b, 32);
+    expect_reject_msg(&b, "outside the file", "byte size boundary (the byte size must not overflow)");
+    free(b.data);
+}
+
+/* general.alignment present but not readable as a u32 (gguf.c:365): the check's first clause must
+ * reject it without the later clauses ever reading the (then unset) local value. */
+static void test_alignment_wrong_type(void) {
+    buf b = {0};
+    put_u32(&b, 0x46554747u); put_u32(&b, 3);
+    put_u64(&b, 0); put_u64(&b, 1);
+    put_str(&b, "general.alignment");
+    put_u32(&b, TR_GGUF_STRING);   /* wrong type: get_u32 fails before any range check */
+    put_str(&b, "x");
+    pad_to(&b, 32);
+    open_expect(&b, 0, "alignment key present but not a u32");
+    free(b.data);
+}
+
+/* general.alignment 0 and 3, alone (gguf.c:365), by message: with no tensor after them nothing
+ * else rejects the file, so a weakened clause either accepts it or divides by zero. */
+static void test_alignment_values(void) {
+    static const uint32_t bad[2] = {0, 3};
+    for (int i = 0; i < 2; i++) {
+        buf b = {0};
+        put_u32(&b, 0x46554747u); put_u32(&b, 3);
+        put_u64(&b, 0); put_u64(&b, 1);
+        put_str(&b, "general.alignment");
+        put_u32(&b, TR_GGUF_UINT32);
+        put_u32(&b, bad[i]);
+        pad_to(&b, 32);
+        expect_reject_msg(&b, "must be a power of two", bad[i] == 0 ? "alignment 0, alone" : "alignment 3, alone");
+        free(b.data);
+    }
+}
+
+/* A string array cut inside its last item (gguf.c:227): the item's length is read and refused
+ * against the bytes left ("string length 2 out of range"); a swallowed failure would go on to the
+ * next key and fail there on "unexpected end of file" instead. */
+static void test_string_item_cut(const buf *valid, const layout *L) {
+    size_t bc = L->arr_len + 8 + (8 + 1);   /* test.words: after its length, "a", then "bc" */
+    buf b = {malloc(bc + 8 + 1), bc + 8 + 1, bc + 8 + 1};
+    memcpy(b.data, valid->data, b.len);     /* bc's length and one of its two bytes */
+    TR_CHECK(b.data[bc] == 2 && b.data[bc + 8] == 'b');
+    expect_reject_msg(&b, "string length 2 out of range", "test.words cut inside \"bc\"");
+    free(b.data);
+}
+
+/* The last key cut inside its value type, and inside an array's length, with the file ending on
+ * the 32-byte alignment right there (gguf.c:212,219). A read that failed and was taken for a
+ * success would leave nothing else to read: no tensor, the data section starting at the file's
+ * end, and the file would open. A 29-byte key ends at 61, 3 bytes short of a type; a 17-byte key
+ * of type array with its element type ends at 57, 7 bytes short of the length. */
+static void test_kv_cut_at_alignment(void) {
+    for (int arr = 0; arr < 2; arr++) {
+        buf b = {0};
+        put_u32(&b, 0x46554747u); put_u32(&b, 3);
+        put_u64(&b, 0); put_u64(&b, 1);
+        char key[30];
+        memset(key, 'k', sizeof key);
+        key[arr ? 17 : 29] = 0;
+        put_str(&b, key);
+        if (arr) { put_u32(&b, TR_GGUF_ARRAY); put_u32(&b, TR_GGUF_UINT8); }
+        TR_CHECK_EQ_INT(b.len, arr ? 57 : 61);
+        pad_to(&b, 32);
+        TR_CHECK_EQ_INT(b.len, 64);
+        expect_reject_msg(&b, arr ? "gguf @57: unexpected end of file" : "gguf @61: unexpected end of file",
+                          arr ? "array length cut at the alignment" : "value type cut at the alignment");
+        free(b.data);
+    }
+}
+
+/* The tensor data read fails after the file shrinks on disk post-open (gguf.c:488): tr_gguf_read
+ * must propagate a real pread failure, not report success after a chunk it never got. On Windows
+ * the reader's handle lets no writer in: the shrink itself is refused and the read gets its bytes. */
+static void test_read_after_shrink(const buf *valid) {
+    TR_CHECK(write_file(valid->data, valid->len) == 0);
+    char err[256];
+    tr_gguf *g = tr_gguf_open(path, err, sizeof err);
+    TR_CHECK(g != NULL);
+    if (g == NULL) return;
+    const tr_gguf_tensor *t = tr_gguf_find_tensor(g, "b");
+    TR_CHECK(t != NULL);
+    if (t != NULL) {
+        uint8_t buf68[68];
+#ifdef _WIN32
+        TR_CHECK(write_file(valid->data, 4) != 0);
+        TR_CHECK(tr_gguf_read(g, t, buf68) == 0 && memcmp(buf68, valid->data + valid->len - 68, 68) == 0);
+#else
+        TR_CHECK(write_file(valid->data, 4) == 0);   /* same path, same inode: shrunk under the open fd */
+        TR_CHECK(tr_gguf_read(g, t, buf68) == -1);
+#endif
+    }
+    tr_gguf_close(g);
+}
+
 int main(int argc, char **argv) {
     char dir[480];
     tr_test_tmpdir(argc > 0 ? argv[0] : "", dir, sizeof dir);
@@ -511,12 +1000,33 @@ int main(int argc, char **argv) {
     layout L;
     buf valid = build_valid(&L);
     test_valid(&valid);
-    test_truncated(&valid);
+    test_truncated(&valid, &L);
     test_corrupted(&L, &valid);
     test_fuzz(&valid);
     test_more();
     test_k_quant(TR_TYPE_Q4_K, "not a multiple of q4_k block 256", 144);
     test_k_quant(TR_TYPE_Q6_K, "not a multiple of q6_k block 256", 210);
+    /* the cases written against mutate_auto's survivors (2026-09-24) */
+    test_err_buffer();
+    test_empty_file();
+    test_count_limits();
+    test_int_types();
+    test_nested_array_alone();
+    test_max_array_boundary();
+    test_max_string_boundary();
+    test_array_len_boundary();
+    test_array_item_truncated();
+    test_scalar_value_truncated();
+    test_ndims_alone();
+    test_ne_zero_alone();
+    test_ne_huge_alone();
+    test_elem_count_boundary();
+    test_byte_size_boundary();
+    test_alignment_wrong_type();
+    test_alignment_values();
+    test_string_item_cut(&valid, &L);
+    test_kv_cut_at_alignment();
+    test_read_after_shrink(&valid);
     remove(path);
     free(valid.data);
     TR_TEST_EXIT();

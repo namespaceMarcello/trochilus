@@ -1117,3 +1117,21 @@ change <binary before>`.
 Check: `make check`; in the container `sh tools/bench_ggml.sh`, `sh tools/bench_expf_refs.sh`,
 `sh tools/mutate_files.sh prof`; `sh tools/test_beside.sh`; `sh tools/bench_native.sh bench_peak
 --runs 15 --one-core`.
+
+### 2026-09-25 — Piece 1 closed; gguf.c's survivors 40 → 12
+- Question 64 in `tests/bench_peak.c`: the 4 × 6 and 3 × 8 tiles as asm streams (one statement,
+  registers named, LESSONS #174) beside 2 × 8 with the same decode, and as kernels (`row4_x6`,
+  `row3_x8`, Q8_0 and Q4_K) in `tr_matmul`'s order, byte for byte against it before timing, red
+  under `-DBENCH_TILE_MUTATE=4` and `=3`, counter `g_tile_kernel_calls`; `--q64` runs only those.
+  Closed as no (MEASUREMENTS §More weight rows per input load).
+- Measured natively: x8's prefill 1.13–1.19×, logits identical; the race against llama.cpp after
+  x8 (MEASUREMENTS §Speed after x8). ORIGINS row 1 closed.
+- `tests/test_gguf.c`: the agent's seventeen cases corrected (LESSONS #172) and five more against
+  the survivors (the magic alone, a string array cut in its last item, the last key cut at the
+  alignment, general.alignment 0 and 3); the truncations checked by the part of the file they end
+  in; on Windows the shrink under an open reader is refused. `gguf.c` unchanged.
+- `tests/test_spec.c`: the generation helper prints a refused session and where generation
+  stopped (LESSONS #175).
+Check: `make check`; `sh tools/bench_native.sh bench_peak --q64 --one-core --runs 11`; in the
+container `python3 tools/mutate_auto.py src/format/gguf.c test_gguf test_model_load test_tokenizer
+--asan --jobs 6`.

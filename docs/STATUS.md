@@ -322,33 +322,37 @@ exactly and the five sections after it; LESSONS #152–#157):
   MEASUREMENTS §Two rows against eight tokens, LESSONS #165–#167): intrinsics were enough;
   the lane tree in SIMD was a tenth of every two-row call. The matmul on a core 87 → 102
   GFLOP/s (61% of the no-FMA peak); **prefill 1.19× on Q8_0 and Q4_K_M at 16 threads, 1.30× on
-  Q4_K_M at 8** (container, load 3–4; the native run waits for 12 GiB free);
+  Q4_K_M at 8** (container; native below);
 - **late evening: pieces 1 and 4 against the references** (MEASUREMENTS §The prompt's matmul
   against the four references, §Softmax and exp against the references; ORIGINS rows 1, 4; LESSONS
   #169–#170). All four references quantize the activations to int8 (colibri as an option). Their
   kernels alone on our shapes (`tools/bench_ggml.sh`, container, loaded): **Q8_0 experts ours
   1.42×** a core (their `mul_mat_id` runs one dot at a time), the dense projections theirs 1.6×
   (tinyBLAS 4 × 4 int8), repacked Q4_K theirs 1.26–2.3×. Question 63 (ik's decode once per row,
-  exact) closed: Q8_0 1.00–1.04×, Q4_K 1.1×: the matmul is bound by its input rows' loads from L2.
-  The exp: ggml's rounds 3.36% of floats otherwise (≤ 2 ulp), glibc's 0.004%, ours none;
-- **next, one piece at a time**: (1) close piece 1: x8's native confirmation (`prefill_context.sh
-  change build/before-x8/...`) and the native engine race, both waiting for 12 GiB free; then
-  question 64 (4 weight rows × 6 tokens: half the input loads per op), prediction first; (2) row 2
-  (the decode's matmul), measurable with `bench_ggml.c`'s harness on one token. Queued: M3's dense
-  weights on the GPU, two rows on AVX2. **For Marcello, 59 and 60**: FMA would give the 8-token
-  stream 1.19× on this Zen 4; 60 (an exact dot) is not measured. 61 after M4.
+  exact) closed: Q8_0 1.00–1.04×, Q4_K 1.1×. The exp: ggml's rounds 3.36% of floats otherwise
+  (≤ 2 ulp), glibc's 0.004%, ours none;
+- **2026-09-25: piece 1 closed** (MEASUREMENTS §Two rows against eight tokens, §Speed after x8,
+  §More weight rows per input load; ORIGINS row 1; LESSONS #173–#176): x8 native **prefill
+  1.15–1.19× at 512 and 2048, 1.13–1.14× at 4000**, logits identical, decode unchanged. Against
+  llama.cpp (container, still machine): **prefill level at 8 threads**, theirs 1.30–1.35× at 16
+  (our 8 → 16 threads 1.11–1.16×, theirs 1.44–1.49×); decode theirs 1.04× at 512, 1.13× at 2048.
+  Question 64 closed as no: 4 × 6 and 3 × 8 lose 6–16% in the matmul (their streams equal x8's),
+  which also refutes question 63's "bound by the input loads" (#176);
+- **next, one piece at a time**: row 2 of ORIGINS (the decode's matmul, one token), measurable with
+  `bench_ggml.c`'s harness on one token; then row 3 (attention with llama.cpp's F16 KV). Queued: the
+  16-thread prefill gap split by zone, M3's dense weights on the GPU, two rows on AVX2. **For
+  Marcello, 59 and 60**: FMA would give the 8-token stream 1.19× on this Zen 4; 60 (an exact dot)
+  is not measured. 61 after M4.
 
-**Night of 2026-09-24**: the gate 428 → 238 s; against llama.cpp (Q8_0, container, before x8)
-prefill 1.41× theirs at 16 threads, decode 1.12× at context 2048 (the KV's bytes: F32 against
-F16), 1.00× at 512; **M2: Q4_K and Q6_K** exact (Q4_K decode 1.5× the Q8_0; Q4_K_M runs). DONE,
-MEASUREMENTS.
+**Night of 2026-09-24**: the gate 428 → 238 s; **M2: Q4_K and Q6_K** exact (Q4_K decode 1.5× the
+Q8_0; Q4_K_M runs).
 
-**Tests and gate** (2026-09-24): `mutate_auto.py` lists the mutants no check runs (gcov) and
-runs ASan on the survivors only (`prof.c` 30 → 9 s, the same verdicts); `gguf.c`, `experts.c`,
-`threads.c`, `platform.c` mutated for the first time (MEASUREMENTS, after §Generated mutations):
-open, `gguf.c`'s 40 survivors (17 cases in `build/gguf_tests_wip.diff`, 6 wrong: LESSONS #172), `threads.c`'s 22 (the spin and the pinning: speed,
-not bits), `platform.c`'s Windows half never mutated (the container compiles its POSIX half). The
-native C tests run beside the container (`tools/beside.sh`): the gate's new time not measured yet.
+**Tests and gate** (2026-09-24/25): `mutate_auto.py` lists the mutants no check runs (gcov) and
+runs ASan on the survivors only; `gguf.c`, `experts.c`, `threads.c`, `platform.c` mutated for the
+first time (MEASUREMENTS, after §Generated mutations). `gguf.c`: 40 survivors → 12, every one read
+(memory or speed only, the same verdict, or fault injection). Open: `threads.c`'s 22 (the spin and
+the pinning: speed, not bits), `platform.c`'s Windows half never mutated (the container compiles
+its POSIX half), the gate's time with the native tests beside the container.
 Review of 2026-09-22/23: LESSONS #102–#125. The native measurements follow the machine's marker.
 
 Steps of 17–20/09 are in `docs/archive/DONE.md`, their numbers in `docs/MEASUREMENTS.md`
@@ -397,9 +401,8 @@ software, question 41) and untouched: factory state of target PCs, M1 designed o
   Three matrices in one read: **no**, three separate GGUF tensors (docs/ORIGINS.md
   §The expert store).
 
-- **Question 44, closed 2026-09-20** (`docs/MEASUREMENTS.md` §Is code behavior a small,
-  deterministic graph?): no, in all four senses; a code region common to C, Python and shell
-  (Jaccard 0.68–0.77, 0.07–0.09 with prose). What remains: a second model.
+- **Question 44, closed 2026-09-20** (MEASUREMENTS): code behaviour is no small graph; a second
+  model remains.
 
 **Order decided by Marcello 2026-09-19 evening**: (a) **M1**, experts from disk, starting from
 measurements 13–16 and with GGUF and pool folders from component comparison inside (point 5);

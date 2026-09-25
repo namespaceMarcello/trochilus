@@ -1,7 +1,7 @@
 {
   "progetto": "Trochilus",
   "sottotitolo": "motore di inferenza per modelli MoE in C, senza dipendenze",
-  "aggiornato": "2026-09-24",
+  "aggiornato": "2026-09-25",
   "stati": {
     "fatto": "finito e provato: test verdi in make check",
     "in-corso": "ci stiamo lavorando adesso",
@@ -88,7 +88,11 @@
       "cosa": "I conti pesanti (moltiplicazioni di matrici) scritti nelle istruzioni vettoriali della CPU, con una versione per ogni famiglia e la scelta a runtime. Ogni versione dà gli stessi bit della versione scalare, e il test lo verifica.",
       "numeri": [
         {
-          "v": "decodificare i pesi una volta per riga e poi F32 su tutti i token (l'idea di ik_llama.cpp, tenuta esatta): Q8_0 1.00-1.04×, Q4_K 1.1×, chiusa; il matmul è legato al caricamento dei token, non alla decodifica",
+          "v": "più righe di pesi per ogni caricamento dei token (4 × 6 e 3 × 8): i conti puri vanno come oggi, ma nel matmul vero perdono il 6-16%; chiusa con un no, e il matmul non è frenato dal caricamento dei token come pensavamo",
+          "d": "2026-09-25"
+        },
+        {
+          "v": "decodificare i pesi una volta per riga e poi F32 su tutti i token (l'idea di ik_llama.cpp, tenuta esatta): Q8_0 1.00-1.04×, Q4_K 1.1×, chiusa",
           "d": "2026-09-24"
         },
         {
@@ -96,8 +100,8 @@
           "d": "2026-09-24"
         },
         {
-          "v": "due righe di pesi contro 8 token alla volta, e la somma finale delle corsie in SIMD: il matmul su un core da 87 a 102 GFLOP/s; prefill 1.19× su Q8_0 e Q4_K_M a 16 thread, 1.30× su Q4_K_M a 8 (container, da confermare nativo), numeri identici al bit",
-          "d": "2026-09-24"
+          "v": "due righe di pesi contro 8 token alla volta, e la somma finale delle corsie in SIMD: il matmul su un core da 87 a 102 GFLOP/s; prefill nativo 1.15-1.19× a 512 e 2048 token, 1.13-1.14× a 4000, generazione uguale, numeri identici al bit",
+          "d": "2026-09-25"
         },
         {
           "v": "due righe di pesi per ogni caricamento delle attivazioni: prefill 1.20-1.26× (Q8_0), 1.11× (Q4_K_M), generazione uguale, numeri identici al bit",
@@ -112,9 +116,7 @@
           "d": "2026-09-19"
         }
       ],
-      "domande": [
-        "64: più righe di pesi per ogni caricamento di un token (4 righe × 6 token)"
-      ],
+      "domande": [],
       "file": [
         "src/kernels/"
       ],
@@ -337,6 +339,10 @@
         {
           "v": "gara con llama.cpp sullo stesso Q8_0: prefill loro 1.8× (era 13×), decode loro 1.04× a contesto 512 e 1.16× a 2048",
           "d": "2026-09-24"
+        },
+        {
+          "v": "gara con llama.cpp dopo le 8 righe per chiamata: prefill pari a 8 thread (loro 1.01-1.03×), loro 1.30-1.35× a 16; decode loro 1.04× a contesto 512, 1.13× a 2048",
+          "d": "2026-09-25"
         },
         {
           "v": "gara con llama.cpp rifatta dopo le due righe per caricamento: prefill loro 1.41× (era 1.8×) a 16 thread e 1.13× a 8; decode 1.00× a contesto 512, 1.12× a 2048",

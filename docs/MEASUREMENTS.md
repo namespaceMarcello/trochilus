@@ -182,7 +182,7 @@ decides | — | — |
 | 62 | ~~The model scanned like a genome: is there exact structure nobody reads once?~~ **Closed 2026-09-24** (§The model read like a genome, §Experts read by a pass of k rows): weights **0.008% of Q8_0 blocks repeated** (220 identical rows of the output head: the tokens never learned; Q4_K 504 rows, 2 140 zero blocks), no zero blocks in Q8_0; routing co-activation strong (lift up to 67, top-3 partners 18–28% of co-firings); **the KV: only layer 0's values are token-determined** (61.6–81.6% of positions repeat), layers 1–15 and every key 0. Tools: `tools/weights_genome.py`, `tools/route_union_report.py`, `tools/kv_repeats_report.py`, to run again on the next model. (Marcello, 2026-09-24: a discovery comes from looking patiently at real data others filtered away) Approximate engines compress the weights with loss and never look for exact repeats; an exact engine can read anything that repeats exactly once, without changing a bit. Prediction, written first: trained weights hold almost no exact repeats (≤ 0.1% of Q8_0 blocks), the routing holds strong co-activation, the KV holds token-determined parts beyond layer 0 in no layer | a hash of every Q8_0 block (34 bytes) over the whole file: duplicates, all-zero blocks, rows shared between experts, per-tensor entropy (with 56); in the routing traces the pairs and groups of experts that fire together (co-activation arrays, for placement and file order); in the probe's dumps, any layer whose keys or values depend on the token alone | cheap, on real data, not done by anyone: most of it may give zero, like the exact skips; what repeats exactly is bytes saved exactly |
 | 61 | **Exactness as the asset for a frontier model locally** (after M4, 2026-09-24): a computation that gives the same bytes anywhere can be moved in time (the KV of your files computed while the machine idles, reused byte for byte), in space (several home machines splitting a model: their RAM bandwidth adds up), and checked (work done by an untrusted fast machine, verified by recomputing random spots) | a KV checkpoint to disk and back per 1000 tokens; one layer across two machines on a LAN (~28 KB a hop at 7168 dims); detection probability against spot-check cost | a 671B MoE reads ~20 GB a token at Q4 (0.35 s from RAM, 13 s from this disk): the wall moves only by adding bandwidth or by not paying the prefill at question time; approximate engines cannot do any of the three |
 | 63 | ~~Decode a panel of weight rows once, then F32 over every token?~~ **Closed 2026-09-24** (§The prompt's matmul against the four references): the same bytes, but **Q8_0 1.00–1.04×, Q4_K 1.10–1.12×** on a core (predicted 1.13–1.27×): the decode is 29% of the stream in L1, the matmul is bound by its input rows' loads from L2 | — | ik_llama.cpp's convert-then-gemm, kept exact |
-| 64 | **A tile of more weight rows per input load (4 rows × 6 tokens)?** (2026-09-24, from question 63 and the references' tiles: llama.cpp 16 × 4, tinyBLAS 4 × 4, ours 2 × 8) | `bench_peak`: a 4 × 6 stream in asm (24 accumulators, 29 zmm), then a `dot_row4_x6` in intrinsics against `tr_matmul`, byte for byte; prediction written first | half the input loads per FP op; each sum still its own `dot_row` |
+| 64 | ~~A tile of more weight rows per input load (4 rows × 6 tokens)?~~ **Closed 2026-09-25 as no** (§More weight rows per input load): the streams of 4 × 6 and 3 × 8 run 1.02× and 1.04× x8's, but in the matmul, exact, they lose (Q8_0 0.88–0.90× and 0.93–0.94×, Q4_K 0.84× and 0.90×; predicted 1.00–1.12×): the matmul is not bound by its input loads | — | the tile stays 2 × 8 |
 
 Reference machine: Ryzen 9 7940HX (Zen 4, 16 core / 32 thread, AVX-512 VNNI/BF16), 31 GB
 RAM (2×16 GB DDR5-5200), NVMe Micron 1 TB, GPU RTX 4070 Laptop 8 GB and Radeon 610M (not used
@@ -2401,6 +2401,26 @@ minutes for all of them (`build/mutate/<name>.txt`):
 `platform.c`'s Windows half is mutated nowhere: the container compiles its POSIX half only, and
 native mutants meet Smart App Control (LESSONS #12). A debt, in STATUS.
 
+**2026-09-25: `gguf.c`'s 40 survivors → 12, every one read.** The agent's seventeen cases
+(LESSONS #172) corrected one by one, each green on the real code, and five more written against
+what was still alive (`tests/test_gguf.c`): the truncations checked by the part of the file they
+end in (header: a read's "unexpected end of file" or the length checks made before a read;
+padding; data), the magic alone failing at `@4`, MAX_ARRAY told apart by the message in a file of
+a few bytes (not 256 MiB), the exact boundaries of the two "array longer than file" checks, the
+element-count and byte-size boundaries by the message they must give, general.alignment 0 and 3
+alone, a string array cut inside its last item, and the last key cut at the alignment (where a
+failed read taken for a success would open the file). `mutate_auto.py --asan --lines <the 39
+lines>` in the container: 92 mutants, then the 17 left, then the 7 lines with cases: **12
+survive, none that changes a result**:
+- memory or speed only: the arena's rounding and its "does it fit" (75, 76), the hash table's
+  capacity (252), the read buffer refilled at its own start (137), a read of exactly READ_CHUNK
+  buffered instead of direct (140: the same bytes), the scalar array's spare byte no reader uses
+  (233);
+- the same verdict another way: `vsnprintf` with room 0 writes nothing (124); a tensor at
+  `offset == data_size` is refused by the size clause beside it with the same message (389);
+- unreachable without fault injection: the reads after a length check against the file (169, 235:
+  only an I/O error fails them) and the two out-of-memory branches of `tr_gguf_open` (323, 350).
+
 ## Speed — Trochilus vs llama.cpp again (2026-09-24)
 
 The race of 2026-09-17 (above) on the binary of commit `55c31ff`: `sh tools/race_llama.sh 5`, both
@@ -2431,6 +2451,32 @@ largest of the two engines):
 - **decode at context 2048: 1.16× at 16 threads, 1.26× at 8** (A/A 5–10%): the cost of a long
   context is still ours (question 18, the attention over the KV), and it is now the largest gap in
   decode.
+
+## Speed — Trochilus vs llama.cpp after x8 (2026-09-25)
+
+The same race (`sh tools/race_llama.sh`, 5 runs a series, order A B B A, both engines in the
+container on OLMoE-1B-7B Q8_0 all in RAM) on commit `f6a8b4c`: the two-row eight-token kernel and
+everything since `55c31ff`. Marker held, a still machine before every series, background load 0.65
+before and 1.86 after (the kernel's System process, Memory Compression, the idle WSL VM). Tokens/s,
+series a / b; results in `build/race_llama/`:
+
+| prompt | threads | Trochilus prefill | llama.cpp prefill | Trochilus decode | llama.cpp decode |
+|---|---|---|---|---|---|
+| 512 | 16 | 294.0 / 295.4 | 377.1 / 386.1 | 33.6 / 33.4 | 34.7 / 35.0 |
+| 512 | 8 | 250.6 / 257.2 | 256.3 / 257.3 | 32.2 / 32.1 | 34.1 / 33.8 |
+| 2048 | 16 | 267.3 / 265.3 | 359.8 / 357.7 | 26.5 / 26.3 | 29.6 / 29.6 |
+| 2048 | 8 | 241.5 / 237.9 | 249.4 / 247.4 | 25.4 / 25.5 | 29.1 / 29.0 |
+
+- **Prefill at 8 threads: level** (llama.cpp 1.01× at 512, 1.03× at 2048, inside the A/A of 1–3%);
+  at 16 threads theirs 1.30× at 512 and 1.35× at 2048 (the day before: 1.8×). Ours 1.45–1.49× the
+  2026-09-24 race at 16 threads, 1.50–1.57× at 8: x8, the SIMD lane tree and what came in between.
+- Where 16 threads still lose: our prefill scales 1.11–1.16× from 8 to 16 threads, theirs
+  1.44–1.49×. The race
+  gives no split by zone (experts against the dense projections, where tinyBLAS runs int8 4 × 4):
+  the next measurement of piece 1's gap, if it is reopened, is `tools/race_llama.sh` with a
+  profile of each engine by zone.
+- **Decode: theirs 1.04–1.05× at 512, 1.12–1.14× at 2048** (the KV's bytes, F32 against F16;
+  the exact levers of STATUS §Next steps).
 
 ## Q4_K on the CPU (2026-09-24)
 
@@ -3246,8 +3292,14 @@ in passes of 512 and of 100.
   decode. Q4_K_M gains as much as Q8_0 now: its permute is paid once for 8 tokens (the morning's
   two-row kernel gave it only 1.03–1.08×). The Q8_0 8-thread cell did not finish (the script's
   tail cut it); not rerun.
-- Next measurement, when the RAM allows: the same `prefill_context.sh change` natively, at 512,
-  2048 and 4000.
+- **Native, 2026-09-25** (`sh tools/prefill_context.sh change build/before-x8/build/trochilus.exe`,
+  8 rounds, marker held, load 1.6 before and 0.7 after; logits identical byte for byte before and
+  after, one token a pass, passes of 64, 512 and 100, and the same tokens after a prompt of 4000).
+  Prefill tok/s, series a / b: **512: 381.9 / 397.6 → 456.2 / 456.2 (1.15–1.19×)**; **2048: 370.7 /
+  367.9 → 426.6 / 425.3 (1.15–1.16×)**; **4000: 327.2 / 328.4 → 372.8 / 371.5 (1.13–1.14×)**.
+  Decode unchanged (512: 40.0 / 40.2 → 40.0 / 40.3; 2048: 37.5 / 36.9 → 37.3 / 37.6; 4000: 34.7 /
+  34.4 → 34.0 / 34.0, within the spreads). The prediction (1.15–1.25×) held at 512 and 2048, a
+  point under it at 4000, where the attention's share of the prompt grows.
 
 **Per type** (`sh tools/bench_native.sh bench_kernels --matrix --runs 9`, 1024 × 2048, 64 tokens,
 ms per token, each type with and without x8 in turn; declared load 2.4 / 2.1, but another window
@@ -3310,7 +3362,8 @@ a slower decode, not the premise (LESSONS #170). With the decode in AVX-512 (the
 - **Below the prediction, and why**: the decode is 29% of the stream in L1 (1.41×), but the real
   matmul reads its eight input rows from L2 at every step and is bound there, as §Attempts' tile
   of 16 tokens had already found; a panel of F32 weights adds 64 bytes a vector to that traffic
-  where int8 added 16. **Closed for Q8_0**; Q4_K's heavier decode leaves 1.1×, not enough to
+  where int8 added 16. *(2026-09-25: question 64 refuted "bound by the input loads": tiles with
+  half of them per product lose in the matmul, §More weight rows per input load.)* **Closed for Q8_0**; Q4_K's heavier decode leaves 1.1×, not enough to
   carry a panel of 128–256 KiB a thread.
 - **The next idea, from these numbers and from the references' tiles**: every input load must feed
   more weight rows. We run 2 rows × 8 tokens (8 input loads per 32 FP ops); llama.cpp's repacked
@@ -3344,6 +3397,51 @@ one core) and its per-type line.
   the native race (`tools/race_llama.sh`) must now split by zone.
 - Exact answers to both are the same idea: decode once (question 63), then F32 with a tile large
   enough; the int8 road stays mode (c).
+
+## More weight rows per input load (question 64, 2026-09-25)
+
+Four rows × six tokens (24 accumulators, 4 weight vectors, 29 of 32 zmm): 6 input loads per 48
+multiply-adds against x8's 8 per 32, half as many a product; but 4 weight vectors decoded for 6
+tokens where x8 decodes 2 for 8, a third more decode a product. Three rows × eight tokens (24
+accumulators, 28 zmm) keeps x8's decode a product and loads two thirds of its inputs: measured
+beside it, the same question from the other side.
+
+**Prediction, written before any run** (container, one core, `bench_peak --one-core`), from
+§The CPU's peak's streams: the f32 stream (no decode) 16.3 cycles a step of 32 ops, the x8 stream
+22.3, so a weight vector's decode costs ~2–3 cycles beside the arithmetic:
+- the 4 × 6 stream in L1 **0.92–1.02× the x8 stream** (arithmetic 24 cycles a step, decode 8–12);
+  the 3 × 8 stream 0.97–1.03× (the same decode a product);
+- `dot_row4_x6` in the matmul's loop, Q8_0 1024 × 2048, 64 tokens: **1.00–1.12× x8's
+  `tr_matmul`**, bit for bit. The gain can only come from the L2 side: x8's matmul runs at 0.86 of
+  its own stream (102 of 119), so 1.17× is the ceiling if the input loads were the whole gap;
+- Q4_K (a permute a weight vector, x8 gained most from sharing it): 0.90–1.05×.
+If the matmul line stays under 1.05×, question 64 closes as no and the tile stays 2 × 8.
+
+**Measured** (`sh tools/bench_native.sh bench_peak --q64 --one-core --runs 11`, native, marker
+held, load 1.1 before and after; the streams are one asm statement each, registers named, their
+loops read in the disassembly, LESSONS #174; the kernels `row4_x6` and `row3_x8` in intrinsics,
+checked byte for byte against `tr_matmul` on every shape before timing, red under an FMA each;
+`tr_matmul` and the two tiles timed in turn, run by run):
+
+| GFLOP/s, one core | today's 2 × 8 | 4 × 6 | 3 × 8 |
+|---|---|---|---|
+| stream in L1 (scale broadcast from memory, the same decode for all three) | 116.9 | 119.1 (1.02×) | 121.4 (1.04×) |
+| Q8_0 1024 × 2048, 64 tokens | 104.1 | 93.4 (0.90×) | 97.3 (0.93×) |
+| Q8_0 2048 × 1024, 64 tokens | 100.9 | 91.1 (0.90×) | 94.5 (0.94×) |
+| Q8_0 2048 × 2048, 512 tokens | 104.3 | 92.2 (0.88×) | 96.8 (0.93×) |
+| Q4_K 1024 × 2048, 64 tokens | 86.9 | 73.4 (0.84×) | 78.2 (0.90×) |
+
+(spreads 0.5–3.6%, two lines 7.4 and 9.5%.)
+
+- **The prediction failed, and with it question 63's explanation.** The streams held (the arithmetic
+  of the three tiles is the same within 4%), but in the matmul both larger tiles lose 6–16%: halving
+  the input loads per product bought nothing, so the matmul is **not** bound by its input rows'
+  loads from L2, as §The prompt's matmul against the four references concluded. What the 13%
+  between x8's stream (119) and its matmul (104) is stays open: the scalar scale conversion
+  (`row4_x6_q8_0` spills 73 general registers around four fp16 conversions a block, x8's kernel 5),
+  the lane tree, the stores.
+- **Closed as no**: no tile shape has more than ~4% to give in its own arithmetic (the streams), and
+  the real kernels of the two lose. The tile stays 2 × 8; the bench keeps the lines (`--q64`).
 
 ## Softmax and exp against the references (2026-09-24)
 
