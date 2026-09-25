@@ -323,26 +323,26 @@ exactly and the five sections after it; LESSONS #152–#157):
   the lane tree in SIMD was a tenth of every two-row call. The matmul on a core 87 → 102
   GFLOP/s (61% of the no-FMA peak); **prefill 1.19× on Q8_0 and Q4_K_M at 16 threads, 1.30× on
   Q4_K_M at 8** (container; native below);
-- **late evening 09-24: pieces 1 and 4 read** (MEASUREMENTS §The prompt's matmul against the four
-  references, §Softmax and exp against the references; ORIGINS rows 1, 4; LESSONS #169–#170): every
-  reference runs int8 activations; piece 4 closed (ggml's exp rounds 3.36% of floats otherwise, ours none);
-- **2026-09-25: piece 1 closed** (MEASUREMENTS §Two rows against eight tokens, §Speed after x8,
-  §More weight rows per input load; ORIGINS row 1; LESSONS #173–#176): x8 native **prefill
-  1.15–1.19× at 512 and 2048, 1.13–1.14× at 4000**, logits identical, decode unchanged. Against
-  llama.cpp (container, still machine): **prefill level at 8 threads**, theirs 1.30–1.35× at 16
-  (our 8 → 16 threads 1.11–1.16×, theirs 1.44–1.49×); decode theirs 1.04× at 512, 1.13× at 2048.
-  Question 64 closed as no: 4 × 6 and 3 × 8 lose 6–16% in the matmul (their streams equal x8's),
-  which also refutes question 63's "bound by the input loads" (#176);
+- **late 09-24: pieces 1 and 4 read** (ORIGINS rows 1, 4; LESSONS #169–#170): every reference runs
+  int8 activations; piece 4 closed (ggml's exp rounds 3.36% of floats otherwise, ours none);
+- **2026-09-25: piece 1 closed** (MEASUREMENTS §Speed after x8; ORIGINS row 1; LESSONS
+  #173–#176): x8 native **prefill 1.15–1.19× at 512 and 2048, 1.13–1.14× at 4000**, logits
+  identical. Against llama.cpp (container): **prefill level at 8 threads**, theirs 1.30–1.35× at 16
+  (our 8 → 16 threads 1.11–1.16×, theirs 1.44–1.49×). Question 64 closed as no (4 × 6 and 3 × 8
+  lose 6–16%), which refutes question 63's "bound by the input loads" (#176);
 - **2026-09-25 evening: piece 2, then question 66** (MEASUREMENTS §The decode's matmul against
   ggml's, §The Q4_K decode dot sequenced; ORIGINS row 2; LESSONS #177-#183). **Q8_0 level from 4
   threads**: its decode gap is attention. **Q4_K level with llama.cpp at 4 threads, exact**: read
   like a genome, the scalar scale decode was 24% of a row; the scales in a vector one block ahead
   and two rows a call (`dot_row2`): the real model's decode **40.3 -> 50.4 tok/s** (llama.cpp
   50.2), the matmul ggml 1.37x -> 1.04x;
-- **next, one piece at a time**: row 3 of ORIGINS (attention, with llama.cpp's F16 KV against our
-  F32). Queued: SMT in the decode (two threads a core, +9-13% from RAM at 4 cores), the prefill at
-  4 threads (llama.cpp 1.6x), vector scales on AVX2, the 16-thread prefill gap, M3's dense
-  weights on the GPU. **For Marcello, 59 and 60** (FMA; int8 activations). 61 after M4.
+- **late 09-25: SMT closed as no, the pool balanced at its tail** (MEASUREMENTS §SMT in the decode,
+  §The pool's tail; LESSONS #184-#186). Natively two threads a core: +1.6-5.7% at 4 cores, 0 at 8
+  (the measured width, 60 tok/s), a collapse at 16 (question 68); the container's siblings are
+  not SMT. `tr_parallel_for_balanced` for the decode: ~1.08x on its calls in the container at 8;
+- **next, one piece at a time**: row 3 of ORIGINS (attention, llama.cpp's F16 KV against our F32).
+  Queued: the prefill at 4 threads (llama.cpp 1.6x), vector scales on AVX2, the 16-thread prefill
+  gap, question 68, M3's dense weights on the GPU. **For Marcello, 59 and 60**. 61 after M4.
 
 **Night of 2026-09-24**: the gate 428 → 238 s; **M2: Q4_K and Q6_K** exact (Q4_K decode 1.5× the
 Q8_0; Q4_K_M runs).

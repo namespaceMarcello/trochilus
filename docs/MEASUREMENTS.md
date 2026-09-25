@@ -185,6 +185,8 @@ decides | — | — |
 | 64 | ~~A tile of more weight rows per input load (4 rows × 6 tokens)?~~ **Closed 2026-09-25 as no** (§More weight rows per input load): the streams of 4 × 6 and 3 × 8 run 1.02× and 1.04× x8's, but in the matmul, exact, they lose (Q8_0 0.88–0.90× and 0.93–0.94×, Q4_K 0.84× and 0.90×; predicted 1.00–1.12×): the matmul is not bound by its input loads | — | the tile stays 2 × 8 |
 | 65 | ~~The decode's matmul (one token, bound by memory): do ggml's kernels read the weights faster than ours?~~ **Closed 2026-09-25** (§The decode's matmul against ggml's): **Q8_0 level from 4 threads** (0.97-1.06x, both at the ceiling), ggml 1.4-1.7x at one thread; **Q4_K ours bound by its arithmetic** (9.3 GB/s a core), ggml 1.34-1.40x at 4 threads, level from 8. The decode's gap is attention (row 3). Three premises for a faster exact Q4_K dot closed as no (four rows at once 0.5-0.9x from RAM, vector scales 0.86x, arithmetic weight 0.77x) | — | — |
 | 66 | ~~Reach llama.cpp's Q4_K decode at 4 threads, exactly (Marcello, 2026-09-25)~~ **Reached 2026-09-25** (§The Q4_K decode dot sequenced): the kernel read like a genome first (the scalar scale decode was 24% of a row), then the scales in a vector one block ahead and two rows a call, the same bits: the real model's decode at 4 threads **40.3 -> 50.4 tok/s (1.25x), llama.cpp 50.2**; the matmul alone ggml 1.37x -> 1.04x. Premise e (a dictionary of tables) closed: 94-99.6% of the sub-blocks have a pair of their own. Open: SMT (+9-13% from RAM at 4 cores), the prefill at 4 threads (llama.cpp 1.6x) | — | — |
+| 67 | ~~SMT in the decode: two threads a core beat llama.cpp on the same 4 cores? (Marcello, 2026-09-25)~~ **Closed 2026-09-25 as no** (§SMT in the decode): natively two threads a core give the decode +1.6-5.7% at 4 cores, nothing at 8 (60.06 against 60.01 tok/s) and a collapse at 16 (8.4 against 58.3); the engine's measured width is 8 cores, one thread each (59.8 tok/s, 8 forced 60.2): no default width gains, not wired. The container cannot answer it (its siblings are not a core's two threads). On the way: the pool's tail (§The pool's tail), tr_parallel_for_balanced | — | — |
+| 68 | Why does the decode collapse at 32 threads on 16 cores (8.4 tok/s against 58.3 at 16, native, TR_POOL_PIN=1; 2.2 against 22.9 on 2026-09-18)? A pool trace (TR_POOL_TRACE) at 32 would say whether it is the wait of every call or a few calls | — | — |
 
 Reference machine: Ryzen 9 7940HX (Zen 4, 16 core / 32 thread, AVX-512 VNNI/BF16), 31 GB
 RAM (2×16 GB DDR5-5200), NVMe Micron 1 TB, GPU RTX 4070 Laptop 8 GB and Radeon 610M (not used
@@ -3636,6 +3638,76 @@ level. An A/B against HEAD's engine in turn (`build/q66/ab_q4k.sh`, the same set
 threads (1.6x: not this question). The Q8_0 A/A of the race: 30.60 and 27.48 (runs 23.6-31.4: the
 machine's noise, the Q4_K series held 46.7-51.0).
 
+## SMT in the decode (question 67, 2026-09-25)
+
+Marcello's task: beat llama.cpp on the same 4 cores by running two threads on each (the genome
+bench had +13% from RAM natively for the one-row kernel, +5% for the pair the engine runs).
+Predictions in `build/smt/predictions.txt`, written before every run.
+
+**The container cannot test it.** `sh tools/race_smt.sh 5` (taskset 0-7: "4 cores and their
+siblings" by lscpu, Q4_K 512 + 128, series Trochilus, llama.cpp, llama.cpp, Trochilus): our prefill
+at 8 threads ran **1.8x** its 4 threads, which two threads on one core never give; the VM's
+processors land wherever Windows puts them, so this is 4 against 8 virtual processors (LESSONS
+#184). There: Trochilus 48.0-49.0 -> 48.6-48.8 tok/s, llama.cpp 48.5-50.5 -> 53.3-53.6 (+6-10%).
+That gap led to §The pool's tail below.
+
+**Natively** (`start /affinity`, CPU attention `TR_GPU=0`, `TR_POOL_PIN=1` for two threads a core,
+Q4_K 512 + 128, runs alternated by `tools/ab_modes.sh`, still machine: 1.7-1.9 processors busy;
+`build/smt/ab_native.sh`, `ab_widths.sh`, `ab_tuner.sh`):
+
+| cores | one thread a core | two threads a core | prefill, two against one |
+|---|---|---|---|
+| 4 (LPs 0-3, 16-19) | 53.0-54.7 (A/A 54.05) | 55.6-56.0 (**+1.6-5.7%**) | 1.06-1.08x |
+| 8 (LPs 0-7, 16-23) | **60.01** | 60.06 (+0%) | 1.08x |
+| 16 (all) | 58.26 | **8.43** (0.15x, question 68) | 0.42x |
+
+The prefill's small gain at 4 and 8 is SMT's signature (the mask did pair siblings). The engine's
+own measured width: **8 cores in 6 runs of 6**, 59.75 tok/s against 60.17 with 8 forced and 53.23
+with 4: the width that matters is 8 cores, where a second thread adds nothing. Predicted P1-P3
+1.03-1.12x; held only at 4 cores, at its low end. **Closed as no: not wired** (a pool with
+sibling threads, a tuner with SMT widths, a forced flag: nothing any default width would gain).
+
+## The pool's tail (2026-09-25)
+
+`tr_parallel_for` gave each thread one contiguous chunk of equal size. A research build
+(`make BUILD=build/linux-trace EXTRA_CFLAGS=-DTR_POOL_TRACE`, natively `build/win-trace`) writes
+every call's dispatch and end and each chunk's start and end (`TR_POOL_TRACE_FILE`);
+`tools/pool_trace.py` sums them by call shape: "balanced" is the mean chunk's work over the wall,
+what a perfect split of the same work would take.
+
+| where | threads | balanced, the decode's matmuls | the last chunk to end |
+|---|---|---|---|
+| container | 4 | 0.94-0.97 | any |
+| container | 8 | **0.77-0.81** | a different one each call |
+| native | 8 | 0.84-0.91 | any |
+| native | 16 | 0.76-0.85 | chunks 2 and 7 more often |
+
+Built: `tr_parallel_for_balanced` (threads.h): each thread runs its chunk in `TR_POOL_BLOCKS` = 64
+blocks, front to back, then takes the blocks other chunks have not started (an atomic add a block;
+each chunk's first block is its owner's); every index still runs once, so the bits cannot move.
+Used by the matmul when every group has one input row (the decode, its experts) and by the decode's
+attention; the prompt keeps the static chunks its tiles want. Tests: test_base (every index once
+over widths, n and min_chunk; a held worker's chunk finished by the others, `helped > 0`: red with
+`TR_POOL_BLOCKS=1` and with the help loop cut to the own chunk), test_phase and test_tier_used
+unchanged (every logit as one thread).
+
+The decode calls' wall a token, from the traces (ms, two runs each):
+
+| where | threads | static | blocks 16 | blocks 64 | blocks 128 |
+|---|---|---|---|---|---|
+| container | 4 | 20.81, 21.01 | 20.94, 21.17 | 20.60, 20.86 | — |
+| container | 8 | 21.37, 20.34 | 18.61, 19.47 / 19.17, 21.31 | **18.82, 19.64** | 19.62, 20.28 |
+| native | 8 | 16.96, 17.26 | — | 17.32, 16.62 | — |
+| native | 16 | 18.32, 18.14 | — | 18.39, 18.61 | — |
+
+In the container at 8 the projections' calls 55.6 -> 49.5 us, the experts' down 214.7 -> 200.2;
+natively at 8 the projections 47.1 -> 45.5 and the rest level; at 16 the stolen blocks' extra
+stream starts cost 1-2% (the mean chunk's work rises), a width the engine does not pick. By
+tokens a second (container, 8 threads, alternated with tools/ab_modes.sh: the A/A spread was 11%)
+no difference could be read. Kept for machines whose processors are taken away mid-call (virtual
+machines: the container's case), at no cost on the width chosen natively. Predicted P5 1.08-1.12x
+at 8 in the container (reached in the calls' wall, ~1.08x), P6 (SMT gains more with it) refuted.
+
 ## Attempts
 
 | Data | Cosa | Prima | Dopo | Spread | Esito |
@@ -3684,3 +3756,5 @@ machine's noise, the Q4_K series held 46.7-51.0).
 | 2026-09-25 | the pair (and four rows) with the scales one block ahead, from RAM | 42.0-42.8 GB/s | 25.4-28.1 | 8-37% | rejected: short interleaved streams (LESSONS #181) |
 | 2026-09-25 | Q4_K tables by a fused multiply-subtract (exact) | 454 / 497 cycles | 481 / 512 | 2-3% | rejected: a second broadcast and a copy |
 | 2026-09-25 | decode rows claimed 64 at a time by an atomic counter (ggml's way) | contiguous chunks | 0.93-0.97x | 9-24% | rejected: short chunks, more stream starts |
+| 2026-09-25 | SMT in the decode, natively: two threads on each of 4 / 8 / 16 cores (TR_POOL_PIN=1 under an affinity mask) | 53.0-54.7 / 60.01 / 58.26 tok/s | 55.6-56.0 / 60.06 / 8.43 | 1-6% | **rejected**: the engine's width is 8 cores, where it adds nothing; 16 x 2 collapses (question 68) |
+| 2026-09-25 | the decode's matmuls and attention balanced at the tail (tr_parallel_for_balanced, 64 blocks a chunk; same bits) | decode calls' wall 20.3-21.4 ms a token (container, 8) / 17.0-17.3 (native, 8) | 18.8-19.6 / 16.6-17.3 | two runs each | kept: ~1.08x in the container at 8, level natively at 8, 1-2% worse natively at 16 (not a chosen width) |

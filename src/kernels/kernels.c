@@ -484,7 +484,10 @@ void tr_matmul_grouped(tr_pool *pool, const tr_mat *w, const int64_t *offsets, i
     /* Keep chunks worth threading: roughly a few thousand scalar multiplies
      * worth of rows per chunk, never less than one row. */
     int64_t min_chunk = ctx.cols > 0 ? (4096 / ctx.cols) + 1 : 1;
-    tr_parallel_for(pool, n, min_chunk, matmul_body, &ctx);
+    /* One input row per group (a decode token, its experts' gathered rows): only weight rows to
+     * stream, balanced at the tail. More rows share tiles, which want long chunks. */
+    if (offsets[n_groups] == n_groups) tr_parallel_for_balanced(pool, n, min_chunk, matmul_body, &ctx);
+    else tr_parallel_for(pool, n, min_chunk, matmul_body, &ctx);
 }
 
 void tr_matmul(tr_pool *pool, const tr_mat *w, const float *x, int64_t n_tokens, float *y) {

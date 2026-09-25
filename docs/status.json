@@ -156,21 +156,42 @@
         {
           "v": "SMT peggiora: 32 thread contro 16 → decode 2.2 contro 22.9 tok/s",
           "d": "2026-09-18"
+        },
+        {
+          "v": "SMT vero (nativo): due thread per core danno al decode +1.6-5.7% a 4 core, niente a 8 (la larghezza che il motore sceglie, 60 tok/s), un crollo a 16 (8.4 contro 58.3 tok/s)",
+          "d": "2026-09-25"
+        },
+        {
+          "v": "la coda del pool: a 8 thread nel container si aspettava il thread più lento per un quinto di ogni moltiplicazione; a blocchi rubati dagli altri, stessi bit: -8% di tempo nelle chiamate del decode, in nativo pari",
+          "d": "2026-09-25"
         }
       ],
       "domande": [
         {
           "n": 31,
           "stato": "aperta",
-          "testo": "lo stimatore della larghezza riscritto non ha ancora un numero sul modello vero"
+          "testo": "lo stimatore della larghezza riscritto: a 512 sul Q4_K nativo sceglie 8 core in 6 corse su 6, pari a 8 forzati; manca il contesto lungo"
+        },
+        {
+          "n": 67,
+          "stato": "chiusa",
+          "testo": "SMT nel decode: due thread per core battono llama.cpp sugli stessi 4 core? no: +1.6-5.7% a 4 core, niente a 8, dove il motore lavora"
+        },
+        {
+          "n": 68,
+          "stato": "aperta",
+          "testo": "perché 32 thread su 16 core fanno crollare il decode (8.4 contro 58.3 tok/s)?"
         }
       ],
       "file": [
         "src/base/threads.c",
-        "tests/test_phase.c"
+        "tests/test_phase.c",
+        "tools/pool_trace.py",
+        "tests/test_base.c"
       ],
       "comandi": [
-        "sh tools/threads_phase.sh sweep"
+        "sh tools/threads_phase.sh sweep",
+        "sh tools/race_smt.sh"
       ],
       "dipende": [
         "kernel"
@@ -812,7 +833,7 @@
       "tappa": "M2",
       "titolo": "K-quant sulla CPU",
       "stato": "in-corso",
-      "cosa": "Formati che tengono i pesi in meno byte (Q4_K, Q6_K, Q2_K, IQ2_XXS): meno disco e meno RAM, la leva che si somma a tutto M1. Fatti il 24/09: Q4_K e Q6_K nel motore, esatti rispetto ai loro pesi dequantizzati (identici al bit a gguf-py, i modelli veri tagliati a 2 strati contro transformers nel make check). Q4_K ha un kernel AVX-512 nostro (i 16 valori di un sotto-blocco calcolati una volta); Q6_K spacchetta i 256 quant di un blocco una volta sola e poi va come Q8_0. Con Q6_K gira Q4_K_M, il file che la gente scarica. I modelli veri in Q4_K e Q4_K_M si fanno dal nostro Q8_0, senza download. Misurato di nuovo: nel prefill non conta decodificare i pesi ma caricare le attivazioni, quindi niente riga dequantizzata una volta per blocco (scartata) e invece due righe di pesi per ogni caricamento (tenuta). Il 25/09 il decode Q4_K a 4 thread ha raggiunto llama.cpp (scale in vettore, due righe per chiamata). Prossimo: le due righe anche su AVX2, e due thread per core (SMT) nel decode.",
+      "cosa": "Formati che tengono i pesi in meno byte (Q4_K, Q6_K, Q2_K, IQ2_XXS): meno disco e meno RAM, la leva che si somma a tutto M1. Fatti il 24/09: Q4_K e Q6_K nel motore, esatti rispetto ai loro pesi dequantizzati (identici al bit a gguf-py, i modelli veri tagliati a 2 strati contro transformers nel make check). Q4_K ha un kernel AVX-512 nostro (i 16 valori di un sotto-blocco calcolati una volta); Q6_K spacchetta i 256 quant di un blocco una volta sola e poi va come Q8_0. Con Q6_K gira Q4_K_M, il file che la gente scarica. I modelli veri in Q4_K e Q4_K_M si fanno dal nostro Q8_0, senza download. Misurato di nuovo: nel prefill non conta decodificare i pesi ma caricare le attivazioni, quindi niente riga dequantizzata una volta per blocco (scartata) e invece due righe di pesi per ogni caricamento (tenuta). Il 25/09 il decode Q4_K a 4 thread ha raggiunto llama.cpp (scale in vettore, due righe per chiamata). Prossimo: le due righe anche su AVX2. Due thread per core (SMT) nel decode: misurato il 25/09, non conviene alla larghezza che il motore usa.",
       "numeri": [
         {
           "v": "decode Q4_K a 4 thread pari a llama.cpp (50.4 contro 50.2 token/s, 1.25x rispetto a prima), stessi bit; il prefill a 4 thread resta dietro (loro 1.6x)",

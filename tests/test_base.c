@@ -16,6 +16,7 @@
 #include "../src/base/threads.h"
 #include "../src/base/cpu.h"
 
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -521,6 +522,65 @@ static void test_pool_active(void) {
     tr_pool_destroy(p);
 }
 
+/* tr_parallel_for_balanced: every index once whatever the width, n and min_chunk, and the help
+ * really happens. The witness: worker 1 holds its first block for 5 ms, so the other workers
+ * finish their own chunks and take the rest of worker 1's; indices of chunk 1 run by another
+ * worker are counted, and a call where nobody helped fails the test (`helped`, the branch of
+ * run_chunk past a thread's own chunk). Red with TR_POOL_BLOCKS=1 (the static split) and with the
+ * help loop cut to the own chunk. */
+typedef struct {
+    unsigned char *count;
+    unsigned char *worker_id;
+    atomic_int held; /* worker 1 has held its first block */
+} slow_ctx;
+
+static void slow_fn(void *ctx_, int64_t begin, int64_t end, int worker) {
+    slow_ctx *ctx = ctx_;
+    if (worker == 1 && !atomic_exchange(&ctx->held, 1)) {
+        double t0 = tr_time_sec();
+        while (tr_time_sec() - t0 < 0.005) { }
+    }
+    for (int64_t i = begin; i < end; i++) {
+        ctx->count[i]++;
+        ctx->worker_id[i] = (unsigned char)worker;
+    }
+}
+
+static void test_parallel_balanced(void) {
+    static const int widths[] = {8, 3, 2, 8, 5};
+    static const int64_t min_chunks[] = {1, 3, 64};
+    unsigned char count[3000], worker_id[3000];
+    tr_pool *p = tr_pool_create(8);
+    TR_CHECK(p != NULL);
+    if (p == NULL) return;
+    for (int iter = 0; iter < 3000; iter++) {
+        int w = widths[iter % 5];
+        int64_t n = 1 + (iter * 13) % 3000, min_chunk = min_chunks[iter % 3];
+        tr_pool_set_active(p, w);
+        memset(count, 0, (size_t)n);
+        cov_ctx ctx = { count, worker_id };
+        tr_parallel_for_balanced(p, n, min_chunk, cov_fn, &ctx);
+        check_coverage(n, count, worker_id, w);
+    }
+    tr_pool_set_active(p, 8);
+    int helped = 0;
+    for (int round = 0; round < 3; round++) {
+        const int64_t n = 2048; /* 8 chunks of 256, blocks of 4 */
+        memset(count, 0, (size_t)n);
+        slow_ctx sc;
+        sc.count = count;
+        sc.worker_id = worker_id;
+        atomic_init(&sc.held, 0);
+        tr_parallel_for_balanced(p, n, 1, slow_fn, &sc);
+        check_coverage(n, count, worker_id, 8);
+        for (int64_t i = n / 8; i < 2 * n / 8; i++)
+            if (worker_id[i] != 1) helped++;
+    }
+    TR_CHECK(helped > 0);
+    printf("  balanced: %d indices of the held chunk run by the other workers over 3 calls\n", helped);
+    tr_pool_destroy(p);
+}
+
 /* ---- thread placement ---------------------------------------------------- */
 
 /* Every slot names a different logical processor, and the first physical_cores of them
@@ -842,6 +902,7 @@ int main(int argc, char **argv) {
 
     test_parallel_varying_chunks();
     test_pool_active();
+    test_parallel_balanced();
     test_cpu_slots();
     test_pool_pinned();
     test_pool_caller_affinity_any_order();

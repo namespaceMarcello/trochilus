@@ -48,7 +48,7 @@ int tr_pool_size(const tr_pool *p);
 void tr_pool_set_active(tr_pool *p, int n);
 int tr_pool_active(const tr_pool *p);
 
-/* Splits [0, n) into at most tr_pool_size contiguous chunks, each holding at
+/* Splits [0, n) into at most tr_pool_active contiguous chunks, each holding at
  * least min_chunk indices (except when n < min_chunk: one chunk), runs fn on
  * every chunk and returns when all are done. A call made from inside a body
  * runs serially on the calling thread, with the worker id of the body it was made
@@ -57,6 +57,19 @@ int tr_pool_active(const tr_pool *p);
  * p == NULL runs serially. Not reentrant from two unrelated threads on the same
  * pool: one job at a time per pool. */
 void tr_parallel_for(tr_pool *p, int64_t n, int64_t min_chunk, tr_range_fn fn, void *ctx);
+
+/* tr_parallel_for, balanced at its tail: each thread runs its chunk in TR_POOL_BLOCKS blocks (of
+ * at least min_chunk indices) front to back, then takes the blocks other chunks have not started
+ * yet, so a thread that runs slow (a sibling busy, a core preempted) no longer holds the others
+ * at the end of the call (docs/MEASUREMENTS.md §The pool's tail). fn is called once per block,
+ * on whichever thread claimed it: a body must accept any partition of [0, n), which the
+ * determinism contract above already asks. For work bound by memory whose index is the whole
+ * cost (the decode's weight rows, its heads); not for bodies that gain from long chunks (the
+ * prompt's tiles of tokens), which keep tr_parallel_for. */
+void tr_parallel_for_balanced(tr_pool *p, int64_t n, int64_t min_chunk, tr_range_fn fn, void *ctx);
+/* Blocks per chunk of tr_parallel_for_balanced; TR_POOL_BLOCKS in the environment, read at
+ * tr_pool_create, overrides it for measurements, and 1 is the static split. */
+#define TR_POOL_BLOCKS 64
 
 /* ---- one thread of one's own, and a monitor to talk to it ----
  * For work that is not a parallel_for: the expert store's I/O thread (src/memory/experts.c).

@@ -194,7 +194,9 @@ remain.
   row of a pass is bit-identical to the one-token pass, generated tokens are the same with
   and without drafting: it is speed, never a different result.
 - **Threads**: pool persistent, sized on **physical cores** (colibri: +2.3x on Zen 3 versus
-  logical cores), `parallel_for` on row ranges. Counting is not enough: if not pinned to
+  logical cores; two threads a core add nothing at the decode's width, MEASUREMENTS §SMT in the
+  decode), `parallel_for` on row ranges, the decode's balanced at the tail (a thread done takes the
+  blocks others have not started: §The pool's tail). Counting is not enough: if not pinned to
   cores, Windows places two on the same physical core and prefill loses 30% (`docs/MEASUREMENTS.md`
   §Where do threads go). **Threads per phase**: a long pass (the prompt) is bound by compute
   and uses the whole pool; a short pass (decode, short draft: up to 4 rows) is bound by weight

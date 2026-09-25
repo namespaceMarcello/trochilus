@@ -1325,8 +1325,10 @@ static int forward_layer(olmoe_model *m, olmoe_session *s, int64_t L, const int3
         ac.n_tok = n_tok;
         ac.pos0 = pos0;
         ac.score_stride = s->score_stride;
-        /* an item costs ~30 ns per cached position: short contexts keep several per chunk */
-        tr_parallel_for(pool, n_head * n_tok, 1 + 256 / (pos0 + n_tok), attn_body, &ac);
+        /* an item costs ~30 ns per cached position: short contexts keep several per chunk; a
+         * decode token's heads, one stream of cached positions each, balanced at the tail */
+        if (n_tok == 1) tr_parallel_for_balanced(pool, n_head, 1 + 256 / (pos0 + 1), attn_body, &ac);
+        else tr_parallel_for(pool, n_head * n_tok, 1 + 256 / (pos0 + n_tok), attn_body, &ac);
     } else if (L == m->n_layers - 1) {
         s->gpu_tokens++;
     }

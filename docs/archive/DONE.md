@@ -1171,3 +1171,22 @@ Check: `make check`; `sh tools/bench_ggml_decode.sh` (container, ~3 min, guarded
 Check: `make check`; `sh tools/bench_q4k_genome.sh` (L1), `sh tools/bench_q4k_genome.sh 9 --ram 4
 --only pf4row` (RAM); `sh tools/bench_ggml_decode.sh 5 q4_k`; `RACE_THREADS=4 sh tools/race_q4k.sh`;
 in the container `sh tools/mutate_row2.sh`.
+
+### 2026-09-25 — The pool balanced at its tail; SMT in the decode closed as no (question 67)
+- `tr_parallel_for_balanced` (threads.{h,c}): each thread runs its chunk in `TR_POOL_BLOCKS` = 64
+  blocks and then takes the blocks the other chunks have not started (`run_chunk`, one atomic add a
+  block, each region on its own line); every index runs once, the bits cannot move. The matmul uses
+  it when every group has one input row (the decode, its experts), the decode's attention too; the
+  prompt keeps `tr_parallel_for`. `TR_POOL_BLOCKS=1` is the static split, for A/B.
+- `TR_POOL_TRACE` (research build: `EXTRA_CFLAGS=-DTR_POOL_TRACE`): every call's and chunk's start
+  and end to `$TR_POOL_TRACE_FILE`; `tools/pool_trace.py` sums them by call shape.
+- `tools/race_smt.sh`: Trochilus and llama.cpp confined by taskset to the same logical processors
+  in the container, two thread counts (not SMT there: LESSONS #184).
+- Test: test_base's `test_parallel_balanced` (every index once over widths, n and min_chunk; a held
+  worker's chunk finished by the others, red with `TR_POOL_BLOCKS=1` and with the help loop cut).
+- Measured (MEASUREMENTS §SMT in the decode, §The pool's tail): natively two threads a core give
+  +1.6-5.7% at 4 cores, nothing at 8 (the engine's measured width, 60 tok/s), a collapse at 16
+  (question 68); the balanced tail ~1.08x on the decode calls in the container at 8, level natively.
+Check: `make check`; `sh tools/race_smt.sh`; a trace: `make BUILD=build/win-trace
+EXTRA_CFLAGS=-DTR_POOL_TRACE build/win-trace/trochilus.exe`, run with `TR_POOL_TRACE_FILE=x.trace`,
+then `tools/.venv/Scripts/python.exe tools/pool_trace.py x.trace`.
