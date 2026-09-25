@@ -73,6 +73,15 @@ typedef struct {
     /* TR_ATTN_X axpys on the same y, one after the other: axpy_f32(y, x + j*stride, a[j], n) for
      * j = 0, 1, 2, 3 in this order, with y loaded and stored once for all of them */
     void (*axpy_f32_x4)(float *y, const float *x, int64_t stride, const float *a, int64_t n);
+    /* A tile of a prompt's attention, TR_ATTN_X queries against TR_ATTN_X keys: out[i*out_stride +
+     * j] = dot_f32(a + i*a_stride, b + j*stride, n) * scale for i, j < TR_ATTN_X, each dot under
+     * the lane contract and then one multiply, as tr_attention_group scales a score */
+    void (*dot_f32_4x4)(const float *a, int64_t a_stride, const float *b, int64_t stride, int64_t n, float scale,
+                        float *out, int64_t out_stride);
+    /* TR_ATTN_X outputs against the same TR_ATTN_X rows: axpy_f32_x4(y + i*y_stride, x, stride,
+     * a + i*a_stride, n) for i < TR_ATTN_X, each output's four additions in order */
+    void (*axpy_f32_4x4)(float *y, int64_t y_stride, const float *x, int64_t stride, const float *a, int64_t a_stride,
+                         int64_t n);
     /* dot of one quantized row (n elements) with f32 x, under the lane contract
      * applied to the dequantized weights: w_k = d_block * q_k computed as a
      * float product first, then w_k * x_k into lane k % 16 */

@@ -423,6 +423,41 @@ static void row2x8_diffs(const tr_kernels *K, const tr_kernels *S, tr_type type,
     g_x8_compared++;
 }
 
+/* A tile of a prompt's attention: 4 query rows of a (len + 5 apart: not b's stride) against the 4
+ * rows of b `stride` apart. Every score must be scalar's dot_f32 of its pair times the scale, and
+ * the tier's 4x4 must equal scalar's 4x4; every one of the 4 outputs (rows of y, len + 2 apart,
+ * the floats between them never touched) scalar's axpy_f32_x4 with its own 4 weights. Counts its
+ * calls: a tile never compared proves nothing (docs/LESSONS.md #43). `avail`: floats of a from a on. */
+static long g_tile_compared;
+static void tile_diffs(const tr_kernels *K, const tr_kernels *S, const float *a, const float *b, int64_t stride,
+                       int64_t len, int64_t avail, unsigned *seed, int special, int *bad) {
+    enum { OUT_STRIDE = TR_ATTN_X + 3, Y_MAX = 4 * (1000 + 2) };
+    static float yk[Y_MAX], ys[Y_MAX];
+    const int64_t a_stride = len + 5, y_stride = len + 2;
+    if ((TR_ATTN_X - 1) * a_stride + len > avail || TR_ATTN_X * y_stride > Y_MAX) return; /* the rows must fit */
+    float scale = special ? rand_special(seed, 1) : 0.0883883f;
+    float ok[TR_ATTN_X * OUT_STRIDE], os[TR_ATTN_X * OUT_STRIDE], w[TR_ATTN_X * OUT_STRIDE];
+    for (int i = 0; i < TR_ATTN_X * OUT_STRIDE; i++) ok[i] = os[i] = 7.0f;
+    K->dot_f32_4x4(a, a_stride, b, stride, len, scale, ok, OUT_STRIDE);
+    S->dot_f32_4x4(a, a_stride, b, stride, len, scale, os, OUT_STRIDE);
+    for (int i = 0; i < TR_ATTN_X; i++)
+        for (int j = 0; j < OUT_STRIDE; j++) {
+            float want = j < TR_ATTN_X ? S->dot_f32(a + i * a_stride, b + j * stride, len) * scale : 7.0f;
+            if (!same_float(ok[i * OUT_STRIDE + j], want) || !same_float(ok[i * OUT_STRIDE + j], os[i * OUT_STRIDE + j]))
+                (*bad)++;
+        }
+    for (int i = 0; i < TR_ATTN_X * OUT_STRIDE; i++) w[i] = rand_special(seed, special);
+    for (int64_t i = 0; i < TR_ATTN_X * y_stride; i++) yk[i] = ys[i] = rand_special(seed, special);
+    K->axpy_f32_4x4(yk, y_stride, b, stride, w, OUT_STRIDE, len);
+    for (int i = 0; i < TR_ATTN_X; i++) S->axpy_f32_x4(ys + i * y_stride, b, stride, w + i * OUT_STRIDE, len);
+    for (int64_t i = 0; i < TR_ATTN_X * y_stride; i++)
+        if (!same_float(yk[i], ys[i])) {
+            (*bad)++;
+            break;
+        }
+    g_tile_compared++;
+}
+
 /* Runs K and S on the same inputs; counts the calls whose results differ. */
 static void count_diffs(const tr_kernels *K, const tr_kernels *S, unsigned seed, int *bad_dot, int *bad_row,
                         int *bad_axpy, int *bad_x4) {
@@ -497,6 +532,7 @@ static void count_diffs(const tr_kernels *K, const tr_kernels *S, unsigned seed,
                         break;
                     }
                 }
+                tile_diffs(K, S, a + off, b + off, stride, len, CMP_MAX_N - off, &seed, round % 2, bad_x4);
             }
         }
         for (int64_t nb = 1; nb <= 128; nb += (nb < 8 ? 1 : 15)) {
@@ -672,6 +708,24 @@ static void wrong_axpy_f32_x4(float *y, const float *x, int64_t stride, const fl
         y[k] = y[k] + ((a[0] * x[k] + a[1] * x[stride + k]) + (a[2] * x[2 * stride + k] + a[3] * x[3 * stride + k]));
 }
 
+/* Wrong only in rounding: the scale folded into the query before the products, what a tile
+ * that saves the last multiply would do. */
+static void wrong_dot_f32_4x4(const float *a, int64_t a_stride, const float *b, int64_t stride, int64_t n, float scale,
+                              float *out, int64_t out_stride) {
+    for (int i = 0; i < TR_ATTN_X; i++)
+        for (int j = 0; j < TR_ATTN_X; j++) {
+            float lane[TR_LANES] = {0};
+            for (int64_t k = 0; k < n; k++) lane[k % TR_LANES] += (a[i * a_stride + k] * scale) * b[j * stride + k];
+            out[i * out_stride + j] = tr_lane_combine(lane);
+        }
+}
+
+/* Wrong only in rounding: each output's four products added to each other first */
+static void wrong_axpy_f32_4x4(float *y, int64_t y_stride, const float *x, int64_t stride, const float *a,
+                               int64_t a_stride, int64_t n) {
+    for (int i = 0; i < TR_ATTN_X; i++) wrong_axpy_f32_x4(y + i * y_stride, x, stride, a + i * a_stride, n);
+}
+
 /* ---- the weight in every dot is dequant_row's float, in every tier ------------------------ */
 /* dot_row(row, x) == dot_f32(dequant_row(row), x) bit for bit (NaN: any NaN), for every type and
  * tier, ordinary and special values, rows up to 4096 (and 4113 for F16's tail lanes): a matmul
@@ -753,6 +807,17 @@ static void test_tiers_match_scalar(void) {
     count_diffs(&wrong, S, 7u, &bad_dot, &bad_row, &bad_axpy, &bad_x4);
     TR_CHECK_EQ_INT(bad_dot + bad_row + bad_axpy, 0);
     TR_CHECK(bad_x4 > 0);
+    /* and each wrong tile alone: the attention's comparisons see them */
+    wrong = *S;
+    wrong.dot_f32_4x4 = wrong_dot_f32_4x4;
+    count_diffs(&wrong, S, 7u, &bad_dot, &bad_row, &bad_axpy, &bad_x4);
+    TR_CHECK_EQ_INT(bad_dot + bad_row + bad_axpy, 0);
+    TR_CHECK(bad_x4 > 0);
+    wrong = *S;
+    wrong.axpy_f32_4x4 = wrong_axpy_f32_4x4;
+    count_diffs(&wrong, S, 7u, &bad_dot, &bad_row, &bad_axpy, &bad_x4);
+    TR_CHECK_EQ_INT(bad_dot + bad_row + bad_axpy, 0);
+    TR_CHECK(bad_x4 > 0);
     /* and a wrong F16 row alone: the Q8_0 rows above must not be what made bad_row move */
     wrong = *S;
     wrong.dot_row[TR_TYPE_F16] = wrong_dot_row_f16;
@@ -814,6 +879,7 @@ static void test_tiers_match_scalar(void) {
          * and that the engine goes through them, is tests/test_tier_used.c */
         g_x8_compared = 0;
         g_pair_compared = 0;
+        g_tile_compared = 0;
         count_diffs(K, S, 2026u + (unsigned)t, &bad_dot, &bad_row, &bad_axpy, &bad_x4);
         TR_CHECK_EQ_INT(bad_dot, 0);
         TR_CHECK_EQ_INT(bad_row, 0);
@@ -827,9 +893,11 @@ static void test_tiers_match_scalar(void) {
         int has_pair = 0;
         for (int type = 0; type < TR_TYPE_COUNT; type++) has_pair |= K->dot_row2[type] != NULL;
         if (has_pair) TR_CHECK(g_pair_compared > 0);
-        printf("  tier %-8s dot_f32, axpy_f32, their x4, dot_row, dot_row2 (%ld calls), dot_row_x4, dot_row2_x4 and "
+        TR_CHECK(g_tile_compared > 0); /* the prompt's tiles */
+        printf("  tier %-8s dot_f32, axpy_f32, their x4 and 4x4 (%ld tiles), dot_row, dot_row2 (%ld calls), dot_row_x4, "
+               "dot_row2_x4 and "
                "dot_row2_x8 (%ld calls) of f32, f16, q8_0, q4_k and q6_k %s\n",
-               K->tier, g_pair_compared, g_x8_compared,
+               K->tier, g_tile_compared, g_pair_compared, g_x8_compared,
                bad_dot == 0 && bad_row == 0 && bad_axpy == 0 && bad_x4 == 0 ? "identical to scalar"
                                                                             : "DIFFER from scalar");
     }

@@ -187,6 +187,8 @@ decides | — | — |
 | 66 | ~~Reach llama.cpp's Q4_K decode at 4 threads, exactly (Marcello, 2026-09-25)~~ **Reached 2026-09-25** (§The Q4_K decode dot sequenced): the kernel read like a genome first (the scalar scale decode was 24% of a row), then the scales in a vector one block ahead and two rows a call, the same bits: the real model's decode at 4 threads **40.3 -> 50.4 tok/s (1.25x), llama.cpp 50.2**; the matmul alone ggml 1.37x -> 1.04x. Premise e (a dictionary of tables) closed: 94-99.6% of the sub-blocks have a pair of their own. Open: SMT (+9-13% from RAM at 4 cores), the prefill at 4 threads (llama.cpp 1.6x) | — | — |
 | 67 | ~~SMT in the decode: two threads a core beat llama.cpp on the same 4 cores? (Marcello, 2026-09-25)~~ **Closed 2026-09-25 as no** (§SMT in the decode): natively two threads a core give the decode +1.6-5.7% at 4 cores, nothing at 8 (60.06 against 60.01 tok/s) and a collapse at 16 (8.4 against 58.3); the engine's measured width is 8 cores, one thread each (59.8 tok/s, 8 forced 60.2): no default width gains, not wired. The container cannot answer it (its siblings are not a core's two threads). On the way: the pool's tail (§The pool's tail), tr_parallel_for_balanced | — | — |
 | 68 | Why does the decode collapse at 32 threads on 16 cores (8.4 tok/s against 58.3 at 16, native, TR_POOL_PIN=1; 2.2 against 22.9 on 2026-09-18)? A pool trace (TR_POOL_TRACE) at 32 would say whether it is the wait of every call or a few calls | — | — |
+| 69 | ~~Pass llama.cpp's decode at long context with the KV exact (Marcello, 2026-09-25)~~ **Closed 2026-09-26 on the CPU** (§The attention against llama.cpp's): level with no context, 5.31 against 3.24 µs a cached position, the bytes of their F16 KV; our attention reads at a plain read's speed, and F32 at their slope needs 81 GB/s (the RAM reads 53-57). On the GPU the same bits pass it (1.31x at 2048) | — | — |
+| 70 | The softmax's exponential in a vector (question 58's AVX-512 kernel, 0.73 ns against `tr_expf`'s 3.52, 0 of 2^32 differ): with the tiles it is half of a prompt's (query, position) pair (4.45 of 9.2 ns on a core). Predicted: the prompt's attention 1.5-1.8x more, the prefill at 4000 +5-8% | `bench_attn` one core (one softmax, tile full), then `prefill_context.sh change` | the prompt's attention after the tiles; the SiLU and the router take it too |
 
 Reference machine: Ryzen 9 7940HX (Zen 4, 16 core / 32 thread, AVX-512 VNNI/BF16), 31 GB
 RAM (2×16 GB DDR5-5200), NVMe Micron 1 TB, GPU RTX 4070 Laptop 8 GB and Radeon 610M (not used
@@ -3707,6 +3709,113 @@ tokens a second (container, 8 threads, alternated with tools/ab_modes.sh: the A/
 no difference could be read. Kept for machines whose processors are taken away mid-call (virtual
 machines: the container's case), at no cost on the width chosen natively. Predicted P5 1.08-1.12x
 at 8 in the container (reached in the calls' wall, ~1.08x), P6 (SMT gains more with it) refuted.
+
+## The attention against llama.cpp's (row 3, 2026-09-26)
+
+Marcello's task: pass llama.cpp where it still leads, the decode at long context, without moving a
+bit. Predictions in `build/attn/predictions.txt`, written before every run.
+
+**How they do it** (ORIGINS row 3, read 09-25): llama.cpp runs flash attention on the CPU by
+default (AUTO resolves on), its KV in **F16**, `[position][head × dim]` a layer. A decode token at
+≥ 512 positions splits the positions over every thread; each thread runs every head over its chunk
+(a 256-byte slice every 4 KiB: sixteen strided passes), with an online softmax, and **sums the
+values in an F16 accumulator rounded at every position** (`ops.cpp` 8755-8809), the chunks merged by
+rescaling. ik_llama.cpp: the same family, positions split for MLA only. colibri and ds4 keep F32
+rows and never split a query's positions.
+
+**Theirs against ours, as a line.** The race of 09-25 (`f6a8b4c`, container, Q8_0, §Speed —
+Trochilus vs llama.cpp after x8) at two contexts gives each engine's decode a token as an intercept (no context) plus a slope
+(each cached position):
+
+| threads | Trochilus | llama.cpp |
+|---|---|---|
+| 8 | 28.1 ms + **5.31 µs** a position | 27.6 ms + **3.24 µs** |
+| 16 | 26.8 ms + 5.24 µs | 26.8 ms + 3.34 µs |
+
+Level with no context: the whole gap is the slope. A position is 256 KiB of F32 KV for us, read at
+49 GB/s, 128 KiB of F16 for them, read at 40 (their strided passes).
+
+**Ours taken apart** (`bench_attn_bw 2048`, native, 11 repetitions of paired steps, 3.9-4.0
+processors busy elsewhere): the engine's attention reads at **the speed of a plain read of the same
+bytes** at every width (engine 52.4-52.8 GB/s at 4, 6 and 8 threads; plain reads 53.0-53.5; 5
+threads 49.5, sixteen heads over five). The products, the softmax and the tail are all hidden
+under the reads: the decode's attention is its bytes.
+
+**P1, one front instead of T: refuted.** The RAM gives 57.6 GB/s to 4 readers and 52-53 to 8 or more
+(§Decode at long context and RAM bandwidth); the premise was that T threads reading T places far
+apart cost the drop. `bench_mem streams` (new: the same 2 GiB as T contiguous shares, or as one
+front the threads take turns on; native, 4-6 processors busy elsewhere, indicative), GB/s:
+
+| threads | T fronts | turns of 256 B | 4 KiB | 32 KiB | 256 KiB |
+|---|---|---|---|---|---|
+| 1 | 24.9 | 23.6 | 24.7 | 24.6 | 24.9 |
+| 4 | 55.7 | 9.5 | 32.3 | 44.7 | 54.0 |
+| 8 | 52.4 | 18.2 | 35.8 | 43.6 | 53.1 |
+| 16 | 50.7 | 25.8 | 36.4 | 44.0 | 51.0 |
+
+Turns cost, up to 256 KiB: a thread's reads must be long runs (each short one restarts its
+prefetcher, as ggml's 64-row claiming did in §The Q4_K decode dot sequenced), and one front
+gains nothing at any length. The attention with one front (`bench_attn_bw front`: K in blocks
+taken in turns, V cut by dimensions, the same bits) ran 0.78-0.81x the engine.
+
+**What that leaves.** To match their slope with exact F32 keys and values, 256 KiB in 3.24 µs is
+**81 GB/s**: the DDR5-5200's paper peak (83), against the 53-57 this machine reads. Lossless
+packing (question 57, 28 bits) would need 71. On the CPU an exact F32 KV cannot pass an F16 one at
+long context; our decode wins there where the KV is not on the CPU's bus: the GPU attention, the
+same bits, 1.31x at 2048 and 1.54-1.58x at 4000 (§The decode's attention on the GPU, in the engine).
+
+## The prompt's attention in tiles (2026-09-26)
+
+The other half of row 3. A prompt's attention is not bound by memory (a group of 16 queries reads
+a block of keys once): **taken apart on one core** (`bench_attn 2048 --threads 1 --heads 1`, ns a
+(query, position) pair, 7 repetitions):
+
+| variant | ns a pair |
+|---|---|
+| one query at a time (`tr_attention_head`) | 14.98 |
+| the engine's group (`tr_attention_group`, x4 kernels) | 12.09 |
+| products only, x4 kernels (blkx nosm) | 7.36 |
+| the softmax alone (a row as long as the context) | 4.45 |
+
+A pair is 512 flops: 7.36 ns is 70 GFLOP/s, where the core's no-FMA peak is ~150-167. The x4
+kernels store each score's sixteen lanes and add them in scalar, sixteen trees a tile.
+
+**Built: tiles of 4 queries x 4 positions** (`dot_f32_4x4`, `axpy_f32_4x4` in the kernel table;
+AVX-512: sixteen accumulators, every key and query vector loaded once for four products, the
+sixteen lane trees in four levels of `avx512_pair_sums`, as the x8 matmul; four outputs against
+four values, each value vector loaded once for four queries; AVX2: four x4 calls). In
+`tr_attention_group` the queries of a block go four at a time wherever the quad's first query sees
+all four positions; every query's positions stay in increasing order, so every score and every sum
+is the same operations. Predicted P2 1.5-1.7x on the products, P3 9.0-9.8 ns a pair in all:
+
+| one core | before | tiles |
+|---|---|---|
+| products only, 2048 | 7.36 | **4.55** (1.62x) |
+| the whole attention, 2048 (the engine's function) | 12.09 | **9.18** (1.32x) |
+| the whole attention, 4000 | 13.07 | 9.44 (1.38x) |
+| 16 threads, 16 heads, 4000, one layer (spreads 17-26%) | 143 ms (blkx) | 116 ms (1.23x) |
+
+The bits: every variant hashes to the one-query line's; `test_kernels` compares 16 400 tiles a
+tier with scalar's and with the tier's own x4 kernels (two mutants of the definition and two of the
+AVX-512 kernel, a tree's pair swapped and two values' order swapped, seen red); `test_tier_used`
+counts the 4x4 calls a synthetic model's prompt makes.
+
+**In the engine** (native, 16 threads, Q8_0). Logits identical byte for byte before and after
+(`prefill_context.sh change`'s exact stage: 600 positions one token a pass and in passes of 64, a
+prompt of 4000 in passes of 512 and of 100, the same tokens after it). Its speed stage stopped at
+round 5 of 8 (the engine's memory guard: 3.2 GB free for a minute) and read nothing: A/A gaps of
+4-8%, every after/before inside them. Then `tools/ab_zone.sh` (new: the two binaries alternated
+run by run, the zone's seconds from `--profile-json`, 8 pairs a prompt, 2.8-3.5 processors busy
+elsewhere); predicted P5 the zone 0.75-0.82 at 4000, 0.77-0.85 at 2048, the prefill 0.92-0.95 and
+0.96-0.98 of its time:
+
+| prompt | attention zone, s (before → after) | after / before, per pair | prefill, after / before |
+|---|---|---|---|
+| 2048 | 0.576 → 0.443 | **0.751** [0.735-0.772] | 0.971 [0.957-0.986] (**1.03x**) |
+| 4000 | 2.352 → 1.815 | **0.762** [0.736-0.813] | 0.944 [0.910-0.995] (**1.06x**) |
+
+The zone 1.31-1.33x, as on a core; at 4000 it was 21% of the prefill, now 17%. The softmax is now
+half of a pair (4.45 of 9.2 ns on a core): question 70, the exact exponential in a vector.
 
 ## Attempts
 

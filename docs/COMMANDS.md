@@ -23,7 +23,8 @@ build/trochilus run ... --spec 8   # speculation from prompt (same tokens)
 sh tools/ab_spec.sh <gguf> <binary> bench/prompts/code.txt 8   # how much --spec yields, alternating runs
 sh tools/build_llamacpp.sh; tools/compare_llamacpp.py ...   # in container: llama.cpp, logits comparison
 tools/speed_compare.py ...   # in container: speed against llama.cpp and colibri (trochilus-models volume)
-sh tools/race_llama.sh [runs]   # by the native rules: Trochilus vs llama.cpp, prompts 512 and 2048, 16 and 8 threads, A B B A (~30 min)
+sh tools/ab_zone.sh <binary-before> <binary-after> <zone> [rounds] [prompts]   # one profiler zone before and after, the binaries alternated run by run (prompts 2048 4000, 16 threads): what a change of a few percent of the prefill needs on a shared machine
+sh tools/race_llama.sh [runs]   # by the native rules: Trochilus vs llama.cpp, prompts 512 and 2048, 16 and 8 threads, A B B A (~30 min); RACE_MODEL, RACE_PROMPTS, RACE_THREADS, RACE_OUT for another model, contexts or widths (read as intercept and slope: MEASUREMENTS §The attention against llama.cpp's)
 sh tools/bench_ggml.sh   # in container: llama.cpp's own matmul kernels alone (ggml API, ref/llama.cpp/build-trochilus), bench_peak's shapes, Q8_0 and Q4_K, mul_mat and mul_mat_id, Q4_K also repacked; 1 and 16 threads, median of 15 (~1 min)
 sh tools/bench_ggml_decode.sh [rounds] [types]   # the decode's matmul (one token, ~1 GiB of weights a pass): ggml's MUL_MAT / MUL_MAT_ID against tr_matmul / tr_matmul_grouped in one binary, same bytes and cores, alternating, beside a plain read of the same bytes; 1-16 threads, Q8_0, Q4_K, Q4_K repacked; guarded like every native measurement (~3 min)
 sh tools/bench_expf_refs.sh [threads]   # in container: llama.cpp's exp (ggml_v_expf) and the C library's against tr_expf on every float (how many differ, worst ulp), then ns a value on one core (~1 min)
@@ -47,7 +48,7 @@ TR_GPU=0 build/trochilus run ...   # the decode's attention stays on the CPU (de
 sh tools/gpu_exact.sh [full|quick] [binary]   # native: GPU against CPU through the engine, byte for byte (full: real model, logits of 2000 positions, tokens after 4000, speculation; quick: the 2-layer cut, in make check); fails if nvidia-smi sees a GPU the engine did not use
 build/tests/bench_gpu_attn.exe info | check <probe dir> [--zero-copy] | edge | expf | time --data <probe dir> --n 2048|4000 --only abcezdws   # the GPU attention premise: bits on the probe dumps, edge cases, tr_expf on all 2^32 floats, time per layer (d: the decode's bursts, w: keep-warm); --mutate fma|tree|sumtree|zero|expf must fail
 build/tests/bench_gpu_q8.exe info | check [--mutate norn|tree|order] | time [--runs 200] [--gap-us 1000]   # the exact Q8_0 matrix-vector product on the GPU: bits against dot_row, GB/s
-build/tests/bench_attn_bw.exe 2048 --runs 19 [variant...]   # why the CPU's decode attention reads below the RAM's speed: variants (engine, head, prefetch, read, read4, mutant) paired step by step, bits checked
+build/tests/bench_attn_bw.exe 2048 --runs 19 [variant...]   # why the CPU's decode attention reads below the RAM's speed: variants (engine, head, prefetch, read, read4, split, front, mutant) paired step by step, bits checked; engine@4 engine@8 read@8 for the widths
 build/tests/bench_expf32.exe --slow-all --error --threads 8   # the exact exp in float32 only (for the GPU) against tr_expf on all 2^32 floats, both variants and the AVX-512 / AVX2 tiers, ~40 s; --no-timing for the check alone; sh tools/bench_native.sh bench_expf32 --quick for the ns a value
 build/tests/bench_kvpack.exe roundtrip | bits | time [--run <name>|all]   # the KV packed in 28 bits, lossless: round trip, the attention's bits on the probe dumps, time against F32 (KVPACK_PROBE_DIR)
 sh tools/bench_native.sh <bench> [args]   # any premise bench of build/tests under the native rules (marker, still machine, load declared, a copy one byte longer); build/bench_native/<bench>/
@@ -75,7 +76,7 @@ sh tools/beside.sh <log> '<first>' <second...>   # the first command in the back
 sh tools/test_beside.sh   # beside.sh's exit codes and output, and no first command left when the second fails (red without the trap); in make check
 make bench               # microbenchmark of kernels (median + noise)
 sh tools/bench_kernels.sh   # the same by the native rules (marker, still machine, load declared), a one-byte-longer copy; CONTAINER=1 in trochilus-dev; build/bench_kernels/; lines above 10% spread named in noisy.txt; bench_kernels --matrix: the whole-matrix tables only (each type with an x8 kernel also without it, -x8, in turn)
-make bench-mem           # RAM bandwidth (sequential, sparse), engine matmul, attention on both layouts
+make bench-mem           # RAM bandwidth (sequential, sparse), engine matmul, attention on both layouts; build/tests/bench_mem.exe streams: T shares against one front taken in turns (256 B to 256 KiB)
 make bench-disk          # disk for who reads experts, no system cache (DISK_FILE=<file>)
 build/trochilus run ... --route-trace <file>   # routing trace: experts picked and predicted
 tools/.venv/Scripts/python.exe tools/route_trace_report.py <trace> | --check   # prediction, LRU cache, streaming
@@ -86,7 +87,7 @@ build/trochilus run ... --expert-budget <MiB|min>   # expert RAM (default: the p
 sh tools/mutate_{route,tune,experts,stream}.sh | tools/mutate_reports.py   # in container: the mutations, all red
 python3 tools/mutate_auto.py <src/file.c> <test> [test...] [--lines A-B,C-D] [--changed REF] [--list] [--asan] [--cmd '<shell>'] [--no-coverage]   # in container: generated mutations, survivors, timeouts, memory refusals and mutants on lines no check runs listed (SURVIVED, TIMEOUT, PRESSURE, UNCOVERED: a gcov pass first); --asan: the sanitizers judge the plain build's survivors; --cmd adds a check per mutant (the oracle, for a model file); --changed HEAD: only the lines changed since HEAD; a progress line per mutant on stderr
 sh tools/mutate_files.sh [olmoe kernels ... main serve prof gguf experts threads platform]   # in container: mutate_auto on each file with its tests and oracles, build/mutate/<name>.txt, time left in build/mutate/<name>.progress; CHANGED=HEAD sh tools/mutate_files.sh <name>: only the lines changed since HEAD
-make bench-attn          # attention on prompt (512/2048/4000) on one layer, broken down by phases, with bit control
+make bench-attn          # attention on prompt (512/2048/4000) on one layer, broken down by phases, with bit control; build/tests/bench_attn.exe 2048 --threads 1 --heads 1 for one core (the tiles: tile full, tile nosm)
 make bench-expf          # tr_expf on all 2^32 floats against rounded value and C library
 tools/.venv/Scripts/python.exe tools/gen_expf_table.py [--check | --scan]   # tr_expf constants from mpmath (src/kernels/expf_table.h)
 sh tools/expf_quality.sh | sh tools/mutate_expf.sh   # in container: tr_expf against old binary (KL) and emulation (byte)

@@ -22,6 +22,9 @@
  *            the exponentials of b; V(b). No thread stops reading memory for a softmax
  *   split    the K pass of every head cut in blocks of 64 positions spread over the threads (every
  *            thread the same number of blocks), then softmax and V per head, a second parallel_for
+ *   front    the T threads read side by side, one front in memory instead of T (AVX-512 only):
+ *            K in blocks of fb positions taken in turns, head after head; softmax per head; V
+ *            cut by dimensions, 16 floats a slice, the slices of a head side by side. Three calls
  *   read     plain reads of the same bytes, K then V per head (diagnostic, writes no output)
  *   read4    the same reads in the kernels' order: line k of 4 positions, k = 0..7 (diagnostic)
  *   nosm     copy without the softmax (diagnostic: what the softmax costs; other bits)
@@ -36,6 +39,8 @@
  *          t=1         time the phases inside every worker (K, softmax, V, start and end waits)
  *          one=1       dot_f32 and axpy_f32 one position at a time instead of the x4 kernels (the
  *                      same bits by their contract): the rows read strictly one after the other
+ *          fb=N        front: positions of K a thread takes before the next thread's turn (default
+ *                      8, 4 KiB; a multiple of 4 below 64)
  *
  *   bench_attn_bw [n_pos] [--runs N] [variant ...]
  *
@@ -64,6 +69,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#include <immintrin.h>
 
 #define MAX_RUNS 41
 #define MAX_VARIANTS 24
@@ -83,9 +89,9 @@
 #define TOKENS 2
 #define SCALE 0.088388348f /* 1 / sqrt(128) */
 
-enum { S_ENGINE, S_HEAD, S_COPY, S_FUSED, S_PAIR, S_SPLIT, S_READ, S_READ4, S_NOSM, S_MUTANT, S_COUNT };
-static const char *const scheme_name[S_COUNT] = {"engine", "head", "copy",  "fused", "pair",  "split",
-                                                 "read",   "read4", "nosm", "mutant"};
+enum { S_ENGINE, S_HEAD, S_COPY, S_FUSED, S_PAIR, S_SPLIT, S_FRONT, S_READ, S_READ4, S_NOSM, S_MUTANT, S_COUNT };
+static const char *const scheme_name[S_COUNT] = {"engine", "head",  "copy", "fused",  "pair", "split",
+                                                 "front",  "read",  "read4", "nosm", "mutant"};
 
 typedef struct {
     int64_t dist; /* bytes ahead of the first position of the call; 0: no prefetch */
@@ -97,6 +103,7 @@ typedef struct {
 typedef struct {
     char spec[64];
     int scheme, threads, gran, timed, exact;
+    int64_t fb; /* front: positions of K a worker takes before its next turn */
     pfopt kpf, vpf;
     int64_t v0; /* bytes of V's start prefetched along the exponentials */
     int v0_hint;
@@ -461,6 +468,48 @@ static void split_sv_body(void *ctx_, int64_t begin, int64_t end, int worker) {
     }
 }
 
+/* front, first call: every head's K pass as blocks of fb positions, head after head, block i
+ * to worker i mod T: the T workers read side by side, one front in memory */
+static void front_k_body(void *ctx_, int64_t begin, int64_t end, int worker) {
+    (void)worker;
+    const run_ctx *c = (const run_ctx *)ctx_;
+    const int64_t fb = c->v->fb, per_head = (c->n_pos + fb - 1) / fb, n = N_HEAD * per_head, T = c->v->threads;
+    for (int64_t w = begin; w < end; w++)
+        for (int64_t i = w; i < n; i += T) {
+            int64_t h = i / per_head, t0 = (i % per_head) * fb;
+            int64_t t1 = t0 + fb < c->n_pos ? t0 + fb : c->n_pos;
+            kblock(c->kt, c->q + h * HEAD_DIM, head_keys(c, h), t0, t1, c->n_pos * POS_BYTES,
+                   c->scores_all + h * KV_CTX, &c->v->kpf, NULL, TR_ATTN_X);
+        }
+}
+
+/* front, second call: tr_softmax of each head's row */
+static void front_sm_body(void *ctx_, int64_t begin, int64_t end, int worker) {
+    (void)worker;
+    const run_ctx *c = (const run_ctx *)ctx_;
+    for (int64_t h = begin; h < end; h++) softmax_copy(c->scores_all + h * KV_CTX, c->n_pos, NULL, 0, 0);
+}
+
+/* front, third call: the V pass cut by dimensions, 16 floats a slice, slice i (head i / 8) to
+ * worker i mod T. A slice is axpy_f32's arithmetic on its 16 floats: 0 + p_0 v_0 + p_1 v_1 + ...
+ * in increasing position, a multiply then an add (no FMA), so the bits are the engine's; the T
+ * workers read the lines of the same rows side by side */
+#define FRONT_SLICE 16
+__attribute__((target("avx512f"))) static void front_v_body(void *ctx_, int64_t begin, int64_t end, int worker) {
+    (void)worker;
+    const run_ctx *c = (const run_ctx *)ctx_;
+    const int64_t per_head = HEAD_DIM / FRONT_SLICE, n = N_HEAD * per_head, T = c->v->threads;
+    for (int64_t w = begin; w < end; w++)
+        for (int64_t i = w; i < n; i += T) {
+            int64_t h = i / per_head, d0 = (i % per_head) * FRONT_SLICE;
+            const float *row = c->scores_all + h * KV_CTX, *val = head_values(c, h) + d0;
+            __m512 acc = _mm512_setzero_ps();
+            for (int64_t t = 0; t < c->n_pos; t++)
+                acc = _mm512_add_ps(acc, _mm512_mul_ps(_mm512_set1_ps(row[t]), _mm512_loadu_ps(val + t * HEAD_DIM)));
+            _mm512_storeu_ps(c->out + h * HEAD_DIM + d0, acc);
+        }
+}
+
 /* ---- the flush between two layers ------------------------------------------------------- */
 
 typedef struct {
@@ -518,12 +567,16 @@ static int parse_variant(const char *spec, variant *v, int max_threads) {
         else if (strcmp(opt, "g") == 0) v->gran = (int)val;
         else if (strcmp(opt, "t") == 0) v->timed = (int)val;
         else if (strcmp(opt, "one") == 0) v->kpf.one = v->vpf.one = (int)val;
+        else if (strcmp(opt, "fb") == 0) v->fb = val;
         else return -1;
         opt = next;
     }
     if (v->kpf.lines == 0 || v->kpf.lines > 32 || v->vpf.lines == 0 || v->vpf.lines > 32) return -1;
     if (v->gran < TR_ATTN_X || v->gran % TR_ATTN_X != 0) return -1;
-    if (v->scheme == S_SPLIT) v->timed = 0;
+    if (v->scheme == S_SPLIT || v->scheme == S_FRONT) v->timed = 0;
+    if (v->fb == 0) v->fb = 8;
+    if (v->fb < 1 || (v->fb < TR_ATTN_BLOCK && v->fb % TR_ATTN_X != 0)) return -1;
+    if (v->scheme == S_FRONT && !__builtin_cpu_supports("avx512f")) return -1;
     v->exact = v->scheme != S_READ && v->scheme != S_READ4 && v->scheme != S_NOSM && v->scheme != S_MUTANT;
     return 0;
 }
@@ -562,6 +615,10 @@ static double run_layer(bench *b, variant *v, int L, long long *n_flush, double 
     if (v->scheme == S_SPLIT) {
         tr_parallel_for(b->pool, N_HEAD * c.n_blk, 1, split_k_body, &c);
         tr_parallel_for(b->pool, N_HEAD, 1, split_sv_body, &c);
+    } else if (v->scheme == S_FRONT) {
+        tr_parallel_for(b->pool, v->threads, 1, front_k_body, &c);
+        tr_parallel_for(b->pool, N_HEAD, 1, front_sm_body, &c);
+        tr_parallel_for(b->pool, v->threads, 1, front_v_body, &c);
     } else {
         tr_parallel_for(b->pool, N_HEAD, 1 + 256 / b->n_pos, heads_body, &c);
     }

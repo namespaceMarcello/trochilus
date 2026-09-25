@@ -43,6 +43,20 @@ static void k_axpy_f32_x4(float *y, const float *x, int64_t stride, const float 
     for (int j = 0; j < TR_ATTN_X; j++) k_axpy_f32(y, x + j * stride, a[j], n);
 }
 
+/* ---- 4 queries against 4 cache positions: the definition is 16 dots, 4 x4 axpys ------ */
+
+static void k_dot_f32_4x4(const float *a, int64_t a_stride, const float *b, int64_t stride, int64_t n, float scale,
+                          float *out, int64_t out_stride) {
+    for (int i = 0; i < TR_ATTN_X; i++)
+        for (int j = 0; j < TR_ATTN_X; j++)
+            out[i * out_stride + j] = k_dot_f32(a + i * a_stride, b + j * stride, n) * scale;
+}
+
+static void k_axpy_f32_4x4(float *y, int64_t y_stride, const float *x, int64_t stride, const float *a, int64_t a_stride,
+                           int64_t n) {
+    for (int i = 0; i < TR_ATTN_X; i++) k_axpy_f32_x4(y + i * y_stride, x, stride, a + i * a_stride, n);
+}
+
 /* ---- F32 ------------------------------------------------------------------ */
 
 static void k_dequant_f32(const void *row, float *out, int64_t n) {
@@ -269,6 +283,8 @@ static void build_scalar_table(tr_kernels *k) {
     k->axpy_f32 = k_axpy_f32;
     k->dot_f32_x4 = k_dot_f32_x4;
     k->axpy_f32_x4 = k_axpy_f32_x4;
+    k->dot_f32_4x4 = k_dot_f32_4x4;
+    k->axpy_f32_4x4 = k_axpy_f32_4x4;
     k->dot_row[TR_TYPE_F32] = k_dot_row_f32;
     k->dot_row[TR_TYPE_F16] = k_dot_row_f16;
     k->dot_row[TR_TYPE_Q8_0] = k_dot_row_q8_0;
@@ -571,10 +587,31 @@ void tr_attention_head(const float *q, const float *keys, const float *values, i
     for (int64_t t = 0; t < n_pos; t++) k->axpy_f32(out, values + t * stride + offset, scores[t], head_dim);
 }
 
+/* Positions [t, end) of one query's row of scores (t a multiple of 4): 4 at a time, then one by one. */
+static inline void attn_dots(const tr_kernels *k, const float *q, const float *keys, int64_t t, int64_t end,
+                             int64_t head_dim, float scale, float *row) {
+    for (; t + TR_ATTN_X <= end; t += TR_ATTN_X) {
+        k->dot_f32_x4(q, keys + t * head_dim, head_dim, head_dim, row + t);
+        for (int x = 0; x < TR_ATTN_X; x++) row[t + x] = row[t + x] * scale;
+    }
+    for (; t < end; t++) row[t] = k->dot_f32(q, keys + t * head_dim, head_dim) * scale;
+}
+
+/* Positions [t, end) of one query's weighted sum of values, in increasing position. */
+static inline void attn_values(const tr_kernels *k, float *out, const float *values, int64_t t, int64_t end,
+                               int64_t head_dim, const float *row) {
+    for (; t + TR_ATTN_X <= end; t += TR_ATTN_X) k->axpy_f32_x4(out, values + t * head_dim, head_dim, row + t, head_dim);
+    for (; t < end; t++) k->axpy_f32(out, values + t * head_dim, row[t], head_dim);
+}
+
 /* Block by block: a block of keys meets every query of the group that sees it, and fills its
  * piece of their score rows; then the softmax of every row; then the values block by block. A
  * query sees a block up to its own position, so the last blocks of a group are cut query by
- * query. Inside a block the positions go 4 at a time, in increasing order. */
+ * query. Inside a block the queries go 4 at a time: a tile of 4 queries against 4 positions
+ * (dot_f32_4x4, axpy_f32_4x4) wherever the quad's first query, the one with the shortest
+ * context, sees all 4; each query's positions past the tiles, and the queries past the last
+ * quad, 4 positions at a time and then one by one. Every query's positions go in increasing
+ * order, so a score and a sum are the same operations whichever way they are grouped. */
 void tr_attention_group(const float *q, int64_t q_stride, const float *keys, const float *values, int64_t n_q,
                         int64_t first_n_pos, int64_t head_dim, float scale, float *scores, int64_t score_stride,
                         float *out, int64_t out_stride) {
@@ -593,16 +630,19 @@ void tr_attention_group(const float *q, int64_t q_stride, const float *keys, con
     for (int64_t t0 = 0; t0 < last_n_pos; t0 += TR_ATTN_BLOCK) {
         int64_t t1 = t0 + TR_ATTN_BLOCK < last_n_pos ? t0 + TR_ATTN_BLOCK : last_n_pos;
         int64_t j0 = t0 + 1 > first_n_pos ? t0 + 1 - first_n_pos : 0; /* the first query that sees t0 */
-        for (int64_t j = j0; j < n_q; j++) {
-            const float *qj = q + j * q_stride;
-            float *row = scores + j * score_stride;
-            int64_t n_pos = first_n_pos + j, end = t1 < n_pos ? t1 : n_pos, t = t0;
-            for (; t + TR_ATTN_X <= end; t += TR_ATTN_X) {
-                k->dot_f32_x4(qj, keys + t * head_dim, head_dim, head_dim, row + t);
-                for (int x = 0; x < TR_ATTN_X; x++) row[t + x] = row[t + x] * scale;
-            }
-            for (; t < end; t++) row[t] = k->dot_f32(qj, keys + t * head_dim, head_dim) * scale;
+        int64_t j = j0;
+        for (; j + TR_ATTN_X <= n_q; j += TR_ATTN_X) {
+            int64_t end = t1 < first_n_pos + j ? t1 : first_n_pos + j, t = t0;
+            for (; t + TR_ATTN_X <= end; t += TR_ATTN_X)
+                k->dot_f32_4x4(q + j * q_stride, q_stride, keys + t * head_dim, head_dim, head_dim, scale,
+                               scores + j * score_stride + t, score_stride);
+            for (int64_t i = j; i < j + TR_ATTN_X; i++)
+                attn_dots(k, q + i * q_stride, keys, t, t1 < first_n_pos + i ? t1 : first_n_pos + i, head_dim, scale,
+                          scores + i * score_stride);
         }
+        for (; j < n_q; j++)
+            attn_dots(k, q + j * q_stride, keys, t0, t1 < first_n_pos + j ? t1 : first_n_pos + j, head_dim, scale,
+                      scores + j * score_stride);
     }
     for (int64_t j = 0; j < n_q; j++) {
         float *oj = out + j * out_stride;
@@ -612,14 +652,19 @@ void tr_attention_group(const float *q, int64_t q_stride, const float *keys, con
     for (int64_t t0 = 0; t0 < last_n_pos; t0 += TR_ATTN_BLOCK) {
         int64_t t1 = t0 + TR_ATTN_BLOCK < last_n_pos ? t0 + TR_ATTN_BLOCK : last_n_pos;
         int64_t j0 = t0 + 1 > first_n_pos ? t0 + 1 - first_n_pos : 0;
-        for (int64_t j = j0; j < n_q; j++) {
-            float *oj = out + j * out_stride;
-            const float *row = scores + j * score_stride;
-            int64_t n_pos = first_n_pos + j, end = t1 < n_pos ? t1 : n_pos, t = t0;
+        int64_t j = j0;
+        for (; j + TR_ATTN_X <= n_q; j += TR_ATTN_X) {
+            int64_t end = t1 < first_n_pos + j ? t1 : first_n_pos + j, t = t0;
             for (; t + TR_ATTN_X <= end; t += TR_ATTN_X)
-                k->axpy_f32_x4(oj, values + t * head_dim, head_dim, row + t, head_dim);
-            for (; t < end; t++) k->axpy_f32(oj, values + t * head_dim, row[t], head_dim);
+                k->axpy_f32_4x4(out + j * out_stride, out_stride, values + t * head_dim, head_dim,
+                                scores + j * score_stride + t, score_stride, head_dim);
+            for (int64_t i = j; i < j + TR_ATTN_X; i++)
+                attn_values(k, out + i * out_stride, values, t, t1 < first_n_pos + i ? t1 : first_n_pos + i, head_dim,
+                            scores + i * score_stride);
         }
+        for (; j < n_q; j++)
+            attn_values(k, out + j * out_stride, values, t0, t1 < first_n_pos + j ? t1 : first_n_pos + j, head_dim,
+                        scores + j * score_stride);
     }
 }
 /* hot: end */

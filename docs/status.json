@@ -1,7 +1,7 @@
 {
   "progetto": "Trochilus",
   "sottotitolo": "motore di inferenza per modelli MoE in C, senza dipendenze",
-  "aggiornato": "2026-09-25",
+  "aggiornato": "2026-09-26",
   "stati": {
     "fatto": "finito e provato: test verdi in make check",
     "in-corso": "ci stiamo lavorando adesso",
@@ -205,6 +205,10 @@
       "cosa": "La memoria del contesto messa in modo che la CPU la legga di seguito invece che a salti. Il contesto lungo era il caso peggiore: adesso legge alla velocità della RAM.",
       "numeri": [
         {
+          "v": "decode a contesto lungo contro llama.cpp, letto come una retta: pari senza contesto, 5.3 contro 3.2 microsecondi per posizione in memoria. Sono i byte della loro KV a 16 bit: esatti a 32 bit servirebbero 81 GB/s, la RAM ne da' 53-57. La nostra attenzione legge gia' alla velocita' di una lettura pura; sulla GPU, stessi bit, li passiamo (1.31x a 2048)",
+          "d": "2026-09-26"
+        },
+        {
           "v": "KV compressa a 28 bit, a macchina ferma: 0.97-1.05× l'attenzione F32; la decodifica si mangia i byte risparmiati (44-45 GB/s contro 49-51): no sulla CPU",
           "d": "2026-09-24"
         },
@@ -229,7 +233,13 @@
           "d": "2026-09-19"
         }
       ],
-      "domande": [],
+      "domande": [
+        {
+          "n": 69,
+          "stato": "chiusa",
+          "testo": "passare llama.cpp nel decode a contesto lungo con la KV esatta? sulla CPU no (servono 81 GB/s), sulla GPU si'"
+        }
+      ],
       "file": [
         "src/kv/kv.c"
       ],
@@ -249,6 +259,10 @@
       "cosa": "Il prompt non si elabora un token per volta ma a blocchi di 512, così le matrici sono grandi e i core lavorano pieni. È anche il pezzo che l'ordine per layer (M1) dovrà riorganizzare.",
       "numeri": [
         {
+          "v": "attenzione del prompt a tessere (4 query per 4 posizioni, le somme delle corsie in vettore): la sua zona 1.31-1.33x nel motore, il prefill 1.03x a 2048 token e 1.06x a 4000; logit del modello vero identici al byte",
+          "d": "2026-09-26"
+        },
+        {
           "v": "prefill da 30.1 a 196.9 tok/s (blocchi + kernel a 4 token)",
           "d": "2026-09-17"
         },
@@ -257,12 +271,22 @@
           "d": "2026-09-19"
         }
       ],
-      "domande": [],
+      "domande": [
+        {
+          "n": 70,
+          "stato": "aperta",
+          "testo": "l'esponenziale del softmax in vettore: dopo le tessere e' meta' del costo di una coppia (query, posizione) del prompt"
+        }
+      ],
       "file": [
-        "src/models/olmoe.c"
+        "src/kernels/kernels.c",
+        "src/kernels/kernels_x86.c",
+        "src/models/olmoe.c",
+        "tests/bench_attn.c"
       ],
       "comandi": [
-        "sh tools/prefill_context.sh measure"
+        "sh tools/prefill_context.sh measure",
+        "sh tools/ab_zone.sh <prima> <dopo> attention 8"
       ],
       "dipende": [
         "kernel",

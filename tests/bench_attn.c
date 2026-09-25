@@ -22,6 +22,8 @@
  *   blk nosm      the same without the softmax
  *   blkx full     blk with one query against 4 keys in the registers and 4 values added to one
  *   blkx nosm     output per load (AVX-512 only): what is left to take from the arithmetic
+ *   tile full     blkx with four queries against four keys (sixteen accumulators, the lane trees in
+ *   tile nosm     SIMD) and four outputs against four values (AVX-512 only)
  *   grp full      the engine's kernel for a group (tr_attention_group), called as the engine
  *                 calls it: what the measurements above became
  *
@@ -72,10 +74,12 @@
 #define ROW_STRIDE (KV_CTX + TR_LANES)
 
 enum {
-    ONE_FULL, ONE_NOSM, ONE_DOTS, ONE_SOFTMAX, ONE_WSUM, BLK_FULL, BLK_NOSM, BLKX_FULL, BLKX_NOSM, GRP_FULL, N_VARIANT
+    ONE_FULL, ONE_NOSM, ONE_DOTS, ONE_SOFTMAX, ONE_WSUM, BLK_FULL, BLK_NOSM, BLKX_FULL, BLKX_NOSM, TILE_FULL, TILE_NOSM,
+    GRP_FULL, N_VARIANT
 };
 static const char *const variant_name[N_VARIANT] = {"one full",  "one nosm",  "one dots",  "one softmax", "one wsum",
-                                                    "blk full",  "blk nosm",  "blkx full", "blkx nosm",   "grp full"};
+                                                    "blk full",  "blk nosm",  "blkx full", "blkx nosm",   "tile full",
+                                                    "tile nosm", "grp full"};
 
 static int cmp_double(const void *a, const void *b) {
     double x = *(const double *)a, y = *(const double *)b;
@@ -198,6 +202,97 @@ static void wsum_x4(const tr_kernels *k, float *out, const float *values, int64_
     }
     wsum_plain(k, out, values, t, t1, scores);
 }
+
+/* kernels_x86.c's avx512_pair_sums: one level of tr_lane_combine's tree for many sums at once */
+__attribute__((target("avx512f")))
+static inline __m512 pair_sums(__m512 a, __m512 b) {
+    const __m512i even = _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30);
+    const __m512i odd = _mm512_setr_epi32(1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31);
+    return _mm512_add_ps(_mm512_permutex2var_ps(a, even, b), _mm512_permutex2var_ps(a, odd, b));
+}
+
+#define TILE_ROW(qp, a0, a1, a2, a3) \
+    do { \
+        __m512 x_ = _mm512_loadu_ps((qp) + d); \
+        a0 = _mm512_add_ps(a0, _mm512_mul_ps(x_, w0)); \
+        a1 = _mm512_add_ps(a1, _mm512_mul_ps(x_, w1)); \
+        a2 = _mm512_add_ps(a2, _mm512_mul_ps(x_, w2)); \
+        a3 = _mm512_add_ps(a3, _mm512_mul_ps(x_, w3)); \
+    } while (0)
+
+/* Four queries against four keys: sixteen accumulators, one per (query, key), every key and query
+ * vector loaded once per four products; the sixteen lane trees in four levels of pair sums, leaf
+ * order (query 0's four scores in lanes 0-3, ...). Each score is bit for bit avx512_dot_f32's,
+ * times SCALE as dots_x4 does it. */
+__attribute__((target("avx512f")))
+static void dots_tile(const float *q, int64_t q_stride, const float *keys, int64_t t, float *scores, int64_t s_stride) {
+    const float *k0 = keys + t * HEAD_DIM, *k1 = k0 + HEAD_DIM, *k2 = k1 + HEAD_DIM, *k3 = k2 + HEAD_DIM;
+    const float *q0 = q, *q1 = q0 + q_stride, *q2 = q1 + q_stride, *q3 = q2 + q_stride;
+    __m512 a00 = _mm512_setzero_ps(), a01 = a00, a02 = a00, a03 = a00, a10 = a00, a11 = a00, a12 = a00, a13 = a00,
+           a20 = a00, a21 = a00, a22 = a00, a23 = a00, a30 = a00, a31 = a00, a32 = a00, a33 = a00;
+    for (int64_t d = 0; d < HEAD_DIM; d += TR_LANES) {
+        __m512 w0 = _mm512_loadu_ps(k0 + d), w1 = _mm512_loadu_ps(k1 + d), w2 = _mm512_loadu_ps(k2 + d),
+               w3 = _mm512_loadu_ps(k3 + d);
+        TILE_ROW(q0, a00, a01, a02, a03);
+        TILE_ROW(q1, a10, a11, a12, a13);
+        TILE_ROW(q2, a20, a21, a22, a23);
+        TILE_ROW(q3, a30, a31, a32, a33);
+    }
+    __m512 lo = pair_sums(pair_sums(pair_sums(a00, a01), pair_sums(a02, a03)),
+                          pair_sums(pair_sums(a10, a11), pair_sums(a12, a13)));
+    __m512 hi = pair_sums(pair_sums(pair_sums(a20, a21), pair_sums(a22, a23)),
+                          pair_sums(pair_sums(a30, a31), pair_sums(a32, a33)));
+    __m512 r = _mm512_mul_ps(pair_sums(lo, hi), _mm512_set1_ps(SCALE));
+    _mm_storeu_ps(scores + t, _mm512_extractf32x4_ps(r, 0));
+    _mm_storeu_ps(scores + s_stride + t, _mm512_extractf32x4_ps(r, 1));
+    _mm_storeu_ps(scores + 2 * s_stride + t, _mm512_extractf32x4_ps(r, 2));
+    _mm_storeu_ps(scores + 3 * s_stride + t, _mm512_extractf32x4_ps(r, 3));
+}
+
+/* Four outputs against four values: each value vector loaded once for the four queries, each
+ * output loaded and stored once per four additions, which go in increasing position for every
+ * query. Each addition is bit for bit avx512_axpy_f32's. */
+__attribute__((target("avx512f")))
+static void wsum_tile(float *out, int64_t o_stride, const float *values, int64_t t, const float *scores,
+                      int64_t s_stride) {
+    const float *v0 = values + t * HEAD_DIM, *v1 = v0 + HEAD_DIM, *v2 = v1 + HEAD_DIM, *v3 = v2 + HEAD_DIM;
+    const float *r0 = scores + t, *r1 = r0 + s_stride, *r2 = r1 + s_stride, *r3 = r2 + s_stride;
+    __m512 s00 = _mm512_set1_ps(r0[0]), s01 = _mm512_set1_ps(r0[1]), s02 = _mm512_set1_ps(r0[2]),
+           s03 = _mm512_set1_ps(r0[3]), s10 = _mm512_set1_ps(r1[0]), s11 = _mm512_set1_ps(r1[1]),
+           s12 = _mm512_set1_ps(r1[2]), s13 = _mm512_set1_ps(r1[3]), s20 = _mm512_set1_ps(r2[0]),
+           s21 = _mm512_set1_ps(r2[1]), s22 = _mm512_set1_ps(r2[2]), s23 = _mm512_set1_ps(r2[3]),
+           s30 = _mm512_set1_ps(r3[0]), s31 = _mm512_set1_ps(r3[1]), s32 = _mm512_set1_ps(r3[2]),
+           s33 = _mm512_set1_ps(r3[3]);
+    float *o0 = out, *o1 = o0 + o_stride, *o2 = o1 + o_stride, *o3 = o2 + o_stride;
+    for (int64_t d = 0; d < HEAD_DIM; d += TR_LANES) {
+        __m512 y0 = _mm512_loadu_ps(o0 + d), y1 = _mm512_loadu_ps(o1 + d), y2 = _mm512_loadu_ps(o2 + d),
+               y3 = _mm512_loadu_ps(o3 + d);
+        __m512 w = _mm512_loadu_ps(v0 + d);
+        y0 = _mm512_add_ps(y0, _mm512_mul_ps(s00, w));
+        y1 = _mm512_add_ps(y1, _mm512_mul_ps(s10, w));
+        y2 = _mm512_add_ps(y2, _mm512_mul_ps(s20, w));
+        y3 = _mm512_add_ps(y3, _mm512_mul_ps(s30, w));
+        w = _mm512_loadu_ps(v1 + d);
+        y0 = _mm512_add_ps(y0, _mm512_mul_ps(s01, w));
+        y1 = _mm512_add_ps(y1, _mm512_mul_ps(s11, w));
+        y2 = _mm512_add_ps(y2, _mm512_mul_ps(s21, w));
+        y3 = _mm512_add_ps(y3, _mm512_mul_ps(s31, w));
+        w = _mm512_loadu_ps(v2 + d);
+        y0 = _mm512_add_ps(y0, _mm512_mul_ps(s02, w));
+        y1 = _mm512_add_ps(y1, _mm512_mul_ps(s12, w));
+        y2 = _mm512_add_ps(y2, _mm512_mul_ps(s22, w));
+        y3 = _mm512_add_ps(y3, _mm512_mul_ps(s32, w));
+        w = _mm512_loadu_ps(v3 + d);
+        y0 = _mm512_add_ps(y0, _mm512_mul_ps(s03, w));
+        y1 = _mm512_add_ps(y1, _mm512_mul_ps(s13, w));
+        y2 = _mm512_add_ps(y2, _mm512_mul_ps(s23, w));
+        y3 = _mm512_add_ps(y3, _mm512_mul_ps(s33, w));
+        _mm512_storeu_ps(o0 + d, y0);
+        _mm512_storeu_ps(o1 + d, y1);
+        _mm512_storeu_ps(o2 + d, y2);
+        _mm512_storeu_ps(o3 + d, y3);
+    }
+}
 #endif
 
 static void dots(int x, const tr_kernels *k, const float *q, const float *keys, int64_t t0, int64_t t1,
@@ -262,14 +357,66 @@ static void one_body(void *ctx_, int64_t begin, int64_t end, int worker) {
 
 /* n_q queries of one head, tokens g0 .. g0 + n_q - 1 of the pass: query j sees first_n + j
  * positions. Row j of scores is filled block by block, only by the queries that see the block. */
+#if HAVE_X86
+/* tile, a block [t0, t1) of the K pass: queries four at a time from the first that sees t0, tiles
+ * where all four see four positions (the quad's first query sees the fewest), each query's rest
+ * as blkx; the queries past the last quad as blkx */
+static void dots_block_tile(const attn_ctx *c, const tr_kernels *k, int64_t h, int64_t g0, int64_t n_q,
+                            int64_t first_n, int64_t j_min, int64_t t0, int64_t t1, const float *keys,
+                            float *scores) {
+    int64_t j = j_min;
+    for (; j + 4 <= n_q; j += 4) {
+        const float *qj = c->q + (g0 + j) * N_QKV + h * HEAD_DIM;
+        int64_t e = t1 < first_n + j ? t1 : first_n + j, t = t0;
+        for (; t + 4 <= e; t += 4) dots_tile(qj, N_QKV, keys, t, scores + j * ROW_STRIDE, ROW_STRIDE);
+        for (int64_t i = 0; i < 4; i++) {
+            int64_t n_i = first_n + j + i;
+            dots_x4(k, qj + i * N_QKV, keys, t, t1 < n_i ? t1 : n_i, scores + (j + i) * ROW_STRIDE);
+        }
+    }
+    for (; j < n_q; j++) {
+        int64_t n_j = first_n + j;
+        dots_x4(k, c->q + (g0 + j) * N_QKV + h * HEAD_DIM, keys, t0, t1 < n_j ? t1 : n_j, scores + j * ROW_STRIDE);
+    }
+}
+
+/* tile, a block of the V pass: the same quads, each query's positions in increasing order */
+static void wsum_block_tile(const attn_ctx *c, const tr_kernels *k, int64_t h, int64_t g0, int64_t n_q,
+                            int64_t first_n, int64_t j_min, int64_t t0, int64_t t1, const float *values,
+                            const float *scores) {
+    int64_t j = j_min;
+    for (; j + 4 <= n_q; j += 4) {
+        float *oj = c->out + (g0 + j) * N_QKV + h * HEAD_DIM;
+        int64_t e = t1 < first_n + j ? t1 : first_n + j, t = t0;
+        for (; t + 4 <= e; t += 4) wsum_tile(oj, N_QKV, values, t, scores + j * ROW_STRIDE, ROW_STRIDE);
+        for (int64_t i = 0; i < 4; i++) {
+            int64_t n_i = first_n + j + i;
+            wsum_x4(k, oj + i * N_QKV, values, t, t1 < n_i ? t1 : n_i, scores + (j + i) * ROW_STRIDE);
+        }
+    }
+    for (; j < n_q; j++) {
+        int64_t n_j = first_n + j;
+        wsum_x4(k, c->out + (g0 + j) * N_QKV + h * HEAD_DIM, values, t0, t1 < n_j ? t1 : n_j,
+                scores + j * ROW_STRIDE);
+    }
+}
+#endif
+
 static void attn_group(const attn_ctx *c, const tr_kernels *k, int64_t h, int64_t g0, int64_t n_q, float *scores) {
     int x = c->variant == BLKX_FULL || c->variant == BLKX_NOSM;
-    int softmax = c->variant == BLK_FULL || c->variant == BLKX_FULL;
+    int tile = c->variant == TILE_FULL || c->variant == TILE_NOSM;
+    int softmax = c->variant == BLK_FULL || c->variant == BLKX_FULL || c->variant == TILE_FULL;
     const float *keys = c->keys + h * KV_CTX * HEAD_DIM, *values = c->values + h * KV_CTX * HEAD_DIM;
     int64_t first_n = c->pos0 + g0 + 1, last_n = first_n + n_q - 1;
     for (int64_t t0 = 0; t0 < last_n; t0 += c->block) {
         int64_t t1 = t0 + c->block < last_n ? t0 + c->block : last_n;
         int64_t j_min = t0 + 1 > first_n ? t0 + 1 - first_n : 0;
+#if HAVE_X86
+        if (tile) {
+            dots_block_tile(c, k, h, g0, n_q, first_n, j_min, t0, t1, keys, scores);
+            continue;
+        }
+#endif
         for (int64_t j = j_min; j < n_q; j++) {
             int64_t n_j = first_n + j;
             dots(x, k, c->q + (g0 + j) * N_QKV + h * HEAD_DIM, keys, t0, t1 < n_j ? t1 : n_j, scores + j * ROW_STRIDE);
@@ -284,6 +431,13 @@ static void attn_group(const attn_ctx *c, const tr_kernels *k, int64_t h, int64_
     for (int64_t t0 = 0; t0 < last_n; t0 += c->block) {
         int64_t t1 = t0 + c->block < last_n ? t0 + c->block : last_n;
         int64_t j_min = t0 + 1 > first_n ? t0 + 1 - first_n : 0;
+#if HAVE_X86
+        if (tile) {
+            wsum_block_tile(c, k, h, g0, n_q, first_n, j_min, t0, t1, values, scores);
+            continue;
+        }
+#endif
+        (void)tile;
         for (int64_t j = j_min; j < n_q; j++) {
             int64_t n_j = first_n + j;
             wsum(x, k, c->out + (g0 + j) * N_QKV + h * HEAD_DIM, values, t0, t1 < n_j ? t1 : n_j,
@@ -389,7 +543,8 @@ int main(int argc, char **argv) {
 
     for (int v = 0; v < N_VARIANT; v++) {
         if (only[0] != '\0' && strncmp(variant_name[v], only, strlen(only)) != 0) continue;
-        if ((v == BLKX_FULL || v == BLKX_NOSM) && !(HAVE_X86 && tr_cpu()->avx512f)) continue;
+        if ((v == BLKX_FULL || v == BLKX_NOSM || v == TILE_FULL || v == TILE_NOSM) && !(HAVE_X86 && tr_cpu()->avx512f))
+            continue;
         attn_ctx c;
         c.q = q;
         c.keys = keys;
@@ -434,7 +589,7 @@ int main(int argc, char **argv) {
     /* the blocked variants are worth a number only if they give the engine's bits */
     int bad = 0, compared = 0;
     for (int v = BLK_FULL; v < N_VARIANT; v++) {
-        int ref = (v == BLK_FULL || v == BLKX_FULL || v == GRP_FULL) ? ONE_FULL : ONE_NOSM;
+        int ref = (v == BLK_FULL || v == BLKX_FULL || v == TILE_FULL || v == GRP_FULL) ? ONE_FULL : ONE_NOSM;
         if (hashes[v] == 0 || hashes[ref] == 0) continue;
         compared++;
         if (hashes[v] != hashes[ref]) {

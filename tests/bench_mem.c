@@ -11,7 +11,9 @@
  *                            blocks   the same memory as blocks of 2 MiB (one expert matrix),
  *                                     256 KiB (one thread's share of one) and 4 KiB (a page),
  *                                     visited in random order
- *   bench_mem weights      the engine's own matmul (tr_matmul_grouped, Q8_0, one token) over 8
+ *   bench_mem streams      the same 2 GiB as T fronts (seq) or as one front the threads take
+ *                          turns on, blocks of 256 B to 256 KiB
+ *   bench_mem weights     the engine's own matmul (tr_matmul_grouped, Q8_0, one token) over 8
  *                          random expert-sized matrices per call, out of 1 GiB of them: what
  *                          the kernels pull through the same bus
  *   bench_mem kv <n_pos>   one decode token's attention over n_pos cached positions of a KV
@@ -241,6 +243,72 @@ static int group_ram(void) {
     return 0;
 }
 
+/* ---- streams: the same bytes as T fronts or as one ------------------------------ */
+/* `ram seq` gives each thread its own contiguous share: T fronts far apart in memory. Here the
+ * threads take turns instead, thread w reading blocks w, w + T, w + 2T, ...: one front the
+ * width of T blocks. The question: does the bandwidth fall past 4 threads because of the cores
+ * or because of the fronts (docs/MEASUREMENTS.md §Decode at long context and RAM bandwidth)? */
+
+typedef struct {
+    const unsigned char *base;
+    size_t block;
+    int64_t n_blocks, n_threads;
+} turns_ctx;
+
+static void turns_body(void *ctx_, int64_t begin, int64_t end, int worker) {
+    const turns_ctx *c = (const turns_ctx *)ctx_;
+    uint64_t s = 0;
+    for (int64_t w = begin; w < end; w++)
+        for (int64_t b = w; b < c->n_blocks; b += c->n_threads) s += read_bytes(c->base + (size_t)b * c->block, c->block);
+    sinks[worker].sum += s;
+}
+
+static int group_streams(void) {
+    const size_t arena_bytes = 2 * GIB;
+    unsigned char *arena = (unsigned char *)tr_alloc_aligned(arena_bytes, 4096);
+    if (arena == NULL) {
+        fprintf(stderr, "bench_mem: out of memory\n");
+        return 1;
+    }
+    tr_pool *all = tr_pool_create(0);
+    fill(all, arena, arena_bytes, 0);
+    tr_pool_destroy(all);
+
+    /* 0: one contiguous share per thread (ram seq); else the block of the turns */
+    static const size_t blocks[] = {0, 256, 4096, 32768, 262144};
+    static const char *names[] = {"fronts T (seq)", "one front, turns 256 B", "one front, turns 4 KiB",
+                                  "one front, turns 32 KiB", "one front, turns 256 KiB"};
+    int counts[16], n_counts = thread_counts(counts);
+    for (int ti = 0; ti < n_counts; ti++) {
+        int T = counts[ti];
+        tr_pool *pool = tr_pool_create(T);
+        if (pool == NULL) return 1;
+        for (size_t p = 0; p < sizeof blocks / sizeof blocks[0]; p++) {
+            turns_ctx c;
+            c.base = arena;
+            c.n_threads = T;
+            if (blocks[p] == 0) {
+                c.block = (arena_bytes / (size_t)T) & ~(size_t)4095;
+                c.n_blocks = T;
+            } else {
+                c.block = blocks[p];
+                c.n_blocks = (int64_t)(arena_bytes / c.block);
+            }
+            double secs[MAX_RUNS];
+            for (int r = -1; r < n_runs; r++) {
+                double t0 = tr_time_sec();
+                tr_parallel_for(pool, T, 1, turns_body, &c);
+                double t1 = tr_time_sec();
+                if (r >= 0) secs[r] = t1 - t0;
+            }
+            report(names[p], T, secs, n_runs, (double)c.n_blocks * (double)c.block, 0);
+        }
+        tr_pool_destroy(pool);
+    }
+    tr_free_aligned(arena);
+    return 0;
+}
+
 /* ---- weights: the engine's matmul over random expert-sized matrices -------------- */
 
 static int group_weights(void) {
@@ -429,9 +497,10 @@ int main(int argc, char **argv) {
     }
     if (n_runs < 3) n_runs = 3;
     if (n_runs > MAX_RUNS) n_runs = MAX_RUNS;
-    int known = strcmp(group, "ram") == 0 || strcmp(group, "weights") == 0 || strcmp(group, "kv") == 0;
+    int known = strcmp(group, "ram") == 0 || strcmp(group, "streams") == 0 || strcmp(group, "weights") == 0 ||
+                strcmp(group, "kv") == 0;
     if (!known) {
-        fprintf(stderr, "usage: bench_mem ram | weights | kv <n_pos>   [--runs N]\n");
+        fprintf(stderr, "usage: bench_mem ram | streams | weights | kv <n_pos>   [--runs N]\n");
         return 2;
     }
 
@@ -447,7 +516,10 @@ int main(int argc, char **argv) {
     }
 
     double t0 = tr_time_sec();
-    int rc = strcmp(group, "ram") == 0 ? group_ram() : strcmp(group, "weights") == 0 ? group_weights() : group_kv(n_pos);
+    int rc = strcmp(group, "ram") == 0       ? group_ram()
+             : strcmp(group, "streams") == 0 ? group_streams()
+             : strcmp(group, "weights") == 0 ? group_weights()
+                                             : group_kv(n_pos);
     printf("elapsed %.1f s\n", tr_time_sec() - t0);
     return rc;
 }

@@ -116,6 +116,24 @@ static void avx2_axpy_f32_x4(float *y, const float *x, int64_t stride, const flo
     }
 }
 
+/* The tiles of a prompt's attention as four x4 calls: sixteen accumulators of two ymm each would
+ * not fit the sixteen registers. The same bits as the definition. */
+TR_TARGET_AVX2
+static void avx2_dot_f32_4x4(const float *a, int64_t a_stride, const float *b, int64_t stride, int64_t n, float scale,
+                             float *out, int64_t out_stride) {
+    for (int i = 0; i < TR_ATTN_X; i++) {
+        float *o = out + i * out_stride;
+        avx2_dot_f32_x4(a + i * a_stride, b, stride, n, o);
+        for (int j = 0; j < TR_ATTN_X; j++) o[j] = o[j] * scale;
+    }
+}
+
+TR_TARGET_AVX2
+static void avx2_axpy_f32_4x4(float *y, int64_t y_stride, const float *x, int64_t stride, const float *a,
+                              int64_t a_stride, int64_t n) {
+    for (int i = 0; i < TR_ATTN_X; i++) avx2_axpy_f32_x4(y + i * y_stride, x, stride, a + i * a_stride, n);
+}
+
 /* An F32 weight row is a plain dot_f32 of the row with x, and against 4 input rows it is
  * dot_f32_x4 with the row as `a`: the tier's own kernels instead of the scalar loop (the
  * router's matrix is F32 in every GGUF). */
@@ -973,6 +991,100 @@ static inline __m512 avx512_pair_sums(__m512 a, __m512 b) {
     return _mm512_add_ps(_mm512_permutex2var_ps(a, even, b), _mm512_permutex2var_ps(a, odd, b));
 }
 
+/* ---- a prompt's attention: four queries against four cache positions ------------------ */
+/* Sixteen accumulators, one per (query, position): every key and query vector is loaded once for
+ * four products, and the sixteen lane trees take four levels of pair sums (45 instructions)
+ * instead of sixteen stores and scalar trees: 1.62x the x4 kernels on the products of a prompt's
+ * attention in L1 (docs/MEASUREMENTS.md §The prompt's attention in tiles). Each score is
+ * avx512_dot_f32's, times scale. A head_dim that is not a multiple of 16 goes through the x4
+ * kernels, which handle the tail. */
+#define TR_TILE_QUERY(qp, a0, a1, a2, a3) \
+    do { \
+        __m512 x_ = _mm512_loadu_ps((qp) + d); \
+        a0 = _mm512_add_ps(a0, _mm512_mul_ps(x_, w0)); \
+        a1 = _mm512_add_ps(a1, _mm512_mul_ps(x_, w1)); \
+        a2 = _mm512_add_ps(a2, _mm512_mul_ps(x_, w2)); \
+        a3 = _mm512_add_ps(a3, _mm512_mul_ps(x_, w3)); \
+    } while (0)
+
+TR_TARGET_AVX512
+static void avx512_dot_f32_4x4(const float *a, int64_t a_stride, const float *b, int64_t stride, int64_t n,
+                               float scale, float *out, int64_t out_stride) {
+    if (n % TR_LANES != 0) {
+        for (int i = 0; i < TR_ATTN_X; i++) {
+            float *o = out + i * out_stride;
+            avx512_dot_f32_x4(a + i * a_stride, b, stride, n, o);
+            for (int j = 0; j < TR_ATTN_X; j++) o[j] = o[j] * scale;
+        }
+        return;
+    }
+    const float *b0 = b, *b1 = b0 + stride, *b2 = b1 + stride, *b3 = b2 + stride;
+    const float *q0 = a, *q1 = q0 + a_stride, *q2 = q1 + a_stride, *q3 = q2 + a_stride;
+    __m512 a00 = _mm512_setzero_ps(), a01 = a00, a02 = a00, a03 = a00, a10 = a00, a11 = a00, a12 = a00, a13 = a00,
+           a20 = a00, a21 = a00, a22 = a00, a23 = a00, a30 = a00, a31 = a00, a32 = a00, a33 = a00;
+    for (int64_t d = 0; d < n; d += TR_LANES) {
+        __m512 w0 = _mm512_loadu_ps(b0 + d), w1 = _mm512_loadu_ps(b1 + d), w2 = _mm512_loadu_ps(b2 + d),
+               w3 = _mm512_loadu_ps(b3 + d);
+        TR_TILE_QUERY(q0, a00, a01, a02, a03);
+        TR_TILE_QUERY(q1, a10, a11, a12, a13);
+        TR_TILE_QUERY(q2, a20, a21, a22, a23);
+        TR_TILE_QUERY(q3, a30, a31, a32, a33);
+    }
+    /* leaf order: lanes 4i..4i+3 are query i's four scores */
+    __m512 lo = avx512_pair_sums(avx512_pair_sums(avx512_pair_sums(a00, a01), avx512_pair_sums(a02, a03)),
+                                 avx512_pair_sums(avx512_pair_sums(a10, a11), avx512_pair_sums(a12, a13)));
+    __m512 hi = avx512_pair_sums(avx512_pair_sums(avx512_pair_sums(a20, a21), avx512_pair_sums(a22, a23)),
+                                 avx512_pair_sums(avx512_pair_sums(a30, a31), avx512_pair_sums(a32, a33)));
+    __m512 r = _mm512_mul_ps(avx512_pair_sums(lo, hi), _mm512_set1_ps(scale));
+    _mm_storeu_ps(out, _mm512_extractf32x4_ps(r, 0));
+    _mm_storeu_ps(out + out_stride, _mm512_extractf32x4_ps(r, 1));
+    _mm_storeu_ps(out + 2 * out_stride, _mm512_extractf32x4_ps(r, 2));
+    _mm_storeu_ps(out + 3 * out_stride, _mm512_extractf32x4_ps(r, 3));
+}
+
+/* 16 elements at offset d of the value row w_, into the four outputs with their weights */
+#define TR_TILE_VALUE(vp, s0, s1, s2, s3) \
+    do { \
+        __m512 w_ = _mm512_loadu_ps((vp) + d); \
+        y0 = _mm512_add_ps(y0, _mm512_mul_ps(s0, w_)); \
+        y1 = _mm512_add_ps(y1, _mm512_mul_ps(s1, w_)); \
+        y2 = _mm512_add_ps(y2, _mm512_mul_ps(s2, w_)); \
+        y3 = _mm512_add_ps(y3, _mm512_mul_ps(s3, w_)); \
+    } while (0)
+
+/* Four outputs against four value rows: each value vector loaded once for the four queries, each
+ * output loaded and stored once per four additions, which go in increasing position for every
+ * output. Each addition is avx512_axpy_f32's. */
+TR_TARGET_AVX512
+static void avx512_axpy_f32_4x4(float *y, int64_t y_stride, const float *x, int64_t stride, const float *a,
+                                int64_t a_stride, int64_t n) {
+    if (n % TR_LANES != 0) {
+        for (int i = 0; i < TR_ATTN_X; i++) avx512_axpy_f32_x4(y + i * y_stride, x, stride, a + i * a_stride, n);
+        return;
+    }
+    const float *x0 = x, *x1 = x0 + stride, *x2 = x1 + stride, *x3 = x2 + stride;
+    const float *r0 = a, *r1 = r0 + a_stride, *r2 = r1 + a_stride, *r3 = r2 + a_stride;
+    __m512 s00 = _mm512_set1_ps(r0[0]), s01 = _mm512_set1_ps(r0[1]), s02 = _mm512_set1_ps(r0[2]),
+           s03 = _mm512_set1_ps(r0[3]), s10 = _mm512_set1_ps(r1[0]), s11 = _mm512_set1_ps(r1[1]),
+           s12 = _mm512_set1_ps(r1[2]), s13 = _mm512_set1_ps(r1[3]), s20 = _mm512_set1_ps(r2[0]),
+           s21 = _mm512_set1_ps(r2[1]), s22 = _mm512_set1_ps(r2[2]), s23 = _mm512_set1_ps(r2[3]),
+           s30 = _mm512_set1_ps(r3[0]), s31 = _mm512_set1_ps(r3[1]), s32 = _mm512_set1_ps(r3[2]),
+           s33 = _mm512_set1_ps(r3[3]);
+    float *o0 = y, *o1 = o0 + y_stride, *o2 = o1 + y_stride, *o3 = o2 + y_stride;
+    for (int64_t d = 0; d < n; d += TR_LANES) {
+        __m512 y0 = _mm512_loadu_ps(o0 + d), y1 = _mm512_loadu_ps(o1 + d), y2 = _mm512_loadu_ps(o2 + d),
+               y3 = _mm512_loadu_ps(o3 + d);
+        TR_TILE_VALUE(x0, s00, s10, s20, s30);
+        TR_TILE_VALUE(x1, s01, s11, s21, s31);
+        TR_TILE_VALUE(x2, s02, s12, s22, s32);
+        TR_TILE_VALUE(x3, s03, s13, s23, s33);
+        _mm512_storeu_ps(o0 + d, y0);
+        _mm512_storeu_ps(o1 + d, y1);
+        _mm512_storeu_ps(o2 + d, y2);
+        _mm512_storeu_ps(o3 + d, y3);
+    }
+}
+
 /* the eight sums, row 0's four then row 1's (named registers, never an array); the last level
  * pairs the vector with itself and keeps its low half */
 #define TR_ROW2_OUT(out, a0, a1, a2, a3, b0, b1, b2, b3) \
@@ -1215,6 +1327,8 @@ const tr_kernels *tr_kernels_x86_tier(const char *tier) {
             g_avx2.axpy_f32 = avx2_axpy_f32;
             g_avx2.dot_f32_x4 = avx2_dot_f32_x4;
             g_avx2.axpy_f32_x4 = avx2_axpy_f32_x4;
+            g_avx2.dot_f32_4x4 = avx2_dot_f32_4x4;
+            g_avx2.axpy_f32_4x4 = avx2_axpy_f32_4x4;
             g_avx2.dot_row[TR_TYPE_F32] = avx2_dot_row_f32;
             g_avx2.dot_row_x4[TR_TYPE_F32] = avx2_dot_row_x4_f32;
             if (c->f16c) {
@@ -1240,6 +1354,8 @@ const tr_kernels *tr_kernels_x86_tier(const char *tier) {
             g_avx512.axpy_f32 = avx512_axpy_f32;
             g_avx512.dot_f32_x4 = avx512_dot_f32_x4;
             g_avx512.axpy_f32_x4 = avx512_axpy_f32_x4;
+            g_avx512.dot_f32_4x4 = avx512_dot_f32_4x4;
+            g_avx512.axpy_f32_4x4 = avx512_axpy_f32_4x4;
             g_avx512.dot_row[TR_TYPE_F32] = avx512_dot_row_f32;
             g_avx512.dot_row_x4[TR_TYPE_F32] = avx512_dot_row_x4_f32;
             g_avx512.dot_row[TR_TYPE_F16] = avx512_dot_row_f16;

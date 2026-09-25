@@ -1190,3 +1190,19 @@ in the container `sh tools/mutate_row2.sh`.
 Check: `make check`; `sh tools/race_smt.sh`; a trace: `make BUILD=build/win-trace
 EXTRA_CFLAGS=-DTR_POOL_TRACE build/win-trace/trochilus.exe`, run with `TR_POOL_TRACE_FILE=x.trace`,
 then `tools/.venv/Scripts/python.exe tools/pool_trace.py x.trace`.
+
+### 2026-09-26 — Piece 3, the attention: read, raced as a line, the prompt's tiles
+- ORIGINS row 3 read in colibri, ds4, llama.cpp and ik_llama.cpp; the 09-25 race read as intercept
+  and slope: level with no context, 5.31 against 3.24 µs a cached position (their F16 KV's bytes;
+  exact F32 would need 81 GB/s). Question 69 closed on the CPU.
+- `bench_mem streams` (T shares against one front taken in turns) and `bench_attn_bw front` (the
+  decode's attention with one front): the premise refuted, both kept for the next of the kind.
+- `dot_f32_4x4`, `axpy_f32_4x4` in the kernel table (scalar definition; AVX-512 tile with the lane
+  trees in pair sums; AVX2 as four x4 calls) and `tr_attention_group` four queries at a time: the
+  prompt's attention zone 1.31-1.33x, prefill 1.03x at 2048 and 1.06x at 4000, logits identical.
+- Tests: test_kernels' `tile_diffs` (16 400 tiles a tier; two mutants of the definition and two of
+  the AVX-512 kernel seen red), test_tier_used's 4x4 counters; `bench_attn` tile variants.
+- `tools/ab_zone.sh`: one zone before and after, alternated run by run. `tools/race_llama.sh` takes
+  RACE_MODEL, RACE_PROMPTS, RACE_THREADS, RACE_OUT. The backslash hook sees `write_bytes(` too.
+Check: `make check`; `build/tests/bench_attn.exe 2048 --threads 1 --heads 1`; `sh tools/ab_zone.sh
+<before> build/trochilus.exe attention 8`.

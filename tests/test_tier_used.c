@@ -8,7 +8,7 @@
  * Identical logits between tiers say the tiers agree, not that a tier is used. Two halves:
  *
  *   the table    for every tier this CPU has, every entry the hot zone goes through is a function
- *                of the tier's own, not scalar's: dot_f32, axpy_f32, their x4, and dot_row and
+ *                of the tier's own, not scalar's: dot_f32, axpy_f32, their x4 and 4x4, dot_row and
  *                dot_row_x4 of EVERY weight type the engine supports (tr_kernels_support). A new
  *                type enters the engine with its tier kernels, or this goes red. A tier is handed
  *                out under its own name, exactly when the CPU has it, and tr_kernels_init takes
@@ -52,7 +52,10 @@ static void test_table(void) {
         missing += K->axpy_f32 == S->axpy_f32;
         missing += K->dot_f32_x4 == S->dot_f32_x4;
         missing += K->axpy_f32_x4 == S->axpy_f32_x4;
-        if (missing != 0) printf("  tier %s: %d of dot_f32, axpy_f32 and their x4 are scalar's\n", K->tier, missing);
+        missing += K->dot_f32_4x4 == S->dot_f32_4x4;
+        missing += K->axpy_f32_4x4 == S->axpy_f32_4x4;
+        if (missing != 0)
+            printf("  tier %s: %d of dot_f32, axpy_f32, their x4 and 4x4 are scalar's\n", K->tier, missing);
         int types = 0;
         for (int type = 0; type < TR_TYPE_COUNT; type++) {
             if (!tr_kernels_support((tr_type)type)) continue;
@@ -163,7 +166,7 @@ static void test_ops(void) {
 static const tr_kernels *g_real;                                       /* the tier under the counters */
 static atomic_ullong n_row[TR_TYPE_COUNT], n_x4[TR_TYPE_COUNT], n_r2[TR_TYPE_COUNT], n_r8[TR_TYPE_COUNT]; /* calls, by type */
 static atomic_ullong n_p2[TR_TYPE_COUNT];   /* dot_row2 calls (two rows, one token), by type */
-static atomic_ullong n_dot_x4, n_axpy_x4;
+static atomic_ullong n_dot_x4, n_axpy_x4, n_dot_4x4, n_axpy_4x4;
 
 #define COUNTED(type, name) \
     static float row_##name(const void *row, const float *x, int64_t n) { \
@@ -200,6 +203,18 @@ static void counted_dot_f32_x4(const float *a, const float *b, int64_t stride, i
 static void counted_axpy_f32_x4(float *y, const float *x, int64_t stride, const float *a, int64_t n) {
     atomic_fetch_add(&n_axpy_x4, 1);
     g_real->axpy_f32_x4(y, x, stride, a, n);
+}
+
+static void counted_dot_f32_4x4(const float *a, int64_t a_stride, const float *b, int64_t stride, int64_t n,
+                                float scale, float *out, int64_t out_stride) {
+    atomic_fetch_add(&n_dot_4x4, 1);
+    g_real->dot_f32_4x4(a, a_stride, b, stride, n, scale, out, out_stride);
+}
+
+static void counted_axpy_f32_4x4(float *y, int64_t y_stride, const float *x, int64_t stride, const float *a,
+                                 int64_t a_stride, int64_t n) {
+    atomic_fetch_add(&n_axpy_4x4, 1);
+    g_real->axpy_f32_4x4(y, y_stride, x, stride, a, a_stride, n);
 }
 
 /* 2 layers, n_embd 64, 4 heads (2 kv), n_ff 64, 8 experts (3 used), vocab 48, context 32 */
@@ -239,6 +254,8 @@ static void test_engine(const char *argv0, tr_type type, const char *name, long 
     if (g_real->dot_row2[TR_TYPE_Q6_K] != NULL) counting.dot_row2[TR_TYPE_Q6_K] = p2_q6_k;
     counting.dot_f32_x4 = counted_dot_f32_x4;
     counting.axpy_f32_x4 = counted_axpy_f32_x4;
+    counting.dot_f32_4x4 = counted_dot_f32_4x4;
+    counting.axpy_f32_4x4 = counted_axpy_f32_4x4;
     for (int i = 0; i < TR_TYPE_COUNT; i++) {
         atomic_store(&n_row[i], 0);
         atomic_store(&n_x4[i], 0);
@@ -248,6 +265,8 @@ static void test_engine(const char *argv0, tr_type type, const char *name, long 
     }
     atomic_store(&n_dot_x4, 0);
     atomic_store(&n_axpy_x4, 0);
+    atomic_store(&n_dot_4x4, 0);
+    atomic_store(&n_axpy_4x4, 0);
 
     const synth_params P = {LAYERS, (uint32_t)n_embd, N_HEAD, N_HEAD_KV, (uint32_t)n_ff, N_EXPERT, N_USED, VOCAB, CTX, type};
     char path[512], err[256];
@@ -299,6 +318,9 @@ static void test_engine(const char *argv0, tr_type type, const char *name, long 
         if (g_real->dot_row_x4[TR_TYPE_F32] != NULL && n_embd == N_EMBD) TR_CHECK(atomic_load(&n_x4[TR_TYPE_F32]) > 0);
         TR_CHECK(atomic_load(&n_dot_x4) > 0);
         TR_CHECK(atomic_load(&n_axpy_x4) > 0);
+        /* the prompt's tiles: a pass of 29 tokens has groups of 16 with quads that see 4 positions */
+        TR_CHECK(atomic_load(&n_dot_4x4) > 0);
+        TR_CHECK(atomic_load(&n_axpy_4x4) > 0);
         printf("  %-5s model on tier %-7s %lld products of its type and %lld of the F32 router, all through the "
                "active table\n",
                name, g_real->tier, of_type, of_router);
