@@ -516,20 +516,57 @@ static inline __m512 avx512_q4_k_values(float scale, float min) {
     return _mm512_sub_ps(_mm512_mul_ps(_mm512_set1_ps(scale), q), _mm512_set1_ps(min));
 }
 
+/* The decode's Q4_K row (docs/MEASUREMENTS.md question 66, tests/bench_q4k_genome.c). Timed in
+ * L1, tr_q4_k_scales's sixteen scalar conversions and multiplies were a quarter of the row; here
+ * the sixteen scales and mins are computed in vectors (the same floats), stored, and each table
+ * takes its scale and min as broadcasts from memory, which the multiply and the subtract fold in.
+ * The block's scales are computed one block ahead: a broadcast of a float stored just before
+ * waits for the store (0.96x the scalar decode), one stored a block earlier does not. From RAM,
+ * a prefetch TR_Q4_K_PREFETCH bytes ahead keeps enough lines in flight for one thread. */
+#define TR_Q4_K_PREFETCH 4608
+
+/* sm[0..7] = scale[0..7], sm[8..15] = min[0..7] of the block at blk, as tr_q4_k_scales computes
+ * them: the 12 packed bytes rearranged by two byte shuffles into sc0..7, m0..7 (6 bits each),
+ * widened and converted (small integers, exact), times [d x 8, dmin x 8] (the halves converted
+ * by vcvtph2ps: exact, and a NaN comes out quieted as the multiply would make it anyway) */
+TR_TARGET_AVX512
+static inline void avx512_q4_k_scales_store(const unsigned char *blk, float sm[16]) {
+    const __m128i v = _mm_loadu_si128((const __m128i *)(const void *)(blk + 4));
+    __m128i a = _mm_shuffle_epi8(v, _mm_setr_epi8(0, 1, 2, 3, 8, 9, 10, 11, 4, 5, 6, 7, 8, 9, 10, 11));
+    __m128i hb = _mm_shuffle_epi8(v, _mm_setr_epi8(-1, -1, -1, -1, 0, 1, 2, 3, -1, -1, -1, -1, 4, 5, 6, 7));
+    /* bytes 12..15 (the mins 4..7) take the high nibble of theirs */
+    __m128i sel = _mm_blend_epi16(a, _mm_and_si128(_mm_srli_epi16(a, 4), _mm_set1_epi8(0x0F)), 0xC0);
+    __m128i low = _mm_and_si128(sel, _mm_setr_epi8(63, 63, 63, 63, 15, 15, 15, 15, 63, 63, 63, 63, 15, 15, 15, 15));
+    __m128i bytes = _mm_or_si128(low, _mm_srli_epi16(_mm_and_si128(hb, _mm_set1_epi8((char)0xC0)), 2));
+    uint32_t dd;
+    memcpy(&dd, blk, 4);
+    __m512 h = _mm512_cvtph_ps(_mm256_castsi128_si256(_mm_cvtsi32_si128((int)dd)));
+    __m512 mul = _mm512_permutexvar_ps(_mm512_setr_epi32(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1), h);
+    _mm512_store_ps(sm, _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(bytes)), mul));
+}
+
 TR_TARGET_AVX512
 static float avx512_dot_row_q4_k(const void *row, const float *x, int64_t n) {
     const unsigned char *p = (const unsigned char *)row;
     int64_t nb = n / TR_Q4_K_BLOCK_ELEMS;
     __m512 acc = _mm512_setzero_ps();
+    const __m512 q = _mm512_setr_ps(0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f, 10.0f, 11.0f, 12.0f,
+                                    13.0f, 14.0f, 15.0f);
+    float sm[2][16] __attribute__((aligned(64)));   /* block b's scales in sm[b & 1] */
+    if (nb > 0) avx512_q4_k_scales_store(p, sm[0]);
     for (int64_t b = 0; b < nb; b++) {
         const unsigned char *blk = p + (size_t)b * TR_Q4_K_BLOCK_BYTES;
         const unsigned char *qs = blk + TR_Q4_K_QS_OFFSET;
         const float *xb = x + b * TR_Q4_K_BLOCK_ELEMS;
-        float scale[8], min[8];
-        tr_q4_k_scales(blk, scale, min);
+        _mm_prefetch((const char *)blk + TR_Q4_K_PREFETCH, _MM_HINT_T0);
+        _mm_prefetch((const char *)blk + TR_Q4_K_PREFETCH + 64, _MM_HINT_T0);
+        _mm_prefetch((const char *)blk + TR_Q4_K_PREFETCH + 128, _MM_HINT_T0);
+        if (b + 1 < nb) avx512_q4_k_scales_store(blk + TR_Q4_K_BLOCK_BYTES, sm[(b + 1) & 1]);
+        const float *s = sm[b & 1];
         for (int c = 0; c < 4; c++) {
-            __m512 vlo = avx512_q4_k_values(scale[2 * c], min[2 * c]);
-            __m512 vhi = avx512_q4_k_values(scale[2 * c + 1], min[2 * c + 1]);
+            /* scale * q - min for q = 0..15, as avx512_q4_k_values */
+            __m512 vlo = _mm512_sub_ps(_mm512_mul_ps(_mm512_set1_ps(s[2 * c]), q), _mm512_set1_ps(s[8 + 2 * c]));
+            __m512 vhi = _mm512_sub_ps(_mm512_mul_ps(_mm512_set1_ps(s[2 * c + 1]), q), _mm512_set1_ps(s[9 + 2 * c]));
             __m512i q0 = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(const void *)(qs + 32 * c)));
             __m512i q1 = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(const void *)(qs + 32 * c + 16)));
             const float *xc = xb + 64 * c;
@@ -544,6 +581,71 @@ static float avx512_dot_row_q4_k(const void *row, const float *x, int64_t n) {
     float lane[TR_LANES];
     _mm512_storeu_ps(lane, acc);
     return tr_lane_combine(lane);
+}
+
+/* Two Q4_K rows against one token (kernels.h, dot_row2), the decode's matmul two rows at a time.
+ * Each row keeps its own accumulator, lanes and order: out[0], out[1] are avx512_dot_row_q4_k's
+ * results bit for bit. The pair buys two chains of adds where one row has one, and the token's
+ * loads shared: 450 against 497 cycles a row in L1 (tests/bench_q4k_genome.c). The scales of
+ * TR_Q4_K_SPAN blocks of both rows are computed first, then those blocks: the early reads of each
+ * block's first bytes are what keeps two interleaved rows streaming from RAM (computed one block
+ * ahead instead, as the one-row kernel does, two rows ran 0.72x from RAM: short streams the
+ * prefetchers do not follow, LESSONS #178). */
+#define TR_Q4_K_SPAN 8
+
+TR_TARGET_AVX512
+static void avx512_dot_row2_q4_k(const void *row0, const void *row1, const float *x, int64_t n, float *out) {
+    const unsigned char *p0 = (const unsigned char *)row0, *p1 = (const unsigned char *)row1;
+    int64_t nb = n / TR_Q4_K_BLOCK_ELEMS;
+    __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps();
+    const __m512 q = _mm512_setr_ps(0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f, 10.0f, 11.0f, 12.0f,
+                                    13.0f, 14.0f, 15.0f);
+    float s0[TR_Q4_K_SPAN][16] __attribute__((aligned(64))), s1[TR_Q4_K_SPAN][16] __attribute__((aligned(64)));
+    for (int64_t b0 = 0; b0 < nb; b0 += TR_Q4_K_SPAN) {
+        int64_t b1 = b0 + TR_Q4_K_SPAN < nb ? b0 + TR_Q4_K_SPAN : nb;
+        for (int64_t b = b0; b < b1; b++) {
+            avx512_q4_k_scales_store(p0 + (size_t)b * TR_Q4_K_BLOCK_BYTES, s0[b - b0]);
+            avx512_q4_k_scales_store(p1 + (size_t)b * TR_Q4_K_BLOCK_BYTES, s1[b - b0]);
+        }
+        for (int64_t b = b0; b < b1; b++) {
+            const unsigned char *k0 = p0 + (size_t)b * TR_Q4_K_BLOCK_BYTES, *k1 = p1 + (size_t)b * TR_Q4_K_BLOCK_BYTES;
+            _mm_prefetch((const char *)k0 + TR_Q4_K_PREFETCH, _MM_HINT_T0);
+            _mm_prefetch((const char *)k0 + TR_Q4_K_PREFETCH + 64, _MM_HINT_T0);
+            _mm_prefetch((const char *)k0 + TR_Q4_K_PREFETCH + 128, _MM_HINT_T0);
+            _mm_prefetch((const char *)k1 + TR_Q4_K_PREFETCH, _MM_HINT_T0);
+            _mm_prefetch((const char *)k1 + TR_Q4_K_PREFETCH + 64, _MM_HINT_T0);
+            _mm_prefetch((const char *)k1 + TR_Q4_K_PREFETCH + 128, _MM_HINT_T0);
+            const float *xb = x + b * TR_Q4_K_BLOCK_ELEMS;
+            const float *a = s0[b - b0], *d = s1[b - b0];
+            for (int c = 0; c < 4; c++) {
+                __m512 lo0 = _mm512_sub_ps(_mm512_mul_ps(_mm512_set1_ps(a[2 * c]), q), _mm512_set1_ps(a[8 + 2 * c]));
+                __m512 hi0 = _mm512_sub_ps(_mm512_mul_ps(_mm512_set1_ps(a[2 * c + 1]), q), _mm512_set1_ps(a[9 + 2 * c]));
+                __m512 lo1 = _mm512_sub_ps(_mm512_mul_ps(_mm512_set1_ps(d[2 * c]), q), _mm512_set1_ps(d[8 + 2 * c]));
+                __m512 hi1 = _mm512_sub_ps(_mm512_mul_ps(_mm512_set1_ps(d[2 * c + 1]), q), _mm512_set1_ps(d[9 + 2 * c]));
+                const unsigned char *q0p = k0 + TR_Q4_K_QS_OFFSET + 32 * c, *q1p = k1 + TR_Q4_K_QS_OFFSET + 32 * c;
+                __m512i a0 = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(const void *)q0p));
+                __m512i a1 = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(const void *)(q0p + 16)));
+                __m512i b0v = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(const void *)q1p));
+                __m512i b1v = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(const void *)(q1p + 16)));
+                const float *xc = xb + 64 * c;
+                __m512 x0 = _mm512_loadu_ps(xc), x1 = _mm512_loadu_ps(xc + 16);
+                __m512 x2 = _mm512_loadu_ps(xc + 32), x3 = _mm512_loadu_ps(xc + 48);
+                acc0 = _mm512_add_ps(acc0, _mm512_mul_ps(_mm512_permutexvar_ps(a0, lo0), x0));
+                acc1 = _mm512_add_ps(acc1, _mm512_mul_ps(_mm512_permutexvar_ps(b0v, lo1), x0));
+                acc0 = _mm512_add_ps(acc0, _mm512_mul_ps(_mm512_permutexvar_ps(a1, lo0), x1));
+                acc1 = _mm512_add_ps(acc1, _mm512_mul_ps(_mm512_permutexvar_ps(b1v, lo1), x1));
+                acc0 = _mm512_add_ps(acc0, _mm512_mul_ps(_mm512_permutexvar_ps(_mm512_srli_epi32(a0, 4), hi0), x2));
+                acc1 = _mm512_add_ps(acc1, _mm512_mul_ps(_mm512_permutexvar_ps(_mm512_srli_epi32(b0v, 4), hi1), x2));
+                acc0 = _mm512_add_ps(acc0, _mm512_mul_ps(_mm512_permutexvar_ps(_mm512_srli_epi32(a1, 4), hi0), x3));
+                acc1 = _mm512_add_ps(acc1, _mm512_mul_ps(_mm512_permutexvar_ps(_mm512_srli_epi32(b1v, 4), hi1), x3));
+            }
+        }
+    }
+    float lane[TR_LANES];
+    _mm512_storeu_ps(lane, acc0);
+    out[0] = tr_lane_combine(lane);
+    _mm512_storeu_ps(lane, acc1);
+    out[1] = tr_lane_combine(lane);
 }
 
 /* ---- one weight row against TR_DOT_TOKENS input rows ---------------------- */
@@ -1151,6 +1253,7 @@ const tr_kernels *tr_kernels_x86_tier(const char *tier) {
             g_avx512.dot_row2_x8[TR_TYPE_Q4_K] = avx512_dot_row2_x8_q4_k;
             g_avx512.dot_row2_x8[TR_TYPE_Q6_K] = avx512_dot_row2_x8_q6_k;
             g_avx512.dot_row[TR_TYPE_Q4_K] = avx512_dot_row_q4_k;
+            g_avx512.dot_row2[TR_TYPE_Q4_K] = avx512_dot_row2_q4_k;
             g_avx512.dot_row_x4[TR_TYPE_Q4_K] = avx512_dot_row_x4_q4_k;
             g_avx512.dot_row[TR_TYPE_Q6_K] = avx512_dot_row_q6_k;
             g_avx512.dot_row_x4[TR_TYPE_Q6_K] = avx512_dot_row_x4_q6_k;

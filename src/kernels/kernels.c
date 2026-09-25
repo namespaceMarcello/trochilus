@@ -344,6 +344,7 @@ typedef struct {
     float *y;
     float (*dot_row)(const void *row, const float *x, int64_t n);
     void (*dot_row_x4)(const void *row, const float *x, int64_t stride, int64_t n, float *out);
+    void (*dot_row2)(const void *row0, const void *row1, const float *x, int64_t n, float *out);
     void (*dot_row2_x4)(const void *row0, const void *row1, const float *x, int64_t stride, int64_t n, float *out);
     void (*dot_row2_x8)(const void *row0, const void *row1, const float *x, int64_t stride, int64_t n, float *out);
     size_t row_bytes;
@@ -361,12 +362,17 @@ static int64_t matmul_group_of(const matmul_ctx *c, int64_t p) {
     return lo;
 }
 
-/* weight rows [r0, r1) against input row p */
+/* weight rows [r0, r1) against input row p: two at a time where the tier has dot_row2 (the
+ * decode's road), each result dot_row's */
 static void matmul_rows(const matmul_ctx *c, int64_t p, int64_t r0, int64_t r1) {
     const unsigned char *base = (const unsigned char *)c->w[matmul_group_of(c, p)].data;
     const float *xp = c->x + p * c->cols;
     float *yp = c->y + p * c->rows;
-    for (int64_t r = r0; r < r1; r++) yp[r] = c->dot_row(base + (size_t)r * c->row_bytes, xp, c->cols);
+    int64_t r = r0;
+    if (c->dot_row2 != NULL)
+        for (; r + 2 <= r1; r += 2)
+            c->dot_row2(base + (size_t)r * c->row_bytes, base + (size_t)(r + 1) * c->row_bytes, xp, c->cols, yp + r);
+    for (; r < r1; r++) yp[r] = c->dot_row(base + (size_t)r * c->row_bytes, xp, c->cols);
 }
 
 /* every weight row against input rows [p0, p1), group by group, in blocks of TR_MATMUL_TILE.
@@ -407,8 +413,14 @@ static void matmul_tiled(const matmul_ctx *c, int64_t p0, int64_t p1) {
                         }
                     }
                     for (; q < b_end; q++) {
-                        c->y[q * c->rows + r] = c->dot_row(row0, c->x + q * c->cols, c->cols);
-                        c->y[q * c->rows + r + 1] = c->dot_row(row1, c->x + q * c->cols, c->cols);
+                        if (c->dot_row2 != NULL) {
+                            c->dot_row2(row0, row1, c->x + q * c->cols, c->cols, out);
+                            c->y[q * c->rows + r] = out[0];
+                            c->y[q * c->rows + r + 1] = out[1];
+                        } else {
+                            c->y[q * c->rows + r] = c->dot_row(row0, c->x + q * c->cols, c->cols);
+                            c->y[q * c->rows + r + 1] = c->dot_row(row1, c->x + q * c->cols, c->cols);
+                        }
                     }
                 }
             }
@@ -463,6 +475,7 @@ void tr_matmul_grouped(tr_pool *pool, const tr_mat *w, const int64_t *offsets, i
     const tr_kernels *k = tr_kernels_get();
     ctx.dot_row = k->dot_row[w[0].type];
     ctx.dot_row_x4 = k->dot_row_x4[w[0].type];
+    ctx.dot_row2 = k->dot_row2[w[0].type];
     ctx.dot_row2_x4 = k->dot_row2_x4[w[0].type];
     ctx.dot_row2_x8 = k->dot_row2_x8[w[0].type];
     ctx.row_bytes = tr_row_bytes(w[0].type, w[0].cols);

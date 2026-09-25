@@ -70,7 +70,15 @@ LEFT=$(stop_victim notrap 98)
 [ "$LEFT" != 0 ] || { echo "test_cleanup: FAILED, without the trap nothing was left: this test cannot see an orphan"; FAIL=1; }
 remove 98
 [ "$(alive 98)" = 0 ] || { echo "test_cleanup: FAILED, could not remove the leftover of the second half"; FAIL=1; }
+# Waiting for a still machine is a long step (up to 15 minutes): a shell serves a TERM only when its
+# foreground child ends, so a guard run bare holds a stopped measurement, its lock and the machine's
+# marker for as long as the wait lasts. Through cleanup_run the signal is served at once
+# (docs/LESSONS.md #177). Seen red on the nine bare call sites of 2026-09-25.
+BARE=$(grep -n -E 'sh -c "\$AB_GUARD"|sh tools/machine_still\.sh' tools/*.sh tools/*.lib |
+  grep -v -E '^[^:]+:[0-9]+:[[:space:]]*#|cleanup_run sh|GUARD=' || true)
+[ -z "$BARE" ] || { echo "test_cleanup: FAILED, a wait for a still machine outside cleanup_run:"; echo "$BARE"; FAIL=1; }
 [ $FAIL = 0 ] || exit 1
-echo "== cleanup: a stopped script takes its children with it; without the trap the child stays (seen)"
+echo "== cleanup: a stopped script takes its children with it; without the trap the child stays (seen);"
+echo "   every wait for a still machine runs through cleanup_run"
 }
 main "$@"; exit

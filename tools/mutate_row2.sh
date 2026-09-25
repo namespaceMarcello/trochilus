@@ -1,7 +1,9 @@
 #!/bin/sh
 # mutate_row2.sh — do the tests see a wrong two-row kernel (dot_row2_x4 and dot_row2_x8: two weight
 # rows against the same four or eight input rows, AVX-512), a wrong lane tree in SIMD, a wrong use
-# of them in tr_matmul, or a wrong SIMD Q6_K scale? A test
+# of them in tr_matmul, or a wrong SIMD Q6_K scale? And the decode's Q4_K: the one-row kernel's
+# vector scales and the pair of rows against one token (dot_row2) with its roads in tr_matmul
+# (question 66). A test
 # never seen red proves nothing (docs/LESSONS.md #43): each mutation is applied to a copy of the
 # tree, the copy is built and the checks that should notice are run: test_kernels (every tier's
 # kernels against scalar's, tr_matmul against dot_row), test_tier_used (the tier's entries, every
@@ -11,7 +13,7 @@
 #   MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src trochilus-dev:local sh tools/mutate_row2.sh
 #
 # One line per mutation: which checks went red. "no mutation" must be all green, every other line
-# must have at least one RED. About 10 minutes.
+# must have at least one RED. About 15 minutes.
 set -e
 # The body is one function, called on the last line (docs/LESSONS.md #69).
 main() {
@@ -93,5 +95,24 @@ run "matmul x8: row 1's sums stored over row 0's" $M \
 run "matmul: the x8 road never taken" $M "if (c->dot_row2_x8 != NULL) {" "if (c->dot_row2_x8 != NULL && c->rows < 0) {"
 run "matmul x8: a whole group of eight left to x4" $M \
   "for (; q + TR_DOT_TOKENS_WIDE <= b_end; q += TR_DOT_TOKENS_WIDE) {" "for (; q + TR_DOT_TOKENS_WIDE < b_end; q += TR_DOT_TOKENS_WIDE) {"
+# the decode's Q4_K (question 66): the one-row kernel's vector scales, one block ahead, and the pair
+# of rows against one token (dot_row2) with its roads in tr_matmul
+run "q4_k scales in a vector: min 4 masked to 3 bits" $K \
+  "63, 63, 63, 63, 15, 15, 15, 15, 63, 63, 63, 63, 15, 15, 15, 15" "63, 63, 63, 63, 15, 15, 15, 15, 63, 63, 63, 63, 7, 15, 15, 15"
+run "q4_k one row: the next block's scales over this block's" $K "sm[(b + 1) & 1]" "sm[b & 1]"
+run "q4_k one row: the high table takes the low min" $K "_mm512_set1_ps(s[9 + 2 * c])" "_mm512_set1_ps(s[8 + 2 * c])"
+run "pair q4_k: row 1's first low table is row 0's" $K "_mm512_permutexvar_ps(b0v, lo1)" "_mm512_permutexvar_ps(b0v, lo0)"
+run "pair q4_k: row 1's high table takes its low min" $K "_mm512_set1_ps(d[9 + 2 * c])" "_mm512_set1_ps(d[8 + 2 * c])"
+run "pair q4_k: row 1's scales read from row 0" $K \
+  "avx512_q4_k_scales_store(p1 + (size_t)b * TR_Q4_K_BLOCK_BYTES, s1[b - b0]);" \
+  "avx512_q4_k_scales_store(p0 + (size_t)b * TR_Q4_K_BLOCK_BYTES, s1[b - b0]);"
+run "pair q4_k: the last span one block short" $K \
+  "int64_t b1 = b0 + TR_Q4_K_SPAN < nb ? b0 + TR_Q4_K_SPAN : nb;" "int64_t b1 = b0 + TR_Q4_K_SPAN < nb ? b0 + TR_Q4_K_SPAN : nb - 1;"
+run "table: avx512 q4_k pair left out" $K \
+  "g_avx512.dot_row2[TR_TYPE_Q4_K] = avx512_dot_row2_q4_k;" "(void)avx512_dot_row2_q4_k;"
+run "matmul rows: the pair stored one row late" $M "xp, c->cols, yp + r);" "xp, c->cols, yp + r + 1);"
+run "matmul tiled: the pair's second result is its first" $M \
+  "c->y[q * c->rows + r + 1] = out[1];" "c->y[q * c->rows + r + 1] = out[0];"
+run "matmul: the pairs never taken" $M "ctx.dot_row2 = k->dot_row2[w[0].type];" "ctx.dot_row2 = NULL;"
 }
 main "$@"; exit

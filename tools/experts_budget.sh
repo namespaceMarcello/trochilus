@@ -88,7 +88,7 @@ measure_begin experts_budget
 # busy with other work, or the marker lost, stops the measurement at the next run
 # (tools/measure_guard.lib, tools/machine_still.sh, docs/LESSONS.md #73, #84)
 measure_machine experts_budget
-still() { sh -c "$AB_GUARD" || { echo "experts_budget: the machine is not still $1 (the marker lost, or a busy CPU), stopping"; exit 3; }; }
+still() { cleanup_run sh -c "$AB_GUARD" || { echo "experts_budget: the machine is not still $1 (the marker lost, or a busy CPU), stopping"; exit 3; }; }
 
 # The model takes 7 GiB and the memory guard wants 3 more left free; Windows needs minutes to
 # take back what the VM has released (docs/LESSONS.md #72). Up to 15 minutes, a look every 30 s.

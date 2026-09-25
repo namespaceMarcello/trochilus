@@ -2,7 +2,8 @@
  * the 16-lane reduction contract (kernels.h) against an independent in-test
  * implementation, dot_row == dot_f32(dequantized), every SIMD tier == scalar,
  * rope/swiglu/attention == their first per-element definitions, tr_matmul
- * thread-count determinism, tr_matmul_grouped == one dot_row per element. */
+ * thread-count determinism, tr_matmul_grouped == one dot_row per element, the decode's one-token
+ * matmul == one dot_row per row at every thread count. */
 #include "test.h"
 
 #include "../src/kernels/kernels.h"
@@ -10,6 +11,7 @@
 #include "../src/base/threads.h"
 
 #include <math.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -392,6 +394,18 @@ static void row2_diffs(const tr_kernels *K, const tr_kernels *S, tr_type type, c
     }
 }
 
+/* Two rows against one input row (dot_row2, the decode's pair): each result scalar's dot_row of its
+ * own row, bit for bit. Counted: a tier whose dot_row2 is never compared proves nothing. */
+static long g_pair_compared;
+static void pair_diffs(const tr_kernels *K, const tr_kernels *S, tr_type type, const unsigned char *r0,
+                       const unsigned char *r1, const float *x, int64_t n, int *bad) {
+    float o[2];
+    K->dot_row2[type](r0, r1, x, n, o);
+    if (!same_float(o[0], S->dot_row[type](r0, x, n))) (*bad)++;
+    if (!same_float(o[1], S->dot_row[type](r1, x, n))) (*bad)++;
+    g_pair_compared++;
+}
+
 /* Two rows against the same eight input rows (x8, a stride of n + 3 floats): each sum scalar's
  * dot_row of its own row and input row, bit for bit. Counts its calls: a tier whose x8 is never
  * compared proves nothing (docs/LESSONS.md #43). */
@@ -489,6 +503,10 @@ static void count_diffs(const tr_kernels *K, const tr_kernels *S, unsigned seed,
             fill_q8_0(row, nb, &seed, round % 2);
             int64_t n = nb * 32;
             if (!same_float(K->dot_row[TR_TYPE_Q8_0](row, b, n), S->dot_row[TR_TYPE_Q8_0](row, b, n))) (*bad_row)++;
+            if (K->dot_row2[TR_TYPE_Q8_0] != NULL) {
+                fill_q8_0(row2, nb, &seed, round % 2);
+                pair_diffs(K, S, TR_TYPE_Q8_0, row, row2, b, n, bad_row);
+            }
             /* the same row against 4 consecutive input rows: same as the tier's own
              * dot_row on each of them, and as scalar's (4 * n floats must fit in b) */
             if (K->dot_row2_x4[TR_TYPE_Q8_0] != NULL && 4 * (n + 3) <= CMP_MAX_N) {
@@ -514,6 +532,10 @@ static void count_diffs(const tr_kernels *K, const tr_kernels *S, unsigned seed,
             fill_q4_k(row, nb, &seed, round % 2);
             int64_t n = nb * 256;
             if (!same_float(K->dot_row[TR_TYPE_Q4_K](row, b, n), S->dot_row[TR_TYPE_Q4_K](row, b, n))) (*bad_row)++;
+            if (K->dot_row2[TR_TYPE_Q4_K] != NULL) {
+                fill_q4_k(row2, nb, &seed, round % 2);
+                pair_diffs(K, S, TR_TYPE_Q4_K, row, row2, b, n, bad_row);
+            }
             if (K->dot_row2_x4[TR_TYPE_Q4_K] != NULL && 4 * (n + 3) <= CMP_MAX_N) {
                 fill_q4_k(row2, nb, &seed, round % 2);
                 row2_diffs(K, S, TR_TYPE_Q4_K, row, row2, b, n, bad_row);
@@ -537,6 +559,10 @@ static void count_diffs(const tr_kernels *K, const tr_kernels *S, unsigned seed,
             fill_q6_k(row, nb, &seed, round % 2);
             int64_t n = nb * 256;
             if (!same_float(K->dot_row[TR_TYPE_Q6_K](row, b, n), S->dot_row[TR_TYPE_Q6_K](row, b, n))) (*bad_row)++;
+            if (K->dot_row2[TR_TYPE_Q6_K] != NULL) {
+                fill_q6_k(row2, nb, &seed, round % 2);
+                pair_diffs(K, S, TR_TYPE_Q6_K, row, row2, b, n, bad_row);
+            }
             if (K->dot_row2_x4[TR_TYPE_Q6_K] != NULL && 4 * (n + 3) <= CMP_MAX_N) {
                 fill_q6_k(row2, nb, &seed, round % 2);
                 row2_diffs(K, S, TR_TYPE_Q6_K, row, row2, b, n, bad_row);
@@ -617,6 +643,16 @@ WRONG_ROW2(q6_k)
 WRONG_ROW2X8(q8_0)
 WRONG_ROW2X8(q4_k)
 WRONG_ROW2X8(q6_k)
+
+/* two rows against one input row: count_diffs must see a wrong dot_row2 */
+#define WRONG_PAIR(name) \
+    static void wrong_pair_##name(const void *r0, const void *r1, const float *x, int64_t n, float *out) { \
+        out[0] = wrong_dot_row_##name(r0, x, n); \
+        out[1] = wrong_dot_row_##name(r1, x, n); \
+    }
+WRONG_PAIR(q8_0)
+WRONG_PAIR(q4_k)
+WRONG_PAIR(q6_k)
 
 static float wrong_dot_row_f16(const void *row, const float *x, int64_t n) {
     static float w[CMP_MAX_N];
@@ -757,6 +793,16 @@ static void test_tiers_match_scalar(void) {
         TR_CHECK_EQ_INT(bad_dot + bad_axpy + bad_x4, 0);
         TR_CHECK(bad_row > 0);
     }
+    /* and a wrong one-token pair of each quantized type alone (the scalar table has none either) */
+    void (*const wrong_pair[3])(const void *, const void *, const float *, int64_t, float *) = {
+        wrong_pair_q8_0, wrong_pair_q4_k, wrong_pair_q6_k};
+    for (int i = 0; i < 3; i++) {
+        wrong = *S;
+        wrong.dot_row2[row2_types[i]] = wrong_pair[i];
+        count_diffs(&wrong, S, 7u, &bad_dot, &bad_row, &bad_axpy, &bad_x4);
+        TR_CHECK_EQ_INT(bad_dot + bad_axpy + bad_x4, 0);
+        TR_CHECK(bad_row > 0);
+    }
 
     for (size_t t = 0; t < sizeof tiers / sizeof tiers[0]; t++) {
         const tr_kernels *K = tr_kernels_tier(tiers[t]);
@@ -767,6 +813,7 @@ static void test_tiers_match_scalar(void) {
         /* same numbers says nothing on WHICH function ran: that the tier's entries are its own,
          * and that the engine goes through them, is tests/test_tier_used.c */
         g_x8_compared = 0;
+        g_pair_compared = 0;
         count_diffs(K, S, 2026u + (unsigned)t, &bad_dot, &bad_row, &bad_axpy, &bad_x4);
         TR_CHECK_EQ_INT(bad_dot, 0);
         TR_CHECK_EQ_INT(bad_row, 0);
@@ -776,9 +823,13 @@ static void test_tiers_match_scalar(void) {
         int has_x8 = 0;
         for (int type = 0; type < TR_TYPE_COUNT; type++) has_x8 |= K->dot_row2_x8[type] != NULL;
         if (has_x8) TR_CHECK(g_x8_compared > 0);
-        printf("  tier %-8s dot_f32, axpy_f32, their x4, dot_row, dot_row_x4, dot_row2_x4 and dot_row2_x8 (%ld calls) "
-               "of f32, f16, q8_0, q4_k and q6_k %s\n",
-               K->tier, g_x8_compared,
+        /* and its two-rows-one-token kernels, if it has any */
+        int has_pair = 0;
+        for (int type = 0; type < TR_TYPE_COUNT; type++) has_pair |= K->dot_row2[type] != NULL;
+        if (has_pair) TR_CHECK(g_pair_compared > 0);
+        printf("  tier %-8s dot_f32, axpy_f32, their x4, dot_row, dot_row2 (%ld calls), dot_row_x4, dot_row2_x4 and "
+               "dot_row2_x8 (%ld calls) of f32, f16, q8_0, q4_k and q6_k %s\n",
+               K->tier, g_pair_compared, g_x8_compared,
                bad_dot == 0 && bad_row == 0 && bad_axpy == 0 && bad_x4 == 0 ? "identical to scalar"
                                                                             : "DIFFER from scalar");
     }
@@ -1147,6 +1198,107 @@ static void test_edges(void) {
     tr_softmax(NULL, 0);
 }
 
+/* ---- the decode's matmul: one token, chunk borders inside it ------------------------------ */
+/* One token against quantized matrices of 2048 columns, as the decode: tr_parallel_for's chunks (at
+ * least 4096 / cols + 1 = 3 rows) split the only input row among the threads, so with three or seven
+ * threads the rows go through matmul_rows, with one through matmul_tiled; the eight one-token groups
+ * of an expert layer go through both. Each product must be dot_row's of its own row, bit for bit,
+ * and exactly one dot_row call or half a dot_row2 call (counted), at every thread count and for
+ * every quantized type; where the tier has dot_row2 for the type, the pairs must have been taken
+ * (67 rows: pairs and a row left alone). Branch covered: matmul_rows on quantized rows (seen red
+ * with its loop stopping one row short), and its pairs. */
+static atomic_long g_dec_dots, g_dec_pairs;
+static const tr_kernels *g_dec_real;
+static tr_type g_dec_type;
+static float dec_dot(const void *row, const float *x, int64_t n) {
+    atomic_fetch_add(&g_dec_dots, 1);
+    return g_dec_real->dot_row[g_dec_type](row, x, n);
+}
+static void dec_pair(const void *row0, const void *row1, const float *x, int64_t n, float *out) {
+    atomic_fetch_add(&g_dec_pairs, 1);
+    g_dec_real->dot_row2[g_dec_type](row0, row1, x, n, out);
+}
+
+static void test_matmul_decode(void) {
+    enum { ROWS = 67, COLS = 2048, G = 8 };
+    static const tr_type types[3] = {TR_TYPE_Q8_0, TR_TYPE_Q4_K, TR_TYPE_Q6_K};
+    static const int threads[3] = {1, 3, 7};
+    const tr_kernels *K = tr_kernels_get();
+    for (int ti = 0; ti < 3; ti++) {
+        tr_type type = types[ti];
+        size_t rb = tr_row_bytes(type, COLS);
+        unsigned char *wdata = (unsigned char *)malloc((size_t)G * ROWS * rb);
+        float *x = (float *)malloc((size_t)G * COLS * sizeof(float));
+        float *ref = (float *)malloc((size_t)G * ROWS * sizeof(float));
+        float *y = (float *)malloc((size_t)G * ROWS * sizeof(float));
+        TR_CHECK(wdata != NULL && x != NULL && ref != NULL && y != NULL);
+        if (wdata == NULL || x == NULL || ref == NULL || y == NULL) {
+            free(wdata);
+            free(x);
+            free(ref);
+            free(y);
+            return;
+        }
+        unsigned seed = 91u + (unsigned)ti;
+        for (int64_t i = 0; i < G * ROWS; i++) {
+            unsigned char *row = wdata + (size_t)i * rb;
+            if (type == TR_TYPE_Q8_0) fill_q8_0(row, COLS / 32, &seed, 0);
+            if (type == TR_TYPE_Q4_K) fill_q4_k(row, COLS / 256, &seed, 0);
+            if (type == TR_TYPE_Q6_K) fill_q6_k(row, COLS / 256, &seed, 0);
+        }
+        for (int64_t i = 0; i < G * COLS; i++) x[i] = rand_float(&seed);
+        tr_mat w[G];
+        int64_t offsets[G + 1];
+        for (int64_t g = 0; g < G; g++) {
+            w[g].type = type;
+            w[g].rows = ROWS;
+            w[g].cols = COLS;
+            w[g].data = wdata + (size_t)g * ROWS * rb;
+            offsets[g] = g;
+            for (int64_t r = 0; r < ROWS; r++)
+                ref[g * ROWS + r] = K->dot_row[type]((const unsigned char *)w[g].data + (size_t)r * rb, x + g * COLS, COLS);
+        }
+        offsets[G] = G;
+
+        static tr_kernels counting;
+        counting = *K;
+        g_dec_real = K;
+        g_dec_type = type;
+        counting.dot_row[type] = dec_dot;
+        if (K->dot_row2[type] != NULL) counting.dot_row2[type] = dec_pair;
+        tr_kernels_set_active(&counting);
+        for (int t = 0; t < 3; t++) {
+            tr_pool *pool = tr_pool_create(threads[t]);
+            TR_CHECK(pool != NULL);
+            if (pool == NULL) continue;
+            atomic_store(&g_dec_dots, 0);
+            atomic_store(&g_dec_pairs, 0);
+            memset(y, 0, (size_t)ROWS * sizeof(float));
+            tr_matmul(pool, &w[0], x, 1, y);
+            TR_CHECK(memcmp(y, ref, (size_t)ROWS * sizeof(float)) == 0);
+            TR_CHECK_EQ_INT(atomic_load(&g_dec_dots) + 2 * atomic_load(&g_dec_pairs), ROWS);
+            if (K->dot_row2[type] != NULL) TR_CHECK(atomic_load(&g_dec_pairs) > 0);
+            atomic_store(&g_dec_dots, 0);
+            atomic_store(&g_dec_pairs, 0);
+            memset(y, 0, (size_t)G * ROWS * sizeof(float));
+            tr_matmul_grouped(pool, w, offsets, G, x, y);
+            TR_CHECK(memcmp(y, ref, (size_t)G * ROWS * sizeof(float)) == 0);
+            TR_CHECK_EQ_INT(atomic_load(&g_dec_dots) + 2 * atomic_load(&g_dec_pairs), G * ROWS);
+            if (K->dot_row2[type] != NULL) TR_CHECK(atomic_load(&g_dec_pairs) > 0);
+            tr_pool_destroy(pool);
+        }
+        tr_kernels_set_active(NULL);
+        printf("  decode matmul %s on tier %s: one token and eight one-token groups, every product one dot_row "
+               "%sat 1, 3 and 7 threads\n",
+               type == TR_TYPE_Q8_0 ? "q8_0" : type == TR_TYPE_Q4_K ? "q4_k" : "q6_k", K->tier,
+               K->dot_row2[type] != NULL ? "or half a dot_row2 (pairs taken) " : "");
+        free(wdata);
+        free(x);
+        free(ref);
+        free(y);
+    }
+}
+
 int main(void) {
     tr_kernels_init();
 
@@ -1168,6 +1320,7 @@ int main(void) {
     test_attention_group();
     test_matmul_thread_determinism();
     test_matmul_grouped();
+    test_matmul_decode();
 
     TR_TEST_EXIT();
 }

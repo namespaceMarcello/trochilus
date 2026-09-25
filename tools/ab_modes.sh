@@ -48,7 +48,7 @@ while [ "$R" -le "$ROUNDS" ]; do
     eval "MODE=\${$K}"
     LABEL=${MODE%%=*}
     CMD=${MODE#*=}
-    if [ -n "$AB_GUARD" ] && ! sh -c "$AB_GUARD" > /dev/null 2>&1; then
+    if [ -n "$AB_GUARD" ] && ! cleanup_run sh -c "$AB_GUARD" > /dev/null 2>&1; then
       echo "ab_modes: the guard '$AB_GUARD' failed before '$LABEL' round $R: the machine changed, stopping." >&2
       rm -f "$OUT"
       exit 3

@@ -32,7 +32,7 @@ cat $OUT/load.txt
 
 # $1: engine, $2: prompt tokens, $3: name of the series
 series() {
-  sh -c "$AB_GUARD" || { echo "race_llama: the machine is not still, or the marker is not ours: stopping"; exit 3; }
+  cleanup_run sh -c "$AB_GUARD" || { echo "race_llama: the machine is not still, or the marker is not ours: stopping"; exit 3; }
   echo "race_llama: $3 ($1, prompt $2, $(date +%H:%M))"
   cleanup_run env MSYS_NO_PATHCONV=1 docker run --rm --privileged -v "$(pwd):/src" \
     -v trochilus-models:/src/models -w /src trochilus-dev:local \

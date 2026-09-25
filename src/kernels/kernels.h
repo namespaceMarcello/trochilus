@@ -82,6 +82,10 @@ typedef struct {
      * read and decoded once for all of them (fewer bytes and conversions per element, same
      * numbers). NULL for a type without a variant: the caller loops over dot_row. */
     void (*dot_row_x4[TR_TYPE_COUNT])(const void *row, const float *x, int64_t stride, int64_t n, float *out);
+    /* Two weight rows against the same input row (a decode token): out[0] = dot_row(row0, x, n)
+     * and out[1] = dot_row(row1, x, n), bit for bit, each row with its own chain of adds. NULL:
+     * the caller calls dot_row twice. */
+    void (*dot_row2[TR_TYPE_COUNT])(const void *row0, const void *row1, const float *x, int64_t n, float *out);
     /* Two weight rows against the same TR_DOT_TOKENS input rows: out[j] = dot_row(row0, x +
      * j*stride, n) and out[TR_DOT_TOKENS + j] = dot_row(row1, x + j*stride, n), each input
      * element loaded once for both rows (half the loads of two dot_row_x4). NULL: the caller

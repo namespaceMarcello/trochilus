@@ -138,7 +138,7 @@ measure_machine() {
 # measure_still <name>: a longer look (10 s), and a wait of up to 15 minutes for whoever is using
 # the machine to finish; then exit 3 with the names of the processes that hold the CPU.
 measure_still() {
-  sh tools/machine_still.sh 3.0 900 10 || { echo "$1: the machine is not still, not measuring"; exit 3; }
+  cleanup_run sh tools/machine_still.sh 3.0 900 10 || { echo "$1: the machine is not still, not measuring"; exit 3; }
 }
 
 # measure_declare <when>: a native measurement says what else the machine was doing, before its

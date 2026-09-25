@@ -53,7 +53,8 @@ Working today, end to end:
 - CPU kernels dispatched at runtime — scalar, AVX2, AVX-512, AVX-512+VNNI — each variant
   **bit-identical** to the scalar one, with a test that enforces it and another that proves the
   tier you think is running is the one that ran. On AVX-512 the prompt's matrix products take two
-  weight rows against eight tokens at a time.
+  weight rows against eight tokens at a time, and the decode's Q4_K products two weight rows against
+  the token, their scales decoded in vectors.
 - **The decode's attention on an NVIDIA GPU**, loaded at runtime (no CUDA toolkit needed to build
   or run): the same bytes as the CPU, checked through the engine; without a GPU nothing changes.
 - `trochilus serve`, which keeps the model loaded between commands; `run`, `chat` and `generate`
@@ -102,6 +103,7 @@ the ones that did not pay are written down too, in `docs/MEASUREMENTS.md`, with 
 | Two weight rows per load of the activations | prefill 1.20-1.26x (Q8_0) |
 | Two weight rows against eight tokens, the lane sums in SIMD | matmul 87 → 102 GFLOP/s on a core; prefill 1.13-1.19x (Q8_0, native, 512 to 4000 tokens) |
 | Q4_K weights instead of Q8_0 | decode 1.5x |
+| Q4_K decode: the block scales in vectors one block ahead, two weight rows per call, a prefetch | decode 1.25x at 4 threads (40.3 → 50.4 tok/s), the same bits |
 
 The context table above predates the GPU attention and the two-row kernels; it will be measured
 again as a whole.
@@ -118,6 +120,12 @@ kernels called alone through ggml, on our shapes, one core (indicative: a loaded
 The whole engine against llama.cpp on the same OLMoE-1B-7B Q8_0 (2026-09-25, both in the same
 container, a still machine): the prompt **level at 8 threads**, theirs 1.30-1.35x at 16 (their
 8-bit activations); the decode theirs 1.04x at 512 tokens of context, 1.13x at 2048.
+
+On the same OLMoE-1B-7B in **Q4_K**, 4 threads (2026-09-25, the same container, 512-token prompt,
+128 generated): the decode **level, 50.4 tok/s against their 50.2**, with every weight still the
+exact dequantized float (they round the activations to 8 bits); the prompt theirs 1.6x (222 against
+139 tok/s: 8-bit activations again). Their decode kernels alone, one core: 2x ours; at 4 threads
+the memory is the limit for both, 1.04x.
 
 ### What we are proud of
 
@@ -155,7 +163,7 @@ and either a test is written that kills it or the reason it cannot matter is wri
 |---|---|---|
 | **M0** | base, GGUF v3, converter (F32/F16/Q8_0), CPU backend with runtime dispatch, OLMoE graph, greedy, CLI, tokenizer, chat template | **done** — exact against `transformers` on Windows and Linux; the real OLMoE-1B-7B answers |
 | **M1** | experts from disk under a RAM budget: slot store, O(1) LRU, on-demand unbuffered reads, automatic plan | **in progress** — the store, the budget, layer-major prefill and reads overlapped with compute are done and measured; what remains is the cost of the first prompt |
-| **M2** | K-quants (Q4_K, Q6_K, Q2_K, IQ2_XXS) on CPU, kernels to the hardware's limit | **in progress** — Q4_K and Q6_K done (Q4_K_M runs); the prompt's kernel at 61% of the CPU's peak |
+| **M2** | K-quants (Q4_K, Q6_K, Q2_K, IQ2_XXS) on CPU, kernels to the hardware's limit | **in progress** — Q4_K and Q6_K done (Q4_K_M runs); the prompt's kernel at 61% of the CPU's peak; the Q4_K decode level with llama.cpp at 4 threads, exact |
 | **M3** | CUDA module, hot experts in VRAM, a plan over VRAM + RAM + disk | **in progress** — the decode's attention done, exact; the dense weights next |
 | M4 | a model of hundreds of gigabytes on the reference laptop | — |
 | M5 | KV checkpoints on disk, a server (OpenAI and Anthropic APIs), speculative decoding with a draft model | speculation from the prompt done; `serve` keeps the model loaded, no API yet |
@@ -198,7 +206,7 @@ The honest list, so nobody has to find out by running it:
 - **The GPU does one thing, on NVIDIA only.** The decode's attention runs there; the weights, the
   prompt and the experts are still on the CPU, and there is no Vulkan or Metal module.
 - **Q4_K and Q6_K are the lowest formats.** No Q2_K or IQ2 yet, so no 2-bit models; AVX2 lacks the
-  two-row kernels AVX-512 has.
+  two-row kernels and the vector Q4_K scales AVX-512 has.
 - **arm64 detection exists, NEON kernels do not.** On ARM the engine would take the scalar path.
 - **Greedy only** — no sampling, no server, no API, nothing beyond the CLI.
 - **A model larger than RAM has not been run yet.** The experts stream from disk under a budget,

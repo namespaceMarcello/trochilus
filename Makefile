@@ -59,7 +59,7 @@ ATTN_BIN := $(BUILD)/tests/bench_attn$(EXE)
 EXPF_BIN := $(BUILD)/tests/bench_expf$(EXE)
 DISK_BIN := $(BUILD)/tests/bench_disk$(EXE)
 # premise benches of 2026-09-24 (docs/MEASUREMENTS.md): built by the gate so they do not rot, run by hand
-RESEARCH_BIN := $(foreach b,bench_gpu_attn bench_gpu_q8 bench_attn_bw bench_kvpack bench_expf32 bench_peak,$(BUILD)/tests/$(b)$(EXE))
+RESEARCH_BIN := $(foreach b,bench_gpu_attn bench_gpu_q8 bench_attn_bw bench_kvpack bench_expf32 bench_peak bench_q4k_genome,$(BUILD)/tests/$(b)$(EXE))
 
 .PHONY: all attn-probe test check-gcc check-clang check-asan check-tsan check-tiny check-real check-cut oracle tier-check oracle-tokenizer chat-check oracle-real spec-check bench bench-mem bench-attn bench-expf bench-disk lint profile check check-linux clean-machine clean platform-guard quick
 all: $(BUILD)/trochilus$(EXE)
@@ -308,6 +308,12 @@ check: clean-machine lint
 	@# SKIPPED, not failed. They share nothing with the container but the processors (they write
 	@# beside their binaries, the container in build/linux-* and its own /tmp); their output comes
 	@# when the container's gate ends
+	@# Windows must have room for the lanes' growth of the VM (~10 GB) and a margin: inside, the
+	@# engine's guard sees the VM's 15 GB, not what Windows has left (docs/LESSONS.md #183). The
+	@# guard is seen refusing first (an impossible need, no wait), then asked for real (waits 20 min)
+	MSYS_NO_PATHCONV=1 docker run --rm --privileged $(DOCKER_IMG) sh -c "sync; echo 3 > /proc/sys/vm/drop_caches"
+	! sh tools/host_memory.sh 100000 0 2> /dev/null
+	sh tools/host_memory.sh 12
 	MSYS_NO_PATHCONV=1 sh tools/beside.sh $(BUILD)/native-tests.log \
 		"env -u MSYS_NO_PATHCONV sh tools/native_tests.sh $(TEST_BIN)" \
 		docker run --rm --security-opt seccomp=unconfined -v "$(CURDIR):/src" \

@@ -183,6 +183,8 @@ decides | — | — |
 | 61 | **Exactness as the asset for a frontier model locally** (after M4, 2026-09-24): a computation that gives the same bytes anywhere can be moved in time (the KV of your files computed while the machine idles, reused byte for byte), in space (several home machines splitting a model: their RAM bandwidth adds up), and checked (work done by an untrusted fast machine, verified by recomputing random spots) | a KV checkpoint to disk and back per 1000 tokens; one layer across two machines on a LAN (~28 KB a hop at 7168 dims); detection probability against spot-check cost | a 671B MoE reads ~20 GB a token at Q4 (0.35 s from RAM, 13 s from this disk): the wall moves only by adding bandwidth or by not paying the prefill at question time; approximate engines cannot do any of the three |
 | 63 | ~~Decode a panel of weight rows once, then F32 over every token?~~ **Closed 2026-09-24** (§The prompt's matmul against the four references): the same bytes, but **Q8_0 1.00–1.04×, Q4_K 1.10–1.12×** on a core (predicted 1.13–1.27×): the decode is 29% of the stream in L1, the matmul is bound by its input rows' loads from L2 | — | ik_llama.cpp's convert-then-gemm, kept exact |
 | 64 | ~~A tile of more weight rows per input load (4 rows × 6 tokens)?~~ **Closed 2026-09-25 as no** (§More weight rows per input load): the streams of 4 × 6 and 3 × 8 run 1.02× and 1.04× x8's, but in the matmul, exact, they lose (Q8_0 0.88–0.90× and 0.93–0.94×, Q4_K 0.84× and 0.90×; predicted 1.00–1.12×): the matmul is not bound by its input loads | — | the tile stays 2 × 8 |
+| 65 | ~~The decode's matmul (one token, bound by memory): do ggml's kernels read the weights faster than ours?~~ **Closed 2026-09-25** (§The decode's matmul against ggml's): **Q8_0 level from 4 threads** (0.97-1.06x, both at the ceiling), ggml 1.4-1.7x at one thread; **Q4_K ours bound by its arithmetic** (9.3 GB/s a core), ggml 1.34-1.40x at 4 threads, level from 8. The decode's gap is attention (row 3). Three premises for a faster exact Q4_K dot closed as no (four rows at once 0.5-0.9x from RAM, vector scales 0.86x, arithmetic weight 0.77x) | — | — |
+| 66 | ~~Reach llama.cpp's Q4_K decode at 4 threads, exactly (Marcello, 2026-09-25)~~ **Reached 2026-09-25** (§The Q4_K decode dot sequenced): the kernel read like a genome first (the scalar scale decode was 24% of a row), then the scales in a vector one block ahead and two rows a call, the same bits: the real model's decode at 4 threads **40.3 -> 50.4 tok/s (1.25x), llama.cpp 50.2**; the matmul alone ggml 1.37x -> 1.04x. Premise e (a dictionary of tables) closed: 94-99.6% of the sub-blocks have a pair of their own. Open: SMT (+9-13% from RAM at 4 cores), the prefill at 4 threads (llama.cpp 1.6x) | — | — |
 
 Reference machine: Ryzen 9 7940HX (Zen 4, 16 core / 32 thread, AVX-512 VNNI/BF16), 31 GB
 RAM (2×16 GB DDR5-5200), NVMe Micron 1 TB, GPU RTX 4070 Laptop 8 GB and Radeon 610M (not used
@@ -3443,6 +3445,63 @@ checked byte for byte against `tr_matmul` on every shape before timing, red unde
 - **Closed as no**: no tile shape has more than ~4% to give in its own arithmetic (the streams), and
   the real kernels of the two lose. The tile stays 2 × 8; the bench keeps the lines (`--q64`).
 
+## The decode's matmul against ggml's (question 65, 2026-09-25)
+
+Piece 2 of ORIGINS §Every piece: one token, every weight read once. The references (ORIGINS row 2):
+llama.cpp skips tinyBLAS at one column (`llamafile_sgemm` returns at n < 2) and runs `vec_dot` one
+row at a time on int8 activations quantized once per matmul, rows claimed 64 at a time by an atomic
+counter; repacked Q4_K runs a `gemv` of 8 rows; ik has `nrc_y = 1` kernels with two block chains a
+row; colibri is one row x one vector on int8 (`dpbusd`); ds4's CPU path has no x86 SIMD at all.
+
+`sh tools/bench_ggml_decode.sh` (container, marker held, load 1.8 before and 2.0 after, 5 rounds x
+2 passes): ggml's MUL_MAT / MUL_MAT_ID (b49650a, its pool pinned with `strict_cpu` to our first T
+slots) and `tr_matmul` / `tr_matmul_grouped` in one binary, the same weight bytes (copies filling
+~1 GiB, every pass from RAM) and cores, alternating, beside a plain read of the same bytes by our
+pool (the ceiling; ~48 GB/s at 4 threads in the container, 57 native). Both engines checked on the
+first node: ggml differs by 0.3-0.45% of the largest output (its int8 activations). GB/s; the
+lines are the median over the five shapes (1024x2048, 2048x1024, 2048x2048, the 50304x2048 head, 8
+of 64 experts), the range in brackets; spreads 2-25%:
+
+| threads | Q8_0 ours | ggml / ours | ours / read | Q4_K ours | ggml / ours | repacked / ours | ours / read |
+|---|---|---|---|---|---|---|---|
+| 1 | 21.2 | **1.54** (1.43-1.69) | 0.60 | 9.3 | **2.70** (2.60-2.75) | 3.20 (3.07-3.36) | 0.27 |
+| 2 | 39.4 | 1.04 (0.94-1.09) | 0.86 | 17.9 | 2.01 (1.83-2.13) | 2.26 (2.24-2.53) | 0.40 |
+| 4 | 46.0 | **1.00** (0.97-1.01) | 0.96 | 33.6 | **1.37** (1.34-1.40) | 1.39 (1.33-1.44) | 0.70 |
+| 8 | 47.7 | 1.02 (1.02-1.06) | 0.95 | 43.5 | 1.07 (0.94-1.09) | 1.06 (1.01-1.12) | 0.88 |
+| 16 | 48.0 | 1.01 (0.95-1.04) | 0.93 | 42.1 | 1.08 (0.99-1.12) | 1.06 (1.01-1.12) | 0.81 |
+
+- **Q8_0, the model's type: level from 4 threads**, both at the ceiling (0.93-0.96 of the read); the
+  decode runs 4 threads at short context and 8 at long. So the race's decode gap (theirs 1.04x at
+  512, 1.13x at 2048) is not this matmul: it is attention (row 3, the KV's bytes). ggml wins alone
+  at one thread, 1.4-1.7x: a core of ours computes 21 GB/s, one of theirs reads its 31-36.
+- **Q4_K: ours is bound by its arithmetic**, 9.3 GB/s a core (0.27 of the read, 17 G weights/s),
+  so at 4 threads ggml is 1.34-1.40x (repacked alike), and level from 8 (0.94-1.12, inside the
+  spreads). The decode's width is picked by measuring: a Q4_K model likely takes 8 (not measured).
+- Prediction (question 65): Q8_0 at one thread 1.2-1.3x (measured 1.4-1.7, more), at two 1.3-1.5x
+  (measured 1.0: two of our cores already read 0.86 of the ceiling), from four 0.95-1.05x (held);
+  the 2048x2048 projections losing 5-10% to sync (not seen: 0.96 of the read); Q4_K 1.2-1.4x at 4
+  (held), <= 1.1x from 8 (held).
+
+**Three premises for a faster exact Q4_K dot, each timed and closed as no** (the kernel alone in
+L1, one core, 2048 columns, best of 5, ns a row; today's `avx512_dot_row_q4_k` 120 ns):
+- **four rows against the token at once** (`dot_row4_x1`, four independent chains of adds, the
+  token loaded once for four; Q8_0, Q4_K, Q6_K, bit for bit, tested and wired): in L1 only
+  1.04-1.08x four `dot_row`s (the core already overlaps consecutive rows: the dot is bound by its
+  throughput, not the add's latency), and **from RAM 0.5-0.9x** the engine (Q8_0 at 1-4 threads
+  0.49-0.88x): four interleaved rows of 1-2 KiB are four short streams the prefetchers do not
+  follow, one row after another is one long stream (LESSONS #178). Removed;
+- **the scales as vector** (`avx512_q4_k_scales`: a dozen vector instructions instead of sixteen
+  scalar conversions, the same floats): 140 ns, 0.86x (two lane permutes a sub-block cost more
+  than two broadcasts from memory);
+- **the weight by arithmetic instead of a lookup** (`scale * cvt(q) - min`, no `vpermps`): 156 ns,
+  0.77x (the float pipes, not the shuffle unit, are what binds: the exact weight costs a multiply
+  and a subtract where the lookup costs one permute).
+- ~~So an exact dot at the F32 definition has ~5% left in Q4_K's kernel on this core~~ **refuted
+  the same day** (question 66, LESSONS #179: an inference; sequenced, the scalar scale decode was
+  24% of the row, and the exact kernel went 1.25x, two rows 1.38x); ggml's 2.7x a
+  core comes from int8 activations (`dpbusd`: 64 multiply-adds an instruction), i.e. from giving
+  up the exact definition: question 60 (Marcello's), not a kernel. Row 2 of ORIGINS closed.
+
 ## Softmax and exp against the references (2026-09-24)
 
 Piece 4 of ORIGINS §Every piece, read: llama.cpp (b49650a) computes softmax and SiLU with
@@ -3470,6 +3529,112 @@ counts are exact, the times indicative):
   the byte only after `tr_expf`.
 - **What it is worth**: the exp is 2–3% of our prefill at 2048–4000 once in SIMD (question 58);
   the 4.6× between exact and approximate is at most ~2% of a prompt. Nothing to take.
+
+## The Q4_K decode dot sequenced (question 66, 2026-09-25)
+
+Marcello's task: reach or beat llama.cpp's decode at 4 threads on Q4_K, keeping the exact
+definition (question 65 had left ggml 1.34-1.40x ahead at 4 threads, "ours bound by its exact
+arithmetic, ~5% left", an inference: LESSONS #179). Method: sequence the kernel before changing
+it, every premise with its prediction written first (`build/q66/predictions.txt` of the day),
+timed in L1, then from RAM, then bit for bit, then in the engine, then the race.
+
+**Step 0, the instructions on this Zen 4** (`sh tools/bench_q4k_genome.sh`, container, one core,
+clock measured by a chain of integer adds, 5.1-5.2 GHz; cycles an instruction, twelve independent
+ones a loop, or dependent for "lat"): `vmulps` / `vaddps` zmm 1.0 (latency 3), `vpermps` zmm 1.0
+(latency 5; ymm 0.5), `vpermt2ps` zmm 1.0, `vpmovzxbd` zmm from memory or register 1.0, `vpsrld`
+zmm 1.0, `vbroadcastss` zmm from memory or register 1.0 (not free), `vcvtsi2ss` 1.1, `vcvtph2ps`
+xmm 0.5, `vmulss` 0.5, a zmm load 1.06. Mixed: any two zmm operations a cycle (permute + multiply +
+add 0.5 an op, multiply + add 0.5, the kernel's own 16-op mix 0.5), but a permute and a widen share
+one pipe (1.0 an op together). Predictions held for all but the broadcast (predicted 0.5 from
+memory) and the widen/permute sharing.
+
+**The kernel with one piece removed at a time** (a row of 2048 in L1, called row after row as
+tr_matmul does; cycles a row, median of 11, spreads 1-5% unless said):
+
+| kernel | cycles | what is gone |
+|---|---|---|
+| tier (`avx512_dot_row_q4_k`) / its copy | 618-623 / 620 | — |
+| f16c | 586 | the halves converted by `vcvtph2ps` instead of in software |
+| prescale | 472 | the scale decode (**146 cycles, 24%**: sixteen `vcvtsi2ss` + `vmulss` and the bit fiddling) |
+| pretable | 421 | and the tables' build (51) |
+| prescale + constant indices | 413 | the indices' widen and shift (59) |
+| prescale + no permute | 359 | and the permutes (54) |
+| pretable + no permute | 329 (spread 32%) | only the loads, the 16 multiplies and 16 adds a block |
+| notree | 615 | the lane tree (3) |
+
+The floor of a one-row kernel is its one chain of adds (16 a block, latency 3: 384 cycles a row,
+partly hidden across rows). Predicted: the scale decode the largest piece (held: predicted 15-25%),
+the chain the floor (held).
+
+**Candidates in L1** (cycles a row; every exact one equal to scalar bit for bit before timing):
+
+| candidate | cycles | ns | vs tier |
+|---|---|---|---|
+| scales in a vector, stored, broadcast from memory in the same block | 598-600 | 116 | 1.03x (the broadcast waits for the store: LESSONS #180) |
+| the same, the whole row's scales first | 527-534 | 103 | 1.17x |
+| the same, **one block ahead** | 497-502 | 97 | **1.25x** |
+| the same, scales broadcast by lane permutes | 731-739 | 142 | 0.85x (as question 65's vector scales) |
+| **two rows a call**, 8 blocks' scales first | 443-450 | 85-87 | **1.38x** |
+| two rows, scales one block ahead | 454 | 88 | 1.37x |
+| four rows | 440 | 85 | 1.41x (the pipes, not the chain, bind from two) |
+| tables by a fused multiply-subtract (exact: scale * q has at most 21 significant bits) | 481 (x2) / 512 (x1) | — | 0.94x / 0.97x of the same without: gcc needs a second broadcast and a copy |
+| FMA into the accumulator (question 59, another definition), today's scalar scales | 589 | 114 | 1.05x |
+
+Premise e, **a dictionary of tables** (`tools/q4k_tables.py`, the real Q4_K file, 35 tensors of
+layers 0, 7 and 15 and the attention outputs): 93.8-99.6% of the sub-blocks have a (scale, min)
+pair of their own, and the 16384 most common pairs (a 1 MiB L2 of tables) cover 1.1-18.7%. Predicted
+> 90% and < 20%: closed as no. Not built (their premises answered by the lines above): the scales
+pre-decoded at load (the ideal "prescale" is 5% under the vector decode, for +44% bytes a block
+from RAM), `vpermt2ps` (costs a permute and still yields 16 weights), panels repacked at load (the
+prepass below gives the pair one stream without them), an exactly rounded dot (question 60, a new
+definition: not needed to reach level), asm ordering (the compiler's order is at 75-80% of the
+two-ops-a-cycle budget).
+
+**From RAM** (`--ram 4`: ~1 GiB of Q4_K rows, 4 threads on 4 cores, one contiguous chunk a thread,
+outputs compared with the tier's; GB/s, medians of 10-18 passes; the container's machine was noisy,
+spreads 7-45%):
+
+| kernel | container | native |
+|---|---|---|
+| read (ceiling) | 47.5-47.9 | 55.6 |
+| the tier before today | 34.7-35.2 | — |
+| vector scales one block ahead | 40.4-40.8 | — |
+| the same with a prefetch 4 rows (4608 bytes) ahead: **the engine's `dot_row`** | 42.0-42.8 | 43.7 |
+| two rows, scales one block ahead | 25.4-26.3 (0.72x: LESSONS #181) | — |
+| two rows, 8 blocks' scales first | 40.9-41.6 | — |
+| the same with the prefetch: **the engine's `dot_row2`** | 43.3-45.3 | 46.8 |
+| four rows, one block ahead | 27.0-28.1 | — |
+| ggml's way, 64 rows claimed at a time by an atomic counter | 0.93-0.97x of the chunks | — |
+
+**SMT** (native; the container's logical processors are virtual): in L1 a core with two threads on
+its two siblings does a row every 87.0 ns against 97.4 alone (1.12x) with the one-row kernel, 84.3
+against 86.3 (1.02x) with the pair, which already fills the pipes. From RAM, 4 cores with 8 threads:
+read 54.7, one-row 49.5 (1.13x its 4 threads), pair 49.3; in the container 49.1 / 46.8 / 48.2. Not
+wired: the pool puts one thread a core first (next step).
+
+**Wired and raced.** `avx512_dot_row_q4_k` now computes the next block's scales in a vector
+(`avx512_q4_k_scales_store`) and prefetches 4608 bytes ahead; `avx512_dot_row2_q4_k` (the new table
+entry `dot_row2`, kernels.h) takes two rows against one token, the scales of 8 blocks of both rows
+first; `matmul_rows` and the one-token remainder of `matmul_tiled` take rows in pairs. Tests:
+test_kernels (every tier's dot_row2 against scalar's dot_row, special values, a wrong pair seen, the
+decode matmul counting pairs), test_tier_used (the pair required on AVX-512, every product counted);
+eleven mutations in `tools/mutate_row2.sh`, all red. `sh tools/bench_ggml_decode.sh 5 q4_k`
+(container, medians over the five shapes; the load 3.2 processors busy):
+
+| threads | ours GB/s | ggml GB/s | ggml / ours | before today | ours / read |
+|---|---|---|---|---|---|
+| 1 | 12.5 | 25.0 | 2.01x (1.96-2.06) | 2.70x | 0.37 |
+| 2 | 24.4 | 35.3 | 1.42x (1.34-1.58) | 2.01x | 0.55 |
+| 4 | 42.8 | 44.6 | **1.04x** (1.01-1.04) | 1.37x | 0.91 |
+| 8 | 45.2 | 46.0 | 1.02x (0.95-1.05) | 1.07x | 0.92 |
+| 16 | 44.3 | 44.1 | 0.96x (0.95-1.03) | 1.08x | 0.86 |
+
+**The real model** (`RACE_THREADS=4 sh tools/race_q4k.sh 5`, prompt 512, 128 generated, median of 5,
+container): Trochilus Q4_K decode **49.91 and 50.90 tok/s**, llama.cpp on the same file **50.16**:
+level. An A/B against HEAD's engine in turn (`build/q66/ab_q4k.sh`, the same settings): **40.57,
+39.98 -> 50.15, 50.56 tok/s, 1.25x**; the prefill unchanged (129-139 both), llama.cpp's 222 at 4
+threads (1.6x: not this question). The Q8_0 A/A of the race: 30.60 and 27.48 (runs 23.6-31.4: the
+machine's noise, the Q4_K series held 46.7-51.0).
 
 ## Attempts
 
@@ -3514,3 +3679,8 @@ counts are exact, the times indicative):
 | 2026-09-24 | the Q8_0 scale by vcvtph2ps in `dot_row2_x8` (three instructions instead of a scalar conversion) | x8 kernel 2048 cols 98.6-98.8 GFLOP/s (container) | 97.3-97.6 | 0.4-4.7% | rejected: the conversion moves onto the FP pipes that bound the loop (LESSONS #167) |
 | 2026-09-24 | the Q8_0 scales converted ahead, 16 blocks at a time (scalar, or a gather and vcvtph2ps), read back by broadcast loads; and a ring of the next block's scale in memory | x8 kernel 2048 cols 100-104 (container) | ahead scalar 89, gather 92-94, ring 100-101 | 0.2-3.9% | rejected: the interleaved scalar conversion is free on the integer units |
 | 2026-09-24 | the x8 step in bench_peak's order (two tokens' loads, then four multiplies, then four adds) against per token | 100-104 (container) | 102-104 | 0.2-3.1% | not distinguishable: the compiler's order kept (LESSONS #162's 20% is the peak loop's, not this one's) |
+| 2026-09-25 | Q4_K `dot_row` AVX-512: the scales in a vector one block ahead, a prefetch 4608 bytes ahead (bit-identical) | 618 cycles a row in L1; 34.7-35.2 GB/s at 4 threads from RAM | 497; 42.0-42.8 | 1-5% L1; 7-45% RAM | kept (LESSONS #179, #180) |
+| 2026-09-25 | Q4_K `dot_row2` AVX-512: two rows against one token, 8 blocks' scales first, prefetch; tr_matmul's decode in pairs (bit-identical) | 497 cycles; 42.0-42.8 GB/s | 443-450; 43.3-45.3 | 1-5%; 15-45% | kept: the real model's decode at 4 threads 40.3 -> 50.4 tok/s with the row above, llama.cpp 50.2 |
+| 2026-09-25 | the pair (and four rows) with the scales one block ahead, from RAM | 42.0-42.8 GB/s | 25.4-28.1 | 8-37% | rejected: short interleaved streams (LESSONS #181) |
+| 2026-09-25 | Q4_K tables by a fused multiply-subtract (exact) | 454 / 497 cycles | 481 / 512 | 2-3% | rejected: a second broadcast and a copy |
+| 2026-09-25 | decode rows claimed 64 at a time by an atomic counter (ggml's way) | contiguous chunks | 0.93-0.97x | 9-24% | rejected: short chunks, more stream starts |

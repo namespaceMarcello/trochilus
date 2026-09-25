@@ -71,7 +71,7 @@ sha256sum $B > $OUT/binaries.sha256 2> /dev/null || true
 # busy with other work, or the marker lost, stops the measurement at the next run
 # (tools/measure_guard.lib, tools/machine_still.sh, docs/LESSONS.md #73, #84)
 measure_machine prefill_overlap
-still() { sh -c "$AB_GUARD" || { echo "prefill_overlap: the machine is not still $1 (the marker lost, or a busy CPU), stopping"; exit 3; }; }
+still() { cleanup_run sh -c "$AB_GUARD" || { echo "prefill_overlap: the machine is not still $1 (the marker lost, or a busy CPU), stopping"; exit 3; }; }
 
 # the model takes 7 GiB and the memory guard wants 3 more free (docs/LESSONS.md #72)
 TRY=0

@@ -1135,3 +1135,39 @@ Check: `make check`; in the container `sh tools/bench_ggml.sh`, `sh tools/bench_
 Check: `make check`; `sh tools/bench_native.sh bench_peak --q64 --one-core --runs 11`; in the
 container `python3 tools/mutate_auto.py src/format/gguf.c test_gguf test_model_load test_tokenizer
 --asan --jobs 6`.
+
+### 2026-09-25 — The decode's matmul against ggml's (ORIGINS row 2 closed)
+- Read how colibri, ds4, llama.cpp and ik_llama.cpp run the one-token matmul (ORIGINS row 2).
+- `tools/bench_ggml_decode.{c,sh}`: ggml's MUL_MAT / MUL_MAT_ID against `tr_matmul` /
+  `tr_matmul_grouped` in one binary, the same weight bytes (~1 GiB of copies, every pass from RAM)
+  and cores, alternating, beside a plain read of the same bytes; the first node of both checked
+  against each other. Measured on a still machine (MEASUREMENTS §The decode's matmul against
+  ggml's): Q8_0 level from 4 threads, Q4_K theirs 1.34-1.40x at 4. Three exact Q4_K kernels tried
+  and closed as no; the engine's kernels unchanged.
+- `tests/test_kernels.c`: the decode's one-token matmul (Q8_0, Q4_K, Q6_K, 2048 columns, dense and
+  eight one-token groups) is one `dot_row` per product at 1, 3 and 7 threads, counted; seen red with
+  `matmul_rows` stopping a row short.
+- The wait for a still machine runs through `cleanup_run` at all nine call sites, so a stopped
+  measurement stops at once and frees the marker; `tools/test_cleanup.sh` fails on a bare one
+  (LESSONS #177).
+Check: `make check`; `sh tools/bench_ggml_decode.sh` (container, ~3 min, guarded).
+
+### 2026-09-25 — The Q4_K decode level with llama.cpp at 4 threads, exact (question 66)
+- `tests/bench_q4k_genome.c` + `tools/bench_q4k_genome.sh`: the decode's Q4_K dot sequenced in L1
+  (the cost of each instruction on this core, the kernel with one piece removed at a time, the
+  candidates bit for bit against scalar), `--ram` / `--ram-smt` / `--dyn` from RAM, `--smt` in L1;
+  built by the gate (RESEARCH_BIN). `tools/q4k_tables.py`: distinct (scale, min) pairs per tensor.
+- `avx512_dot_row_q4_k`: the block's scales and mins in a vector (`avx512_q4_k_scales_store`, the
+  same floats), one block ahead, and a prefetch 4608 bytes ahead: 1.25x in L1.
+- `dot_row2` (kernels.h): two weight rows against one token; `avx512_dot_row2_q4_k` (the scales of
+  8 blocks of both rows first); `tr_matmul`'s decode takes rows in pairs (`matmul_rows` and the
+  one-token remainder of `matmul_tiled`). The real model's decode at 4 threads 40.3 -> 50.4 tok/s,
+  llama.cpp 50.2; the matmul alone ggml 1.37x -> 1.04x at 4 threads.
+- Tests: test_kernels compares every tier's `dot_row2` with scalar's `dot_row` (a wrong one seen),
+  the decode matmul counts pairs and requires them; test_tier_used requires AVX-512's Q4_K pair and
+  counts every product; eleven new mutations in `tools/mutate_row2.sh`.
+- `make check` on Windows waits until Windows has 12 GB free before the container's lanes
+  (`tools/host_memory.sh`, LESSONS #183). `RACE_THREADS` picks `tools/race_q4k.sh`'s threads.
+Check: `make check`; `sh tools/bench_q4k_genome.sh` (L1), `sh tools/bench_q4k_genome.sh 9 --ram 4
+--only pf4row` (RAM); `sh tools/bench_ggml_decode.sh 5 q4_k`; `RACE_THREADS=4 sh tools/race_q4k.sh`;
+in the container `sh tools/mutate_row2.sh`.

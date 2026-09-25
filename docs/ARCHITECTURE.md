@@ -174,7 +174,8 @@ remain.
   measurements.
 - **Passes**: one eval call runs in passes of at most `n_batch` tokens (512, `-b`); decode
   is one pass of one token, same code. In one pass every number is the same kernel call as
-  with one token only (one matmul element = one `dot_row`; norms, RoPE, router, and expert
+  with one token only (one matmul element = one `dot_row`, or its half of a `dot_row2` that
+  takes two weight rows against the decode's token, the same bits; norms, RoPE, router, and expert
   sum per token; one token's attention on positions up to it), so logits and cache are
   bit-identical for every `n_batch`. Experts work on (token, expert) pairs ordered by expert;
   matrices are visited in token blocks, and one weight row goes against 4 tokens at a time

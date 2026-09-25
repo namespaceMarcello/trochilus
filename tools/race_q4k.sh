@@ -5,6 +5,7 @@
 # of RUNS runs after one warm-up, the decode width forced to the thread count).
 #
 #   sh tools/race_q4k.sh [runs] [m]    from the repo root, in Git Bash; about 20 minutes
+#   RACE_THREADS=4 sh tools/race_q4k.sh   other thread counts (default 16,8)
 #
 # Order Q4_K, Q8_0, Q8_0, Q4_K: two series per file, their gap the A/A. With `m`: Q4_K_M against
 # Q4_K in the same order, llama.cpp on the Q4_K_M. The Q4_K and Q4_K_M files come from
@@ -33,12 +34,12 @@ cat $OUT/load.txt
 
 # $1: engine, $2: model, $3: name of the series
 series() {
-  sh -c "$AB_GUARD" || { echo "race_q4k: the machine is not still, or the marker is not ours: stopping"; exit 3; }
+  cleanup_run sh -c "$AB_GUARD" || { echo "race_q4k: the machine is not still, or the marker is not ours: stopping"; exit 3; }
   echo "race_q4k: $3 ($1, $2, $(date +%H:%M))"
   cleanup_run env MSYS_NO_PATHCONV=1 docker run --rm --privileged -v "$(pwd):/src" \
     -v trochilus-models:/src/models -w /src trochilus-dev:local \
     /opt/venv/bin/python tools/speed_compare.py --model $2 --trochilus build/linux-gcc/trochilus \
-    --llama-bench $LB --engines $1 --threads 16,8 --prompt 512 --gen 128 --runs $R \
+    --llama-bench $LB --engines $1 --threads ${RACE_THREADS:-16,8} --prompt 512 --gen 128 --runs $R \
     --out $OUT/$3.json > $OUT/$3.txt 2>&1 || { echo "race_q4k: $3 failed"; tail -5 $OUT/$3.txt; exit 1; }
 }
 series trochilus $A $NA-a
