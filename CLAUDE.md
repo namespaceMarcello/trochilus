@@ -15,6 +15,16 @@ the numbers; push every lever to the limit the hardware allows (the peak FLOP/s,
 exact bytes), not to "good enough". A premise that gives zero is a discovery too: written, closed,
 next. Pioneer: what nobody has measured is where to look first.
 
+**The quantum spirit: what is entangled need not travel** (Marcello, 2026-09-26). Measure one of
+two entangled particles and you know the other: no signal between them. The engine's time is
+messages: bytes from RAM to the cores, results between threads, rows from the CPU to the GPU. A
+message the receiver could deduce exactly from what it already holds is waste: exactness forbids
+guessing a bit, never knowing it from elsewhere. Before moving a byte, ask what it is entangled
+with: the same value at another position, a coarse model inside the exact one's bits, the next
+token inside the present state, a thread's work inside its own index. Hold several futures in one
+pass (drafts), collapsed by the exact computation to the scalar definition's bits. The win is
+counted in bytes read per exact token: the unit where llama.cpp must be passed.
+
 **The method for any speed work, in this order** (Marcello, 2026-09-25, "decisive, we use it": it
 took the Q4_K decode level with llama.cpp, MEASUREMENTS §The Q4_K decode dot sequenced):
 1. **measure before changing, one piece removed at a time**: the deletion series and each
@@ -43,17 +53,14 @@ The prediction is written before the run; the report to Marcello follows the sam
 - **Agents speak English to each other**, in briefs and in reports. With Marcello, Italian.
 - A brief is **short and complete**: goal, constraints, files to touch, shape of the answer, when
   it is done. An agent's report: what it did, files touched, what is still open.
-- Report to Marcello: **schematic, short, foolproof** (Marcello, 2026-09-24: "the way you explain
-  things, I don't follow them"). First line: the "so what?" in plain words (did we gain? how much,
-  where). Then one line per item, no jargon (or a gloss in two words), at most 2–3 numbers, ≤ ~10
-  lines. Two points: what was done, how to try it. The why and the detail go in `docs/STATUS.md`.
+- Report to Marcello: **schematic, short, foolproof** (2026-09-24). First line: the "so what?" in
+  plain words (gained? how much, where); one line per item, no jargon, 2–3 numbers, ≤ ~10 lines:
+  what was done, how to try it. The why and the detail go in `docs/STATUS.md`.
 - Logic and kernels: choose, build, deliver. Questions are asked up front, not halfway through.
-- **One piece at a time, to the end, against the three references** (Marcello, 2026-09-24, asked
-  more than once): before building on a piece of the engine, read how colibri, ds4 and llama.cpp
-  (with ik_llama.cpp) do it in `ref/`, measure theirs against ours where it runs, write it in the
-  piece's row of `docs/ORIGINS.md` §Every piece against the references; then build something
-  better, measure, compare again. A piece closes only with its row read and measured; the next
-  piece starts after, never beside it.
+- **One piece at a time, to the end, against the three references** (2026-09-24): read how colibri,
+  ds4 and llama.cpp (with ik_llama.cpp) do it in `ref/`, measure theirs against ours, write it in
+  the piece's row of `docs/ORIGINS.md` §Every piece; then build better, measure, compare again. The
+  next piece starts after, never beside it.
 - **Marcello asks for the commit.** Prepare everything (tests green, documents written) and stop.
 - **Public repository** `namespaceMarcello/trochilus` (since 2026-09-22): everything committed is
   visible to anyone. Pushes and visibility are Marcello's call.
@@ -63,28 +70,23 @@ The prediction is written before the run; the report to Marcello follows the sam
 Goal: the success rate rises with every request. It is measured in `docs/LESSONS.md` (the "found
 by" column): no mistake should reach Marcello if a test could have caught it first.
 
-1. **Before**: `docs/STATUS.md`, then `grep` in `docs/LESSONS.md` for the area being touched, then
-   the piece's row in `docs/ORIGINS.md` §Every piece: if it is not "read and measured", reading and
-   racing the references (`ref/`, `tools/bench_ggml.sh` for ggml's kernels alone) is the first step.
+1. **Before**: `docs/STATUS.md`, `grep` in `docs/LESSONS.md` for the area, the piece's row in
+   `docs/ORIGINS.md`: if not "read and measured", reading and racing the references comes first.
 2. **A mistake or a discovery**, as soon as it happens, however small: one line in
    `docs/LESSONS.md`.
-3. **Every mistake becomes a check**: a test that reproduces it (red before the fix, green after),
-   or a check in `make check`, a pin, a hook. A sentence in a document is weak prevention: write a
-   *rule*, or the lesson stays open.
-   **A test is seen red at least once, and it says which branch it exercises**: red before the fix,
-   or under a mutation (`tools/mutate_*.sh`) when the code is born together with the test; the head
-   of the file states which branch it covers, and a counter (`TR_CHECK(n > 0)`) fails it if that
-   branch was never taken. Equal results do not tell you which code ran (LESSONS #43, #50, #54,
-   #78).
-4. **Every new scenario enters the tests**: a model, a family, a tensor shape, a platform, a use
-   (long prompt, full context, malformed file) becomes a case in the right suite: C tests in
+3. **Every mistake becomes a check**: a test that reproduces it (red before the fix), a check in
+   `make check`, a pin, a hook; a sentence alone is a *rule*, and the lesson stays open.
+   **A test is seen red at least once and says which branch it exercises**: red before the fix or
+   under a mutation (`tools/mutate_*.sh`); its head names the branch, and a counter
+   (`TR_CHECK(n > 0)`) fails it if the branch never ran (LESSONS #43, #50, #54, #78).
+4. **Every new scenario enters the tests** (a model, a shape, a platform, a use): C tests in
    `tests/`, an oracle in `make oracle`, a performance scenario in `bench/scenarios.json`.
 5. **Before saying "done"**: `make check` green (0-warning build, tests, oracles, sanitizers where
    available). An agent does not close a step: the orchestrator's verification does.
 6. **After an agent**: read the report against the code, `make check`, `docker ps` and background
    processes (LESSONS #5).
-7. **Upstream**: when porting or reading code from colibri and ds4, every bug found goes in
-   `docs/UPSTREAM.md` with its proof; a PR or an issue only after Marcello says yes.
+7. **Upstream**: a bug found in colibri or ds4 goes in `docs/UPSTREAM.md` with its proof; a PR or
+   an issue only after Marcello says yes.
 8. **Documents**, per the table below.
 
 ### Before every commit: document
