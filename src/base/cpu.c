@@ -474,11 +474,15 @@ static void apply_cpu_max(tr_cpu_info *c) {
     } else if (strcmp(v, "avx2") == 0) {
         c->avx512f = c->avx512bw = c->avx512vl = c->avx512dq = 0;
         c->avx512vnni = c->avx512bf16 = c->avx512vbmi = 0;
+    } else if (strcmp(v, "avx512-novbmi") == 0) {
+        /* the avx512 tier without byte permutes, as on CPUs before Ice Lake: its Q4_K panel is the float
+         * transpose, which a VBMI machine never runs otherwise (docs/LESSONS.md #213) */
+        c->avx512vbmi = 0;
     } else if (strcmp(v, "neon") == 0) {
         c->dotprod = c->i8mm = c->sve = 0;
     } else if (strcmp(v, "avx512") != 0) { /* avx512 is the top x86 tier: nothing above it to clear */
         /* a typo must not pass for a cap: the run would measure or test the best tier instead */
-        tr_log(TR_LOG_WARN, "TR_CPU_MAX='%s' is not a tier (scalar, avx2, avx512, neon): ignored", v);
+        tr_log(TR_LOG_WARN, "TR_CPU_MAX='%s' is not a tier (scalar, avx2, avx512-novbmi, avx512, neon): ignored", v);
     }
 }
 

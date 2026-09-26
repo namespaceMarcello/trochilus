@@ -4241,8 +4241,88 @@ multiplies with the input broadcast from memory, T adds).
   38% tails at 4 threads: the E24 hack's 70%).
 
 Open: the panel toward the thinker's P ≈ 3 token-equivalents (the phase vectors' decode is what remains),
-the interleave shared by gate/up and by q/k/v, the race in the container (Q4_K at 4 threads, Q8_0 at 16),
-the float-transpose Q4_K panel (CPUs without VBMI) not exercised on this machine.
+the interleave shared by gate/up and by q/k/v, the race in the container (Q4_K at 4 threads, Q8_0 at 16).
+The float-transpose Q4_K panel now runs here under `TR_CPU_MAX=avx512-novbmi` (LESSONS #213).
+
+## Exact sums at the float's speed: Marcello's challenge (2026-09-26)
+
+The question: a prompt matmul that loses no bit in its sums (activations as ≥ 31.5-bit block fixed point,
+exact integer sums, one rounding: E32's class or better, correctly rounded 96-99% on the real inputs) and
+runs at least as fast as phase-major's float. Every idea with its prediction first
+(`build/e24/predictions.txt`), prototypes in `build/e24/wino/` (wino.c, e32w.c, gpu_tc.c, results.txt).
+
+**The budget.** This core issues 2 zmm ops a cycle, at most 1 of them multiply-class (§Phase-major's
+genome). The float kernel spends both: a `vmulps` and a `vaddps` per 16 MACs, 16 MAC a cycle. An exact
+32-bit activation times a 4-bit weight is 128 bit-products; `vpdpbusd` gives 64 byte products (8 × 8) a
+cycle and the weight fills half of each: 4 digit passes per 64 MACs, 16 MAC a cycle again. Exactness at
+the float's price, no better, unless the byte's free half does work.
+
+**Spirit quantum: the activation rides in the weight's free nibble (Winograd 1968, FFIP 2023).**
+Σ_j (q_2j + D_2j+1 + 120)(q_2j+1 + D_2j − 8) = Σ_k q_k D_k + a row term (at load) + a token term (once a
+call): with digits D in [−120, 120] (base 241) both factors fit a byte (u8 and s8), so one `vpdpbusd`
+carries 128 digit-MACs for 2 byte adds on the free ALU slot. Predicted and measured to the cycle (wino.c,
+one core, cycles per block of 8 dp): 8 plain 8.00 (64 digit-MACs a cycle), 2 Winograd + 6 plain 8.00
+(80), **4 + 4 8.00 (96: 1.5×)**, 5 + 3 9.00, 6 + 2 10.00, 8 Winograd 12.00 (85). E32 at 4 + 4 is 24 exact
+MACs a cycle in the pure loop, 1.5× the float's 16.
+- Spirit pioneer, the scalar core beside the vector: `mulx` of a 32-bit activation by two weights 40 bits
+  apart gives 2 exact MACs; alone 1.8 cycles each, 4 of them free per 8 dp, 8 cost 14 cycles: +1 exact MAC
+  a cycle (+4-6%), not pursued.
+
+**The tile (e32w.c): one definition, two kernels, 0 of 64 outputs differ from its scalar definition.**
+16 rows × 4 tokens, K = 2048, Q4_K rows repacked 16 at a time (e24.c's bytes); T and M exact in int64,
+the f64 steps of E24's definition. Plain E32 (4 digits base 256): **127.0** GFLOP/s-eq (L1), 125.3 (L2).
+Winograd (W0, W1 base 241 + P2, P3 base 256): **136.6** / 135.1. The float tile: 164.7. The deletion
+series of the Winograd kernel, one piece out at a time: the formation 6%, the per-sub-block init 0.7%,
+pairing the digits and the sub-block scale 12%, the nibble unpack 3%, **the super-block's end 23%** (the
+mins per digit by `vpdpwssd`, T and M combined by `vpmullq` with extracts). That end rewritten in f64
+only (every value an integer under 2^53: T = lo + 58081·hi by one exact fma, M = Σ m_j B_j by 8 exact
+fmas from the token's exact sub-block sums): **149.0**, still bit-identical; the scale and pairing are then
+the largest piece (13%). The ports' model of that kernel: ~28.75 multiply-slot and ~30 ALU ops per token
+and sub-block, 17.4 exact MAC a cycle = 182 GFLOP/s-eq (1.09× the float's peak); measured 82% of it.
+Q4_K's per-32 scales and mins, which the float folds into its panel once for every token, cost the
+integer kernel per token: about a third of its ops. 2 + 2 digits is the optimum (3 + 1 and 4 + 0 are
+ALU-bound).
+- **W16, the scale inside the weight (the thinker's lens, built and measured):** the 16-bit word
+  w = sc_j·q_k (10 bits) carries its sub-block's scale into a panel, the digits are 16 bits (base 64591,
+  2 of them ≈ 31.96 bits), one `vpdpwssd` takes two Winograd pairs a lane ((w_k + V_k' − 473)(w_k' + V_k
+  − 473) fits s16 × s16). The int32 lanes wrap; a 64-column window's true sum stays under 2^31, so once
+  its row and token terms are subtracted the lane is exact; windows go to f64 by even and odd lanes
+  (shifts and `vcvtqq2pd`, no shuffle). Port genome: 8 `vpdpwssd` 7.99 cycles (32 word-MACs a cycle),
+  8 Winograd 12.00 (42.7), 4 + 4 9.33. The tile, bit-identical (0 of 1024): **158.7** GFLOP/s-eq (L1),
+  150.5 (16 groups, L2: the panel is 64 KB a group); same run, plain 126.2, Winograd in bytes 151.2.
+  0.96× the float tile; the model gives 182 (87% reached), the formation is 64 of its ~118 ops a window.
+  Its deletion series (L1): full 156.0, without each window's flush into f64 177.7 (+14%), without the
+  mins and the super-block's end 173.1 (+11%), without the window's init 159.7, without all three
+  **198.6**: the W16 loop itself runs at 1.21× the float tile. The window (64 columns, so the true sum
+  stays under 2^31) and the mins (per row and per token, as the float pays them only in its panel) are
+  what is left between exact and faster.
+- **The thinker's round on W16, each idea with its prediction (all bit-identical, 0 of 1024):** (1) each
+  window into int64 by a biased even/odd split: the 16 lanes read as 8 qwords, the odd lane is the qword's
+  high half (`vpsraq`), the even lane the whole qword with +2^31 riding in the window's init, the bias
+  and the odd part taken out once a super-block: 14 ops a window and token → 6. Predicted 165-170:
+  **167.2** (L2; 16 groups 156.9). (3) the mins' 8-deep fma chains split in two (exact: integers under
+  2^53): predicted +3-5%, measured +0.5%, not latency. (2) the 4W+4P anomaly isolated in wino.c: 4W+4P
+  9.05 cycles, plain ops in register form 8.00, one broadcast a Winograd op 8.00, `vpaddd` for `vpaddw`
+  9.28, 3W+5P 7.99: the broadcast loads (12 per 8 dp) are not free above about one a cycle; a broadcast
+  shared by two row groups (32-row tiles) would take the loop from 42.7 to 48 word-MACs a cycle, not built.
+- **So on the tile, the challenge is met:** the exact W16 tile at T = 4 runs **167.2 GFLOP/s-eq against
+  the float's 164.7 at T = 24** (both panels in L2), and against the float's ~138 at T = 4, 1.21×. Its
+  panel (the 16-bit words sc·q and each window's row terms) is half the float panel's bytes and needs no
+  conversion; not yet timed, nor the activations' digits, nor the engine.
+
+**Four dimensions, which unit: the GPU's int8 tensor cores (gpu_tc.c, PTX through the driver).** RTX 4070
+Laptop, 36 SMs, registers only: `mma.sync` m16n8k32 s8 × s8 → s32 (exact) **59.10 T-MAC/s**; the float
+contract `mul.rn` + `add.rn` **3.29**; `fma.rn` 6.46; `dp4a` 14.66. E32's 4 digit passes on the tensor
+cores: 14.8 T-MAC-eq/s, **4.5× the float contract on the same GPU** (2.3× even an fma the contract
+forbids), ~12× this CPU's whole float peak. The first run gave mul + add 6.39: the 16 chains shared one
+product and the driver's compiler computed it once; each chain now has its own weight.
+
+**Verdict so far.** On this CPU's vector unit the exact E32 tile by W16 is at least as fast as the float
+(167.2 against 164.7; bytes-Winograd 149.0, plain digits 127.0), with the float's own ceiling 167 and
+W16's loop alone at 198.6; Q8_0 has no exact kernel faster than the float (the thinker's model: its per-32
+F16 scale cannot ride in a 16-bit word, ~0.9×). Where int8 matrix units exist (the GPU's tensor cores
+here; AMX, SME, NPUs elsewhere) the exact integer definition is also the fast one, and the float contract
+cannot use them. Order-free sums also make any split, width or device give the same bits.
 
 ## Attempts
 
@@ -4298,3 +4378,6 @@ the float-transpose Q4_K panel (CPUs without VBMI) not exercised on this machine
 | 2026-09-26 | gate, up and the activation in one call on the two matrices (two streams a thread; same bits) | three calls | head-normalised level; raw 10-20% slower | the whole run 10-15% | removed (LESSONS #195); rows interleaved at load 1.006-1.023x on the free machine: question 72 closed as no |
 | 2026-09-26 | 2 MB pages for the weights and the KV in the container (madvise) | 42.6-46.5 GB/s | 42.3-46.6 | 7-30% | no: on the free machine too (plain read level, the matmul 0.93-1.01x); code removed |
 | 2026-09-26 | the softmax's and SwiGLU's exp in a vector (the table's `expf_f32`, AVX-512 and AVX2 without FMA; same bits, 0 of 2^32 differ) | the prompt's attention zone 0.42-0.45 / 1.80-1.91 s at 2048 / 4000 (native, 16 threads) | 0.32-0.34 / 1.28-1.44 | 8 pairs, background 2.3-2.4 (free) | **kept**: the zone 0.732-0.747, the prefill 0.951 at 2048 and 0.953 at 4000 (1.05x) |
+| 2026-09-26 | exact E32 Q4_K tile by Winograd's inner product (the digit in the weight's free nibble; bit-identical to its definition) | plain E32 127.0 GFLOP/s-eq, the float tile 164.7 (one core) | 149.0 after the f64 super-block end (136.6 before); W16 (scale inside a 16-bit weight) 158.7, with its windows into int64 167.2 | one core, background ~2.0-2.4 | W16 at T = 4 167.2 against the float tile's 164.7 at T = 24: exact and at least as fast on the tile; not yet in the engine (question 77, §Exact sums at the float's speed) |
+| 2026-09-26 | the float contract's arithmetic against int8 tensor cores on the laptop's RTX 4070 (premise) | mul.rn + add.rn 3.29 T-MAC/s | mma.sync s8 59.10 T-MAC/s (exact); E32 = 14.8 eq, 4.5x | one run each, 7 launches, best | premise measured: question 74 (does the GPU count?) for Marcello |
+| 2026-09-26 | the next item's 16 rows prefetched into L2 before the current item's tiles (the panel from cold weights 3.7-4.0 us against 1.83 hot, measured alone; same bits) | experts zone, Q4_K, 512 tokens, 4 threads | 0.990 [0.970-1.022], prefill 0.995 | 6 alternated pairs, load rising to 3.5 mid-run | reverted: inside the noise (predicted +4-6%); to retry spread over the tile's phases, at a free machine |

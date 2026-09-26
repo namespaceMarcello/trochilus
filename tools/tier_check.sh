@@ -34,6 +34,14 @@ for tier in scalar avx2; do
             { echo "tier-check: $t fails under TR_CPU_MAX=$tier"; tail -5 "$OUT/$t-$tier.log"; exit 1; }
     done
 done
+# the avx512 tier without byte permutes (docs/LESSONS.md #213): a VBMI machine runs the float-transpose
+# Q4_K panel only under this cap; the kernel tests must pass on it and say that panel ran
+if "$B/tests/test_kernels" | grep -q "Q4_K panel from byte permutes"; then
+    kernels=$(TR_CPU_MAX=avx512-novbmi "$B/tests/test_kernels") ||
+        { echo "tier-check: test_kernels fails under TR_CPU_MAX=avx512-novbmi"; exit 1; }
+    echo "$kernels" | grep -q "Q4_K panel from the float transpose" ||
+        { echo "tier-check: TR_CPU_MAX=avx512-novbmi did not take VBMI away"; exit 1; }
+fi
 
 # 40 tokens below the fixture's vocabulary (128) and context (128)
 TOKENS=$(i=0; s=""; while [ $i -lt 40 ]; do s="$s$(( (i * 37 + 11) % 128 )),"; i=$((i + 1)); done; echo "${s%,}")

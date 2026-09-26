@@ -310,14 +310,25 @@ interleaved, 2 MB pages, drafts in the high bits, question 75's 8-bit draft KV o
   container), 8 threads 241 → 353, 16 threads 369 → 575; **Q8_0** 8 threads 267-287 → 374-377, 16
   threads 390-419 → 550-569; the decode unchanged; the real model's logits byte-identical at 1, 4, 8
   and 16 threads. E24 (exact integers, 3 digits of 8 bits) was built and measured first: as fast, not
-  more exact than F32 on the real inputs (per 32: 41% of outputs worse), set aside; E32 (4 digits,
-  correctly rounded 96-99%) stays a question for Marcello;
-- **next, one piece at a time**: the race in the container (Q4_K at 4 threads, Q8_0 at 8 and 16:
-  `tools/race_q4k.sh`, `tools/race_llama.sh`); the experts' panel (1.83 µs against a median of 28
-  tokens an expert: 124-127 GFLOP/s a core against the dense 141-143); the interleave shared by
-  gate/up and by q/k/v; Q6_K's panel; the non-VBMI panel under the tier check (#213); the
-  container's pin at 16 threads (`tools/prompt_scale.sh`); question 74 (**does the GPU count?**) and
-  76; the Q4_K race at long context.
+  more exact than F32 on the real inputs (per 32: 41% of outputs worse), set aside;
+- **2026-09-26 night: the orchestration under test, exact sums at the float's speed** (LESSONS
+  #213-#216; MEASUREMENTS §Exact sums at the float's speed). `test_matmul_grouped_s` found a heap
+  overrun (a no-pool call inside a larger pool's body) and a guard hole, both fixed; `tools/mutate_pm.sh`
+  17 of 17 red; `TR_CPU_MAX=avx512-novbmi` runs the float-transpose panel. The challenge, with the
+  thinker in rounds: **W16** (Winograd's inner product in 16-bit words, the sub-block scale inside the
+  weight word sc·q, int32 lanes that wrap and are exact over a 64-column window, windows into int64 by a
+  biased even/odd split) is bit-identical to an order-free integer definition (E32-class) and runs
+  **167.2 GFLOP/s-eq at 4 tokens a tile against the float tile's 164.7 at 24** (the float at 4: ~138).
+  The RTX 4070's int8 tensor cores: 59.1 exact T-MAC/s against the float contract's 3.29 (E32 4.5x
+  there). The experts' cold panel costs 2.0-2.2x a hot one alone, but prefetching the next item's rows
+  gave 0.990 (noise): reverted. **Question 77 for Marcello: E32 as the definition (every byte changes,
+  toward the exact math), with question 74.** `make quick` green; `make check` waits for 12 GB free;
+- **next, one piece at a time**: `make check` when Windows has 12 GB free; if Marcello says yes to 77,
+  W16 into the engine for Q4_K (its panel and the activations' digits timed first, then the experts
+  zone A/B; the 32-row tile for the broadcast loads, +12% on the loop); the race in the container (Q4_K
+  at 4 threads, Q8_0 at 8 and 16: `tools/race_q4k.sh`, `tools/race_llama.sh`); the interleave shared
+  by gate/up and by q/k/v; Q6_K's panel; questions 74 (**does the GPU count?**) and 76; the Q4_K race
+  at long context.
   Queued: tile-block stealing in the prompt's matmul, prefill at 4 threads, vector scales on AVX2,
   question 68, M3's dense weights on the GPU. **For Marcello, 59 and 60**. 61 after M4.
 

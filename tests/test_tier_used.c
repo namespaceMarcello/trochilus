@@ -324,7 +324,7 @@ static void test_engine(const char *argv0, tr_type type, const char *name, long 
             if (got != want) printf("  %s model, weight type %d: %lld products through the active table, %lld wanted\n",
                                     name, i, got, want);
         }
-        /* a pass of 11 tokens must take the widest road the tier has: phase-major (a panel of the type,
+        /* a pass of N_PROMPT tokens must take the widest road the tier has: phase-major (a panel of the type,
          * tiles of the prompt's rows), else two rows at once, else x4; and so must attention; every
          * matrix of these models has an even number of rows */
         const int pm = g_real->pm_tile != NULL && g_real->pm_panel[type] != NULL;

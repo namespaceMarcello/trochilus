@@ -9,6 +9,7 @@
 #include "../src/kernels/kernels.h"
 #include "../src/kernels/kernels_internal.h"
 #include "../src/base/threads.h"
+#include "../src/base/cpu.h"
 
 #include <math.h>
 #include <stdatomic.h>
@@ -1391,12 +1392,29 @@ static void test_matmul_decode(void) {
     }
 }
 
+/* an activation for the phase-major test: ordinary, with a zero now and then, or (special) the values
+ * careless code breaks on, kept rare: an inf or NaN in a lane hides every rounding difference */
+static float pm_input(unsigned *seed, int special) {
+    if (!special) return (next_rand(seed) % 13u == 0) ? 0.0f : rand_float(seed);
+    switch (next_rand(seed) % 512u) {
+    case 0: return INFINITY;
+    case 1: return -INFINITY;
+    case 2: case 3: return 3.0e38f;              /* the product overflows */
+    case 4: return -3.0e38f;
+    default: return rand_special(seed, 1);       /* +-0, subnormals, underflowing products */
+    }
+}
+
 /* ---- the prompt's matmul in phase-major order (kernels.h pm_*) ---------------------------------------
  * Branch: every tier with pm_panel[type], pm_interleave and pm_tile: 16 rows' panel, T input rows
  * interleaved, every tile width T = 4..TR_PM_TILE_MAX, against the scalar tier's dot_row bit for bit;
- * rows of ordinary and of special blocks (the halves' whole bit range), inputs from rand_float and with
- * zeros, n of one block, of two and OLMoE's 2048. A tier without the entries is skipped; the counter
- * fails the test if no output was ever compared. */
+ * rows of ordinary and of special blocks (the halves' whole bit range), inputs ordinary (with zeros) and
+ * special (+-0, subnormals, +-inf, overflowing and underflowing products), n of one block, of two and
+ * OLMoE's 2048; the interleaved rows in a buffer of exactly TR_PM_XIL_FLOATS(n, T) floats (ASan sees a
+ * run past the pad). And the sign of an all-zero dot: Q8_0 rows of negative weights against +0.0 inputs
+ * and positive ones against -0.0, whose every product is -0.0: the sum starts from +0.0 (docs/LESSONS.md
+ * #214). A tier without the entries is skipped; the counter fails the test if nothing was compared. The
+ * line printed says which Q4_K panel the avx512 tier has (tools/tier_check.sh checks the cap). */
 static void test_phase_major(void) {
     static const char *tiers[2] = {"avx2", "avx512"};
     static const tr_type types[2] = {TR_TYPE_Q4_K, TR_TYPE_Q8_0};
@@ -1417,18 +1435,34 @@ static void test_phase_major(void) {
                 unsigned char *w = (unsigned char *)malloc(TR_PM_ROWS * rb);
                 float *x = (float *)malloc((size_t)TR_PM_TILE_MAX * (size_t)n * sizeof(float));
                 float *panel = (float *)malloc((size_t)TR_PM_PANEL_FLOATS(n) * sizeof(float));
-                float *xil = (float *)malloc((size_t)TR_PM_XIL_FLOATS(n, TR_PM_TILE_MAX) * sizeof(float));
                 float *part = (float *)malloc(TR_PM_PART * sizeof(float));
                 float *y = (float *)malloc((size_t)TR_PM_TILE_MAX * 40 * sizeof(float));
-                TR_CHECK(w != NULL && x != NULL && panel != NULL && xil != NULL && part != NULL && y != NULL);
-                if (w != NULL && x != NULL && panel != NULL && xil != NULL && part != NULL && y != NULL) {
+                TR_CHECK(w != NULL && x != NULL && panel != NULL && part != NULL && y != NULL);
+                if (w != NULL && x != NULL && panel != NULL && part != NULL && y != NULL) {
                     unsigned seed = 1234u + (unsigned)(ni * 7 + ti);
-                    for (int special = 0; special < 2; special++) {
-                        for (int r = 0; r < TR_PM_ROWS; r++) fill_row_of(type, w + (size_t)r * rb, n, &seed, special);
-                        for (int64_t i = 0; i < TR_PM_TILE_MAX * n; i++)
-                            x[i] = (next_rand(&seed) % 13u == 0) ? 0.0f : rand_float(&seed);
+                    /* weights ordinary or special, inputs ordinary or special; 4: signed zeros (Q8_0) */
+                    for (int mode = 0; mode < 5; mode++) {
+                        const int wspecial = mode & 1, xspecial = (mode >> 1) & 1, zeros = mode == 4;
+                        if (zeros && type != TR_TYPE_Q8_0) continue;
+                        for (int r = 0; r < TR_PM_ROWS; r++) fill_row_of(type, w + (size_t)r * rb, n, &seed, wspecial);
+                        for (int64_t i = 0; i < TR_PM_TILE_MAX * n; i++) x[i] = pm_input(&seed, xspecial);
+                        if (zeros) { /* rows 0-7 negative against +0.0 in inputs 0-11, rows 8-15 positive, -0.0 */
+                            for (int r = 0; r < TR_PM_ROWS; r++)
+                                for (int64_t b = 0; b < n / 32; b++) {
+                                    unsigned char *blk = w + (size_t)r * rb + (size_t)b * TR_Q8_0_BLOCK_BYTES;
+                                    const uint16_t d = 0x3C00u; /* 1.0 */
+                                    memcpy(blk, &d, 2);
+                                    for (int i = 0; i < 32; i++)
+                                        blk[2 + i] = (unsigned char)(int8_t)(r < 8 ? -1 - (int)(next_rand(&seed) % 127u)
+                                                                               : 1 + (int)(next_rand(&seed) % 127u));
+                                }
+                            for (int64_t i = 0; i < TR_PM_TILE_MAX * n; i++) x[i] = i < 12 * n ? 0.0f : -0.0f;
+                        }
                         K->pm_panel[type](w, rb, n, panel);
                         for (int T = 4; T <= TR_PM_TILE_MAX; T++) {
+                            float *xil = (float *)malloc((size_t)TR_PM_XIL_FLOATS(n, T) * sizeof(float));
+                            TR_CHECK(xil != NULL);
+                            if (xil == NULL) continue;
                             /* y rows 40 floats apart: the kernel writes 16, the rest stays a canary */
                             for (int i = 0; i < TR_PM_TILE_MAX * 40; i++) y[i] = -777.0f;
                             K->pm_interleave(x, n, n, T, xil);
@@ -1436,18 +1470,19 @@ static void test_phase_major(void) {
                             for (int t = 0; t < T; t++) {
                                 for (int r = 0; r < TR_PM_ROWS; r++) {
                                     float want = S->dot_row[type](w + (size_t)r * rb, x + (size_t)t * n, n);
-                                    TR_CHECK(bit_eq(y[t * 40 + r], want));
+                                    TR_CHECK(xspecial ? same_float(y[t * 40 + r], want) : bit_eq(y[t * 40 + r], want));
+                                    if (zeros && (r < 8) == (t < 12)) TR_CHECK(bit_eq(want, 0.0f));
                                     compared++;
                                 }
                                 for (int r = TR_PM_ROWS; r < 40; r++) TR_CHECK(y[t * 40 + r] == -777.0f);
                             }
+                            free(xil);
                         }
                     }
                 }
                 free(w);
                 free(x);
                 free(panel);
-                free(xil);
                 free(part);
                 free(y);
             }
@@ -1456,6 +1491,185 @@ static void test_phase_major(void) {
     /* on a CPU without AVX-512 no tier has the entries yet: nothing to compare, and nothing to fail */
     const tr_kernels *A = tr_kernels_tier("avx512");
     if (A != NULL) TR_CHECK(compared > 0);
+    if (A != NULL && A->pm_panel[TR_TYPE_Q4_K] != NULL)
+        printf("  phase-major on tier avx512: %lld outputs equal to dot_row, the Q4_K panel from %s\n", (long long)compared,
+               tr_cpu()->avx512vbmi ? "byte permutes (vbmi)" : "the float transpose");
+}
+
+/* ---- tr_matmul_grouped_s: the phase-major road's orchestration (kernels.c pm_*) --------------------
+ * Branch: the plan (chunks, tiles, groups under PM_MIN_ROWS on dot_row2), the panel a worker keeps
+ * between its items, and the guards that send a call back to tr_matmul_grouped. Against
+ * tr_matmul_grouped with no pool (every output one dot_row) byte for byte: 13 groups of 0, 1..5 input
+ * rows (both sides of PM_MIN_ROWS), 23..25 (one tile and two), 255..257 and 513 (PM_CHUNK's edges);
+ * 16 and 48 weight rows; Q4_K and Q8_0; no pool and pools of 1, 3, 7 and 16; each case twice in a row,
+ * on other weights of the same shape. With 16 rows and no pool, consecutive groups share their rows'
+ * index: a panel kept by its rows alone would serve the wrong group; one group of 5 inputs called
+ * twice: a panel kept from the call before would serve. Counted (pm_tile): the road was taken, and
+ * never where it must not be: a pool larger than the scratch, a worker index past the scratch's (no
+ * pool, inside a larger pool's body), a Q4_K row that is not whole blocks (docs/LESSONS.md #214). */
+static atomic_long g_pms_tiles;
+static const tr_kernels *g_pms_real;
+static void pms_tile(const float *panel, const float *xil, int64_t n, int T, float *part, float *y, int64_t y_stride) {
+    atomic_fetch_add(&g_pms_tiles, 1);
+    g_pms_real->pm_tile(panel, xil, n, T, part, y, y_stride);
+}
+
+typedef struct {
+    const tr_mat *w;
+    const int64_t *offsets;
+    int64_t n_groups;
+    const float *x;
+    float *y;
+    const tr_pm_scratch *s;
+    atomic_int called;
+} pms_nested;
+
+/* one chunk run by a worker the scratch has no room for calls the matmul with no pool */
+static void pms_nested_body(void *ctx_, int64_t begin, int64_t end, int worker) {
+    (void)begin;
+    (void)end;
+    pms_nested *c = (pms_nested *)ctx_;
+    int expected = 0;
+    if (worker < c->s->n_workers || !atomic_compare_exchange_strong(&c->called, &expected, 1)) return;
+    tr_matmul_grouped_s(NULL, c->w, c->offsets, c->n_groups, c->x, c->y, c->s);
+}
+
+static void test_matmul_grouped_s(void) {
+    enum { G = 13, COLS = 256 };
+    static const int64_t sizes[G] = {0, 1, 2, 3, 4, 5, 23, 24, 25, 255, 256, 257, 513};
+    static const tr_type types[2] = {TR_TYPE_Q4_K, TR_TYPE_Q8_0};
+    static const int64_t rows_of[2] = {16, 48};
+    static const int threads[4] = {1, 3, 7, 16};
+    const tr_kernels *K = tr_kernels_get();
+    if (K->pm_tile == NULL || K->pm_interleave == NULL) {
+        printf("  matmul_grouped_s: tier %s has no phase-major entries, nothing to compare\n", K->tier);
+        return;
+    }
+    int64_t offsets[G + 1];
+    offsets[0] = 0;
+    for (int g = 0; g < G; g++) offsets[g + 1] = offsets[g] + sizes[g];
+    const int64_t N = offsets[G];
+    static tr_kernels counting;
+    g_pms_real = K;
+    counting = *K;
+    counting.pm_tile = pms_tile;
+    tr_kernels_set_active(&counting);
+    long taken = 0, refused = 0;
+    for (int ti = 0; ti < 2; ti++) {
+        const tr_type type = types[ti];
+        if (K->pm_panel[type] == NULL) continue;
+        const size_t rb = tr_row_bytes(type, COLS);
+        for (int ri = 0; ri < 2; ri++) {
+            const int64_t R = rows_of[ri];
+            const size_t wbytes = (size_t)G * (size_t)R * rb, ybytes = (size_t)N * (size_t)R * sizeof(float);
+            unsigned char *wd[2] = {(unsigned char *)malloc(wbytes), (unsigned char *)malloc(wbytes)};
+            float *x = (float *)malloc((size_t)N * COLS * sizeof(float));
+            float *ref[2] = {(float *)malloc(ybytes), (float *)malloc(ybytes)};
+            float *y = (float *)malloc(ybytes);
+            tr_pm_scratch s, s4;
+            int ok = wd[0] != NULL && wd[1] != NULL && x != NULL && ref[0] != NULL && ref[1] != NULL && y != NULL;
+            ok = ok && tr_pm_scratch_init(&s, 16, G, N, COLS, N * COLS) == 0;
+            ok = ok && tr_pm_scratch_init(&s4, 4, G, N, COLS, N * COLS) == 0;
+            TR_CHECK(ok);
+            if (ok) {
+                unsigned seed = 91u + (unsigned)(ti * 2 + ri);
+                for (int v = 0; v < 2; v++)
+                    for (int64_t r = 0; r < G * R; r++) fill_row_of(type, wd[v] + (size_t)r * rb, COLS, &seed, 0);
+                for (int64_t i = 0; i < N * COLS; i++) x[i] = (next_rand(&seed) % 13u == 0) ? 0.0f : rand_float(&seed);
+                tr_mat w[2][G];
+                for (int v = 0; v < 2; v++) {
+                    for (int g = 0; g < G; g++) {
+                        w[v][g].type = type;
+                        w[v][g].rows = R;
+                        w[v][g].cols = COLS;
+                        w[v][g].data = wd[v] + (size_t)g * (size_t)R * rb;
+                    }
+                    tr_matmul_grouped(NULL, w[v], offsets, G, x, ref[v]);
+                }
+                for (int pi = -1; pi < 4; pi++) {
+                    tr_pool *pool = pi < 0 ? NULL : tr_pool_create(threads[pi]);
+                    TR_CHECK(pi < 0 || pool != NULL);
+                    if (pi >= 0 && pool == NULL) continue;
+                    for (int v = 0; v < 2; v++) {
+                        memset(y, 0x7F, ybytes);
+                        atomic_store(&g_pms_tiles, 0);
+                        tr_matmul_grouped_s(pool, w[v], offsets, G, x, y, &s);
+                        TR_CHECK(memcmp(y, ref[v], ybytes) == 0);
+                        TR_CHECK(atomic_load(&g_pms_tiles) > 0);
+                        taken++;
+                    }
+                    if (pool != NULL) tr_pool_destroy(pool);
+                }
+                /* one group of 5 inputs, twice on other weights: with 16 rows the same (group, rows) */
+                const int64_t one[2] = {0, 5};
+                for (int v = 0; v < 2; v++) {
+                    tr_matmul_grouped(NULL, &w[v][12], one, 1, x, ref[1 - v]);
+                    memset(y, 0x7F, ybytes);
+                    tr_matmul_grouped_s(NULL, &w[v][12], one, 1, x, y, &s);
+                    TR_CHECK(memcmp(y, ref[1 - v], 5 * (size_t)R * sizeof(float)) == 0);
+                }
+                for (int v = 0; v < 2; v++) tr_matmul_grouped(NULL, w[v], offsets, G, x, ref[v]);
+                /* the refusals: none may run a tile, every one gives the old road's bytes */
+                tr_pool *p8 = tr_pool_create(8);
+                TR_CHECK(p8 != NULL);
+                if (p8 != NULL) {
+                    memset(y, 0x7F, ybytes);
+                    atomic_store(&g_pms_tiles, 0);
+                    tr_matmul_grouped_s(p8, w[0], offsets, G, x, y, &s4); /* 8 workers, room for 4 */
+                    TR_CHECK(memcmp(y, ref[0], ybytes) == 0);
+                    TR_CHECK_EQ_INT(atomic_load(&g_pms_tiles), 0);
+                    pms_nested nc;
+                    nc.w = w[1];
+                    nc.offsets = offsets;
+                    nc.n_groups = G;
+                    nc.x = x;
+                    nc.y = y;
+                    nc.s = &s4;
+                    atomic_store(&nc.called, 0);
+                    memset(y, 0x7F, ybytes);
+                    atomic_store(&g_pms_tiles, 0);
+                    tr_parallel_for(p8, 8, 1, pms_nested_body, &nc);
+                    TR_CHECK_EQ_INT(atomic_load(&nc.called), 1);
+                    TR_CHECK(memcmp(y, ref[1], ybytes) == 0);
+                    TR_CHECK_EQ_INT(atomic_load(&g_pms_tiles), 0);
+                    refused += 2;
+                    tr_pool_destroy(p8);
+                }
+            }
+            if (ok || s.plan != NULL) tr_pm_scratch_free(&s);
+            if (ok || s4.plan != NULL) tr_pm_scratch_free(&s4);
+            free(wd[0]);
+            free(wd[1]);
+            free(x);
+            free(ref[0]);
+            free(ref[1]);
+            free(y);
+        }
+    }
+    /* a Q4_K row of 272 columns is not whole blocks (row bytes 0): no tile may run on it */
+    {
+        tr_pm_scratch s;
+        unsigned char *wq = (unsigned char *)calloc(16, 2 * 144);
+        float *x = (float *)calloc(8 * 272, sizeof(float)), *y = (float *)calloc(8 * 16, sizeof(float));
+        const int64_t off[2] = {0, 8};
+        int ok = wq != NULL && x != NULL && y != NULL && tr_pm_scratch_init(&s, 1, 1, 8, 272, 8 * 272) == 0;
+        TR_CHECK(ok);
+        if (ok && K->pm_panel[TR_TYPE_Q4_K] != NULL) {
+            tr_mat wm = {TR_TYPE_Q4_K, 16, 272, wq};
+            atomic_store(&g_pms_tiles, 0);
+            tr_matmul_grouped_s(NULL, &wm, off, 1, x, y, &s);
+            TR_CHECK_EQ_INT(atomic_load(&g_pms_tiles), 0);
+            refused++;
+        }
+        if (ok) tr_pm_scratch_free(&s);
+        free(wq);
+        free(x);
+        free(y);
+    }
+    tr_kernels_set_active(NULL);
+    TR_CHECK(taken > 0 && refused > 0);
+    printf("  matmul_grouped_s on tier %s: %ld calls through phase-major equal to dot_row, %ld refusals on "
+           "the old road\n", K->tier, taken, refused);
 }
 
 int main(void) {
@@ -1482,6 +1696,7 @@ int main(void) {
     test_matmul_decode();
     test_one_row_per_group();
     test_phase_major();
+    test_matmul_grouped_s();
 
     TR_TEST_EXIT();
 }

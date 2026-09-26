@@ -12,7 +12,7 @@ sh tools/native_tests.sh build/tests/test_*.exe   # the C tests on Windows itsel
 make                     # build/trochilus (core, no dependencies)
 make test                # C tests: kernel SIMD = scalar, malformed GGUF, pool, profiler
 make oracle              # tiny models: generate, convert, compare with transformers
-make tier-check          # the engine under every tier (TR_CPU_MAX): model test and logits byte-identical
+make tier-check          # the engine under every tier (TR_CPU_MAX): model test and logits byte-identical; test_kernels also under avx512-novbmi (the float-transpose Q4_K panel)
 make oracle-tokenizer    # OLMoE tokenizer against transformers: ids, pieces, NFC, decode
 make oracle-real         # true OLMoE cut to 2 layers against transformers (skipped without model)
 build/trochilus run -m <f.gguf> -f prompt.txt -n 200    # text input, greedy generation
@@ -97,6 +97,7 @@ make bench-attn          # attention on prompt (512/2048/4000) on one layer, bro
 make bench-expf          # tr_expf on all 2^32 floats against rounded value and C library
 tools/.venv/Scripts/python.exe tools/gen_expf_table.py [--check | --scan]   # tr_expf constants from mpmath (src/kernels/expf_table.h)
 sh tools/expf_quality.sh | sh tools/mutate_expf.sh   # in container: tr_expf against old binary (KL) and emulation (byte)
+sh tools/mutate_pm.sh    # in container: 17 mutations of the phase-major matmul (tile, tree, panels, interleave, plan, guards), each must turn test_kernels red (best tier or avx512-novbmi); ~10 min
 sh tools/platform_bits.sh   # do Windows and Linux give same bytes? logits and RoPE tables of both platforms
 sh tools/prefill_context.sh measure | change <binary before>   # prefill at 512/2048/4000 in one session, A/A, logits to byte, zones
 tools/.venv/Scripts/python.exe tools/prefill_context_report.py attn|zones <file>   # MEASUREMENTS tables §Prefill on long prompts

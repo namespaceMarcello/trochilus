@@ -294,13 +294,17 @@
         {
           "v": "attenzione a gruppi su prompt lunghi: 1.09-1.13×",
           "d": "2026-09-19"
+        },
+        {
+          "v": "somme esatte alla velocità del float (la sfida di Marcello, col pensatore a turni): W16, il trucco di Winograd (1968) in parole da 16 bit con la scala del sotto-blocco dentro il peso, identico bit per bit a una definizione esatta a interi, fa 167.2 GFLOP/s contro i 164.7 del tile float (e 1.21x a pari larghezza): esatto e almeno veloce quanto il float, nel tile. Sui tensor core int8 della RTX 4070: 59.1 T-MAC/s esatti contro 3.29 del float, E32 lì 4.5x",
+          "d": "2026-09-26"
         }
       ],
       "domande": [
         {
           "n": 77,
           "stato": "aperta",
-          "testo": "E32: una definizione più esatta del float (attivazioni a 32 bit in interi, somme esatte, arrotondata correttamente nel 96-99% dei casi) a ~0.85x di phase-major; esatta anche sui tensor core int8 della GPU. La vogliamo?"
+          "testo": "E32 come definizione (attivazioni a 32 bit in interi, somme esatte, arrotondata correttamente nel 96-99% dei casi): nel tile Q4_K W16 è già più veloce del float (167.2 contro 164.7), sulla GPU 4.5x il float, gli stessi bit su CPU e GPU; Q8_0 sulla CPU no (~0.9x). Cambia ogni byte delle uscite, verso la matematica esatta. La vogliamo nel motore, e la GPU conta (domanda 74)?"
         },
         {
           "n": 70,
@@ -442,6 +446,10 @@
         {
           "v": "gara con llama.cpp rifatta dopo le due righe per caricamento: prefill loro 1.41× (era 1.8×) a 16 thread e 1.13× a 8; decode 1.00× a contesto 512, 1.12× a 2048",
           "d": "2026-09-24"
+        },
+        {
+          "v": "la strada phase-major ora ha un test suo (gruppi da 0 a 513 ingressi, 1-16 thread, due chiamate di fila): ha trovato una scrittura fuori dal buffer (una chiamata senza pool dentro un pool più grande) e una guardia che lasciava passare righe non fatte di blocchi interi, entrambe corrette; 17 mutazioni del codice phase-major, tutte viste rosse; il pannello Q4_K senza VBMI gira ora anche su questa macchina (TR_CPU_MAX=avx512-novbmi)",
+          "d": "2026-09-26"
         }
       ],
       "domande": [],

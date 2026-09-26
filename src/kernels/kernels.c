@@ -587,12 +587,35 @@ static void pm_interleave_body(void *ctx_, int64_t begin, int64_t end, int worke
     }
 }
 
+/* input rows [p_begin, p_end) of group g against its 16 weight rows from r0, one dot_row2 (or two dot_row)
+ * per pair of rows: the same bits as a tile */
+static void pm_rows_by_dot(const pm_ctx *c, int64_t g, int64_t r0, int64_t p_begin, int64_t p_end) {
+    const unsigned char *rows = (const unsigned char *)c->w[g].data + (size_t)r0 * c->row_bytes;
+    for (int64_t p = p_begin; p < p_end; p++) {
+        const float *xp = c->x + p * c->cols;
+        float *yp = c->y + p * c->rows + r0;
+        for (int r = 0; r < TR_PM_ROWS; r += 2) {
+            const unsigned char *a = rows + (size_t)r * c->row_bytes, *b = a + c->row_bytes;
+            if (c->k->dot_row2[c->w[g].type] != NULL) {
+                c->k->dot_row2[c->w[g].type](a, b, xp, c->cols, yp + r);
+            } else {
+                yp[r] = c->k->dot_row[c->w[g].type](a, xp, c->cols);
+                yp[r + 1] = c->k->dot_row[c->w[g].type](b, xp, c->cols);
+            }
+        }
+    }
+}
+
 static void pm_item_body(void *ctx_, int64_t begin, int64_t end, int worker) {
     const pm_ctx *c = (const pm_ctx *)ctx_;
     const pm_plan *pl = &c->plan;
-    float *panel = c->s->work + (size_t)worker * (size_t)(TR_PM_PANEL_FLOATS(c->s->max_cols) + TR_PM_PART);
-    float *part = panel + (size_t)TR_PM_PANEL_FLOATS(c->s->max_cols);
-    int64_t *last = pl->last + 2 * worker;
+    /* a worker the scratch has no panel for (a call with no pool from inside a larger pool's body runs
+     * on that body's worker): its items go by dot_row2 */
+    const int own = worker < c->s->n_workers;
+    float *panel = own ? c->s->work + (size_t)worker * (size_t)(TR_PM_PANEL_FLOATS(c->s->max_cols) + TR_PM_PART)
+                       : NULL;
+    float *part = own ? panel + (size_t)TR_PM_PANEL_FLOATS(c->s->max_cols) : NULL;
+    int64_t *last = own ? pl->last + 2 * worker : NULL;
     int64_t g = 0, lo = 0, hi = c->n_groups - 1;
     while (lo < hi) { /* the last group whose first item is <= begin */
         int64_t mid = lo + (hi - lo + 1) / 2;
@@ -606,20 +629,8 @@ static void pm_item_body(void *ctx_, int64_t begin, int64_t end, int worker) {
         int64_t rg = local / nch, ch = local % nch;
         int64_t r0 = rg * TR_PM_ROWS, p_begin = c->offsets[g], n_in = c->offsets[g + 1] - p_begin;
         const unsigned char *rows = (const unsigned char *)c->w[g].data + (size_t)r0 * c->row_bytes;
-        if (n_in < PM_MIN_ROWS) {
-            for (int64_t p = p_begin; p < p_begin + n_in; p++) {
-                const float *xp = c->x + p * c->cols;
-                float *yp = c->y + p * c->rows + r0;
-                for (int r = 0; r < TR_PM_ROWS; r += 2) {
-                    const unsigned char *a = rows + (size_t)r * c->row_bytes, *b = a + c->row_bytes;
-                    if (c->k->dot_row2[c->w[g].type] != NULL) {
-                        c->k->dot_row2[c->w[g].type](a, b, xp, c->cols, yp + r);
-                    } else {
-                        yp[r] = c->k->dot_row[c->w[g].type](a, xp, c->cols);
-                        yp[r + 1] = c->k->dot_row[c->w[g].type](b, xp, c->cols);
-                    }
-                }
-            }
+        if (n_in < PM_MIN_ROWS || !own) { /* the chunk's input rows, cut as the plan cuts them */
+            pm_rows_by_dot(c, g, r0, p_begin + ch * n_in / nch, p_begin + (ch + 1) * n_in / nch);
             continue;
         }
         if (last[0] != g || last[1] != rg) {
@@ -644,8 +655,9 @@ static int matmul_phase_major(tr_pool *pool, const tr_mat *w, const int64_t *off
     const int64_t rows = w[0].rows, cols = w[0].cols, n_in = offsets[n_groups];
     if (s == NULL || s->plan == NULL || k->pm_tile == NULL || k->pm_interleave == NULL || k->pm_panel[type] == NULL)
         return 0;
-    if (rows % TR_PM_ROWS != 0 || cols % 16 != 0 || cols > s->max_cols || n_groups > s->max_groups ||
-        n_in > s->max_tokens || n_in * cols > s->max_x)
+    /* a row must be whole blocks of its type too (a Q4_K row of 272 columns has 0 bytes) */
+    if (rows % TR_PM_ROWS != 0 || cols % 16 != 0 || tr_row_bytes(type, cols) == 0 || cols > s->max_cols ||
+        n_groups > s->max_groups || n_in > s->max_tokens || n_in * cols > s->max_x)
         return 0;
     int any = 0;
     for (int64_t g = 0; g < n_groups; g++) any |= offsets[g + 1] - offsets[g] >= PM_MIN_ROWS;

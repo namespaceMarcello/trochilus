@@ -1277,3 +1277,25 @@ tools/mutate_expf.sh`; `sh tools/prompt_scale.sh build/ps 8 16`, then
   byte-identical at 1, 4, 8 and 16 threads (MEASUREMENTS §Phase-major).
 Check: `make check`; `build/trochilus logits -m <model> --tokens <ids> --out a.bin -t 1` and `-t 16`
 against a build of the commit before, `cmp`; `build/trochilus generate -m <Q4_K> -p 512 -n 1 -t 4`.
+
+### 2026-09-26 — Phase-major's orchestration under test; exact sums measured against the float
+- The thinker's third review closed: `test_matmul_grouped_s` (tr_matmul_grouped_s against
+  tr_matmul_grouped byte for byte: 13 group sizes from 0 to 513, 16 and 48 rows, Q4_K and Q8_0, no pool
+  and 1/3/7/16 threads, twice on other weights; `pm_tile` counted where the road must and must not run).
+  It found a heap overrun: a call with no pool inside a larger pool's body ran on a worker past the
+  scratch's (now dot_row2 for that worker's items, `pm_rows_by_dot`); a Q4_K row that is not whole
+  blocks passed the guard (now `tr_row_bytes` is asked). `test_phase_major` with +-0, subnormals,
+  +-inf, overflowing products, the sign of all-(-0.0) dots, each xil sized for its T (LESSONS #214).
+- `TR_CPU_MAX=avx512-novbmi`: the float-transpose Q4_K panel runs on this machine;
+  `tools/tier_check.sh` runs test_kernels under it (LESSONS #213 closed). `tools/mutate_pm.sh`: 17
+  mutations of the tile, tree, panels, interleave, plan and guards, every one red.
+- Marcello's challenge, measured with the thinker in rounds (MEASUREMENTS §Exact sums at the float's
+  speed): Winograd's inner product puts an activation digit in the weight's free bits (1.5x the dp's
+  digit-MACs in the pure loop); W16, the same in 16-bit words with the sub-block scale inside the weight
+  and int32 lanes exact over 64-column windows, is bit-identical to an order-free integer definition and
+  runs 167.2 GFLOP/s-eq against the float tile's 164.7; on the RTX 4070 the int8 tensor cores do 59.1
+  exact T-MAC/s against the float contract's 3.29. Prototypes in build/e24/wino/, not in the engine.
+- `tools/lint.py` refuses a date after today in the documents (LESSONS #216).
+Check: `make check`; `MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src trochilus-dev:local
+sh tools/mutate_pm.sh` (every line but the first RED); `TR_CPU_MAX=avx512-novbmi
+build/tests/test_kernels` prints "the Q4_K panel from the float transpose".

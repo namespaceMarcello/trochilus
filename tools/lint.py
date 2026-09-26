@@ -56,6 +56,19 @@ def check_doc_limits():
         fail("struttura", f"docs/STATUS.md is {stato.stat().st_size} bytes (limit 40 KB)")
 
 
+def check_no_future_dates():
+    """#216: a day's work was dated from the story ("the evening of the 26th, so tomorrow") instead of the
+    machine's clock: every document of that day a day late. No date in the documents may be after today."""
+    import datetime
+    today = datetime.date.today().isoformat()
+    files = [ROOT / "CLAUDE.md", ROOT / "docs" / "status.json", *sorted((ROOT / "docs").rglob("*.md"))]
+    for f in files:
+        for n, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+            for d in re.findall(r"\b20\d\d-[01]\d-[0-3]\d\b", line):
+                if d > today:
+                    fail(216, f"{f.relative_to(ROOT)}:{n}: {d} is after today ({today})")
+
+
 def check_lessons_table():
     """The lessons table stays machine-readable: 8 columns, consecutive numbers."""
     rows = [l for l in (ROOT / "docs" / "LESSONS.md").read_text(encoding="utf-8").splitlines()
@@ -356,7 +369,7 @@ def check_expf_table():
 
 
 def main():
-    for check in (check_docs_control_chars, check_line_endings, check_doc_limits, check_lessons_table,
+    for check in (check_docs_control_chars, check_line_endings, check_doc_limits, check_no_future_dates, check_lessons_table,
                   check_type_table, check_tests_no_tmpfile, check_hot_zones, check_global_state,
                   check_makefile_recipes_ascii, check_shell_scripts_whole, check_scripts_clean_up,
                   check_no_failure_into_tee, check_expf_table):

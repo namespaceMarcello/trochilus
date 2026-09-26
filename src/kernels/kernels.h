@@ -126,7 +126,7 @@ typedef struct {
      *   (TR_PM_PANEL_FLOATS(n) floats);
      * pm_interleave: T input rows (stride floats apart) laid out xil[p * (n/16 * T + TR_PM_PAD) + m * T + t]
      *   = x_t[16m + p] (TR_PM_XIL_FLOATS(n, T) floats);
-     * pm_tile: the panel's rows against the T interleaved rows, T one of 24, 16, 8, 4 (TR_PM_TILE_MAX):
+     * pm_tile: the panel's rows against the T interleaved rows, T from 4 to TR_PM_TILE_MAX:
      *   y[t * y_stride + r] = dot_row(row r, x_t, n) bit for bit; part is TR_PM_PART floats of scratch.
      * NULL where the tier has none: the caller keeps dot_row2_x8 and the others. */
     void (*pm_panel[TR_TYPE_COUNT])(const void *rows, size_t row_bytes, int64_t n, float *panel);
@@ -167,7 +167,7 @@ void tr_matmul_grouped(tr_pool *pool, const tr_mat *w, const int64_t *offsets, i
 typedef struct {
     float *xil;
     int64_t max_x;              /* floats of xil */
-    float *work;                /* n_workers * (TR_PM_ROWS * max_cols + TR_PM_PART) floats */
+    float *work;                /* n_workers * (TR_PM_PANEL_FLOATS(max_cols) + TR_PM_PART) floats: panels with pads */
     int64_t max_cols;
     int n_workers;
     int64_t *plan;              /* item, chunk and tile tables, and each worker's last panel */
