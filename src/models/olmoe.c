@@ -30,6 +30,17 @@ void tr_attn_probe(int64_t layer, int64_t head, const float *q, const float *key
 void tr_attn_probe_out(int64_t layer, int64_t head, const float *out, int64_t n_pos, int64_t head_dim);
 #endif
 
+#ifdef TR_DRAFT_PROBE
+/* A diagnostic build only (make draft-probe, tools/draft_probe.c): a draft's routing (the top k of
+ * the used experts, rescaled) and a decode token's attention over a subset of positions (a window,
+ * or those the exact session's previous token attended to most). The probe returns 1 when it
+ * computed the head itself. The engine is never built with it. */
+void tr_draft_probe_route(float *sel_w, int64_t n_used);
+int tr_draft_probe_attention(int64_t layer, int64_t head, const float *q, const float *keys, const float *values,
+                             int64_t n_pos, int64_t head_dim, float scale, float *scores, int64_t score_stride,
+                             float *out);
+#endif
+
 /* ---- weights ---------------------------------------------------------- */
 
 typedef struct {
@@ -132,6 +143,7 @@ typedef struct {
     float *scores;    /* attention scores, a group of rows per pool worker: [n_workers][OLMOE_ATTN_QUERIES][score_stride] */
     int64_t score_stride; /* floats from a row of scores to the next: n_ctx and some (score_row_stride) */
     int64_t n_workers;
+    tr_pm_scratch pm; /* the prompt's phase-major matmul (kernels.h tr_matmul_grouped_s) */
 
     olmoe_route_trace *trace; /* NULL: tracing off (docs/MEASUREMENTS.md domande 13-15) */
 
@@ -771,6 +783,14 @@ static void *olmoe_experts(const void *model) {
 
 static void olmoe_route_trace_free(olmoe_route_trace *tr); /* below, after the hot zone */
 
+#ifdef TR_DRAFT_PROBE
+/* tools/draft_probe.c: the session's cache, overwritten with the exact session's cut to 16 bits. */
+tr_kv *tr_draft_probe_kv(void *session);
+tr_kv *tr_draft_probe_kv(void *session) {
+    return &((olmoe_session *)session)->kv;
+}
+#endif
+
 static void olmoe_session_free(void *session) {
     olmoe_session *s = (olmoe_session *)session;
     if (s == NULL) return;
@@ -800,6 +820,7 @@ static void olmoe_session_free(void *session) {
     tr_free_aligned(s->h3);
     tr_free_aligned(s->logits);
     tr_free_aligned(s->scores);
+    tr_pm_scratch_free(&s->pm);
     tr_free_aligned(s->x_all);
     free(s);
 }
@@ -833,8 +854,14 @@ static void *olmoe_session_create(void *model, int64_t n_ctx, int64_t n_batch, c
                            (uint64_t)(n_workers * OLMOE_ATTN_QUERIES * score_row_stride(actual_ctx) + m->vocab) +
                            rope_elems * 2;
     uint64_t scratch_i64 = (uint64_t)B * (uint64_t)U * 2 + (uint64_t)m->n_expert + 1 + (uint64_t)m->n_expert;
+    /* the phase-major matmul's scratch: the largest input a prompt's call passes (the experts' gathered rows),
+     * the widest row, a panel per worker */
+    const int64_t pm_cols = m->n_embd > m->n_ff ? (m->n_embd > m->n_qkv ? m->n_embd : m->n_qkv)
+                                                : (m->n_ff > m->n_qkv ? m->n_ff : m->n_qkv);
+    const int64_t pm_x = B * U * pm_cols > B * pm_cols ? B * U * pm_cols : B * pm_cols;
     uint64_t scratch_bytes = scratch_f32 * sizeof(float) + scratch_i64 * sizeof(int64_t) +
-                             (uint64_t)(n_workers * m->n_expert);
+                             (uint64_t)(n_workers * m->n_expert) +
+                             tr_pm_scratch_bytes((int)n_workers, m->n_expert, B * U, pm_cols, pm_x);
 
     /* Layer-major prefill (docs/MEASUREMENTS.md "Il prefill legge il modello una volta per passata")
      * only pays for itself, and only helps, when the store cannot hold the whole table: ask it
@@ -891,8 +918,9 @@ static void *olmoe_session_create(void *model, int64_t n_ctx, int64_t n_batch, c
     s->score_stride = score_row_stride(actual_ctx);
     s->scores = alloc_f32(n_workers * OLMOE_ATTN_QUERIES * s->score_stride);
     if (store_partial) s->x_all = alloc_f32(actual_ctx * m->n_embd);
+    int pm_rc = tr_pm_scratch_init(&s->pm, (int)n_workers, m->n_expert, B * U, pm_cols, pm_x);
 
-    if (kv_rc != 0 || s->rope_cos == NULL || s->rope_sin == NULL || s->x == NULL ||
+    if (kv_rc != 0 || pm_rc != 0 || s->rope_cos == NULL || s->rope_sin == NULL || s->x == NULL ||
         s->normed == NULL || s->attn_out == NULL || s->ffn_out == NULL || s->q == NULL || s->attn_concat == NULL ||
         s->k == NULL || s->v == NULL || s->router == NULL || s->sel_id == NULL || s->sel_w == NULL ||
         s->place == NULL || s->offsets == NULL || s->acquire_ids == NULL || s->taken == NULL || s->xg == NULL ||
@@ -962,6 +990,12 @@ static void attn_body(void *ctx_, int64_t begin, int64_t end, int worker) {
 #ifdef TR_ATTN_PROBE
             if (c->n_tok == 1)
                 tr_attn_probe(c->layer, h, c->q + h * c->head_dim, keys, values, c->pos0 + 1, c->head_dim, c->scale);
+#endif
+#ifdef TR_DRAFT_PROBE
+            if (c->n_tok == 1 && tr_draft_probe_attention(c->layer, h, c->q + h * c->head_dim, keys, values, c->pos0 + 1,
+                                                          c->head_dim, c->scale, scores, c->score_stride,
+                                                          c->out + h * c->head_dim))
+                continue;
 #endif
             tr_attention_group(c->q + i * c->n_qkv + h * c->head_dim, c->n_qkv, keys, values, n_q, c->pos0 + i + 1,
                                c->head_dim, c->scale, scores, c->score_stride,
@@ -1127,6 +1161,9 @@ static void route_token(const olmoe_model *m, float *router, const unsigned char
         for (int64_t i = 0; i < n_used; i++) sum += sel_w[i];
         for (int64_t i = 0; i < n_used; i++) sel_w[i] /= sum;
     }
+#ifdef TR_DRAFT_PROBE
+    tr_draft_probe_route(sel_w, n_used); /* sel_w is still in decreasing order here */
+#endif
     for (int64_t i = 1; i < n_used; i++) {
         int64_t id = sel_id[i];
         float w = sel_w[i];
@@ -1249,9 +1286,9 @@ static int forward_layer(olmoe_model *m, olmoe_session *s, int64_t L, const int3
     tr_prof_end(prof, TR_PROF_ATTN_NORM, t);
 
     t = tr_prof_begin(prof);
-    tr_matmul(pool, &layer->wq, s->normed, n_tok, s->q);
-    tr_matmul(pool, &layer->wk, s->normed, n_tok, s->k);
-    tr_matmul(pool, &layer->wv, s->normed, n_tok, s->v);
+    tr_matmul_s(pool, &layer->wq, s->normed, n_tok, s->q, &s->pm);
+    tr_matmul_s(pool, &layer->wk, s->normed, n_tok, s->k, &s->pm);
+    tr_matmul_s(pool, &layer->wv, s->normed, n_tok, s->v, &s->pm);
     tr_prof_end(prof, TR_PROF_QKV_PROJ, t);
     tr_prof_count(prof, TR_PROF_QKV_PROJ, mat_bytes(&layer->wq) + mat_bytes(&layer->wk) + mat_bytes(&layer->wv),
                   0);
@@ -1327,6 +1364,7 @@ static int forward_layer(olmoe_model *m, olmoe_session *s, int64_t L, const int3
         ac.score_stride = s->score_stride;
         /* an item costs ~30 ns per cached position: short contexts keep several per chunk; a
          * decode token's heads, one stream of cached positions each, balanced at the tail */
+        TR_TRACE_NOTE(attn_kv_bytes(n_tok, pos0, n_head, head_dim), -1, pos0 + n_tok);
         if (n_tok == 1) tr_parallel_for_balanced(pool, n_head, 1 + 256 / (pos0 + 1), attn_body, &ac);
         else tr_parallel_for(pool, n_head * n_tok, 1 + 256 / (pos0 + n_tok), attn_body, &ac);
     } else if (L == m->n_layers - 1) {
@@ -1336,7 +1374,7 @@ static int forward_layer(olmoe_model *m, olmoe_session *s, int64_t L, const int3
     if (prof->enabled) tr_prof_count_kv(prof, TR_PROF_ATTENTION, attn_kv_bytes(n_tok, pos0, n_head, head_dim));
 
     t = tr_prof_begin(prof);
-    tr_matmul(pool, &layer->wo, s->attn_concat, n_tok, s->attn_out);
+    tr_matmul_s(pool, &layer->wo, s->attn_concat, n_tok, s->attn_out, &s->pm);
     add_ctx dc;
     dc.y = x;
     dc.x = s->attn_out;
@@ -1393,8 +1431,8 @@ static int forward_layer(olmoe_model *m, olmoe_session *s, int64_t L, const int3
     tr_prof_end(prof, TR_PROF_EXPERT_GATHER, t);
 
     t = tr_prof_begin(prof);
-    tr_matmul_grouped(pool, layer->gate_exps, s->offsets, n_expert, s->xg, s->h1);
-    tr_matmul_grouped(pool, layer->up_exps, s->offsets, n_expert, s->xg, s->h2);
+    tr_matmul_grouped_s(pool, layer->gate_exps, s->offsets, n_expert, s->xg, s->h1, &s->pm);
+    tr_matmul_grouped_s(pool, layer->up_exps, s->offsets, n_expert, s->xg, s->h2, &s->pm);
     tr_prof_end(prof, TR_PROF_EXPERT_GATE_UP, t);
 
     t = tr_prof_begin(prof);
@@ -1402,7 +1440,7 @@ static int forward_layer(olmoe_model *m, olmoe_session *s, int64_t L, const int3
     tr_prof_end(prof, TR_PROF_EXPERT_ACT, t);
 
     t = tr_prof_begin(prof);
-    tr_matmul_grouped(pool, layer->down_exps, s->offsets, n_expert, s->h1, s->h3);
+    tr_matmul_grouped_s(pool, layer->down_exps, s->offsets, n_expert, s->h1, s->h3, &s->pm);
     tr_prof_end(prof, TR_PROF_EXPERT_DOWN, t);
     if (prof->enabled) {
         for (int64_t e = 0; e < n_expert; e++)
@@ -1445,7 +1483,7 @@ static void forward_logits(olmoe_model *m, olmoe_session *s, float *x, int64_t n
     tr_prof_end(prof, TR_PROF_OUTPUT_NORM, t);
 
     t = tr_prof_begin(prof);
-    tr_matmul(pool, &m->output, rows, n_logits, s->logits);
+    tr_matmul_s(pool, &m->output, rows, n_logits, s->logits, &s->pm);
     tr_prof_end(prof, TR_PROF_LM_HEAD, t);
     tr_prof_count(prof, TR_PROF_LM_HEAD, mat_bytes(&m->output), 0);
     s->n_logits = n_logits;

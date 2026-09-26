@@ -53,6 +53,7 @@ typedef struct {
     unsigned sse42 : 1, avx : 1, avx2 : 1, fma : 1, f16c : 1;
     unsigned avx512f : 1, avx512bw : 1, avx512vl : 1, avx512dq : 1;
     unsigned avx512vnni : 1, avx512bf16 : 1, avxvnni : 1;
+    unsigned avx512vbmi : 1; /* byte permutes across a register (vpermb, vpermt2b) */
 
     /* arm64 */
     unsigned neon : 1, dotprod : 1, i8mm : 1, sve : 1;

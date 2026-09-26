@@ -188,7 +188,13 @@ decides | — | — |
 | 67 | ~~SMT in the decode: two threads a core beat llama.cpp on the same 4 cores? (Marcello, 2026-09-25)~~ **Closed 2026-09-25 as no** (§SMT in the decode): natively two threads a core give the decode +1.6-5.7% at 4 cores, nothing at 8 (60.06 against 60.01 tok/s) and a collapse at 16 (8.4 against 58.3); the engine's measured width is 8 cores, one thread each (59.8 tok/s, 8 forced 60.2): no default width gains, not wired. The container cannot answer it (its siblings are not a core's two threads). On the way: the pool's tail (§The pool's tail), tr_parallel_for_balanced | — | — |
 | 68 | Why does the decode collapse at 32 threads on 16 cores (8.4 tok/s against 58.3 at 16, native, TR_POOL_PIN=1; 2.2 against 22.9 on 2026-09-18)? A pool trace (TR_POOL_TRACE) at 32 would say whether it is the wait of every call or a few calls | — | — |
 | 69 | ~~Pass llama.cpp's decode at long context with the KV exact (Marcello, 2026-09-25)~~ **Closed 2026-09-26 on the CPU** (§The attention against llama.cpp's): level with no context, 5.31 against 3.24 µs a cached position, the bytes of their F16 KV; our attention reads at a plain read's speed, and F32 at their slope needs 81 GB/s (the RAM reads 53-57). On the GPU the same bits pass it (1.31x at 2048) | — | — |
-| 70 | The softmax's exponential in a vector (question 58's AVX-512 kernel, 0.73 ns against `tr_expf`'s 3.52, 0 of 2^32 differ): with the tiles it is half of a prompt's (query, position) pair (4.45 of 9.2 ns on a core). Predicted: the prompt's attention 1.5-1.8x more, the prefill at 4000 +5-8% | `bench_attn` one core (one softmax, tile full), then `prefill_context.sh change` | the prompt's attention after the tiles; the SiLU and the router take it too |
+| 70 | The softmax's exponential in a vector (question 58's AVX-512 kernel, 0.73 ns against `tr_expf`'s 3.52, 0 of 2^32 differ): with the tiles it is half of a prompt's (query, position) pair (4.45 of 9.2 ns on a core). Predicted: the prompt's attention 1.5-1.8x more, the prefill at 4000 +5-8%. **Built 2026-09-26** (§The softmax's exp in a vector): the table's `expf_f32`, AVX-512 and AVX2 without FMA, 0 of 2^32 differ from `tr_expf` in each tier; the prompt's attention 12.6 -> 8.9 ns a pair on a core (1.42x, loaded machine, indicative); in the engine on a free machine (8 pairs, background 2.3-2.4): the attention zone 1.34-1.37x, **the prefill 1.05x at 2048 and at 4000** | — | — |
+| 71 | A draft inside the exact bits (Q8_0 high nibble, KV high 16 bits) verified k tokens a pass: can it pass llama.cpp's bytes a token? (Marcello, 2026-09-26) **Measured** (§The engine read as entangled pairs): 97-100% where the exact model is sure, 82-98% overall; **0.81-1.04x llama.cpp's bytes on the real text** (model), 0.97-1.09x on the greedy continuation: this form closed on the CPU. **The two levers measured 2026-09-26** (§The draft's two levers): the second choice as a leaf +0.07-0.10x on prose and Italian; a KV of constant bytes (the previous token's top positions and their successors) keeps the sure positions at 512 and on code, not on prose at 2048-4000; **1.15-1.46x llama.cpp only on code** (repetitive), 0.89-1.04x on prose and Italian (model, upper bounds). Open: the skipped part of the softmax handed over by the exact pass; the selection's staleness | `make draft-probe`, `tools/draft_probe_report.py` | a pass's own drafts are 56% of its bytes; passes end where the draft doubts |
+| 72 | ~~Gate and up interleaved at load, one call with the activation~~ **Closed 2026-09-26 as no** (§The engine read as entangled pairs): on the free machine 1.006-1.023x of three calls from RAM (predicted 1.03-1.08x): with the experts balanced three calls already read at 97-98% of a plain read | — | — |
+| 73 | The head's argmax from its high plane: bounds from the high nibbles, exact dots only for the rows that can still win; greedy needs the argmax, `logits` keeps every row | the rows left after the bounds, on the real text | <= 49 MiB a token (4%) |
+| 74 | The draft on the GPU: the Q8_0 high-nibble planes and the draft's KV in VRAM, the CPU verifying from RAM, overlapped (the idea bounce of 2026-09-26, `build/entangled/bounce.md`): ~2.2x overlapped, ~1.7x serial in time (model). For Marcello: does the GPU count in the race (the GPU attention did) | a ~50-line CUDA probe timing one batch-1 draft step (plane 635 MiB + KV halves 256): pass <= 6 ms a draft token, fail > 15 ms | the draft's 891 MiB a draft token off the RAM bus |
+| 75 | ~~A draft KV in int4 (or int8) written once per position, and a draft head of the top ~16k rows~~ **Measured 2026-09-26** (§The draft's KV in 8 and 4 bits): the 8-bit copy changes no draft token and lifts every cell 0.02-0.14x; out of sample prose 0.93-1.09x, Italian 0.95-1.12x, code 1.14-1.26x; the 16k head covers 85-93% of the exact tokens: out. Prose does not pass 1.1x: the draft's weight plane is what is left | — | — |
+| 76 | Why does a 4-bit draft KV agree with the exact model more often than a 16-bit one (18 flips won, 3 lost, mostly where the exact margin is under 1 nat)? A guess: noise on the old keys inflates their softmax weight (Jensen) against the last 64 kept at 16 bits | kv4 with no positions kept at 16 bits; Gaussian noise on the 16-bit draft's old keys | a draft that is cheaper and closer at once |
 
 Reference machine: Ryzen 9 7940HX (Zen 4, 16 core / 32 thread, AVX-512 VNNI/BF16), 31 GB
 RAM (2×16 GB DDR5-5200), NVMe Micron 1 TB, GPU RTX 4070 Laptop 8 GB and Radeon 610M (not used
@@ -3687,8 +3693,8 @@ what a perfect split of the same work would take.
 Built: `tr_parallel_for_balanced` (threads.h): each thread runs its chunk in `TR_POOL_BLOCKS` = 64
 blocks, front to back, then takes the blocks other chunks have not started (an atomic add a block;
 each chunk's first block is its owner's); every index still runs once, so the bits cannot move.
-Used by the matmul when every group has one input row (the decode, its experts) and by the decode's
-attention; the prompt keeps the static chunks its tiles want. Tests: test_base (every index once
+Used by the matmul when every group has one input row (the decode; its experts only from 2026-09-26,
+the condition missed their 64 groups: LESSONS #192) and by the decode's attention; the prompt keeps the static chunks its tiles want. Tests: test_base (every index once
 over widths, n and min_chunk; a held worker's chunk finished by the others, `helped > 0`: red with
 `TR_POOL_BLOCKS=1` and with the help loop cut to the own chunk), test_phase and test_tier_used
 unchanged (every logit as one thread).
@@ -3702,7 +3708,8 @@ The decode calls' wall a token, from the traces (ms, two runs each):
 | native | 8 | 16.96, 17.26 | — | 17.32, 16.62 | — |
 | native | 16 | 18.32, 18.14 | — | 18.39, 18.61 | — |
 
-In the container at 8 the projections' calls 55.6 -> 49.5 us, the experts' down 214.7 -> 200.2;
+In the container at 8 the projections' calls 55.6 -> 49.5 us, the experts' down 214.7 -> 200.2 (noise: they
+still ran static, LESSONS #192);
 natively at 8 the projections 47.1 -> 45.5 and the rest level; at 16 the stolen blocks' extra
 stream starts cost 1-2% (the mean chunk's work rises), a width the engine does not pick. By
 tokens a second (container, 8 threads, alternated with tools/ab_modes.sh: the A/A spread was 11%)
@@ -3817,6 +3824,426 @@ elsewhere); predicted P5 the zone 0.75-0.82 at 4000, 0.77-0.85 at 2048, the pref
 The zone 1.31-1.33x, as on a core; at 4000 it was 21% of the prefill, now 17%. The softmax is now
 half of a pair (4.45 of 9.2 ns on a core): question 70, the exact exponential in a vector.
 
+## The engine read as entangled pairs (2026-09-26)
+
+Marcello's task: pass llama.cpp keeping every bit, with the quantum lens (CLAUDE.md): a byte the
+receiver could deduce exactly from what it already holds need not travel. The unit is **MiB read
+per exact token**, OLMoE Q8_0: weights 1200 (dense N = 385: attention 272, head 104, router and
+norms 9; one token's experts E1 = 815), and 0.25 MiB of F32 K and V a cached position: ours
+1200 + 0.25 L, llama.cpp's 1200 + 0.125 L (F16): 1328 / 1264 at 512, 1712 / 1456 at 2048, 2200 /
+1700 at 4000. Predictions in `build/entangled/predictions.txt`, written before every run. The
+evening ran beside two other busy windows (9.6-11 logical processors busy): those timings were read
+as structure only, and the deciding runs waited in `build/entangled/when_free.sh`, which started by
+itself on the free machine at 03:02 (background 1.6-2.5 processors, 0.7-0.9 of them the kernel's
+System; Marcello: timings only then). Results in `build/entangled/free/`.
+
+**The inventory** (what determines what; the most a token could save; the premise and its state):
+
+| pair | entangled | most saved a token | premise | state |
+|---|---|---|---|---|
+| a coarse model inside the exact bits | a Q8_0 code's high nibble (with the block's scale) is a 4-bit model; a float's high 16 bits a bf16 | a draft at 18/34 of the weights and half the KV, verified k tokens a pass | `tools/draft_probe.c`: agreement from the exact state | 82-98%; 0.81-1.09x llama.cpp's bytes (model): not built |
+| the bus's silence inside a token | the next call's weights are known at load: entangled with nothing | the RAM idle share of a token: 5-15% | `tools/token_timeline.py` | a bug found: decode **1.04-1.08x**, the RAM idle 1-4% |
+| gate and up, used together | row r of gate and row r of up, 2 MB apart | one stream and one barrier where two | `bench_mem gateup` | 1.006-1.023x from RAM: no |
+| the page tables | 512 pages of 4 KiB are one of 2 MiB | TLB walks under 1.4 GB of streams | THP in the container | no, on the free machine too |
+| the same value at another position | layer 0's values depend on the token only | <= 1/32 of the KV (question 62) | - | closed by 62's number |
+| the next token inside the present | neighbours share 3.6-4.0 of 8 experts; the next router 92-95% | no bytes: reads ahead of time | questions 54, 62 | known; the verify pass's union uses it |
+| two memories | the KV written in RAM and VRAM | the KV off the CPU's bus: 1712 -> 1200 at 2048 | built (GPU attention) | another race: the whole machine |
+| a thread's work inside its index | 322 pool calls a token, 145 of them inline | the calls' tails and dispatches | the timeline | measured below |
+| the head's argmax inside its high plane | greedy needs the argmax, not every logit | <= 49 MiB (4%) | bounds from the high plane, exact on the candidates | not measured |
+
+### The bus's silence: a token's timeline
+
+A new instrument: the traced pool (`-DTR_POOL_TRACE`) now records, per call, the bytes it reads and
+the shape that names it (`TR_TRACE_NOTE` in tr_matmul_grouped and the decode's attention; inline
+calls traced too), and `tools/token_timeline.py` lays a decode token out call by call against a
+plain read's GB/s. Container, Q8_0, 8 threads, context 808-842, 35 tokens (P1 predicted the calls
+90-94% of a token, the RAM idle >= 12%):
+
+| | per token |
+|---|---|
+| wall | 33.7 ms, 1406.6 MiB, 43.8 GB/s (a plain read 50.0 in the same session) |
+| in calls / between calls | 99.4% / 0.6% (0.2 ms) |
+| calls | 322: 64 dense projections, 48 expert matmuls, 16 attentions, 16 swiglu, 145 inline n = 1 |
+| **the RAM idle** | **4.18 ms (12.4%)**: experts' gate/up 1.12, down 0.55, q/k/v/o 0.32, inline calls 0.29, swiglu 0.20, attention 0.20, between calls 0.20, head 0.06 |
+
+The gaps between calls are nothing; the loss is inside the calls, and `tools/pool_trace.py` says
+where: the dense projections' tail 0.85 us, **the experts' 41-60 us**. The dense calls ran balanced
+(`tr_parallel_for_balanced`, §The pool's tail), the experts never did: the matmul chose balanced when
+`offsets[n_groups] == n_groups`, and a decode token's experts are 8 rows in 64 groups (LESSONS
+#192). Fixed (`tr_matmul_one_row_per_group`, tested on the experts' shape, red with the old
+condition); logits identical byte for byte on the real model (600 positions one token a pass, and
+passes of 64), 64 generated tokens identical. Natively (indicative, loaded): the down's tail 28.1 ->
+2.5 us, gate/up's 15.8 -> 5.3. **On the free machine** (native, 8 threads, CPU attention, context
+~800, 64 tokens, the traced builds alternated, 4 pairs; no prediction was written for the fix's
+size, only P1's idle share):
+
+| | before (static experts) | after (balanced) |
+|---|---|---|
+| a token | 29.4-31.3 ms | **28.2-29.0 ms** (after / before per pair 0.925-0.958) |
+| read over the token | 47.2-50.3 GB/s | **51.0-52.4** (a plain read 53-55) |
+| the RAM idle | 1.5-3.4 ms (5.2-10.9%) | **0.3-1.1 ms (1.1-3.7%)** |
+| the experts' tails, gate/up and down | 13.4-53.0 and 23.8-67.6 us | 1.6-1.7 and 1.6-1.7 us |
+| tokens a second | 31.8-33.9 | 34.1-35.2 |
+
+`tools/ab_zone.sh` (the untraced binaries, 8 pairs a prompt): the experts' zones 0.964 [0.926-0.987]
+at 512 and 0.958 [0.932-0.988] at 2048, the decode 0.976 [0.946-1.006] at both. The decode now reads
+at 97% of a plain read's speed; what the RAM still waits for is the attention's tail (16 heads over 8
+threads, 13-20 us a layer) and the 145 inline calls.
+
+**Taken apart, one fusion.** Gate, up and the activation in one call (one tail a layer instead of
+three) was built bit for bit (a test on three types, three tiers, three widths, red with gate and
+up swapped) and removed after two native pairs on the loaded machine ran it 10-20% slower; in those
+pairs every call was slower, the untouched head 9-13% too (LESSONS #195). Taken apart since: Q8_0
+has no two-row kernel (`dot_row2` is Q4_K's), so the fused call read gate and up as two streams a
+thread. The four dimensions of the question, which bytes (a row of gate and a row of up are always
+used together, 2 MB apart), when they arrive (two streams or one), who reads them (the thread's
+share), in what sequence (three calls, three barriers): rows interleaved at load are one stream,
+one call, one barrier. `bench_mem gateup` prices it alone from RAM (three calls, fused on two
+streams, fused interleaved, the same without the activation, a plain read; P4 predicted interleaved
+1.03-1.08x of three calls); its loaded run spread 15-124%. **On the free machine** (21 repetitions,
+twice), GB/s at 8 threads: three calls 53.9 / 53.5, fused on two streams 53.0 / 54.2, **fused
+interleaved 54.2 / 54.8**, the same without the activation 54.7 / 54.9, a plain read 54.9 / 55.2; at 4
+threads 55.9 / 55.5 against 57.6 / 56.9. Interleaving gives 1.006-1.023x, under P4: three calls
+already read at 97-98% of a plain read once the experts are balanced, and the activation hides under
+the reads. **Question 72 closed as no**: no layout change for ≤ 2% of one zone.
+
+### 2 MB pages in the container
+
+The container's kernel gives huge pages on request (`transparent_hugepage` = madvise). The weights
+and the KV with `madvise(MADV_HUGEPAGE)` (a research build, `-DTR_THP`) land on them (8.36 GB of
+AnonHugePages), but three alternated pairs of `bench_mem` gave nothing above the noise (plain read at
+8: 42.6 / 46.5 / 44.3 against 44.6 / 42.3 / 46.6 GB/s; the engine's matmul 44.6 / 47.0 / 46.3 against
+46.3 / 45.6 / 48.0; spreads 7-30%, loaded). P3 predicted +0-4%. **On the free machine**, four
+alternated pairs: a plain read at 8 threads 49.6 / 50.0 / 50.7 / 51.2 against 52.2 / 50.9 / 50.8 / 50.9
+GB/s, the engine's matmul 51.3 / 53.5 / 51.7 / 53.3 against 48.8 / 53.8 / 45.2 / 49.5: nothing, the
+matmul if anything worse. Closed as no; the code stays out.
+
+### A draft inside the exact bits
+
+The draft reads each Q8_0 block's high plane (its scale and the codes' high nibbles, read as
+16 hi + 8: 18 of 34 bytes) and the KV's high 16 bits (a bf16 read at its midpoint), and runs from
+the exact state: `tools/draft_probe.c` keeps the exact session E and a draft session D whose cache
+is E's cut, and at every position runs the same token once per variant (the tier's own kernels on
+rows cut on the fly), rewound, then takes E's row cut. Variants: the KV cut alone (`kv16`); the
+planes (`planes`); the planes with the top 4 of the 8 experts, rescaled (`top4`); with a window of
+the first 4 and last 256 positions (`win256`). 256 positions a run on the exact greedy continuation
+of the three texts of question 53 (prose, code, Italian: the old ARCHITETTURA.md), container. The
+agreements are measured; the bytes a token (model, not measured) come from simulating the passes along the sequence (the draft proposes up to k tokens,
+the exact pass keeps the leading agreements and adds its own; the pass reads N + E1 U(k + 1) + KV
+once, U from question 54), `tools/draft_probe_report.py`:
+
+| text, context | rep4 | kv16 | planes | where the exact margin < 1 nat (share) | >= 1 nat | best k | MiB a token | llama.cpp / it |
+|---|---|---|---|---|---|---|---|---|
+| prose 512 | 13% | 100% | **94.9%** | 78.7% (24%) | **100%** | 6 | 1189 | 1.06x |
+| code 512 | 31% | 100% | **95.3%** | 73.2% (16%) | 99.5% | 6 | 1189 | 1.06x |
+| Italian 512 | 6% | 99.6% | **88.3%** | 64.7% (33%) | **100%** | 1 | 1305 | 0.97x |
+| code 2048 | 9% | 100% | **94.5%** | 80.3% (24%) | 99.0% | 10 | 1374 | 1.06x |
+| prose 2048 | 57% | 100% | 97.7% | 71.4% (8%) | 100% | 6 | 1330 | 1.09x |
+| Italian 2048 | 77% | 100% | 97.3% | 74.1% (11%) | 100% | 14 | 1345 | 1.08x |
+
+- **The KV's low 16 bits decide nothing**: 1 token of 1792 moved. **The planes are sure where the
+  exact model is sure**: 99.0-100% wherever its top-2 margin is at least 1 nat, 64-80% where it is
+  under; the overall figure is how unsure the text is. Above the separate Q4_K of question 53
+  (88.7-94.7%): nothing drifts, the draft restarts from the exact cache. P2 predicted 86-91% on
+  prose, 92-96% on code: above it on prose, inside on code, and the KV alone as predicted.
+- **The bytes: 0.97-1.09x of llama.cpp's**, not the win: a pass's own drafts are 56% of its bytes
+  (prose 512: 6 x 699 MiB against a verification of 3040). The runs at 2048 on prose and Italian
+  loop (57% and 77% of their 4-grams seen before): their agreement is inflated, as question 53's
+  code trajectory was (LESSONS #194).
+- **Cheaper drafts lose the sureness**: 4 experts or a window keep 80-98% where the model is sure,
+  not 100%, and fall to 18-59% where it is not; in bytes 0.88-1.12x, the best ones on the looping
+  runs.
+
+**Along the real text** (`--text 1`: the exact model reads the file's own tokens, no loop; the
+draft's own margin recorded; the bytes a token (model, not measured) from passes simulated at fixed
+k or stopping where the draft's margin falls under tau = 0.5-3 nats, the best of both):
+
+| text, context | rep4 | kv16 | planes | margin < 1 nat (share) | >= 1 nat | best k, tau | MiB a token (model) | llama.cpp / it |
+|---|---|---|---|---|---|---|---|---|
+| prose 512 | 0% | 98.4% | **85.2%** | 67.0% (44%) | 99.3% | 2, - | 1329 | 0.95x |
+| code 512 | 8% | 100% | **93.4%** | 74.2% (24%) | 99.5% | 9, 0.5 | 1218 | 1.04x |
+| Italian 512 | 0% | 99.6% | **85.5%** | 66.4% (43%) | 100% | 1, - | 1320 | 0.96x |
+| prose 2048 | 2% | 100% | **87.9%** | 71.2% (41%) | 99.3% | 11, 0.5 | 1599 | 0.91x |
+| code 2048 | 15% | 100% | **93.0%** | 77.0% (29%) | 99.5% | 15, 0.5 | 1426 | 1.02x |
+| Italian 2048 | 0% | 98.8% | **83.6%** | 64.8% (42%) | 97.3% | 3, 0.5 | 1661 | 0.88x |
+| prose 4000 | 0% | 100% | **82.4%** | 66.9% (52%) | 99.2% | 1, - | 2099 | 0.81x |
+| code 4000 | 25% | 100% | **94.9%** | 52.0% (10%) | 99.6% | 9, 0.5 | 1687 | 1.01x |
+| Italian 4000 | 3% | 99.2% | **85.2%** | 63.4% (39%) | 99.4% | 9, 0.5 | 1983 | 0.86x |
+
+- Real text is less sure than the model's own continuation (39-52% of prose and Italian positions
+  under 1 nat, against 8-33% on the greedy runs): the draft stays at 97.3-100% where the model is
+  sure, and the whole falls to 82-88% on prose and Italian, 93-95% on code.
+- **In bytes 0.81-1.04x of llama.cpp's, worse with the context**: a draft token reads the KV's high
+  halves, 0.125 MiB a position, k times a pass, while the exact pass reads the whole KV once. The
+  draft stopping where it doubts helps only code (tau = 0.5). **Pair 1 closed on the CPU in this
+  form**: no plane layout. What the numbers leave open (question 71): at a position where the draft
+  doubts, its second choice as an extra leaf of the verification (+1 row, where most passes end); a
+  draft whose own bytes do not grow with the context (the window lost the sureness: 48-96% where
+  the model is sure).
+
+## The draft's KV in 8 and 4 bits (question 75, 2026-09-26)
+
+The idea bounce's second lever (`build/entangled/bounce.md`): the draft reads the history from a copy
+written once as each row leaves the last 64 positions (as KIVI: K per channel over groups of 32
+positions, V per position, each group's min and step in fp16, 8 or 4 bits a value; the last 64 at
+16 bits), and a draft head of the first 16384 rows (+h16k). Container, `--text 1`, 128 positions a
+run (`build/entangled/run_kv.sh`, data in `build/entangled/kv/`); bytes from the report's model;
+each cell: agreement, then the leaf's best in sample / **out of sample** (k and tau chosen on one
+half of the positions, scored on the other, both ways) against llama.cpp's bytes a token:
+
+| text, context | planes (16-bit KV) | kv8 | kv4 | +h16k (planes) |
+|---|---|---|---|---|
+| prose 512 | 85.9%, 1.02 / 0.97 | 85.9%, 1.04 / **1.00** | 89.1%, 1.09 / 1.09 | 80.5%, 0.96 / 0.82 |
+| Italian 512 | 85.2%, 1.02 / 0.99 | 85.2%, 1.04 / **1.01** | 87.5%, 1.05 / 1.00 | 71.9%, 0.89 / 0.90 |
+| code 512 | 93.0%, 1.16 / 1.12 | 93.0%, 1.21 / **1.14** | 94.5%, 1.23 / 1.16 | 87.5%, 1.02 / 0.95 |
+| prose 2048 | 85.9%, 1.04 / 1.01 | 85.9%, 1.12 / **1.09** | 85.9%, 1.08 / 1.00 | 76.6%, 0.91 / 0.85 |
+| Italian 2048 | 84.4%, 0.95 / 0.90 | 84.4%, 1.01 / **0.95** | 85.2%, 1.05 / 1.01 | 79.7%, 0.94 / 0.87 |
+| code 2048 | 93.8%, 1.15 / 1.16 | 93.8%, 1.25 / **1.26** | 94.5%, 1.31 / 1.33 | 85.2%, 0.93 / 0.90 |
+| prose 4000 | 80.5%, 0.89 / 0.87 | 80.5%, 0.96 / **0.93** | 83.6%, 1.02 / 0.99 | 71.1%, 0.78 / 0.73 |
+| Italian 4000 | 88.3%, 1.04 / 0.99 | 88.3%, 1.18 / **1.12** | 88.3%, 1.22 / 1.19 | 76.6%, 0.83 / 0.80 |
+| code 4000 | 96.1%, 1.02 / 1.00 | 96.1%, 1.15 / **1.14** | 96.1%, 1.25 / 1.21 | 88.3%, 0.92 / 0.92 |
+
+- **The 8-bit copy costs the draft nothing**: its token equals the 16-bit draft's at all 1152
+  positions, and it lifts every cell by 0.02-0.14× (the history's bytes 256 → 142 MiB a draft token
+  at 2048). The in-sample best overstates by 0.00-0.08× (the out-of-sample column is the one that
+  counts; 64 positions a half, itself noisy).
+- **Prose stays at 0.93-1.09× and Italian at 0.95-1.12× out of sample** (kv8): 1.1× only on Italian at
+  4000 and on code (1.14-1.26×). What is left of a draft token is its weight plane (635 MiB against
+  the copy's 80-270): the next lever is the draft's weights, or another bus (question 74).
+- **The 16k-row head is out**: the lowest 16384 ids hold 85-93% of the exact tokens, and a miss costs
+  more than the 37 MiB saved (0.73-0.95× out of sample).
+- **The 4-bit copy agrees more often than the 16-bit one** (question 76): it changes 27 of 1152 tokens,
+  and where one of the two drafts is right and the other not, the 4-bit one wins 18 and loses 3,
+  mostly where the exact margin is under 1 nat (a sign test ~0.001). The path is the same (the 8-bit
+  copy changes none), so the gain is the 4-bit rounding itself; not used until it is understood.
+
+## The race after the balanced experts (2026-09-26)
+
+`build/entangled/race_when_free.sh` started by itself at 13:59 (`tools/race_llama.sh`: container,
+Q8_0, 8 threads, prompts 512 and 2048, 128 generated, 3 runs a series, A B B A; the engine of the
+day: the balanced experts and the vector exp). Background 3.6-3.7 logical processors before and after
+(0.96-1.06 of them the kernel's System; the free machine of 03:02 had 1.6-2.5), and a 3-second
+native build of mine (16 jobs) at 14:09 fell on the last 2048 series (LESSONS #204): indicative.
+
+| | 512: trochilus a / b | llama.cpp a / b | theirs / ours | 2048: trochilus a / b | llama.cpp a / b | theirs / ours |
+|---|---|---|---|---|---|---|
+| decode tok/s | 33.27 / 32.50 | 33.47 / 33.41 | 1.006-1.028 | 26.29 / 25.55 | 25.37 / 27.03 | 0.965-1.058 |
+| prefill tok/s | 257.3 / 237.3 | 268.2 / 260.4 | 1.042-1.097 | 236.5 / 238.2 | 243.1 / 238.0 | 0.999-1.028 |
+
+Read as structure only (LESSONS #205). **Again on a free machine** (`build/entangled/strict_rerun.sh`:
+started at 14:28 once the machine stayed at <= 2.5 processors for 30 s; background 2.04 before the
+first series, 2.93 after the last; the series still at the old limit of 3.5, the guard was tightened
+two minutes later):
+
+| | 512: trochilus a / b | llama.cpp a / b | theirs / ours | 2048: trochilus a / b | llama.cpp a / b | theirs / ours |
+|---|---|---|---|---|---|---|
+| decode tok/s | 33.02 / 32.35 | 33.06 / 32.46 | **1.001-1.003** | 25.70 / 25.67 | 26.84 / 26.66 | **1.039-1.044** |
+| prefill tok/s | 264.8 / 237.8 | 255.1 / 258.3 | 0.963-1.086 | 245.6 / 244.2 | 235.1 / 246.1 | 0.957-1.008 |
+
+**The decode is level with llama.cpp at 512 and theirs is 1.04× at 2048** (on 09-25: 1.04-1.05× and
+1.12-1.14×): the balanced experts (1.04-1.08×) and, at 2048, the decode attention's softmax in a
+vector. The prefill at 8 threads is level at both. What is left at 2048 is the KV's bytes (their F16,
+§The attention against llama.cpp's): the GPU attention passes it.
+
+## The softmax's exp in a vector (question 70, 2026-09-26)
+
+Question 58's exact float-only exp is a kernel-table entry: `expf_f32(x, y, n)`, y[i] =
+`tr_expf(x[i])`, y may be x, the scalar definition a loop over `tr_expf`. AVX-512 (16 lanes) and
+AVX2 (8) run question 58's variant without FMA (ln2/256 in three 8-bit pieces, Dekker's product): a
+lane is settled when an error of 2^-39 cannot move its rounding (on the subnormal grid below
+2^-126), and the others, about 1 in 33 000, take `tr_expf` itself. `tr_softmax` (the prompt's and
+the decode's attention, the router) subtracts the max in float and calls it in place; `tr_swiglu`
+calls it in chunks of 64 on the stack. `test_expf` compares every tier with `tr_expf` on all 2^32
+floats, in place and not, tails 0-16 (12 s with gcc on 4 threads, 41 s under ASan): **0 differ in
+each tier**; softmax and SiLU bit for bit under every tier. Seen red (`tools/mutate_expf.sh`): lane
+3 of the AVX-512 tier one ulp up (268 376 318 floats), the unsettled lanes keeping the fast guess
+(10 204 avx512, 10 422 avx2: only the exhaustive loop sees it).
+
+| `bench_attn 2048 --threads 1 --heads 1`, ns a (query, position), 3 rounds alternated, loaded machine | before | after |
+|---|---|---|
+| group, whole (the softmax in it) | 11.87 / 13.30 / 12.57 | 7.68 / 8.86 / 10.01 |
+| tile without the softmax (the control) | 5.90 / 6.80 / 7.73 | 5.11 / 6.83 / 7.32 |
+
+The softmax's share of a pair ~5.8 → ~2.0 ns (median minus the control), the bits' hash the same
+before and after: **1.42×** on the prompt's attention against 1.5-1.8× predicted, indicative.
+
+**In the engine, natively** (`build/entangled/after_race.sh`, started by itself after the race:
+`tools/ab_zone.sh`, Q8_0, 16 threads, the launch snapshot against the vector exp, 8 pairs alternated
+run by run; background 2.26-2.79 processors, 0.84-0.89 of them System; predicted first: the zone
+0.67-0.77, the prefill +3-5% at 2048 and +4-7% at 4000):
+
+| prompt | the attention zone, after / before | the prefill, after / before |
+|---|---|---|
+| 2048 | **0.753** [0.729-0.773] (0.42-0.45 → 0.32-0.34 s) | **0.975** [0.948-0.990] |
+| 4000 | **0.742** [0.725-0.778] (1.80-1.91 → 1.30-1.44 s) | **0.948** [0.930-0.975] |
+
+Not a completely free machine (it idles at 1.8 with the containers stopped; LESSONS #205). **Again
+on a free machine** (`build/entangled/strict_rerun.sh`, after the race; background 2.42 before, 2.30
+after; each run at <= 3.0; data in `build/entangled/strict/ab_zone/`):
+
+| prompt | the attention zone, after / before | the prefill, after / before |
+|---|---|---|
+| 2048 | **0.732** [0.710-0.772] | **0.951** [0.943-0.970] |
+| 4000 | **0.747** [0.634-0.859] | **0.953** [0.815-1.038] |
+
+At 4000 three of the eight pairs ran through a burst elsewhere (the before binary 11.3-12.7 s against
+10.3-10.4); the five clean pairs give the prefill 0.934-0.968. **The prompt's attention 1.34-1.37×,
+the prefill 1.05× at 2048 and at 4000**, inside the prediction (+3-5% and +4-7%). Open: the SwiGLU's
+share, a NEON tier.
+
+## The draft's two levers (question 71, 2026-09-26)
+
+Container, `--text 1` (the real text), 128 positions a run, one run a cell, bytes from the report's
+model (not measured); llama.cpp 1264 / 1456 / 1700 MiB a token at 512 / 2048 / 4000. Two levers
+on the Q8_0 high nibbles (`planes`, the whole KV at 16 bits): (a) the draft's second choice as one
+more leaf of the verification, at the first position where the draft's own margin is under tau (+1
+row, the union of experts grown by one row); (b) a KV of constant bytes: `nx96` keeps the sinks (4),
+the last 64 and the 96 positions the exact previous token weighted most, head by head, plus the
+position after each (<= 260, ~33 MiB); `sel192` the top 192 without the successors. Data in
+`build/w3-draft/` (`report.txt`: every variant).
+
+| text, context | planes: agreement (sure) | planes + leaf: tokens a pass, vs llama.cpp | nx96: agreement (sure) | nx96 + leaf: tokens a pass, vs llama.cpp |
+|---|---|---|---|---|
+| prose 512 | 85.9% (98.6%) | 3.35, 1.02× | 84.4% (97.2%) | 2.93, 0.98× |
+| code 512 | 93.0% (98.9%) | 6.28, 1.16× | 91.4% (100%) | 6.05, **1.20×** |
+| Italian 512 | 85.2% (100%) | 4.07, 1.02× | 81.2% (98.6%) | 2.60, 0.95× |
+| prose 2048 | 85.9% (100%) | 5.38, 1.04× | 82.8% (97.6%) | 3.23, 1.03× |
+| code 2048 | 93.8% (99.0%) | 6.82, 1.15× | 89.1% (96.0%) | 5.27, **1.20×** |
+| Italian 2048 | 84.4% (97.5%) | 3.37, 0.95× | 77.3% (90.0%) | 3.08, 1.02× |
+| prose 4000 | 80.5% (100%) | 3.02, 0.89× | 63.3% (87.5%) | 2.19, 0.90× |
+| code 4000 | 96.1% (99.1%) | 4.88, 1.02× | 96.1% (98.2%) | 9.38, **1.46×** |
+| Italian 4000 | 88.3% (100%) | 5.35, 1.04× | 69.5% (84.1%) | 3.03, 1.04× |
+
+- **Only code passes llama.cpp by 1.1×** (1.15-1.20× at 512 and 2048, 1.46× at 4000 with nx96), and
+  the code text repeats (rep4 9-12%): the easy case, where the prompt's lookup already gave 1.66× net
+  on repetitive code (question 52). Prose and Italian stay at 0.89-1.04×.
+- **The leaf is the lever that works**: +0.07-0.10× on prose and Italian (predicted at most +2%:
+  wrong), tokens a pass 1.80 → 3.02 on prose at 4000 and 1.87 → 4.07 on Italian at 512; the draft's
+  top two hold the exact token at 92-100% of the positions.
+- **In the selection, the successors are what works**: the position after each one the previous
+  token looked at, which a copying head reads next. Without them (sel192) the sure positions fall to
+  61-93% (predicted >= 97%: wrong); nx96 keeps them at 512 and on code, and loses them on prose and
+  Italian at 2048-4000 (84-90%).
+- What the draft may cost for 1.1× (planes' agreement, with the leaf): 582-801 MiB a token on prose,
+  598-1034 on Italian, and the weight plane alone reads 635: a KV of constant bytes that loses nothing
+  passes at prose 2048 and 4000 and Italian 4000; at 512 the weight plane itself must shrink.
+- Upper bounds: the best (k, tau) is chosen on the same 128 positions it is scored on; the probe
+  hands the draft the exact selection of position p-1, where a chain's j-th token has one j steps old
+  (not measured); the leaf's chain stops at the fork; the union of experts is extrapolated past 16
+  rows.
+
+Open: nx96 on prose and Italian at 2048-4000 (the exact pass hands the draft the part of the softmax
+the draft skips, max, sum and weighted V a head: head_dim + 2 floats, constant; or nx192, ~56 MiB);
+the staleness of the selection; bytes measured instead of modelled.
+
+## The prompt from 8 to 16 threads (2026-09-26)
+
+The race's gap (§Speed after x8, container, Q8_0): our prefill 8 → 16 threads 1.11-1.16×,
+llama.cpp's 1.44-1.49×. Natively on Q4_K (the traced build, 2048 tokens of olmoe.c, `generate -n
+1`, one run a width, twice with the order swapped; another agent's container ran beside it, so
+structure, not decisions; `tools/prompt_scale.sh`, `tools/prompt_timeline.py`, data in
+`build/w2-scale/`):
+
+| run | order | 8 threads | 16 threads | 8 → 16 |
+|---|---|---|---|---|
+| a | 8 first | 154 tok/s | 229 | 1.49× |
+| b | 16 first | 163 | 245 | 1.50× |
+
+**Natively on Q4_K the prompt scales as llama.cpp's did in the race**: the 1.11-1.16× belongs to the
+container (the WSL2 VM), to Q8_0, or to both; not separated today (the VM had 2.3 GB free and the
+engine refused the Q8_0's store). Where 16 threads lose against a perfect 2× (the pool's time over
+a perfect scaling of the 8-thread run: 2763 / 2047 ms of 8831 / 8268):
+
+1. **every unit of work slower, 61-67% of the loss**: GFLOP/s a busy thread 8 → 16, dense q/k/v/o
+   61.0 → 49.1, experts' gate/up 57.9 → 47.2, down 54.8 → 45.5, attention 40.3 → 29.2. The dense
+   projections are compute-bound (512 tokens a weight) and slow down 1.24× like the experts: an
+   all-core effect (the clock with 16 busy cores, the shared L3), not the partition. Inferred, not
+   measured (a fixed-FLOP loop at 8 and 16 busy cores says it); llama.cpp pays it on this chip too,
+   and 1.24× caps 2× at 1.61×;
+2. **the tails, 33-39%**: 12.2-12.3% of the pool's time at 8 threads, 17.4-20.5% at 16. The
+   prompt's matmul gives every thread one fixed region (`tr_parallel_for`) and some cores are
+   slower: chunks 0, 2, 8, 12 (cores 0, 1, 4, 6 of the first CCD) take 3-19% longer a unit, chunk 0
+   (the calling thread) finishes last in 25-44% of the big calls at 16. The regions are equal (32
+   tokens × 2048 rows in the dense calls): the cores' speed, not the cut;
+3. the per-row calls without weights (norms, adds, RoPE, KV writes; 580): 293-336 ms at 16
+   against 273-301 at 8, 0.5-0.7% of the prompt;
+4. between calls 91-98 ms at both widths: nothing.
+
+**Proposed, not built** (the largest piece that is ours): the prompt's grouped matmul stealing work
+in blocks that keep whole 8-token tiles (a group, 16 output rows, all its tokens; regions cut by
+cost, then `run_chunk`'s atomic stealing). The balanced call's contiguous ranges hold at most 4
+whole tiles in a 32-token region, too few to absorb a core 1.17× slower. Same bits: every element is
+one dot of a kernel bit-identical to scalar, the partition only chooses the thread. Predicted
+natively: the tails 17-20% → ~4% of the pool's time, 16 threads −13 to −16% (~245 → 285 tok/s), 8
+threads −7 to −8%; less on a still machine if part of the slow cores was the other load. Open: the
+container's Q8_0 at 8 and 16, pinned and not (`PS_BIN=build/linux-gcc/trochilus TR_POOL_PIN=0|2 sh
+tools/prompt_scale.sh <out> 16 8`: if the pin inside the VM is the cause, since Hyper-V places the
+vCPUs as it likes and llama.cpp does not pin, pin 0 at 16 threads gives >= 1.3× pin 2); the native
+Q8_0 with 10 GB free.
+
+## Phase-major: the prompt's matmul at the float's peak, the same bits (2026-09-26)
+
+Marcello's task: beat llama.cpp where it still led, the Q4_K prompt at 4 threads (theirs 1.6×, 222 against
+139 tok/s, their activations rounded to 8 bits) and the Q8_0 prompt at 16 threads (theirs 1.30-1.35×,
+container). A thinker (Opus) and the orchestrator bouncing ideas in rounds; predictions in
+`build/e24/predictions.txt`, prototypes in the session's scratch.
+
+**The core's genome** (native, one core, 5.23 GHz, inline asm, 8 independent chains): `vpdpbusd` zmm one a
+cycle (64 byte-MACs), latency 4. Every multiply takes its slot: `vpmulld`, `vpmullw`, `vpmaddwd`,
+`vpdpwssd`, `vmulps`, `vmulpd` (8 dp + 4 of them = 12 cycles). Adds, logic, shifts, the conversions
+`vcvtdq2ps`/`vcvtqq2pd`/`vpmovsxdq`, moves and broadcast loads are free beside one dp a cycle, up to about
+one zmm op each (8 dp + 12 ALU = 1.25 cycles a dp); `vpshufb` and `vpermb` are not. F32 without FMA: one
+`vmulps` and one `vaddps` zmm a cycle, 16 MAC/cycle, 167 GFLOP/s at 5.23 GHz.
+
+**First idea, E24 (exact integers): measured, set aside.** Activations in 24-bit block fixed point (3
+signed 8-bit digits), `vpdpbusd`, exact int32 sums, F64 across super-blocks, one rounding: a new
+definition, free of order. Kernel 145 → 157.6 GFLOP/s-eq a core, bit-identical to its own scalar
+definition; Q8_0 144.5. Accuracy on the engine's real inputs against the exact dot (TwoProduct + fsum), in
+F32 ulps, median / p99: today's F32 definition 1.8-2.3 / 108-166; E24 with one shift per 256 2.0-5.2 /
+132-525; with a shift per 32-sub-block (at most 3 finer, folded into the rescale) 1.3-2.4 / 81-212, the
+same class as F32 and not better (the thinker's forward: 41% of outputs worse, 22% twice worse); E32 (4
+digits) 0.25 / 0.5-1.2, correctly rounded 96-99%. In the engine (a scratch build, weights repacked in a
+side cache): 4.29 M outputs equal to its scalar definition, the generated text identical, the prompt 193
+tok/s at 4 threads (1.38×), the experts at 70% of the kernel. Set aside: it changes every byte for
+today's accuracy. E32 stays a question (more exact than the float; exact on int8 tensor cores).
+
+**Phase-major (the thinker's idea).** The lane contract's lane p is the chain k = p, p + 16, ... in
+increasing k: a sequence in time, not a place. Sixteen weight rows can run it side by side, one row a SIMD
+lane, each lane adding dot_row's products in dot_row's order, then the same tree on the 16 phase vectors:
+the same bits by construction, and no scale, decode or reduction in the loop (a step is one panel load, T
+multiplies with the input broadcast from memory, T adds).
+- The stream alone: 157.4 GFLOP/s, 15.05 MAC/cycle, 0 of 768 differ (predicted 15.0-15.9). With GCC's
+  inline asm taking the broadcast as an "m" operand the 24 accumulators were stored every step: 7.6.
+- A whole Q4_K matmul (dequantized and transposed into a panel per 16 rows): 130 GFLOP/s at 1024 × 2048
+  × 64, 150 at 2048 × 2048 × 512; 0 of 65 536 and of 1 048 576 outputs differ from `dot_row`.
+- The engine's own pieces alone (one core, n = 2048): the tile 164.7 GFLOP/s at T = 24 (98.6% of the
+  peak), 162-164 from T = 12, 138-154 at T = 4-10. The panel 3.48 µs (11.3 token-equivalents) → 2.74 (the
+  scales by `avx512_q4_k_scales_store`: scalar they were 0.69 of 3.29 µs, one piece removed at a time) →
+  1.83 (the quants transposed as bytes, 8 `vpermt2b` for 512 weights, VBMI: the float transpose was 0.38 of
+  the panel). The inputs' interleave 61.7 µs at T = 24 (stores 8-12 KB apart in one L1 set) → 7.9 (16 × 16
+  transposes in registers and 16 floats of pad after each phase's run; the pad on the panel too), once a
+  call for 64-128 row groups.
+- **The engine, a 512-token prompt, native, a free machine (background 1.6-1.9), alternated**: Q4_K at 4
+  threads 139.9-142.4 → **218.3-223.2 tok/s** (median ~220; llama.cpp 222 in the container); 8 threads
+  241.4 → 352.5; 16 threads 368.8 → 575.2. Q8_0: 8 threads 266.5-287.1 → 374.4-376.6; 16 threads
+  390.4-418.9 → 550.4-569.0. The decode unchanged (4 threads 54.6-58.6 against 55.0-58.5): a group under
+  4 input rows keeps the x4 and x8 kernels.
+- **Exactness**: the real model's logits byte-identical before and after (Q4_K, 160 tokens, at 1, 4, 8 and
+  16 threads; Q8_0, 96 tokens, at 16); 48 generated tokens identical; `test_phase_major` (every tile width
+  4..24, n 256 / 512 / 2048, ordinary and special blocks, Q4_K and Q8_0) red on a regrouped tree (6 941
+  checks).
+- The zones at 4 threads (Q4_K): the dense q/k/v/o 141-143 GFLOP/s a core (87% of the tile alone), the
+  experts 124-127. What is left on the experts is the panel (1.83 µs per expert and 16 rows, against a
+  median of 28 tokens an expert) and the small tiles.
+- The thinker's plan, from OLMoE's real routing (1024 tokens, 16 layers): tokens an expert in a 512-token
+  pass median 28, p10 2, p90 165, max 511; tiles of every width 4..24 cut evenly (no padding, 1.7% of the
+  work under 12); items (expert, 16 rows) costed by tokens with stealing (a static split by count leaves
+  38% tails at 4 threads: the E24 hack's 70%).
+
+Open: the panel toward the thinker's P ≈ 3 token-equivalents (the phase vectors' decode is what remains),
+the interleave shared by gate/up and by q/k/v, the race in the container (Q4_K at 4 threads, Q8_0 at 16),
+the float-transpose Q4_K panel (CPUs without VBMI) not exercised on this machine.
+
 ## Attempts
 
 | Data | Cosa | Prima | Dopo | Spread | Esito |
@@ -3867,3 +4294,7 @@ half of a pair (4.45 of 9.2 ns on a core): question 70, the exact exponential in
 | 2026-09-25 | decode rows claimed 64 at a time by an atomic counter (ggml's way) | contiguous chunks | 0.93-0.97x | 9-24% | rejected: short chunks, more stream starts |
 | 2026-09-25 | SMT in the decode, natively: two threads on each of 4 / 8 / 16 cores (TR_POOL_PIN=1 under an affinity mask) | 53.0-54.7 / 60.01 / 58.26 tok/s | 55.6-56.0 / 60.06 / 8.43 | 1-6% | **rejected**: the engine's width is 8 cores, where it adds nothing; 16 x 2 collapses (question 68) |
 | 2026-09-25 | the decode's matmuls and attention balanced at the tail (tr_parallel_for_balanced, 64 blocks a chunk; same bits) | decode calls' wall 20.3-21.4 ms a token (container, 8) / 17.0-17.3 (native, 8) | 18.8-19.6 / 16.6-17.3 | two runs each | kept: ~1.08x in the container at 8, level natively at 8, 1-2% worse natively at 16 (not a chosen width) |
+| 2026-09-26 | the decode's experts balanced at the tail too (the condition missed their 64 groups, LESSONS #192; same bits) | a token 29.4-31.3 ms, tails 13-68 us (native, free machine) | 28.2-29.0 ms, tails 1.6-1.7 us | 4 pairs; ab_zone 8 pairs | **kept**: decode 1.04-1.08x (traced pairs), the experts' zones 0.958-0.964, the RAM idle 5-11% -> 1-4% |
+| 2026-09-26 | gate, up and the activation in one call on the two matrices (two streams a thread; same bits) | three calls | head-normalised level; raw 10-20% slower | the whole run 10-15% | removed (LESSONS #195); rows interleaved at load 1.006-1.023x on the free machine: question 72 closed as no |
+| 2026-09-26 | 2 MB pages for the weights and the KV in the container (madvise) | 42.6-46.5 GB/s | 42.3-46.6 | 7-30% | no: on the free machine too (plain read level, the matmul 0.93-1.01x); code removed |
+| 2026-09-26 | the softmax's and SwiGLU's exp in a vector (the table's `expf_f32`, AVX-512 and AVX2 without FMA; same bits, 0 of 2^32 differ) | the prompt's attention zone 0.42-0.45 / 1.80-1.91 s at 2048 / 4000 (native, 16 threads) | 0.32-0.34 / 1.28-1.44 | 8 pairs, background 2.3-2.4 (free) | **kept**: the zone 0.732-0.747, the prefill 0.951 at 2048 and 0.953 at 4000 (1.05x) |

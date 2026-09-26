@@ -616,13 +616,35 @@ static int wait_server(int want_up) {
     return -1;
 }
 
-/* the server is gone from its endpoint and, on POSIX, exited 0 (under ASan: with no leak) */
-static int server_ended(server s) {
+#ifdef _WIN32
+/* how many times server_ended found the log still held after the endpoint was gone */
+static int g_log_held;
+#endif
+
+/* the server is gone from its endpoint and has exited: on POSIX with 0 (under ASan: with no
+ * leak); on Windows, where `start` leaves no handle to wait on, when its log can be opened without
+ * sharing: the server holds it until it exits. The endpoint alone is not enough: between a hangup
+ * and the next accept it can look gone while the server has still to write its last line
+ * (docs/LESSONS.md #198). */
+static int server_ended(server s, const char *log) {
     if (wait_server(0) != 0) return -1;
 #ifdef _WIN32
     (void)s;
-    return 0;
+    double end = tr_time_sec() + DEADLINE;
+    while (tr_time_sec() < end) {
+        HANDLE h = CreateFileA(log, GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h != INVALID_HANDLE_VALUE) {
+            CloseHandle(h);
+            return 0;
+        }
+        if (GetLastError() != ERROR_SHARING_VIOLATION) return 0; /* no log: nothing holds it */
+        g_log_held++;
+        Sleep(5);
+    }
+    fprintf(stderr, "test_serve: the server still holds %s after 20 s\n", log);
+    return -1;
 #else
+    (void)log;
     int rc = wait_pid((pid_t)s, DEADLINE);
     forget((pid_t)s);
     if (rc != 0) fprintf(stderr, "test_serve: the server exited %d\n", rc);
@@ -1088,7 +1110,7 @@ int main(int argc, char **argv) {
 #endif
 
     TR_CHECK(cli("serve --stop") == 0);
-    TR_CHECK(server_ended(main_server) == 0);
+    TR_CHECK(server_ended(main_server, log) == 0);
     slurp(log, err, sizeof err);
     ERR_HAS("serve: listening on");
     ERR_HAS("serve: stopped");
@@ -1110,7 +1132,7 @@ int main(int argc, char **argv) {
     }
     TR_CHECK(requests == 1 && loads == 1);
     TR_CHECK(cli("serve --stop") == 0);
-    TR_CHECK(server_ended(with_model) == 0);
+    TR_CHECK(server_ended(with_model, log3) == 0);
     slurp(log3, err, sizeof err);
     ERR_HAS("test_serve.gguf|");
     TR_CHECK(strstr(err, "no model yet") == NULL);
@@ -1129,7 +1151,7 @@ int main(int argc, char **argv) {
     sleep_ms(300);
     TR_CHECK(cli("serve --status") == 0);
     TR_CHECK(cli("serve --stop") == 0);
-    TR_CHECK(server_ended(forever) == 0);
+    TR_CHECK(server_ended(forever, log3) == 0);
 
     /* no command for 1500 ms: the server leaves by itself, though --status is asked all along
      * (only a command counts as use) */
@@ -1137,7 +1159,7 @@ int main(int argc, char **argv) {
     server idle = start_server("TR_SERVE_IDLE_MS=1500", "--idle 1", log2);
     TR_CHECK(wait_server(1) == 0);
     double t_up = tr_time_sec();
-    TR_CHECK(server_ended(idle) == 0);
+    TR_CHECK(server_ended(idle, log2) == 0);
     double t_gone = tr_time_sec() - t_up;
     TR_CHECK(t_gone < 10.0);
     slurp(log2, err, sizeof err);
@@ -1175,7 +1197,7 @@ int main(int argc, char **argv) {
         status_counts(&requests, &loads);
         TR_CHECK(requests == 0 && loads == 0);
         TR_CHECK(cli("serve --stop") == 0);
-        TR_CHECK(server_ended(other_build) == 0);
+        TR_CHECK(server_ended(other_build, log3) == 0);
         remove(other);
     }
 
@@ -1267,5 +1289,8 @@ int main(int argc, char **argv) {
     remove(out_path);
     remove(err_path);
     remove(in_path);
+#ifdef _WIN32
+    printf("  server_ended: the log still held %d times after the endpoint was gone\n", g_log_held);
+#endif
     TR_TEST_EXIT();
 }

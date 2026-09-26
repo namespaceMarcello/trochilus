@@ -121,11 +121,40 @@ struct tr_pool {
  * engine proper never has it. */
 #include <stdio.h>
 enum { TRACE_CALLS = 60000, TRACE_CHUNKS = 64 };
-typedef struct { int64_t n; int chunks; double t0, t1; } trace_call_rec;
+typedef struct { int64_t n; int chunks; double t0, t1; uint64_t bytes; int64_t rows, cols; } trace_call_rec;
 static trace_call_rec g_trace_call[TRACE_CALLS];               /* global-ok: research build only */
 static double g_trace_chunk[TRACE_CALLS][TRACE_CHUNKS][2];     /* global-ok: research build only */
 static atomic_int g_trace_n;                                    /* global-ok: research build only */
 static int g_trace_armed;                                       /* global-ok: research build only */
+/* The next call's note (tr_pool_trace_note), per calling thread; taken by that call. */
+static _Thread_local uint64_t t_note_bytes;                     /* global-ok: research build only */
+static _Thread_local int64_t t_note_rows, t_note_cols;          /* global-ok: research build only */
+
+void tr_pool_trace_note(uint64_t bytes, int64_t rows, int64_t cols) {
+    t_note_bytes = bytes;
+    t_note_rows = rows;
+    t_note_cols = cols;
+}
+
+static void trace_dump(void);
+
+/* A new call's record, or -1 past TRACE_CALLS; takes the thread's pending note. */
+static int trace_begin(int64_t n, int chunks) {
+    if (!g_trace_armed) { g_trace_armed = 1; atexit(trace_dump); }
+    int tc = atomic_fetch_add(&g_trace_n, 1);
+    if (tc >= TRACE_CALLS || chunks > TRACE_CHUNKS) tc = -1;
+    if (tc >= 0) {
+        g_trace_call[tc].n = n;
+        g_trace_call[tc].chunks = chunks;
+        g_trace_call[tc].bytes = t_note_bytes;
+        g_trace_call[tc].rows = t_note_rows;
+        g_trace_call[tc].cols = t_note_cols;
+        g_trace_call[tc].t0 = tr_time_sec();
+    }
+    t_note_bytes = 0;
+    t_note_rows = t_note_cols = 0;
+    return tc;
+}
 
 static void trace_dump(void) {
     const char *path = getenv("TR_POOL_TRACE_FILE");
@@ -140,7 +169,7 @@ static void trace_dump(void) {
         fprintf(f, "%lld %d %.3f %.3f", (long long)c->n, c->chunks, (c->t0 - base) * 1e6, (c->t1 - base) * 1e6);
         for (int k = 0; k < c->chunks && k < TRACE_CHUNKS; k++)
             fprintf(f, " %.3f %.3f", (g_trace_chunk[i][k][0] - base) * 1e6, (g_trace_chunk[i][k][1] - base) * 1e6);
-        fprintf(f, "\n");
+        fprintf(f, " %llu %lld %lld\n", (unsigned long long)c->bytes, (long long)c->rows, (long long)c->cols);
     }
     fclose(f);
 }
@@ -422,9 +451,18 @@ static void pool_run(tr_pool *p, int64_t n, int64_t min_chunk, tr_range_fn fn, v
     }
     if (chunks <= 1) {
         int worker = t_worker_id >= 0 ? t_worker_id : 0;
+#if defined(TR_POOL_TRACE)
+        /* A call the pool runs inline is traced too (one chunk): the timeline's gaps are then
+         * only the code between calls. Not a call nested in a body. */
+        int tc = p != NULL && t_depth == 0 ? trace_begin(n, 1) : -1;
+        if (tc >= 0) g_trace_chunk[tc][0][0] = g_trace_call[tc].t0;
+#endif
         t_depth++;
         fn(ctx, 0, n, worker);
         t_depth--;
+#if defined(TR_POOL_TRACE)
+        if (tc >= 0) g_trace_chunk[tc][0][1] = g_trace_call[tc].t1 = tr_time_sec();
+#endif
         return;
     }
 
@@ -445,14 +483,7 @@ static void pool_run(tr_pool *p, int64_t n, int64_t min_chunk, tr_range_fn fn, v
     p->call_chunks = chunks;
     p->call_block = block;
 #if defined(TR_POOL_TRACE)
-    if (!g_trace_armed) { g_trace_armed = 1; atexit(trace_dump); }
-    int tc = atomic_fetch_add(&g_trace_n, 1);
-    if (tc >= TRACE_CALLS || chunks > TRACE_CHUNKS) tc = -1;
-    if (tc >= 0) {
-        g_trace_call[tc].n = n;
-        g_trace_call[tc].chunks = chunks;
-        g_trace_call[tc].t0 = tr_time_sec();
-    }
+    int tc = trace_begin(n, chunks);
 #endif
     atomic_store(&p->remaining, chunks - 1);
     for (int i = 1; i < chunks; i++) {

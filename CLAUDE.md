@@ -93,6 +93,7 @@ by" column): no mistake should reach Marcello if a test could have caught it fir
 | If this changed… | Write in |
 |---|---|
 | code (every commit) | `docs/archive/DONE.md`: `### <date> — <title>`, what it is and how to try it |
+| a significant implementation: a capability a user sees, a number against llama.cpp, a milestone step (Marcello, 2026-09-26: without being asked) | `README.md`: §What we have done, the speed table, the race with llama.cpp, §What is missing; only what is offered, never the roads left. The commit hook asks for it on every commit that changes `src/`, or for `no-readme: <why>` in the message |
 | a mistake, a discovery, a debt | `docs/LESSONS.md`, with the prevention and who found it |
 | code ported from colibri or ds4 | `docs/ORIGINS.md` + the file header |
 | a decision, a debt, a measurement, the next step | `docs/STATUS.md` (replace, do not append; 40 KB cap) |

@@ -54,7 +54,11 @@ Working today, end to end:
   **bit-identical** to the scalar one, with a test that enforces it and another that proves the
   tier you think is running is the one that ran. On AVX-512 the prompt's matrix products take two
   weight rows against eight tokens at a time, and the decode's Q4_K products two weight rows against
-  the token, their scales decoded in vectors.
+  the token, their scales decoded in vectors. The prompt's attention works in tiles of four queries
+  by four positions, and the exponential of the softmax and of SwiGLU runs in vectors too, every
+  lane the correctly rounded value (checked on all 2^32 floats, tier by tier).
+- A thread pool that balances the decode's matrix products at their tail, so the memory bus stays
+  busy to the end of each call: a decode token reads at 51-52 GB/s of the RAM's 53-55.
 - **The decode's attention on an NVIDIA GPU**, loaded at runtime (no CUDA toolkit needed to build
   or run): the same bytes as the CPU, checked through the engine; without a GPU nothing changes.
 - `trochilus serve`, which keeps the model loaded between commands; `run`, `chat` and `generate`
@@ -65,8 +69,9 @@ Working today, end to end:
   and compared byte for byte against `apply_chat_template`).
 - Block prefill, prompt-driven speculative decoding, thread widths measured per phase, a KV cache
   laid out for the memory bus, and experts read from disk under a RAM budget.
-- A built-in profiler, microbenchmarks for memory, disk, attention and `expf`, and a measurement
-  harness that refuses to run on a busy machine.
+- A built-in profiler, a timeline of each token call by call, microbenchmarks for memory, disk,
+  attention and `expf`, and a measurement harness that waits for a completely free machine and marks
+  any run whose background load was not low.
 
 ### Measured
 
@@ -104,6 +109,10 @@ the ones that did not pay are written down too, in `docs/MEASUREMENTS.md`, with 
 | Two weight rows against eight tokens, the lane sums in SIMD | matmul 87 → 102 GFLOP/s on a core; prefill 1.13-1.19x (Q8_0, native, 512 to 4000 tokens) |
 | Q4_K weights instead of Q8_0 | decode 1.5x |
 | Q4_K decode: the block scales in vectors one block ahead, two weight rows per call, a prefetch | decode 1.25x at 4 threads (40.3 → 50.4 tok/s), the same bits |
+| The prompt's attention in tiles of 4 queries × 4 positions, the lane sums in SIMD | the attention 1.31-1.33x; prefill 1.03x at 2048 tokens, 1.06x at 4000 |
+| The decode's expert products balanced across threads at their tail | decode 1.04-1.08x at 8 threads; the RAM idle 5-11% → 1-4% of a token |
+| The softmax's and SwiGLU's exponential in vectors, correctly rounded in every lane | the prompt's attention 1.34-1.37x; prefill 1.05x at 2048 and 4000 tokens |
+| The prompt's matmul in phase-major order: sixteen weight rows as SIMD lanes, each running the lane contract's chain of adds in time, the same bits | the kernel 164.7 GFLOP/s on a core (98.6% of the float's peak without FMA); Q4_K prompt 1.55x at 4 threads (140 → 218-223 tok/s), 1.56x at 16; Q8_0 1.31-1.46x at 8 and 16 threads (native, logits identical) |
 
 The context table above predates the GPU attention and the two-row kernels; it will be measured
 again as a whole.
@@ -117,15 +126,24 @@ kernels called alone through ggml, on our shapes, one core (indicative: a loaded
 | Dense projections, Q8_0 | **163 GFLOP/s** (8-bit activations) | 102 GFLOP/s, exact |
 | `exp` on all 2^32 floats | rounds 3.4% of them otherwise | correctly rounded, every one |
 
-The whole engine against llama.cpp on the same OLMoE-1B-7B Q8_0 (2026-09-25, both in the same
-container, a still machine): the prompt **level at 8 threads**, theirs 1.30-1.35x at 16 (their
-8-bit activations); the decode theirs 1.04x at 512 tokens of context, 1.13x at 2048.
+The Trochilus column is before 2026-09-26: the phase-major prompt's tile now runs at 164.7 GFLOP/s on
+a core and a whole Q4_K matmul at 150 (2048 × 2048 × 512, native), still exact to the bit.
+
+The whole engine against llama.cpp on the same OLMoE-1B-7B Q8_0 (2026-09-26, both in the same
+container, 8 threads, a completely free machine): the prompt **level** at 512 and at 2048 tokens;
+the decode **level at 512 tokens of context** (1.00x; the day before theirs was 1.04x) and theirs
+1.04x at 2048 (1.13x the day before), where their KV cache is 16-bit and ours 32-bit, exact. At
+16 threads their prompt was 1.30-1.35x ours (2026-09-25; their 8-bit activations); since then the
+phase-major prompt runs natively 1.31-1.46x faster at 8 and 16 threads, with the same bits (the race
+in the container is to be run again).
 
 On the same OLMoE-1B-7B in **Q4_K**, 4 threads (2026-09-25, the same container, 512-token prompt,
 128 generated): the decode **level, 50.4 tok/s against their 50.2**, with every weight still the
 exact dequantized float (they round the activations to 8 bits); the prompt theirs 1.6x (222 against
 139 tok/s: 8-bit activations again). Their decode kernels alone, one core: 2x ours; at 4 threads
-the memory is the limit for both, 1.04x.
+the memory is the limit for both, 1.04x. **Since 2026-09-26 the prompt is level**: the phase-major
+matmul, every bit still the exact definition's, takes our Q4_K prompt at 4 threads to 218-223 tok/s
+natively against their 222 (the race in the container is to be run again).
 
 ### What we are proud of
 
@@ -137,7 +155,9 @@ logits **byte for byte** on the real model.
 **Our `expf` is correctly rounded, and the proof is exhaustive.** `src/kernels/expf.c` is a
 64-entry table and a polynomial, with the eight hard cases computed at 200 bits. `make bench-expf`
 checks **all 4 278 190 082 float values** against the reference, under gcc and under clang, and it
-runs in the gate. That is what made the two operating systems agree to the byte.
+runs in the gate. That is what made the two operating systems agree to the byte. Its vector form,
+eight or sixteen lanes at a time with no fused multiply-add, is checked against it on every one of
+the 2^32 floats in each tier, in the gate too.
 
 **Speculative decoding that cannot change the answer.** The draft comes from the text already in
 the context, verification is a single pass over 1 + k positions, and every row of a pass is bit
@@ -148,7 +168,10 @@ speculation and without it. It buys speed and can never buy a different result.
 all of A and then all of B moves the result by 10-25% as the machine warms up — that mistake once
 cost us a good optimization, which is how we know. Every session carries an A/A control and a
 declared background load, and a difference smaller than the worst A/A of that session is written
-down as "not distinguishable".
+down as "not distinguishable". A timing is taken only on a completely free machine: the harness
+waits until no more than 2.5 logical processors are busy, and a run whose declared background was
+higher is marked "NOT FREE" in its own log, so a number taken on a loaded machine cannot pass for
+a result.
 
 **Every mistake becomes an automatic check.** `docs/LESSONS.md` is the log: each entry names how
 it was found and the test, lint rule or gate check that now prevents it from coming back. The hot
@@ -206,7 +229,8 @@ The honest list, so nobody has to find out by running it:
 - **The GPU does one thing, on NVIDIA only.** The decode's attention runs there; the weights, the
   prompt and the experts are still on the CPU, and there is no Vulkan or Metal module.
 - **Q4_K and Q6_K are the lowest formats.** No Q2_K or IQ2 yet, so no 2-bit models; AVX2 lacks the
-  two-row kernels and the vector Q4_K scales AVX-512 has.
+  two-row kernels, the vector Q4_K scales and the phase-major prompt AVX-512 has, and Q6_K has no
+  phase-major panel yet.
 - **arm64 detection exists, NEON kernels do not.** On ARM the engine would take the scalar path.
 - **Greedy only** — no sampling, no server, no API, nothing beyond the CLI.
 - **A model larger than RAM has not been run yet.** The experts stream from disk under a budget,

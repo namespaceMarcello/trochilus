@@ -16,6 +16,8 @@
 #   guard       AB_GUARD passes on our marker and refreshes it, fails once the marker is not ours
 #   not ours    measure_end leaves a marker whose line is no longer ours
 #   refused     measure_end of a script that never took the marker leaves the one that is there
+#   not free    measure_not_free flags a declared background above 2.5 busy processors (3.70, 2.51)
+#               and not one at or under it, nor a line without the number (docs/LESSONS.md #205)
 # A counter per branch fails the test if a branch was never reached.
 # The body is one function, called on the last line (docs/LESSONS.md #69).
 main() {
@@ -110,7 +112,7 @@ measure_mark leftover > /dev/null
 # under test here, so it is replaced by `true`
 touch -t $OLD "$MACHINE_MARKER"
 measure_machine leftover > /dev/null
-GUARD=$(echo "$AB_GUARD" | sed 's|sh tools/machine_still.sh 3.5 600 2|true|')
+GUARD=$(echo "$AB_GUARD" | sed 's|sh tools/machine_still.sh 3.0 600 2|true|')
 [ "$GUARD" != "$AB_GUARD" ] || fail "guard: the CPU check is not where this test expects it"
 sh -c "$GUARD" && reached || fail "guard: fails on our own marker"
 [ -n "$(find "$MACHINE_MARKER" -mmin -1)" ] || fail "guard: did not refresh our marker"
@@ -129,8 +131,17 @@ MEASURE_MARK_LINE=""
 measure_end
 [ -e "$MACHINE_MARKER" ] && reached || fail "refused: measure_end removed a marker it never took"
 
-[ $REACHED -eq 10 ] || fail "$REACHED of 10 branches reached"
+# not free: the declared background decides whether a run's timings are results (#205)
+BG="background load: %s logical processors busy over 20 s, 0.9 of them the kernel's System process"
+measure_not_free "$(printf "$BG" 3.70)" && measure_not_free "$(printf "$BG" 2.51)" && reached ||
+  fail "not free: a background above 2.5 was not flagged"
+measure_not_free "$(printf "$BG" 2.50)" || measure_not_free "$(printf "$BG" 1.80)" || measure_not_free "no number" ||
+  reached
+measure_not_free "$(printf "$BG" 2.50)" && fail "not free: 2.50 flagged"
+measure_not_free "no number" && fail "not free: a line without the number flagged"
+
+[ $REACHED -eq 12 ] || fail "$REACHED of 12 branches reached"
 [ $FAILED = 0 ] || exit 1
-echo "== test_marker: the marker is taken, waited for, and given back only by its writer (10 branches)"
+echo "== test_marker: the marker is taken, waited for, and given back only by its writer; not free above 2.5 (12 branches)"
 }
 main "$@"; exit

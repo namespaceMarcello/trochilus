@@ -23,7 +23,7 @@
 # AB_GUARD, when set, is a shell command run before every run: if it fails the machine is no
 # longer the one the comparison started on, and the comparison stops there instead of mixing
 # runs of two machines (docs/LESSONS.md #73: another session started its containers again
-# seven minutes into a measurement). Example: AB_GUARD='sh tools/machine_still.sh 3.5 600 2';
+# seven minutes into a measurement). Example: AB_GUARD='sh tools/machine_still.sh 3.0 600 2';
 # the measuring scripts set it with measure_machine (tools/measure_guard.lib).
 set -e
 # The body is one function, called on the last line: the shell parses all of it before it runs

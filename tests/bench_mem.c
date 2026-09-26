@@ -16,6 +16,13 @@
  *   bench_mem weights     the engine's own matmul (tr_matmul_grouped, Q8_0, one token) over 8
  *                          random expert-sized matrices per call, out of 1 GiB of them: what
  *                          the kernels pull through the same bus
+ *   bench_mem gateup      a decode token's experts' gate, up and activation over 1 GiB of units
+ *                          (8 random a call): three calls (tr_matmul_grouped twice, tr_swiglu), one
+ *                          call reading the two matrices side by side (two streams a thread), one
+ *                          call on gate and up rows interleaved at load (one stream), the same
+ *                          without the activation, and a plain read of the same bytes; the variants
+ *                          alternated at every repetition (docs/MEASUREMENTS.md §The engine read as
+ *                          entangled pairs)
  *   bench_mem kv <n_pos>   one decode token's attention over n_pos cached positions of a KV
  *                          cache shaped like OLMoE-1B-7B's (16 layers, 16 heads of 128, f32, K
  *                          and V, context 4096), with 64 MiB of other memory read between two
@@ -371,6 +378,143 @@ static int group_weights(void) {
     return 0;
 }
 
+/* ---- gateup: a decode token's gate, up and activation, laid out and called four ways ------ */
+
+/* One expert's gate and up (EXP_ROWS rows each) are a unit of 2 * EXP_ROWS rows. Separate: the
+ * gate's rows, then the up's (two matrices, as the GGUF stores them); interleaved: gate row r and
+ * up row r side by side. Only the order of reads changes between the layouts, so one arena of
+ * random Q8_0 serves both. */
+typedef struct {
+    const unsigned char *const *unit; /* EXP_USED units */
+    size_t row_bytes;
+    int interleaved;
+    int activate; /* 0: the two dots only (the reads' price without the activation) */
+    float *y;
+    const float *x;
+    float (*dot_row)(const void *, const float *, int64_t);
+    void (*dot_row2)(const void *, const void *, const float *, int64_t, float *);
+} gateup_ctx;
+
+static void gateup_body(void *ctx_, int64_t begin, int64_t end, int worker) {
+    (void)worker;
+    const gateup_ctx *c = (const gateup_ctx *)ctx_;
+    for (int64_t i = begin; i < end; i++) {
+        int64_t e = i / EXP_ROWS, r = i % EXP_ROWS;
+        const unsigned char *u = c->unit[e];
+        const unsigned char *g = c->interleaved ? u + (size_t)(2 * r) * c->row_bytes : u + (size_t)r * c->row_bytes;
+        const unsigned char *up = c->interleaved ? g + c->row_bytes : u + (size_t)(EXP_ROWS + r) * c->row_bytes;
+        float gu[2];
+        if (c->dot_row2 != NULL) {
+            c->dot_row2(g, up, c->x + e * EXP_COLS, EXP_COLS, gu);
+        } else {
+            gu[0] = c->dot_row(g, c->x + e * EXP_COLS, EXP_COLS);
+            gu[1] = c->dot_row(up, c->x + e * EXP_COLS, EXP_COLS);
+        }
+        if (c->activate) {
+            float v = gu[0];
+            c->y[i] = v / (1.0f + tr_expf(-v)) * gu[1];
+        } else {
+            c->y[i] = gu[0] + gu[1];
+        }
+    }
+}
+
+typedef struct {
+    const unsigned char *const *unit;
+    size_t unit_bytes;
+} gateup_read_ctx;
+
+/* the ceiling: the same bytes, each thread a contiguous share of each unit, as a plain read */
+static void gateup_read_body(void *ctx_, int64_t begin, int64_t end, int worker) {
+    const gateup_read_ctx *c = (const gateup_read_ctx *)ctx_;
+    uint64_t acc = 0;
+    for (int64_t i = begin; i < end; i++) {
+        int64_t e = i / 64, part = i % 64;
+        size_t share = c->unit_bytes / 64;
+        acc += read_bytes(c->unit[e] + (size_t)part * share, share & ~(size_t)63);
+    }
+    sinks[worker].sum += acc;
+}
+
+static int group_gateup(void) {
+    size_t row_bytes = tr_row_bytes(TR_TYPE_Q8_0, EXP_COLS);
+    size_t unit_bytes = (size_t)2 * EXP_ROWS * row_bytes;
+    size_t n_units = GIB / unit_bytes;
+    unsigned char *arena = (unsigned char *)tr_alloc_aligned(GIB, 4096);
+    uint32_t *order = (uint32_t *)malloc(n_units * sizeof(uint32_t));
+    float *x = (float *)tr_alloc_aligned((size_t)EXP_USED * EXP_COLS * sizeof(float), 64);
+    float *h1 = (float *)tr_alloc_aligned((size_t)EXP_USED * EXP_ROWS * sizeof(float), 64);
+    float *h2 = (float *)tr_alloc_aligned((size_t)EXP_USED * EXP_ROWS * sizeof(float), 64);
+    if (arena == NULL || order == NULL || x == NULL || h1 == NULL || h2 == NULL) {
+        fprintf(stderr, "bench_mem: out of memory\n");
+        return 1;
+    }
+    tr_pool *all = tr_pool_create(0);
+    fill(all, arena, GIB, 0);
+    fill(all, (unsigned char *)x, (size_t)EXP_USED * EXP_COLS * sizeof(float), 1);
+    tr_pool_destroy(all);
+    uint64_t s = 0xABCDEFull;
+    for (size_t b = 0; b + 34 <= n_units * unit_bytes; b += 34) {
+        uint16_t d = (uint16_t)(0x3000 | (rng_next(&s) & 0x3FF));
+        memcpy(arena + b, &d, 2);
+    }
+    shuffle(order, n_units, 0xFEEDull);
+    size_t n_calls = n_units / EXP_USED;
+    const tr_kernels *K = tr_kernels_get();
+    int64_t offsets[EXP_USED + 1];
+    for (int i = 0; i <= EXP_USED; i++) offsets[i] = i;
+    enum { V = 5 };
+    static const char *const names[V] = {"gateup three calls", "gateup fused 2 streams", "gateup fused interleaved",
+                                         "gateup interleaved, no act", "gateup plain read"};
+    static const int threads[2] = {4, 8};
+    for (int ti = 0; ti < 2; ti++) {
+        int T = threads[ti];
+        tr_pool *pool = tr_pool_create(T);
+        if (pool == NULL) return 1;
+        double secs[V][MAX_RUNS];
+        for (int r = -1; r < n_runs; r++) {
+            for (int v = 0; v < V; v++) {
+                double t0 = tr_time_sec();
+                for (size_t call = 0; call < n_calls; call++) {
+                    const unsigned char *unit[EXP_USED];
+                    for (int e = 0; e < EXP_USED; e++) unit[e] = arena + (size_t)order[call * EXP_USED + (size_t)e] * unit_bytes;
+                    if (v == 0) {
+                        tr_mat wg[EXP_USED], wu[EXP_USED];
+                        for (int e = 0; e < EXP_USED; e++) {
+                            wg[e].type = wu[e].type = TR_TYPE_Q8_0;
+                            wg[e].rows = wu[e].rows = EXP_ROWS;
+                            wg[e].cols = wu[e].cols = EXP_COLS;
+                            wg[e].data = unit[e];
+                            wu[e].data = unit[e] + (size_t)EXP_ROWS * row_bytes;
+                        }
+                        tr_matmul_grouped(pool, wg, offsets, EXP_USED, x, h1);
+                        tr_matmul_grouped(pool, wu, offsets, EXP_USED, x, h2);
+                        tr_swiglu(pool, h1, h2, (int64_t)EXP_USED * EXP_ROWS);
+                    } else if (v < 4) {
+                        gateup_ctx c = {unit, row_bytes, v >= 2, v != 3, h1, x, K->dot_row[TR_TYPE_Q8_0],
+                                        K->dot_row2[TR_TYPE_Q8_0]};
+                        tr_parallel_for_balanced(pool, (int64_t)EXP_USED * EXP_ROWS, 3, gateup_body, &c);
+                    } else {
+                        gateup_read_ctx c = {unit, unit_bytes};
+                        tr_parallel_for_balanced(pool, (int64_t)EXP_USED * 64, 1, gateup_read_body, &c);
+                    }
+                }
+                double t1 = tr_time_sec();
+                if (r >= 0) secs[v][r] = t1 - t0;
+            }
+        }
+        sinks[0].sum += float_bits(h1);
+        for (int v = 0; v < V; v++) report(names[v], T, secs[v], n_runs, (double)(n_calls * EXP_USED) * (double)unit_bytes, 0);
+        tr_pool_destroy(pool);
+    }
+    tr_free_aligned(h2);
+    tr_free_aligned(h1);
+    tr_free_aligned(x);
+    free(order);
+    tr_free_aligned(arena);
+    return 0;
+}
+
 /* ---- kv: one token's attention, two layouts --------------------------------------- */
 
 typedef struct {
@@ -498,9 +642,9 @@ int main(int argc, char **argv) {
     if (n_runs < 3) n_runs = 3;
     if (n_runs > MAX_RUNS) n_runs = MAX_RUNS;
     int known = strcmp(group, "ram") == 0 || strcmp(group, "streams") == 0 || strcmp(group, "weights") == 0 ||
-                strcmp(group, "kv") == 0;
+                strcmp(group, "gateup") == 0 || strcmp(group, "kv") == 0;
     if (!known) {
-        fprintf(stderr, "usage: bench_mem ram | streams | weights | kv <n_pos>   [--runs N]\n");
+        fprintf(stderr, "usage: bench_mem ram | streams | weights | gateup | kv <n_pos>   [--runs N]\n");
         return 2;
     }
 
@@ -519,6 +663,7 @@ int main(int argc, char **argv) {
     int rc = strcmp(group, "ram") == 0       ? group_ram()
              : strcmp(group, "streams") == 0 ? group_streams()
              : strcmp(group, "weights") == 0 ? group_weights()
+             : strcmp(group, "gateup") == 0  ? group_gateup()
                                              : group_kv(n_pos);
     printf("elapsed %.1f s\n", tr_time_sec() - t0);
     return rc;

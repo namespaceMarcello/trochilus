@@ -5,7 +5,8 @@
 #
 #   MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src trochilus-dev:local sh tools/mutate_expf.sh
 #
-# One line per mutation, four checks: test_expf (the quick test), every-float (bench_expf
+# One line per mutation, four checks: test_expf (the quick test, with every vector tier's
+# expf_f32 against tr_expf on all the 2^32 floats), every-float (bench_expf
 # --check, all the 2^32 floats), table (tools/gen_expf_table.py --check: the header is what its
 # script writes) and lint (the hot zone). "no mutation" must be all green, every other line must
 # have at least one RED. About 10 minutes.
@@ -60,7 +61,8 @@ run "overflow: the threshold one float too low" $H "0x1.62e42e0000000p+6f" "0x1.
 run "overflow: the threshold one float too high" $H "0x1.62e42e0000000p+6f" "0x1.62e4300000000p+6f"
 run "underflow: the threshold at -103" $H "-0x1.a000000000000p+6f" "-0x1.9c00000000000p+6f"
 run "scale: k / 64 rounded toward zero" src/kernels/expf.c "((k >> 6) + 1023)" "((k / 64) + 1023)"
-run "softmax on the library's expf" src/kernels/kernels.c "x[i] = tr_expf(x[i] - m)" "x[i] = expf(x[i] - m)"
-run "SiLU on the library's expf" src/kernels/kernels.c "(1.0f + tr_expf(-v))" "(1.0f + expf(-v))"
+run "softmax and SiLU on the library's expf (the scalar tier's expf_f32)" src/kernels/kernels.c "y[k] = tr_expf(x[k]);" "y[k] = expf(x[k]);"
+run "vector exp: lane 3 of the AVX-512 tier one ulp up" src/kernels/kernels_x86.c "unsigned bad = (unsigned)(uint16_t)~(ok | nan | ovf | uf);" "unsigned bad = (unsigned)(uint16_t)~(ok | nan | ovf | uf); bits = _mm512_mask_add_epi32(bits, 0x8, bits, _mm512_set1_epi32(1));"
+run "vector exp: the unsettled lanes keep the fast guess (AVX-512)" src/kernels/kernels_x86.c "xexp_fallback(xs, y + i, bad);" "(void)xs;"
 }
 main "$@"; exit

@@ -131,14 +131,16 @@ measure_machine() {
   # a script that measures one sets TR_SERVER=1 on those runs alone
   TR_SERVER=0
   export TR_SERVER MACHINE_MARKER MEASURE_MARK_LINE
-  AB_GUARD='[ "$(head -1 "$MACHINE_MARKER" 2> /dev/null)" = "$MEASURE_MARK_LINE" ] && touch -c "$MACHINE_MARKER" && sh tools/machine_still.sh 3.5 600 2'
+  AB_GUARD='[ "$(head -1 "$MACHINE_MARKER" 2> /dev/null)" = "$MEASURE_MARK_LINE" ] && touch -c "$MACHINE_MARKER" && sh tools/machine_still.sh 3.0 600 2'
   export AB_GUARD
 }
 
 # measure_still <name>: a longer look (10 s), and a wait of up to 15 minutes for whoever is using
-# the machine to finish; then exit 3 with the names of the processes that hold the CPU.
+# the machine to finish; then exit 3 with the names of the processes that hold the CPU. The limit
+# is Marcello's rule, timings only on a completely free machine: it idles at 1.8 processors with
+# the containers stopped, and 2.5 is the most a free machine showed (docs/LESSONS.md #205).
 measure_still() {
-  cleanup_run sh tools/machine_still.sh 3.0 900 10 || { echo "$1: the machine is not still, not measuring"; exit 3; }
+  cleanup_run sh tools/machine_still.sh 2.5 900 10 || { echo "$1: the machine is not still, not measuring"; exit 3; }
 }
 
 # measure_declare <when>: a native measurement says what else the machine was doing, before its
@@ -147,6 +149,16 @@ measure_still() {
 # alone holds 0.8 of a core with everything stopped, and every number here has it underneath).
 measure_declare() {
   if command -v powershell.exe > /dev/null 2>&1; then
-    echo "$1: $(powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/background_load.ps1 20 | tr -d '\r')"
+    MEASURE_BG=$(powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/background_load.ps1 20 | tr -d '\r')
+    echo "$1: $MEASURE_BG"
+    # above 2.5 busy processors the machine was not free: its timings are structure (#205)
+    if measure_not_free "$MEASURE_BG"; then
+      echo "$1: NOT FREE (more than 2.5 logical processors busy): these timings are structure, not results"
+    fi
   fi
+}
+
+# measure_not_free <background line>: true when the line's busy processors exceed 2.5
+measure_not_free() {
+  echo "$1" | awk '{ for (i = 1; i < NF; i++) if ($(i + 1) == "logical") exit !($i > 2.5); exit 1 }'
 }

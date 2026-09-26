@@ -56,6 +56,14 @@ struct tr_session {
     void *tune_now_ctx;
 };
 
+#ifdef TR_DRAFT_PROBE
+/* tools/draft_probe.c: the architecture's session behind s (a diagnostic build only). */
+void *tr_draft_probe_session(tr_session *s);
+void *tr_draft_probe_session(tr_session *s) {
+    return s->impl;
+}
+#endif
+
 /* defined near tr_decode_tune_widths below; tr_session_create arms the first measurement too */
 static void tune_arm(tr_session *s);
 

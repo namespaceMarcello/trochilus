@@ -121,6 +121,7 @@ static void detect_x86(tr_cpu_info *c) {
                 c->avx512bw = have_avx512_os && ((ebx >> 30) & 1u);
                 c->avx512vl = have_avx512_os && ((ebx >> 31) & 1u);
                 c->avx512vnni = have_avx512_os && ((ecx >> 11) & 1u);
+                c->avx512vbmi = have_avx512_os && ((ecx >> 1) & 1u);
             }
             if (__get_cpuid_count(7, 1, &eax, &ebx, &ecx, &edx)) {
                 c->avxvnni = have_avx_os && ((eax >> 4) & 1u);
@@ -468,11 +469,11 @@ static void apply_cpu_max(tr_cpu_info *c) {
     if (strcmp(v, "scalar") == 0) {
         c->sse42 = c->avx = c->avx2 = c->fma = c->f16c = 0;
         c->avx512f = c->avx512bw = c->avx512vl = c->avx512dq = 0;
-        c->avx512vnni = c->avx512bf16 = c->avxvnni = 0;
+        c->avx512vnni = c->avx512bf16 = c->avxvnni = c->avx512vbmi = 0;
         c->neon = c->dotprod = c->i8mm = c->sve = 0;
     } else if (strcmp(v, "avx2") == 0) {
         c->avx512f = c->avx512bw = c->avx512vl = c->avx512dq = 0;
-        c->avx512vnni = c->avx512bf16 = 0;
+        c->avx512vnni = c->avx512bf16 = c->avx512vbmi = 0;
     } else if (strcmp(v, "neon") == 0) {
         c->dotprod = c->i8mm = c->sve = 0;
     } else if (strcmp(v, "avx512") != 0) { /* avx512 is the top x86 tier: nothing above it to clear */
@@ -549,6 +550,7 @@ void tr_cpu_describe(const tr_cpu_info *c, char *buf, int buf_len) {
         APPEND_FLAG(c->avx512vl, "avx512vl");
         APPEND_FLAG(c->avx512vnni, "avx512vnni");
         APPEND_FLAG(c->avx512bf16, "avx512bf16");
+        APPEND_FLAG(c->avx512vbmi, "avx512vbmi");
     } else if (c->arch == TR_ARCH_ARM64) {
         APPEND_FLAG(c->neon, "neon");
         APPEND_FLAG(c->dotprod, "dotprod");

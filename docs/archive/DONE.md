@@ -1206,3 +1206,74 @@ then `tools/.venv/Scripts/python.exe tools/pool_trace.py x.trace`.
   RACE_MODEL, RACE_PROMPTS, RACE_THREADS, RACE_OUT. The backslash hook sees `write_bytes(` too.
 Check: `make check`; `build/tests/bench_attn.exe 2048 --threads 1 --heads 1`; `sh tools/ab_zone.sh
 <before> build/trochilus.exe attention 8`.
+
+### 2026-09-26 — The engine read as entangled pairs: the token's timeline, the experts balanced, a draft inside the bits
+- The inventory of what the engine moves that it could know from elsewhere (MEASUREMENTS §The engine
+  read as entangled pairs), each pair with its most, its premise and a prediction written first.
+- The token's timeline: the traced pool records each call's bytes and shape (`TR_TRACE_NOTE`,
+  inline calls traced too), `tools/token_timeline.py` lays a decode token out against a plain read.
+  It found the RAM idle 12-15% of a token, almost all in the calls' tails.
+- The decode's experts now run balanced at their tail (`tr_matmul_one_row_per_group`; the old
+  condition never held for 64 groups, LESSONS #192): on the free machine **decode 1.04-1.08x** at 8
+  threads, the token read at 51-52 GB/s, the experts' tails 13-68 -> 1.7 us; the same bits.
+- `tools/draft_probe.c` (`make draft-probe`, `--text 1` along the real text) and
+  `tools/draft_probe_report.py`: a draft from the Q8_0 high nibbles and the KV's high 16 bits agrees
+  97-100% where the exact model is sure, 82-98% overall; 0.81-1.04x llama.cpp's bytes a token on the
+  real text (model): not built.
+- `bench_mem gateup` (gate/up layouts from RAM: interleaving 1.006-1.023x, closed); `tools/ab_zone.sh`
+  takes the decode's zones (AB_ZONE_PHASE, AB_ZONE_N, AB_ZONE_THREADS, zones summed with +); 2 MB
+  pages measured on a free machine (nothing, code removed). `make check` compiles the probe's and the
+  trace's branches, and runs its three model lanes one at a time when the Docker VM has under 11 GiB.
+- test_serve on Windows waits for the server's exit (its log opens without sharing), not only for
+  its endpoint to vanish: a race seen once under load (LESSONS #198).
+Check: `make check`; `make BUILD=build/win-trace EXTRA_CFLAGS=-DTR_POOL_TRACE build/win-trace/trochilus.exe`,
+a run with `TR_POOL_TRACE_FILE=x.trace`, then `tools/.venv/Scripts/python.exe tools/token_timeline.py x.trace`.
+
+### 2026-09-26 — The softmax's exp in a vector; the draft's two levers; the prompt from 8 to 16 threads
+- The kernel table's `expf_f32` (question 70): question 58's exact float-only exp on AVX-512 and AVX2
+  without FMA, the lanes its rounding test does not settle through `tr_expf`; `tr_softmax` and
+  `tr_swiglu` call it. `test_expf` compares every tier with `tr_expf` on all 2^32 floats (0 differ);
+  on a free machine the prompt's attention 1.34-1.37x, the prefill 1.05x at 2048 and at 4000
+  (`tools/ab_zone.sh`, 8 pairs). `tools/mutate_expf.sh`
+  rewritten on the new code, with two new mutations (LESSONS #201).
+- The draft probe (question 71): each variant's second choice, one more leaf simulated in
+  `tools/draft_probe_report.py`, two draft KVs of constant bytes (`planes_nx96`, `planes_sel192`;
+  the probe's attention hook takes the layer and the head). Only code passes llama.cpp's bytes by
+  1.1x (model).
+- `tools/prompt_scale.sh` and `tools/prompt_timeline.py`: a prompt pass traced at two widths, the
+  pool's time split into work, tails and gaps per call type, and the loss against a perfect scaling.
+  Natively on Q4_K the prompt scales 1.49-1.50x from 8 to 16 threads (LESSONS #202).
+- test_serve's red pair seen (LESSONS #198 closed).
+- Question 75 in the draft probe: `planes_kv8` and `planes_kv4` read the history from a copy of 8 or
+  4 bits a value (K per channel over 32 positions, V per position, the last 64 at 16 bits); the
+  report scores a 16k-row draft head (+h16k) and every leaf out of sample ("oos"). An 8-bit draft KV
+  changes no draft token; prose does not pass 1.1x (0.93-1.09x out of sample, model).
+- The README brought up to date (the tiles, the balanced experts, the vector exp, the race on a free
+  machine, the guard), and kept so: the commit hook (`.claude/hooks/document-before-commit.cjs`, now
+  in English) asks for `README.md` on every commit that changes `src/`, or for `no-readme: <why>`.
+- The measurement guard brought to Marcello's rule (timings only on a completely free machine,
+  LESSONS #205): a measurement starts at most at 2.5 busy processors (the machine idles at 1.8),
+  each run at 3.0, and a declared background above 2.5 prints "NOT FREE" in the log;
+  `tools/test_marker.sh` tests it (12 branches).
+Check: `make check`; `MSYS_NO_PATHCONV=1 docker run --rm -v "$PWD:/src" -w /src trochilus-dev:local sh
+tools/mutate_expf.sh`; `sh tools/prompt_scale.sh build/ps 8 16`, then
+`tools/.venv/Scripts/python.exe tools/prompt_timeline.py build/ps/trace_t8.txt build/ps/trace_t16.txt --ccd 8`.
+
+### 2026-09-26 — Phase-major: the prompt's matmul at the float's peak, the same bits
+- The kernel table's `pm_panel` (Q4_K, Q8_0), `pm_interleave` and `pm_tile` (AVX-512; kernels.h): the
+  lane contract's lane p runs as a chain in time, sixteen weight rows side by side, one a SIMD lane,
+  each with dot_row's products in dot_row's order and the same tree. A panel of 16 rows (the Q4_K one
+  from a byte transpose on VBMI, `pm_build_byte_idx`; a float transpose without it), the inputs
+  interleaved with a pad after each phase's run (`TR_PM_PAD`), tiles of every width 4..24.
+- `tr_matmul_grouped_s` / `tr_matmul_s` with a `tr_pm_scratch` owned by the session: the call's plan
+  (chunks of at most 256 input rows and tiles cut evenly), items (group, 16 rows, chunk) through
+  `tr_parallel_for_balanced`, the worker's panel kept while its next item has the same rows; a group
+  of fewer than 4 input rows keeps dot_row2 and dot_row, a call without one keeps the old road (the
+  decode). OLMoE's prompt calls (q, k, v, o, the experts, the logits) take it.
+- `avx512vbmi` in `tr_cpu`. `test_phase_major` (test_kernels: every tile width 4..24, n 256 / 512 /
+  2048, ordinary and special blocks, Q4_K and Q8_0, a canary after each output run) and
+  `test_tier_used` counting the phase-major products.
+- The prompt at 4 threads, Q4_K, 512 tokens, native: 140 → 218-223 tok/s; the real model's logits
+  byte-identical at 1, 4, 8 and 16 threads (MEASUREMENTS §Phase-major).
+Check: `make check`; `build/trochilus logits -m <model> --tokens <ids> --out a.bin -t 1` and `-t 16`
+against a build of the commit before, `cmp`; `build/trochilus generate -m <Q4_K> -p 512 -n 1 -t 4`.

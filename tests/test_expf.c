@@ -10,7 +10,10 @@
  *             that bench_expf and tools/expf_hard_cases.py show to be the correctly rounded value
  *   table     every entry of the table of exceptions takes the table, gives the value written
  *             there, and that value is the reference too
- *   softmax, SiLU   tr_softmax and tr_swiglu are their definitions with tr_expf, bit for bit
+ *   softmax, SiLU   tr_softmax and tr_swiglu are their definitions with tr_expf, bit for bit,
+ *             under every tier of the table (they call its expf_f32)
+ *   expf_f32  every vector tier against tr_expf on all the 2^32 floats, in place and not, with
+ *             tails of every length (question 70)
  *
  * Seen red: tools/mutate_expf.sh (a wrong constant, the margin of the rounding test, a wrong
  * entry of the table, the thresholds, a softmax on the library's expf). */
@@ -19,7 +22,9 @@
 #include <string.h>
 
 #include "test.h"
+#include "../src/base/threads.h"
 #include "../src/kernels/kernels.h"
+#include "../src/kernels/kernels_internal.h"
 
 static float from_bits(uint32_t u) {
     float f;
@@ -125,7 +130,7 @@ static float pseudo(unsigned *seed, float span) {
 /* On Windows the library's expf gives the same bits and this cannot tell which one ran (there
  * tools/lint.py refuses expf( in the hot zone); on Linux glibc's differs on one argument in
  * 25 000, and the rows below take 100 000 exponentials. */
-static void test_softmax_and_silu(void) {
+static void test_softmax_and_silu_tier(void) {
     enum { N = 4001, ROWS = 15 };
     static float x[N], got[N], want[N], gate[N];
     unsigned seed = 11u;
@@ -154,10 +159,104 @@ static void test_softmax_and_silu(void) {
     TR_CHECK_EQ_INT(bad, 0);
 }
 
+static const char *const tier_names[] = {"scalar", "avx2", "avx512"};
+enum { N_TIER_NAMES = sizeof tier_names / sizeof tier_names[0] };
+
+/* tr_softmax and tr_swiglu take the active table's expf_f32: the same bits under every tier */
+static void test_softmax_and_silu(void) {
+    int tiers = 0;
+    for (int t = 0; t < N_TIER_NAMES; t++) {
+        const tr_kernels *k = tr_kernels_tier(tier_names[t]);
+        if (k == NULL) continue;
+        tr_kernels_set_active(k);
+        test_softmax_and_silu_tier();
+        tiers++;
+    }
+    tr_kernels_set_active(NULL);
+    TR_CHECK(tiers > 0);
+}
+
+/* ---- every tier's expf_f32 against tr_expf on all the 2^32 floats (question 70) ----------------- *
+ * Blocks of 2^16 consecutive bit patterns over a pool. Each block goes through every tier in two
+ * calls whose split point moves with the block (a first call of 2^16 - (b mod 17) elements, then the
+ * rest: tails of 0..16 and calls shorter than one register); odd blocks in place (y = x, as the
+ * softmax calls it), even blocks out of place. Every lane is compared with tr_expf bit for bit (NaN
+ * included: both return x + x). Branches: the settled lanes, the subnormal grid, the lanes handed to
+ * tr_expf (about 1 in 33 000), the specials, the tails. Seen red: lane 3 of the AVX-512 tier one ulp
+ * up (268 376 318 floats), the unsettled lanes keeping the fast guess instead of tr_expf (10 422 avx2,
+ * 10 204 avx512: only this exhaustive loop sees it, the softmax rows do not). */
+enum { ALL_BLOCK = 1 << 16, ALL_WORKERS = 4 };
+static float all_x[ALL_WORKERS][ALL_BLOCK], all_y[ALL_WORKERS][ALL_BLOCK];
+static uint32_t all_ref[ALL_WORKERS][ALL_BLOCK];
+
+typedef struct {
+    const tr_kernels *tiers[N_TIER_NAMES];
+    int n_tiers;
+    int64_t bad[ALL_WORKERS][N_TIER_NAMES];
+    int64_t seen[ALL_WORKERS][N_TIER_NAMES];
+} all_ctx;
+
+static void all_body(void *ctx_, int64_t begin, int64_t end, int worker) {
+    all_ctx *c = (all_ctx *)ctx_;
+    float *x = all_x[worker], *y = all_y[worker];
+    uint32_t *ref = all_ref[worker];
+    for (int64_t b = begin; b < end; b++) {
+        for (int64_t i = 0; i < ALL_BLOCK; i++) {
+            x[i] = from_bits((uint32_t)(b * ALL_BLOCK + i));
+            ref[i] = to_bits(tr_expf(x[i]));
+        }
+        int64_t split = ALL_BLOCK - b % 17;
+        for (int t = 0; t < c->n_tiers; t++) {
+            if (b & 1) {
+                memcpy(y, x, sizeof all_x[0]);
+                c->tiers[t]->expf_f32(y, y, split);
+                c->tiers[t]->expf_f32(y + split, y + split, ALL_BLOCK - split);
+            } else {
+                c->tiers[t]->expf_f32(x, y, split);
+                c->tiers[t]->expf_f32(x + split, y + split, ALL_BLOCK - split);
+            }
+            int64_t bad = 0;
+            for (int64_t i = 0; i < ALL_BLOCK; i++) bad += to_bits(y[i]) != ref[i];
+            c->bad[worker][t] += bad;
+            c->seen[worker][t] += ALL_BLOCK;
+        }
+    }
+}
+
+static void test_all_floats_every_tier(void) {
+    static all_ctx c;
+    memset(&c, 0, sizeof c);
+    for (int t = 0; t < N_TIER_NAMES; t++) {
+        const tr_kernels *k = tr_kernels_tier(tier_names[t]);
+        if (k != NULL && t > 0) c.tiers[c.n_tiers++] = k; /* scalar is tr_expf itself */
+    }
+    if (c.n_tiers == 0) {
+        printf("test_expf: no vector tier on this CPU, the exhaustive vector check is skipped\n");
+        return;
+    }
+    tr_pool *pool = tr_pool_create(ALL_WORKERS);
+    TR_CHECK(pool != NULL);
+    if (pool == NULL) return;
+    tr_parallel_for(pool, (int64_t)1 << 16, 1, all_body, &c);
+    tr_pool_destroy(pool);
+    for (int t = 0; t < c.n_tiers; t++) {
+        int64_t bad = 0, seen = 0;
+        for (int w = 0; w < ALL_WORKERS; w++) {
+            bad += c.bad[w][t];
+            seen += c.seen[w][t];
+        }
+        printf("test_expf: %s expf_f32, %lld of %lld floats different from tr_expf\n", c.tiers[t]->tier,
+               (long long)bad, (long long)seen);
+        TR_CHECK(seen == (int64_t)1 << 32);
+        TR_CHECK(bad == 0);
+    }
+}
+
 int main(void) {
     test_special();
     test_fast();
     test_table();
     test_softmax_and_silu();
+    test_all_floats_every_tier();
     TR_TEST_EXIT();
 }

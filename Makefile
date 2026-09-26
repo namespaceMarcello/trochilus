@@ -170,6 +170,15 @@ bench-expf: $(EXPF_BIN)
 attn-probe:
 	$(MAKE) BUILD=$(BUILD)/probe EXTRA_CFLAGS=-DTR_ATTN_PROBE EXTRA_LDFLAGS=tools/attn_probe.c all
 
+# A diagnostic program: how often a draft read from the exact model's own bits (the high nibble of
+# every Q8_0 code, the KV's high 16 bits) picks the exact greedy token (tools/draft_probe.c, read
+# by tools/draft_probe_report.py; docs/MEASUREMENTS.md §The engine read as entangled pairs).
+draft-probe:
+	$(MAKE) BUILD=$(BUILD)/draftprobe EXTRA_CFLAGS=-DTR_DRAFT_PROBE $(BUILD)/draftprobe/draft_probe$(EXE)
+
+$(BUILD)/draft_probe$(EXE): tools/draft_probe.c $(CORE_OBJ)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDLIBS)
+
 # Scenarios with the engine profiler (bench/scenarios.json), compared with the
 # previous run on this machine. See docs/ARCHITECTURE.md §Profiling.
 # SCENARIOS=bench/scenarios-olmoe-1b-7b.json for the real model (skipped if not downloaded)
@@ -301,6 +310,9 @@ check: clean-machine lint
 		$(RESEARCH_BIN)
 	@# the diagnostic probe's branch of olmoe.c (make attn-probe) still compiles, with 0 warnings
 	$(CC) $(filter-out -MMD -MP,$(CFLAGS)) -Werror -DTR_ATTN_PROBE -fsyntax-only src/models/olmoe.c tools/attn_probe.c
+	@# and the draft probe's (make draft-probe) and the traced pool's (TR_POOL_TRACE, the token's timeline)
+	$(CC) $(filter-out -MMD -MP,$(CFLAGS)) -Werror -DTR_DRAFT_PROBE -fsyntax-only src/models/olmoe.c src/models/model.c tools/draft_probe.c
+	$(CC) $(filter-out -MMD -MP,$(CFLAGS)) -Werror -DTR_POOL_TRACE -fsyntax-only src/base/threads.c src/kernels/kernels.c src/models/olmoe.c
 	@# the models volume, when it exists, replaces models/ read over the Windows bind mount:
 	@# the real-model checks load the same file from ext4 instead of 9p (docs/LESSONS.md #41).
 	@# Beside it (tools/beside.sh), the C tests once more on Windows itself: its branches of src/base
@@ -344,7 +356,12 @@ check-linux:
 	$(MAKE) -j$(NPROC) -Orecurse check-gcc check-clang check-asan check-tsan
 	$(MAKE) BUILD=build/linux-gcc CC=gcc WERROR=1 PY=$${PY:-tools/.venv/bin/python} build/linux-gcc/trochilus \
 		$(FIX)/model-f32.gguf $(FIX)/model-f16.gguf $(FIX)/model-q8_0.gguf $(TOKFIX)/vocab.gguf
-	$(MAKE) -j3 -Orecurse check-tiny check-real check-cut
+	@# three lanes when the VM has room for their ~10 GB peak, else one after the other: another
+	@# project's container can hold 5 GB of the VM, and the engine's guard then refuses a lane
+	@# (docs/LESSONS.md #197)
+	J=$$(awk '/^MemAvailable:/ { print ($$2 >= 11 * 1024 * 1024) ? 3 : 1 }' /proc/meminfo); \
+		echo "check-linux: $$J lane(s) at once ($$(awk '/^MemAvailable:/ { printf "%.1f", $$2 / 1048576 }' /proc/meminfo) GiB available)"; \
+		$(MAKE) -j$$J -Orecurse check-tiny check-real check-cut
 
 check-tiny:
 	@# every dequantization the engine has, bit for bit gguf-py's (the reader of our oracles)

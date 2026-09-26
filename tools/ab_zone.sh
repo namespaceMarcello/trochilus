@@ -7,6 +7,8 @@
 #
 #   sh tools/ab_zone.sh <binary-before> <binary-after> <zone> [rounds] [prompts]
 #   e.g. sh tools/ab_zone.sh build/before/build/trochilus.exe build/trochilus.exe attention 8 "2048 4000"
+#   AB_ZONE_PHASE=decode AB_ZONE_N=64 AB_ZONE_THREADS=8 sh tools/ab_zone.sh <before> <after> \
+#     expert_gate_up+expert_down 8 "512 2048"    the decode's zones (a + sums several), 8 threads forced
 #
 # Native, the rules of every measurement (tools/measure_guard.lib): the machine's marker, a still
 # machine before every run. Binaries Smart App Control already lets run (a fresh copy may be held:
@@ -22,6 +24,11 @@ Z=$3
 R=${4:-8}
 PROMPTS=${5:-2048 4000}
 M=${AB_ZONE_MODEL:-models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf}
+PH=${AB_ZONE_PHASE:-prefill}
+N=${AB_ZONE_N:-2}
+T=${AB_ZONE_THREADS:-16}
+XA=""
+[ $PH = decode ] && XA="--decode-threads $T"
 PY=tools/.venv/Scripts/python.exe
 [ -x $PY ] || PY=tools/.venv/bin/python
 OUT=build/ab_zone
@@ -42,10 +49,10 @@ while [ $i -lt $R ]; do
     for W in $ORDER; do
       if [ $W = before ]; then B=$BB; else B=$BA; fi
       cleanup_run sh -c "$AB_GUARD" || { echo "ab_zone: the machine is not still: stopping"; exit 3; }
-      cleanup_run $B generate -m $M -p $P -n 2 -t 16 -c $((P + 96)) --profile-json $OUT/p.json > /dev/null 2>&1
+      cleanup_run $B generate -m $M -p $P -n $N -t $T $XA -c $((P + N + 96)) --profile-json $OUT/p.json > /dev/null 2>&1
       $PY -c "
-import json; z = json.load(open('$OUT/p.json'))['engine']['phases']['prefill']
-print('$W', $P, $i, round(z['seconds'], 4), round(z['zones']['$Z']['seconds'], 4))" >> $OUT/runs.txt
+import json; z = json.load(open('$OUT/p.json'))['engine']['phases']['$PH']
+print('$W', $P, $i, round(z['seconds'], 4), round(sum(z['zones'][k]['seconds'] for k in '$Z'.split('+')), 4))" >> $OUT/runs.txt
     done
   done
   i=$((i + 1))
@@ -61,7 +68,7 @@ for p in sorted({k[0] for k in d}):
     pairs = [v for (pp, i), v in d.items() if pp == p and len(v) == 2]
     rz = sorted(v['after'][1] / v['before'][1] for v in pairs)
     rp = sorted(v['after'][0] / v['before'][0] for v in pairs)
-    print('prompt %d, %d pairs: zone $Z after/before %.3f [%.3f-%.3f], prefill %.3f [%.3f-%.3f]' % (
+    print('prompt %d, %d pairs: zone $Z after/before %.3f [%.3f-%.3f], $PH %.3f [%.3f-%.3f]' % (
         p, len(pairs), statistics.median(rz), rz[0], rz[-1], statistics.median(rp), rp[0], rp[-1]))
 " > $OUT/summary.txt
 cat $OUT/summary.txt

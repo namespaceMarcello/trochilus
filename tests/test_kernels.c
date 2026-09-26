@@ -1275,6 +1275,30 @@ static void test_edges(void) {
  * every quantized type; where the tier has dot_row2 for the type, the pairs must have been taken
  * (67 rows: pairs and a row left alone). Branch covered: matmul_rows on quantized rows (seen red
  * with its loop stopping one row short), and its pairs. */
+/* Which grouped matmuls run balanced (tr_matmul_one_row_per_group): the branch the experts of a
+ * decode token take. Their shape, 8 rows in 8 of 64 groups, was the one the old test ("rows ==
+ * groups") missed (docs/LESSONS.md #192); every case below names the call it stands for. */
+static void test_one_row_per_group(void) {
+    int64_t dense_one[2] = {0, 1};  /* a decode token's projection */
+    int64_t dense_four[2] = {0, 4}; /* a prompt's */
+    int64_t experts[65];            /* a decode token's experts: 8 of 64 groups, one row each */
+    int64_t shared[65];             /* two tokens that share an expert */
+    int64_t k = 0, j = 0;
+    for (int g = 0; g < 64; g++) {
+        experts[g] = k;
+        k += g % 8 == 3;
+        shared[g] = j;
+        j += g == 5 ? 2 : g % 8 == 3;
+    }
+    experts[64] = k;
+    shared[64] = j;
+    TR_CHECK(tr_matmul_one_row_per_group(dense_one, 1) == 1);
+    TR_CHECK(tr_matmul_one_row_per_group(dense_four, 1) == 0);
+    TR_CHECK(experts[64] == 8 && tr_matmul_one_row_per_group(experts, 64) == 1);
+    TR_CHECK(tr_matmul_one_row_per_group(shared, 64) == 0);
+    printf("  one row per group: a decode's projection and experts balanced, a prompt's and two tokens' not\n");
+}
+
 static atomic_long g_dec_dots, g_dec_pairs;
 static const tr_kernels *g_dec_real;
 static tr_type g_dec_type;
@@ -1367,6 +1391,73 @@ static void test_matmul_decode(void) {
     }
 }
 
+/* ---- the prompt's matmul in phase-major order (kernels.h pm_*) ---------------------------------------
+ * Branch: every tier with pm_panel[type], pm_interleave and pm_tile: 16 rows' panel, T input rows
+ * interleaved, every tile width T = 4..TR_PM_TILE_MAX, against the scalar tier's dot_row bit for bit;
+ * rows of ordinary and of special blocks (the halves' whole bit range), inputs from rand_float and with
+ * zeros, n of one block, of two and OLMoE's 2048. A tier without the entries is skipped; the counter
+ * fails the test if no output was ever compared. */
+static void test_phase_major(void) {
+    static const char *tiers[2] = {"avx2", "avx512"};
+    static const tr_type types[2] = {TR_TYPE_Q4_K, TR_TYPE_Q8_0};
+    static const int64_t ns[3] = {256, 512, 2048};
+    const tr_kernels *S = tr_kernels_tier("scalar");
+    TR_CHECK(S != NULL);
+    if (S == NULL) return;
+    int64_t compared = 0;
+    for (int ti = 0; ti < 2; ti++) {
+        const tr_kernels *K = tr_kernels_tier(tiers[ti]);
+        if (K == NULL || K->pm_tile == NULL || K->pm_interleave == NULL) continue;
+        for (int yi = 0; yi < 2; yi++) {
+            tr_type type = types[yi];
+            if (K->pm_panel[type] == NULL) continue;
+            for (int ni = 0; ni < 3; ni++) {
+                const int64_t n = ns[ni];
+                const size_t rb = tr_row_bytes(type, n);
+                unsigned char *w = (unsigned char *)malloc(TR_PM_ROWS * rb);
+                float *x = (float *)malloc((size_t)TR_PM_TILE_MAX * (size_t)n * sizeof(float));
+                float *panel = (float *)malloc((size_t)TR_PM_PANEL_FLOATS(n) * sizeof(float));
+                float *xil = (float *)malloc((size_t)TR_PM_XIL_FLOATS(n, TR_PM_TILE_MAX) * sizeof(float));
+                float *part = (float *)malloc(TR_PM_PART * sizeof(float));
+                float *y = (float *)malloc((size_t)TR_PM_TILE_MAX * 40 * sizeof(float));
+                TR_CHECK(w != NULL && x != NULL && panel != NULL && xil != NULL && part != NULL && y != NULL);
+                if (w != NULL && x != NULL && panel != NULL && xil != NULL && part != NULL && y != NULL) {
+                    unsigned seed = 1234u + (unsigned)(ni * 7 + ti);
+                    for (int special = 0; special < 2; special++) {
+                        for (int r = 0; r < TR_PM_ROWS; r++) fill_row_of(type, w + (size_t)r * rb, n, &seed, special);
+                        for (int64_t i = 0; i < TR_PM_TILE_MAX * n; i++)
+                            x[i] = (next_rand(&seed) % 13u == 0) ? 0.0f : rand_float(&seed);
+                        K->pm_panel[type](w, rb, n, panel);
+                        for (int T = 4; T <= TR_PM_TILE_MAX; T++) {
+                            /* y rows 40 floats apart: the kernel writes 16, the rest stays a canary */
+                            for (int i = 0; i < TR_PM_TILE_MAX * 40; i++) y[i] = -777.0f;
+                            K->pm_interleave(x, n, n, T, xil);
+                            K->pm_tile(panel, xil, n, T, part, y, 40);
+                            for (int t = 0; t < T; t++) {
+                                for (int r = 0; r < TR_PM_ROWS; r++) {
+                                    float want = S->dot_row[type](w + (size_t)r * rb, x + (size_t)t * n, n);
+                                    TR_CHECK(bit_eq(y[t * 40 + r], want));
+                                    compared++;
+                                }
+                                for (int r = TR_PM_ROWS; r < 40; r++) TR_CHECK(y[t * 40 + r] == -777.0f);
+                            }
+                        }
+                    }
+                }
+                free(w);
+                free(x);
+                free(panel);
+                free(xil);
+                free(part);
+                free(y);
+            }
+        }
+    }
+    /* on a CPU without AVX-512 no tier has the entries yet: nothing to compare, and nothing to fail */
+    const tr_kernels *A = tr_kernels_tier("avx512");
+    if (A != NULL) TR_CHECK(compared > 0);
+}
+
 int main(void) {
     tr_kernels_init();
 
@@ -1389,6 +1480,8 @@ int main(void) {
     test_matmul_thread_determinism();
     test_matmul_grouped();
     test_matmul_decode();
+    test_one_row_per_group();
+    test_phase_major();
 
     TR_TEST_EXIT();
 }

@@ -293,56 +293,33 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
 
 ## Next steps
 
-**Day of 2026-09-24: the long-context decode, exact** (MEASUREMENTS §Skipping cached positions
-exactly and the five sections after it; LESSONS #152–#157):
-- **skipping positions exactly: closed** (OLMoE's attention is flat: an oracle skips ≤ 0.2% of the
-  bytes); `make attn-probe` checks the premise again on the next model;
-- **the decode's attention on the GPU, built** (`src/backend/gpu_attn.{h,c}`, the same bytes,
-  `tools/gpu_exact.sh`): **decode 1.31–1.32× at 2048, 1.54–1.58× at 4000**; one warp keeps the
-  laptop GPU awake between layers (LESSONS #153, #158);
-- CPU: **one position at a time** for a decode token: exact, kept, but not distinguishable on a
-  still machine (0.96–1.05× a token, the zone −9% at 2048; the bench's 1.10–1.13× was under load,
-  LESSONS #160); the KV packed in 28 bits exact, 1.13× fewer bytes, not timed yet (question 57);
-- speculation at long context (question 52): nil on prose, 1.57 tokens a pass rewriting code,
-  1.66× net on repetitive code; a pass of ~4 rows reads ~2.8× the experts;
-- **evening: the premises measured** (MEASUREMENTS §A Q4 draft to §The KV packed in 28 bits; LESSONS
-  #161–#164). **53**: the Q4_K picks the Q8_0's token 88.7–94.7% of the time, but **54**'s union is
-  small: a pass of 8 drafts is **~2.0× fewer bytes a token** on prose. **55**: the matmul at 49–53%
-  of the no-FMA peak. **56**: codes at 7.59–7.69 bits of 8, closed. **62**: 0.008% of blocks repeat.
-  **57**: the packed KV 0.97–1.05×, no. **58**: the float-only exact exp in AVX-512 and AVX2, 0 of
-  2^32 differ, 4.8× / 4.4× `tr_expf` a value: not wired (question 70 wires it);
-- **two rows against eight tokens, built** (`dot_row2_x8`, AVX-512, Q8_0/Q4_K/Q6_K, the same bits;
-  MEASUREMENTS §Two rows against eight tokens, LESSONS #165–#167): the lane tree in SIMD
-  was a tenth of every two-row call. The matmul on a core 87 → 102
-  GFLOP/s (61% of the no-FMA peak); **prefill 1.19× on Q8_0 and Q4_K_M at 16 threads, 1.30× on
-  Q4_K_M at 8** (container; native below);
-- **late 09-24: pieces 1 and 4 read** (ORIGINS rows 1, 4; LESSONS #169–#170): the references run
-  int8 activations; ggml's exp rounds 3.36% of floats otherwise, ours none;
-- **2026-09-25: piece 1 closed** (MEASUREMENTS §Speed after x8; ORIGINS row 1; LESSONS
-  #173–#176): x8 native **prefill 1.15–1.19× at 512 and 2048, 1.13–1.14× at 4000**, logits
-  identical. Against llama.cpp (container): **prefill level at 8 threads**, theirs 1.30–1.35× at 16
-  (our 8 → 16 threads 1.11–1.16×, theirs 1.44–1.49×). Question 64 closed as no (4 × 6 and 3 × 8
-  lose 6–16%), which refutes question 63's "bound by the input loads" (#176);
-- **2026-09-25 evening: piece 2, then question 66** (MEASUREMENTS §The decode's matmul against
-  ggml's, §The Q4_K decode dot sequenced; ORIGINS row 2; LESSONS #177-#183). **Q8_0 level from 4
-  threads**: its decode gap is attention. **Q4_K level with llama.cpp at 4 threads, exact**: read
-  like a genome, the scalar scale decode was 24% of a row; the scales in a vector one block ahead
-  and two rows a call (`dot_row2`): the real model's decode **40.3 -> 50.4 tok/s** (llama.cpp
-  50.2), the matmul ggml 1.37x -> 1.04x;
-- **late 09-25: SMT closed as no, the pool balanced at its tail** (MEASUREMENTS §SMT in the decode,
-  §The pool's tail; LESSONS #184-#186): +1.6-5.7% at 4 cores, 0 at 8, a collapse at 16 (question 68);
-  `tr_parallel_for_balanced` for the decode, ~1.08x on its calls in the container at 8;
-- **2026-09-26: piece 3, the attention, read and measured** (ORIGINS row 3; MEASUREMENTS §The
-  attention against llama.cpp's, §The prompt's attention in tiles; LESSONS #187-#190). **Decode**:
-  the race as a line is level with no context, 5.31 against 3.24 µs a cached position: their F16
-  KV's bytes (also summed in F16); ours reads at a plain read's speed, and F32 at their slope needs
-  81 GB/s (the RAM reads 53-57): closed on the CPU (question 69), the GPU attention passes it. One
-  front in memory refuted (#188). **Prompt**: tiles of 4 queries × 4 positions, the lane trees in
-  SIMD: the attention zone **1.31-1.33×** in the engine, logits identical; prefill 1.03× at 2048, 1.06× at 4000;
-- **next, one piece at a time**: question 70 (the softmax's exp in a vector, now half of a prompt's
-  pair); the Q4_K race at long context (`RACE_MODEL=...Q4_K.gguf RACE_PROMPTS="512 2048"
-  RACE_THREADS=8 sh tools/race_llama.sh 3`). Queued: prefill at 4 threads (llama.cpp 1.6x), vector
-  scales on AVX2, the 16-thread prefill gap, question 68, M3's dense weights on the GPU. **For Marcello, 59 and 60**. 61 after M4.
+**2026-09-24/26, in short** (MEASUREMENTS from §Skipping cached positions exactly to §The prompt from
+8 to 16 threads; LESSONS #152-#206): the decode's attention on the GPU, the same bytes (1.31-1.58×);
+the x8 and two-row kernels; the Q4_K decode level with llama.cpp at 4 threads, exact (50.4 against
+50.2 tok/s); the prompt's attention in tiles (1.31-1.33×); the decode's experts balanced at the tail
+(decode 1.04-1.08× at 8 threads); the softmax's and SwiGLU's exp in a vector (prefill 1.05×); the
+race of 14:28, a free machine: decode level at 512, theirs 1.04× at 2048. Closed as no: SMT, gate/up
+interleaved, 2 MB pages, drafts in the high bits, question 75's 8-bit draft KV out of sample;
+- **2026-09-26 evening: phase-major, the prompt's matmul at the float's peak with the same bits**
+  (MEASUREMENTS §Phase-major; LESSONS #207-#213; the thinker's idea, two agents bouncing rounds). The
+  lane contract's lane p is a chain in time, so sixteen weight rows run as SIMD lanes: a panel per 16
+  rows (Q4_K from a byte transpose on VBMI, Q8_0), the inputs interleaved once a call, tiles of 4..24
+  rows cut evenly, items (group, 16 rows, chunk) with stealing (kernels.h `pm_*`,
+  `tr_matmul_grouped_s`). The tile 164.7 GFLOP/s a core, 98.6% of the no-FMA peak. Native, free
+  machine, alternated: **Q4_K prompt at 4 threads 140 → 218-223 tok/s** (llama.cpp 222 in the
+  container), 8 threads 241 → 353, 16 threads 369 → 575; **Q8_0** 8 threads 267-287 → 374-377, 16
+  threads 390-419 → 550-569; the decode unchanged; the real model's logits byte-identical at 1, 4, 8
+  and 16 threads. E24 (exact integers, 3 digits of 8 bits) was built and measured first: as fast, not
+  more exact than F32 on the real inputs (per 32: 41% of outputs worse), set aside; E32 (4 digits,
+  correctly rounded 96-99%) stays a question for Marcello;
+- **next, one piece at a time**: the race in the container (Q4_K at 4 threads, Q8_0 at 8 and 16:
+  `tools/race_q4k.sh`, `tools/race_llama.sh`); the experts' panel (1.83 µs against a median of 28
+  tokens an expert: 124-127 GFLOP/s a core against the dense 141-143); the interleave shared by
+  gate/up and by q/k/v; Q6_K's panel; the non-VBMI panel under the tier check (#213); the
+  container's pin at 16 threads (`tools/prompt_scale.sh`); question 74 (**does the GPU count?**) and
+  76; the Q4_K race at long context.
+  Queued: tile-block stealing in the prompt's matmul, prefill at 4 threads, vector scales on AVX2,
+  question 68, M3's dense weights on the GPU. **For Marcello, 59 and 60**. 61 after M4.
 
 **Night of 2026-09-24**: the gate 428 → 238 s; **M2: Q4_K and Q6_K** exact (Q4_K decode 1.5× the
 Q8_0; Q4_K_M runs).
@@ -434,7 +411,10 @@ forces width** (`--decode-threads`), never `auto`: no conclusion rests on unvali
 2. **Measured width, on other machines** (question 31, after point 0): `sh
    tools/threads_phase.sh widths` and `sh tools/decode_context.sh widths` on different machine, as
    soon as one available (4–8 cores, more memory channels, Apple Silicon no pin, P/E cores).
-3. **Int8/VNNI in prefill, yes or no** (questions 21 and 28, LESSONS #65): where gap with
+3. **Superseded 2026-09-26** (MEASUREMENTS §Phase-major): the exact definition in phase-major order
+   runs at the float's peak and levels llama.cpp's int8 prompt at 4 threads, so an int8 mode is no
+   longer the lever; the open question is the other way, E32, a more exact definition (4 digits,
+   correctly rounded 96-99%) at ~0.85× phase-major. Before: **Int8/VNNI in prefill, yes or no** (questions 21 and 28, LESSONS #65): where gap with
    llama.cpp is (1.8–2.3× on kernel), but not exact. If yes: declared mode (`--fast-prefill`),
    off by default, with oracle measuring logit shift. Exact path «8 tokens in registers» measured
    and discarded. Marcello decides, asking 2026-09-19 if anything exists between float and int8:

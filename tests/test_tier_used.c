@@ -195,6 +195,23 @@ COUNTED(TR_TYPE_Q8_0, q8_0)
 COUNTED(TR_TYPE_Q4_K, q4_k)
 COUNTED(TR_TYPE_Q6_K, q6_k)
 
+/* the prompt's phase-major road (kernels.h pm_*): panels by type, and the products of every tile,
+ * TR_PM_ROWS rows by T input rows (a tile has no type: the models here have one quantized type) */
+static atomic_ullong n_pm_panel[TR_TYPE_COUNT], n_pm_products;
+#define COUNTED_PANEL(type, name) \
+    static void pmp_##name(const void *rows, size_t row_bytes, int64_t n, float *panel) { \
+        atomic_fetch_add(&n_pm_panel[type], 1); \
+        g_real->pm_panel[type](rows, row_bytes, n, panel); \
+    }
+COUNTED_PANEL(TR_TYPE_Q8_0, q8_0)
+COUNTED_PANEL(TR_TYPE_Q4_K, q4_k)
+COUNTED_PANEL(TR_TYPE_Q6_K, q6_k)
+static void counted_pm_tile(const float *panel, const float *xil, int64_t n, int T, float *part, float *y,
+                            int64_t y_stride) {
+    atomic_fetch_add(&n_pm_products, (unsigned long long)(TR_PM_ROWS * T));
+    g_real->pm_tile(panel, xil, n, T, part, y, y_stride);
+}
+
 static void counted_dot_f32_x4(const float *a, const float *b, int64_t stride, int64_t n, float *out) {
     atomic_fetch_add(&n_dot_x4, 1);
     g_real->dot_f32_x4(a, b, stride, n, out);
@@ -256,12 +273,18 @@ static void test_engine(const char *argv0, tr_type type, const char *name, long 
     counting.axpy_f32_x4 = counted_axpy_f32_x4;
     counting.dot_f32_4x4 = counted_dot_f32_4x4;
     counting.axpy_f32_4x4 = counted_axpy_f32_4x4;
+    if (g_real->pm_panel[TR_TYPE_Q8_0] != NULL) counting.pm_panel[TR_TYPE_Q8_0] = pmp_q8_0;
+    if (g_real->pm_panel[TR_TYPE_Q4_K] != NULL) counting.pm_panel[TR_TYPE_Q4_K] = pmp_q4_k;
+    if (g_real->pm_panel[TR_TYPE_Q6_K] != NULL) counting.pm_panel[TR_TYPE_Q6_K] = pmp_q6_k;
+    if (g_real->pm_tile != NULL) counting.pm_tile = counted_pm_tile;
+    atomic_store(&n_pm_products, 0);
     for (int i = 0; i < TR_TYPE_COUNT; i++) {
         atomic_store(&n_row[i], 0);
         atomic_store(&n_x4[i], 0);
         atomic_store(&n_r2[i], 0);
         atomic_store(&n_r8[i], 0);
         atomic_store(&n_p2[i], 0);
+        atomic_store(&n_pm_panel[i], 0);
     }
     atomic_store(&n_dot_x4, 0);
     atomic_store(&n_axpy_x4, 0);
@@ -295,20 +318,32 @@ static void test_engine(const char *argv0, tr_type type, const char *name, long 
             long long want = (i == (int)type ? of_type : 0) + (i == TR_TYPE_F32 ? of_router : 0);
             long long got = (long long)atomic_load(&n_row[i]) + 4 * (long long)atomic_load(&n_x4[i]) +
                             8 * (long long)atomic_load(&n_r2[i]) + 16 * (long long)atomic_load(&n_r8[i]) +
-                            2 * (long long)atomic_load(&n_p2[i]);
+                            2 * (long long)atomic_load(&n_p2[i]) +
+                            (i == (int)type ? (long long)atomic_load(&n_pm_products) : 0);
             TR_CHECK_EQ_INT(got, want);
             if (got != want) printf("  %s model, weight type %d: %lld products through the active table, %lld wanted\n",
                                     name, i, got, want);
         }
-        /* a pass of 11 tokens must take the widest road the tier has (two rows at once, else x4),
-         * and so must attention; every matrix of these models has an even number of rows */
-        if (g_real->dot_row2_x8[type] != NULL) TR_CHECK(atomic_load(&n_r8[type]) > 0);
+        /* a pass of 11 tokens must take the widest road the tier has: phase-major (a panel of the type,
+         * tiles of the prompt's rows), else two rows at once, else x4; and so must attention; every
+         * matrix of these models has an even number of rows */
+        const int pm = g_real->pm_tile != NULL && g_real->pm_panel[type] != NULL;
+        if (pm) {
+            TR_CHECK(atomic_load(&n_pm_panel[type]) > 0);
+            TR_CHECK(atomic_load(&n_pm_products) > 0);
+        } else if (g_real->dot_row2_x8[type] != NULL) {
+            TR_CHECK(atomic_load(&n_r8[type]) > 0);
+        }
         /* and a one-token pass must take the decode's pair where the tier has it */
         if (g_real->dot_row2[type] != NULL) TR_CHECK(atomic_load(&n_p2[type]) > 0);
-        printf("  %-5s model: %llu calls of 2 rows x 8 tokens, %llu of 2 x 4, %llu of 1 x 4, %llu dots\n", name,
+        printf("  %-5s model: %llu phase-major products in %llu panels, %llu calls of 2 rows x 8 tokens, %llu of "
+               "2 x 4, %llu of 1 x 4, %llu dots\n",
+               name, (unsigned long long)atomic_load(&n_pm_products), (unsigned long long)atomic_load(&n_pm_panel[type]),
                (unsigned long long)atomic_load(&n_r8[type]), (unsigned long long)atomic_load(&n_r2[type]),
                (unsigned long long)atomic_load(&n_x4[type]), (unsigned long long)atomic_load(&n_row[type]));
-        if (g_real->dot_row2_x4[type] != NULL) {
+        if (pm) {
+            TR_CHECK_EQ_INT(atomic_load(&n_x4[type]), 0); /* no pair of rows left to the one-row road */
+        } else if (g_real->dot_row2_x4[type] != NULL) {
             TR_CHECK(atomic_load(&n_r2[type]) > 0);
             TR_CHECK_EQ_INT(atomic_load(&n_x4[type]), 0); /* no pair of rows left to the one-row road */
         }

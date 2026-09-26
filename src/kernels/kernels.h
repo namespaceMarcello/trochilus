@@ -40,6 +40,17 @@
 #define TR_DOT_TOKENS 4
 /* Input rows a dot_row2_x8 kernel handles in one pass over its two weight rows. */
 #define TR_DOT_TOKENS_WIDE 8
+/* Phase-major matmul (the table's pm_* entries): weight rows per panel (one per SIMD lane), the widest
+ * tile of input rows, and the floats of a tile's scratch (one lane vector per phase and input row). */
+#define TR_PM_ROWS 16
+#define TR_PM_TILE_MAX 24
+#define TR_PM_PART (16 * TR_PM_TILE_MAX * TR_PM_ROWS)
+/* Floats added after each phase's run in a panel and in an interleaved tile: phases a power of two of
+ * bytes apart fall in one set of the L1 (8 ways) and the 16 stores of a step evict each other. */
+#define TR_PM_PAD 16
+/* floats of a panel of n columns, and of an interleaved tile of T input rows */
+#define TR_PM_PANEL_FLOATS(n) (16 * ((int64_t)(n) + TR_PM_PAD))
+#define TR_PM_XIL_FLOATS(n, T) (16 * ((int64_t)(n) / 16 * (T) + TR_PM_PAD))
 /* Cache positions a dot_f32_x4 or axpy_f32_x4 kernel handles per load of the query or the output. */
 #define TR_ATTN_X 4
 /* Cache positions per block in tr_attention_group: a block of keys (then of values) stays in the
@@ -106,8 +117,26 @@ typedef struct {
      * of them. NULL: the caller uses dot_row2_x4. */
     void (*dot_row2_x8[TR_TYPE_COUNT])(const void *row0, const void *row1, const float *x, int64_t stride, int64_t n,
                                        float *out);
+    /* The prompt's matmul in phase-major order (docs/MEASUREMENTS.md §Phase-major). The lane contract's
+     * lane p (elements k = p, p + 16, ... in increasing k, then the tree) is a sequence in time, not a place
+     * in a register: TR_PM_ROWS weight rows can run it side by side, one row a SIMD lane, and each lane
+     * adds exactly dot_row's products in dot_row's order. Three steps, n a multiple of 16:
+     * pm_panel: TR_PM_ROWS consecutive rows (row_bytes apart), each weight dequantized as dot_row
+     *   computes it, laid out panel[p * (n + TR_PM_PAD) + m * TR_PM_ROWS + r] = w_r[16m + p]
+     *   (TR_PM_PANEL_FLOATS(n) floats);
+     * pm_interleave: T input rows (stride floats apart) laid out xil[p * (n/16 * T + TR_PM_PAD) + m * T + t]
+     *   = x_t[16m + p] (TR_PM_XIL_FLOATS(n, T) floats);
+     * pm_tile: the panel's rows against the T interleaved rows, T one of 24, 16, 8, 4 (TR_PM_TILE_MAX):
+     *   y[t * y_stride + r] = dot_row(row r, x_t, n) bit for bit; part is TR_PM_PART floats of scratch.
+     * NULL where the tier has none: the caller keeps dot_row2_x8 and the others. */
+    void (*pm_panel[TR_TYPE_COUNT])(const void *rows, size_t row_bytes, int64_t n, float *panel);
+    void (*pm_interleave)(const float *x, int64_t stride, int64_t n, int T, float *xil);
+    void (*pm_tile)(const float *panel, const float *xil, int64_t n, int T, float *part, float *y, int64_t y_stride);
     /* decode one row of n elements to f32 */
     void (*dequant_row[TR_TYPE_COUNT])(const void *row, float *out, int64_t n);
+    /* y[i] = tr_expf(x[i]) for i < n, element-wise; y may be x (in place). The exponential of the
+     * softmax and of the SiLU, several lanes at a time: every lane is tr_expf's bits. */
+    void (*expf_f32)(const float *x, float *y, int64_t n);
 } tr_kernels;
 
 /* Selects the best tier this CPU supports. Idempotent. */
@@ -131,6 +160,37 @@ void tr_matmul(tr_pool *pool, const tr_mat *w, const float *x, int64_t n_tokens,
  * are skipped. y[p*rows + r] = row r of w[g] · x[p*cols ..] for the group g of row p. */
 void tr_matmul_grouped(tr_pool *pool, const tr_mat *w, const int64_t *offsets, int64_t n_groups, const float *x,
                        float *y);
+/* Scratch of the prompt's phase-major matmul (the table's pm_* entries), owned by the caller, built once
+ * by tr_pm_scratch_init and reused by every call: the interleaved input rows (as many floats as the
+ * largest x a call passes), a panel and a tile's part per pool worker, and the call's plan (its items,
+ * token chunks and tiles). A zeroed struct is "none". */
+typedef struct {
+    float *xil;
+    int64_t max_x;              /* floats of xil */
+    float *work;                /* n_workers * (TR_PM_ROWS * max_cols + TR_PM_PART) floats */
+    int64_t max_cols;
+    int n_workers;
+    int64_t *plan;              /* item, chunk and tile tables, and each worker's last panel */
+    int64_t max_groups, max_tokens;
+} tr_pm_scratch;
+/* 0 on success; the sizes are the largest a call will pass: groups, input rows (tokens), columns and
+ * input floats (tokens x columns). The same struct is freed by tr_pm_scratch_free (zeroed after). */
+int tr_pm_scratch_init(tr_pm_scratch *s, int n_workers, int64_t max_groups, int64_t max_tokens, int64_t max_cols,
+                       int64_t max_x);
+void tr_pm_scratch_free(tr_pm_scratch *s);
+uint64_t tr_pm_scratch_bytes(int n_workers, int64_t max_groups, int64_t max_tokens, int64_t max_cols, int64_t max_x);
+/* tr_matmul_grouped and tr_matmul, the same y bit for bit, taking the phase-major road where it applies:
+ * the tier has pm_panel for w's type and pm_tile, rows and cols are multiples of TR_PM_ROWS and 16, the
+ * call fits s; a group of fewer than 4 input rows keeps the x4 and x8 kernels. s == NULL: the old road. */
+void tr_matmul_grouped_s(tr_pool *pool, const tr_mat *w, const int64_t *offsets, int64_t n_groups, const float *x,
+                         float *y, const tr_pm_scratch *s);
+void tr_matmul_s(tr_pool *pool, const tr_mat *w, const float *x, int64_t n_tokens, float *y, const tr_pm_scratch *s);
+/* 1 if no group of tr_matmul_grouped's has more than one input row: a decode token's projections
+ * (one group, one row) and its experts (n_expert groups, the used ones one row each, the rest
+ * empty), whose call is only weight rows to stream and runs balanced at its tail. Until
+ * 2026-09-26 the test was "rows == groups", never true for the experts' 64 groups and 8 rows
+ * (docs/LESSONS.md #192). */
+int tr_matmul_one_row_per_group(const int64_t *offsets, int64_t n_groups);
 /* out = dequantized row `row` of w (cols elements): an embedding lookup. */
 void tr_get_row(const tr_mat *w, int64_t row, float *out);
 /* x[i] = x[i] / sqrt(mean(x^2) + eps) * weight[i], mean via the lane contract, f32. */

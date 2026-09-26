@@ -3,6 +3,7 @@
  * No FMA (built with -ffp-contract=off), no state except the kernel table. */
 #include "kernels.h"
 #include "kernels_internal.h"
+#include "../base/platform.h"
 
 #include <math.h>
 #include <string.h>
@@ -31,6 +32,11 @@ static float lane_sum(const float *x, int64_t n) {
 
 static void k_axpy_f32(float *y, const float *x, float a, int64_t n) {
     for (int64_t k = 0; k < n; k++) y[k] = y[k] + a * x[k];
+}
+
+/* the definition of every tier's expf_f32 */
+static void k_expf_f32(const float *x, float *y, int64_t n) {
+    for (int64_t k = 0; k < n; k++) y[k] = tr_expf(x[k]);
 }
 
 /* ---- 4 cache positions per call: the definition is 4 calls ------------------ */
@@ -300,6 +306,7 @@ static void build_scalar_table(tr_kernels *k) {
     k->dequant_row[TR_TYPE_Q8_0] = k_dequant_q8_0;
     k->dequant_row[TR_TYPE_Q4_K] = k_dequant_q4_k;
     k->dequant_row[TR_TYPE_Q6_K] = k_dequant_q6_k;
+    k->expf_f32 = k_expf_f32;
 }
 
 const tr_kernels *tr_kernels_scalar(void) {
@@ -500,10 +507,256 @@ void tr_matmul_grouped(tr_pool *pool, const tr_mat *w, const int64_t *offsets, i
     /* Keep chunks worth threading: roughly a few thousand scalar multiplies
      * worth of rows per chunk, never less than one row. */
     int64_t min_chunk = ctx.cols > 0 ? (4096 / ctx.cols) + 1 : 1;
+#if defined(TR_POOL_TRACE)
+    int64_t used = 0; /* the weights this call reads: the groups with rows */
+    for (int64_t g = 0; g < n_groups; g++) used += offsets[g + 1] > offsets[g];
+    TR_TRACE_NOTE((uint64_t)used * (uint64_t)ctx.rows * ctx.row_bytes, ctx.rows, ctx.cols);
+#endif
     /* One input row per group (a decode token, its experts' gathered rows): only weight rows to
      * stream, balanced at the tail. More rows share tiles, which want long chunks. */
-    if (offsets[n_groups] == n_groups) tr_parallel_for_balanced(pool, n, min_chunk, matmul_body, &ctx);
+    if (tr_matmul_one_row_per_group(offsets, n_groups)) tr_parallel_for_balanced(pool, n, min_chunk, matmul_body, &ctx);
     else tr_parallel_for(pool, n, min_chunk, matmul_body, &ctx);
+}
+
+/* ---- the prompt's matmul in phase-major order (kernels.h pm_*, tr_matmul_grouped_s) ----------------
+ * An item is (group g, 16 weight rows rg, a chunk of g's input rows): the worker builds the rows' panel
+ * (kept while its next item has the same rows) and runs every tile of the chunk. Chunks are at most
+ * PM_CHUNK input rows and tiles 4..TR_PM_TILE_MAX, both cut evenly (the thinker's tiling on OLMoE's
+ * real routing: no padding, 1.7% of the work in tiles under 12). A group of fewer than 4 input rows has
+ * one chunk per 16 rows and keeps dot_row2 and dot_row. Each output is one pm_tile or one dot_row of its
+ * own, whatever the thread: the same y at every thread count. */
+#define PM_CHUNK 256
+#define PM_MIN_ROWS 4
+
+/* the plan's tables inside s->plan */
+typedef struct {
+    int64_t *item0;       /* [n_groups + 1] first item of each group */
+    int64_t *nchunk;      /* [n_groups] chunks of each group */
+    int64_t *chunk0;      /* [n_groups + 1] first chunk of each group */
+    int64_t *tile0;       /* [n_chunks + 1] first tile of each chunk */
+    int64_t *tile_p;      /* [n_tiles] first input row of each tile */
+    int64_t *tile_t;      /* [n_tiles] its width */
+    int64_t *last;        /* [n_workers][2] the group and rows of the worker's panel, -1: none */
+} pm_plan;
+
+static int64_t pm_max_chunks(const tr_pm_scratch *s) { return s->max_groups + s->max_tokens / PM_CHUNK + 1; }
+static int64_t pm_max_tiles(const tr_pm_scratch *s) { return s->max_tokens / PM_MIN_ROWS + pm_max_chunks(s) + 1; }
+
+static pm_plan pm_plan_of(const tr_pm_scratch *s) {
+    pm_plan p;
+    int64_t *q = s->plan;
+    p.item0 = q;
+    q += s->max_groups + 1;
+    p.nchunk = q;
+    q += s->max_groups;
+    p.chunk0 = q;
+    q += s->max_groups + 1;
+    p.tile0 = q;
+    q += pm_max_chunks(s) + 1;
+    p.tile_p = q;
+    q += pm_max_tiles(s);
+    p.tile_t = q;
+    q += pm_max_tiles(s);
+    p.last = q;
+    return p;
+}
+
+typedef struct {
+    const tr_mat *w;
+    const int64_t *offsets;
+    int64_t n_groups, rows, cols;
+    const float *x;
+    float *y;
+    const tr_kernels *k;
+    const tr_pm_scratch *s;
+    pm_plan plan;
+    size_t row_bytes;
+} pm_ctx;
+
+/* tile i's interleaved rows: where its input rows sit in x, plus the pads of the tiles before it */
+static float *pm_xil_of(const pm_ctx *c, int64_t i) {
+    return c->s->xil + c->plan.tile_p[i] * c->cols + i * 16 * TR_PM_PAD;
+}
+
+static void pm_interleave_body(void *ctx_, int64_t begin, int64_t end, int worker) {
+    (void)worker;
+    const pm_ctx *c = (const pm_ctx *)ctx_;
+    for (int64_t i = begin; i < end; i++) {
+        int64_t p0 = c->plan.tile_p[i];
+        c->k->pm_interleave(c->x + p0 * c->cols, c->cols, c->cols, (int)c->plan.tile_t[i], pm_xil_of(c, i));
+    }
+}
+
+static void pm_item_body(void *ctx_, int64_t begin, int64_t end, int worker) {
+    const pm_ctx *c = (const pm_ctx *)ctx_;
+    const pm_plan *pl = &c->plan;
+    float *panel = c->s->work + (size_t)worker * (size_t)(TR_PM_PANEL_FLOATS(c->s->max_cols) + TR_PM_PART);
+    float *part = panel + (size_t)TR_PM_PANEL_FLOATS(c->s->max_cols);
+    int64_t *last = pl->last + 2 * worker;
+    int64_t g = 0, lo = 0, hi = c->n_groups - 1;
+    while (lo < hi) { /* the last group whose first item is <= begin */
+        int64_t mid = lo + (hi - lo + 1) / 2;
+        if (pl->item0[mid] <= begin) lo = mid;
+        else hi = mid - 1;
+    }
+    g = lo;
+    for (int64_t it = begin; it < end; it++) {
+        while (pl->item0[g + 1] <= it) g++;
+        int64_t local = it - pl->item0[g], nch = pl->nchunk[g];
+        int64_t rg = local / nch, ch = local % nch;
+        int64_t r0 = rg * TR_PM_ROWS, p_begin = c->offsets[g], n_in = c->offsets[g + 1] - p_begin;
+        const unsigned char *rows = (const unsigned char *)c->w[g].data + (size_t)r0 * c->row_bytes;
+        if (n_in < PM_MIN_ROWS) {
+            for (int64_t p = p_begin; p < p_begin + n_in; p++) {
+                const float *xp = c->x + p * c->cols;
+                float *yp = c->y + p * c->rows + r0;
+                for (int r = 0; r < TR_PM_ROWS; r += 2) {
+                    const unsigned char *a = rows + (size_t)r * c->row_bytes, *b = a + c->row_bytes;
+                    if (c->k->dot_row2[c->w[g].type] != NULL) {
+                        c->k->dot_row2[c->w[g].type](a, b, xp, c->cols, yp + r);
+                    } else {
+                        yp[r] = c->k->dot_row[c->w[g].type](a, xp, c->cols);
+                        yp[r + 1] = c->k->dot_row[c->w[g].type](b, xp, c->cols);
+                    }
+                }
+            }
+            continue;
+        }
+        if (last[0] != g || last[1] != rg) {
+            c->k->pm_panel[c->w[g].type](rows, c->row_bytes, c->cols, panel);
+            last[0] = g;
+            last[1] = rg;
+        }
+        int64_t ci = pl->chunk0[g] + ch;
+        for (int64_t i = pl->tile0[ci]; i < pl->tile0[ci + 1]; i++) {
+            int64_t p0 = pl->tile_p[i];
+            c->k->pm_tile(panel, pm_xil_of(c, i), c->cols, (int)pl->tile_t[i], part, c->y + p0 * c->rows + r0,
+                          c->rows);
+        }
+    }
+}
+
+/* 1 when the call took the phase-major road */
+static int matmul_phase_major(tr_pool *pool, const tr_mat *w, const int64_t *offsets, int64_t n_groups,
+                              const float *x, float *y, const tr_pm_scratch *s) {
+    const tr_kernels *k = tr_kernels_get();
+    const tr_type type = w[0].type;
+    const int64_t rows = w[0].rows, cols = w[0].cols, n_in = offsets[n_groups];
+    if (s == NULL || s->plan == NULL || k->pm_tile == NULL || k->pm_interleave == NULL || k->pm_panel[type] == NULL)
+        return 0;
+    if (rows % TR_PM_ROWS != 0 || cols % 16 != 0 || cols > s->max_cols || n_groups > s->max_groups ||
+        n_in > s->max_tokens || n_in * cols > s->max_x)
+        return 0;
+    int any = 0;
+    for (int64_t g = 0; g < n_groups; g++) any |= offsets[g + 1] - offsets[g] >= PM_MIN_ROWS;
+    if (!any) return 0;
+
+    pm_ctx c;
+    c.w = w;
+    c.offsets = offsets;
+    c.n_groups = n_groups;
+    c.rows = rows;
+    c.cols = cols;
+    c.x = x;
+    c.y = y;
+    c.k = k;
+    c.s = s;
+    c.plan = pm_plan_of(s);
+    c.row_bytes = tr_row_bytes(type, cols);
+    pm_plan *pl = &c.plan;
+    /* the plan: chunks and tiles cut evenly (piece i of L in n: [i*L/n, (i+1)*L/n)) */
+    int64_t n_items = 0, n_chunks = 0, n_tiles = 0;
+    for (int64_t g = 0; g < n_groups; g++) {
+        int64_t cg = offsets[g + 1] - offsets[g];
+        int64_t nch = cg >= PM_MIN_ROWS ? (cg + PM_CHUNK - 1) / PM_CHUNK : 1;
+        pl->item0[g] = n_items;
+        pl->nchunk[g] = nch;
+        pl->chunk0[g] = n_chunks;
+        if (cg > 0) n_items += (rows / TR_PM_ROWS) * nch;
+        if (cg >= PM_MIN_ROWS) {
+            for (int64_t ch = 0; ch < nch; ch++) {
+                int64_t c0 = offsets[g] + ch * cg / nch, c1 = offsets[g] + (ch + 1) * cg / nch, len = c1 - c0;
+                int64_t nt = (len + TR_PM_TILE_MAX - 1) / TR_PM_TILE_MAX;
+                pl->tile0[n_chunks++] = n_tiles;
+                for (int64_t t = 0; t < nt; t++) {
+                    pl->tile_p[n_tiles] = c0 + t * len / nt;
+                    pl->tile_t[n_tiles] = c0 + (t + 1) * len / nt - pl->tile_p[n_tiles];
+                    n_tiles++;
+                }
+            }
+        } else {
+            pl->tile0[n_chunks++] = n_tiles; /* its one chunk has no tiles */
+        }
+    }
+    pl->item0[n_groups] = n_items;
+    pl->chunk0[n_groups] = n_chunks;
+    pl->tile0[n_chunks] = n_tiles;
+    for (int i = 0; i < 2 * s->n_workers; i++) pl->last[i] = -1;
+
+    tr_parallel_for(pool, n_tiles, 1, pm_interleave_body, &c);
+    tr_parallel_for_balanced(pool, n_items, 1, pm_item_body, &c);
+    return 1;
+}
+
+void tr_matmul_grouped_s(tr_pool *pool, const tr_mat *w, const int64_t *offsets, int64_t n_groups, const float *x,
+                         float *y, const tr_pm_scratch *s) {
+    if (n_groups <= 0 || offsets[n_groups] <= 0 || w[0].rows <= 0) return;
+    if (pool != NULL && s != NULL && tr_pool_size(pool) > s->n_workers) s = NULL;
+    if (matmul_phase_major(pool, w, offsets, n_groups, x, y, s)) return;
+    tr_matmul_grouped(pool, w, offsets, n_groups, x, y);
+}
+
+void tr_matmul_s(tr_pool *pool, const tr_mat *w, const float *x, int64_t n_tokens, float *y, const tr_pm_scratch *s) {
+    const int64_t offsets[2] = {0, n_tokens};
+    tr_matmul_grouped_s(pool, w, offsets, 1, x, y, s);
+}
+
+/* hot: end */
+
+uint64_t tr_pm_scratch_bytes(int n_workers, int64_t max_groups, int64_t max_tokens, int64_t max_cols, int64_t max_x) {
+    tr_pm_scratch t;
+    t.max_groups = max_groups;
+    t.max_tokens = max_tokens;
+    uint64_t plan = (uint64_t)((max_groups + 1) * 3 + pm_max_chunks(&t) + 1 + 2 * pm_max_tiles(&t) + 2 * n_workers);
+    return (uint64_t)(max_x + pm_max_tiles(&t) * 16 * TR_PM_PAD) * sizeof(float) +
+           (uint64_t)n_workers * (uint64_t)(TR_PM_PANEL_FLOATS(max_cols) + TR_PM_PART) * sizeof(float) +
+           plan * sizeof(int64_t);
+}
+
+int tr_pm_scratch_init(tr_pm_scratch *s, int n_workers, int64_t max_groups, int64_t max_tokens, int64_t max_cols,
+                       int64_t max_x) {
+    memset(s, 0, sizeof *s);
+    if (n_workers < 1) n_workers = 1;
+    s->n_workers = n_workers;
+    s->max_groups = max_groups;
+    s->max_tokens = max_tokens;
+    s->max_cols = max_cols;
+    s->max_x = max_x;
+    uint64_t plan = (uint64_t)((max_groups + 1) * 3 + pm_max_chunks(s) + 1 + 2 * pm_max_tiles(s) + 2 * n_workers);
+    s->xil = (float *)tr_alloc_aligned((size_t)(max_x + pm_max_tiles(s) * 16 * TR_PM_PAD) * sizeof(float), 64);
+    s->work = (float *)tr_alloc_aligned(
+        (size_t)n_workers * (size_t)(TR_PM_PANEL_FLOATS(max_cols) + TR_PM_PART) * sizeof(float), 64);
+    s->plan = (int64_t *)tr_alloc_aligned((size_t)plan * sizeof(int64_t), 64);
+    if (s->xil == NULL || s->work == NULL || s->plan == NULL) {
+        tr_pm_scratch_free(s);
+        return -1;
+    }
+    return 0;
+}
+
+void tr_pm_scratch_free(tr_pm_scratch *s) {
+    tr_free_aligned(s->xil);
+    tr_free_aligned(s->work);
+    tr_free_aligned(s->plan);
+    memset(s, 0, sizeof *s);
+}
+
+/* hot: begin */
+
+int tr_matmul_one_row_per_group(const int64_t *offsets, int64_t n_groups) {
+    for (int64_t g = 0; g < n_groups; g++)
+        if (offsets[g + 1] - offsets[g] > 1) return 0;
+    return 1;
 }
 
 void tr_matmul(tr_pool *pool, const tr_mat *w, const float *x, int64_t n_tokens, float *y) {
@@ -543,12 +796,16 @@ void tr_rope_neox(float *x, int64_t n_heads, int64_t head_dim, const float *cos_
     }
 }
 
+/* x[i] = tr_expf(x[i] - m): the difference rounded to float first, then the table's expf_f32,
+ * which is tr_expf lane by lane (question 70) */
 void tr_softmax(float *x, int64_t n) {
     if (n <= 0) return;
+    const tr_kernels *k = g_active != NULL ? g_active : tr_kernels_scalar();
     float m = x[0];
     for (int64_t i = 1; i < n; i++)
         if (x[i] > m) m = x[i];
-    for (int64_t i = 0; i < n; i++) x[i] = tr_expf(x[i] - m);
+    for (int64_t i = 0; i < n; i++) x[i] = x[i] - m;
+    k->expf_f32(x, x, n);
     float sum = lane_sum(x, n);
     for (int64_t i = 0; i < n; i++) x[i] /= sum;
 }
@@ -558,15 +815,24 @@ typedef struct {
     const float *y;
 } swiglu_ctx;
 
+/* Elements per call of expf_f32 in tr_swiglu: the exponentials of a chunk sit on the stack. */
+#define SWIGLU_CHUNK 64
+
 static void swiglu_body(void *ctx_, int64_t begin, int64_t end, int worker) {
     (void)worker;
     swiglu_ctx *ctx = (swiglu_ctx *)ctx_;
+    const tr_kernels *k = g_active != NULL ? g_active : tr_kernels_scalar();
     float *x = ctx->x;
     const float *y = ctx->y;
-    for (int64_t i = begin; i < end; i++) {
-        float v = x[i];
-        float silu = v / (1.0f + tr_expf(-v));
-        x[i] = silu * y[i];
+    float e[SWIGLU_CHUNK];
+    for (int64_t i0 = begin; i0 < end; i0 += SWIGLU_CHUNK) {
+        int64_t len = end - i0 < SWIGLU_CHUNK ? end - i0 : SWIGLU_CHUNK;
+        for (int64_t i = 0; i < len; i++) e[i] = -x[i0 + i];
+        k->expf_f32(e, e, len); /* e[i] = tr_expf(-v) */
+        for (int64_t i = 0; i < len; i++) {
+            float silu = x[i0 + i] / (1.0f + e[i]);
+            x[i0 + i] = silu * y[i0 + i];
+        }
     }
 }
 

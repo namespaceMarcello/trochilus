@@ -150,6 +150,14 @@
       "cosa": "I core del portatile usati senza sprechi: il prompt su tutti, la generazione sulla larghezza che la sessione misura da sola. Il decode non usa tutti i core perché il limite è la memoria, non il calcolo.",
       "numeri": [
         {
+          "v": "il prompt da 8 a 16 thread scala 1.49-1.50x in nativo su Q4_K, come llama.cpp nella gara (1.44-1.49x): il divario di 1.11-1.16x era del container con Q8_0. A 16 thread le code sono il 17-20% del tempo (core più lenti, regioni fisse): proposto il lavoro rubato a blocchi di tessere, non costruito",
+          "d": "2026-09-26"
+        },
+        {
+          "v": "gli esperti del decode ora divisi fra i thread in modo bilanciato anche loro (la condizione non li prendeva mai, 8 righe in 64 gruppi). A macchina libera: generazione 1.04-1.08× a 8 thread, il token legge a 51-52 GB/s su 53-55 della RAM, la RAM ferma passa dal 5-11% all'1-4% del token; stessi bit",
+          "d": "2026-09-26"
+        },
+        {
           "v": "prompt su tutto il pool, decode sulla larghezza misurata: 1.05-1.09×",
           "d": "2026-09-18"
         },
@@ -181,6 +189,11 @@
           "n": 68,
           "stato": "aperta",
           "testo": "perché 32 thread su 16 core fanno crollare il decode (8.4 contro 58.3 tok/s)?"
+        },
+        {
+          "n": 72,
+          "stato": "chiusa",
+          "testo": "gate e up intrecciati al caricamento? no: a macchina libera 1.006-1.023×, le tre chiamate leggono già al 97-98% della RAM"
         }
       ],
       "file": [
@@ -204,6 +217,10 @@
       "stato": "fatto",
       "cosa": "La memoria del contesto messa in modo che la CPU la legga di seguito invece che a salti. Il contesto lungo era il caso peggiore: adesso legge alla velocità della RAM.",
       "numeri": [
+        {
+          "v": "pagine da 2 MB per pesi e KV nel container (dove si fa la gara): a macchina libera nessun guadagno; chiuso",
+          "d": "2026-09-26"
+        },
         {
           "v": "decode a contesto lungo contro llama.cpp, letto come una retta: pari senza contesto, 5.3 contro 3.2 microsecondi per posizione in memoria. Sono i byte della loro KV a 16 bit: esatti a 32 bit servirebbero 81 GB/s, la RAM ne da' 53-57. La nostra attenzione legge gia' alla velocita' di una lettura pura; sulla GPU, stessi bit, li passiamo (1.31x a 2048)",
           "d": "2026-09-26"
@@ -259,6 +276,14 @@
       "cosa": "Il prompt non si elabora un token per volta ma a blocchi di 512, così le matrici sono grandi e i core lavorano pieni. È anche il pezzo che l'ordine per layer (M1) dovrà riorganizzare.",
       "numeri": [
         {
+          "v": "phase-major (idea del pensatore): la corsia p del contratto è una catena nel tempo, 16 righe dei pesi corrono come corsie SIMD con gli stessi bit; il tile 164.7 GFLOP/s per core (98.6% del picco float); prompt Q4_K a 4 thread 140 -> 218-223 tok/s (llama.cpp 222), a 16 thread 369 -> 575; Q8_0 a 16 thread 390-419 -> 550-569; logit identici al byte",
+          "d": "2026-09-26"
+        },
+        {
+          "v": "l'esponenziale del softmax e dello SwiGLU in vettore (AVX-512 e AVX2, senza FMA): 0 differenze su tutti i 2^32 float in ogni livello; a macchina libera l'attenzione del prompt 1.34-1.37x e il prefill 1.05x a 2048 e a 4000 token",
+          "d": "2026-09-26"
+        },
+        {
           "v": "attenzione del prompt a tessere (4 query per 4 posizioni, le somme delle corsie in vettore): la sua zona 1.31-1.33x nel motore, il prefill 1.03x a 2048 token e 1.06x a 4000; logit del modello vero identici al byte",
           "d": "2026-09-26"
         },
@@ -273,18 +298,25 @@
       ],
       "domande": [
         {
-          "n": 70,
+          "n": 77,
           "stato": "aperta",
-          "testo": "l'esponenziale del softmax in vettore: dopo le tessere e' meta' del costo di una coppia (query, posizione) del prompt"
+          "testo": "E32: una definizione più esatta del float (attivazioni a 32 bit in interi, somme esatte, arrotondata correttamente nel 96-99% dei casi) a ~0.85x di phase-major; esatta anche sui tensor core int8 della GPU. La vogliamo?"
+        },
+        {
+          "n": 70,
+          "stato": "chiusa",
+          "testo": "l'esponenziale del softmax in vettore: costruito, gli stessi bit di tr_expf; prefill +5%"
         }
       ],
       "file": [
+        "src/kernels/kernels.h",
         "src/kernels/kernels.c",
         "src/kernels/kernels_x86.c",
         "src/models/olmoe.c",
         "tests/bench_attn.c"
       ],
       "comandi": [
+        "build/trochilus generate -m <Q4_K> -p 512 -n 1 -t 4",
         "sh tools/prefill_context.sh measure",
         "sh tools/ab_zone.sh <prima> <dopo> attention 8"
       ],
@@ -322,7 +354,7 @@
         {
           "n": 58,
           "stato": "chiusa",
-          "testo": "l'exp esatto a soli float in SIMD: 4.8× per valore, prompt ~1.02-1.03×, non collegato al motore"
+          "testo": "l'exp esatto a soli float in SIMD: 4.8x per valore; collegato al motore il 26/09 (domanda 70: softmax e SwiGLU)"
         }
       ],
       "file": [
@@ -343,6 +375,10 @@
       "stato": "in-corso",
       "cosa": "Revisione del lettore GGUF, dell'archivio degli esperti, del pool, della piattaforma e del cancello (22/09), poi del modello, dei kernel, del tokenizer e della riga di comando (23/09). Il 23: la riga di comando dimensionava i buffer da -n e -p (un trabocco vicino a 2^62) e troncava --tokens a 32 bit; tre opzioni di OLMoE non erano mai state confrontate con transformers (ora c'e' un oracolo apposta); la pressione di memoria nel VM di Docker contava come mutanti uccisi. Poi letti i sopravvissuti di tokenizer.c (75 → 43) e di main.c (334 → 43), tutti nominati: la riga di comando ha un solo parser delle opzioni, coi numeri stretti nel loro intervallo (-n abc esce con 2), e test_cli prova ogni comando. Lo strumento delle mutazioni non nasconde più sopravvissuti dietro timeout da carico e rifiuti di memoria, uccide un controllo scaduto con tutto quello che aveva lanciato (sette processi orfani avevano rallentato e falsato una campagna), ed è abbastanza veloce da girare dopo ogni modifica (CHANGED=HEAD muta solo le righe cambiate). Restano gguf.c, experts.c, threads.c e platform.c fuori da mutate_files.sh, e gli script di misura da portare alla regola nuova della macchina (il file macchina-ferma).",
       "numeri": [
+        {
+          "v": "gara con llama.cpp dopo gli esperti bilanciati e l'exp in vettore, a macchina libera (container, Q8_0, 8 thread): decode pari a contesto 512 (1.00x), loro 1.04x a 2048 (prima 1.12-1.14x); prefill pari a 512 e a 2048. A 2048 resta la loro KV a 16 bit: sulla GPU li passiamo",
+          "d": "2026-09-26"
+        },
         {
           "v": "mutazioni più veloci con gli stessi verdetti (prima un giro di copertura, ASan solo sui sopravvissuti): prof.c da 30 a 9 s; gguf.c, experts.c, threads.c, platform.c mutati per la prima volta in 20 minuti; i test C nativi del gate accanto al container",
           "d": "2026-09-24"
@@ -435,6 +471,14 @@
       "cosa": "Guardare ogni byte del modello, della memoria del contesto e delle scelte degli esperti, per trovare struttura esatta che nessuno legge: ripetizioni, zeri, parti prevedibili. Dove c'è, si risparmia senza cambiare un bit; dove non c'è, lo sappiamo e non ci si torna.",
       "numeri": [
         {
+          "v": "la linea del tempo di un token (tools/token_timeline.py): la RAM resta ferma il 12-15% del token, quasi tutto nell'attesa del thread più lento alla fine delle chiamate, non fra una chiamata e l'altra (0.6%)",
+          "d": "2026-09-26"
+        },
+        {
+          "v": "i 16 bit bassi della memoria del contesto non decidono il token: 1 token cambiato su 1792",
+          "d": "2026-09-26"
+        },
+        {
           "v": "i pesi quantizzati sono quasi incomprimibili: i codici Q8_0 portano 7.6-7.7 bit su 8, i Q4_K 3.83-3.87 su 4 (compressione senza perdita ~7% e ~4%): chiuso",
           "d": "2026-09-24"
         },
@@ -457,12 +501,18 @@
           "n": 62,
           "stato": "chiusa",
           "testo": "c'è struttura esatta nel modello? solo nel vocabolario morto e nei valori del layer 0"
+        },
+        {
+          "n": 73,
+          "stato": "aperta",
+          "testo": "il token più probabile dalla metà alta della testa d'uscita, esatto solo sulle righe che possono ancora vincere (fino al 4% dei byte)"
         }
       ],
       "file": [
         "tools/weights_genome.py",
         "tools/kv_repeats_report.py",
-        "tools/route_union_report.py"
+        "tools/route_union_report.py",
+        "tools/token_timeline.py"
       ],
       "comandi": [
         "tools/.venv/Scripts/python.exe tools/weights_genome.py models/<file>.gguf"
@@ -1089,6 +1139,18 @@
       "cosa": "Indovinare più token in una volta riusando pezzi del prompt, e verificarli tutti insieme. Gli stessi token di prima, solo più in fretta quando il testo si ripete — come succede nel codice.",
       "numeri": [
         {
+          "v": "la memoria del contesto della bozza a 8 bit: la bozza sceglie gli stessi token in tutte le 1152 posizioni e legge meno byte; valutata fuori campione, prosa 0.93-1.09x llama.cpp, italiano 0.95-1.12x, codice 1.14-1.26x (modello). La testa ridotta a 16k righe copre solo l'85-93% dei token: scartata. Sulla prosa resta il piano dei pesi della bozza (635 MiB a token)",
+          "d": "2026-09-26"
+        },
+        {
+          "v": "le due leve della bozza dentro i bit: la sua seconda scelta come foglia in più (+0.07-0.10x) e una memoria del contesto a byte costanti (le posizioni guardate dal token precedente e le successive). Batte llama.cpp di 1.15-1.46x solo sul codice, che si ripete; su prosa e italiano 0.89-1.04x (modello): non si costruisce così",
+          "d": "2026-09-26"
+        },
+        {
+          "v": "una bozza dentro i bit del modello esatto (metà alta di ogni peso Q8_0, memoria del contesto a 16 bit), che riparte ogni volta dallo stato esatto: indovina il 97-100% dove il modello è sicuro, 82-98% in tutto; sul testo vero 0.81-1.04× i byte di llama.cpp (modello), peggio col contesto: così com'è non si costruisce",
+          "d": "2026-09-26"
+        },
+        {
           "v": "una passata di k righe legge 1.55 / 2.33 / 3.34 / 4.42× gli esperti di un token a k = 2 / 4 / 8 / 16 (a caso sarebbero 1.88 / 3.31 / 5.25 / 7.06): i token vicini riusano gli stessi esperti",
           "d": "2026-09-24"
         },
@@ -1106,13 +1168,35 @@
           "n": 32,
           "stato": "aperta",
           "testo": "quante righe di bozza conviene tirare, dalla lunghezza del match"
+        },
+        {
+          "n": 71,
+          "stato": "aperta",
+          "testo": "la bozza dentro i bit: le due leve misurate, supera 1.1x solo sul codice; resta il pezzo di softmax che la bozza salta, passato dalla passata esatta"
+        },
+        {
+          "n": 74,
+          "stato": "aperta",
+          "testo": "la bozza sulla GPU mentre la CPU verifica (~1.7-2.2x, modello): serve la decisione di Marcello, se la GPU conta nella gara"
+        },
+        {
+          "n": 75,
+          "stato": "chiusa",
+          "testo": "la memoria della bozza a 8 bit: gratis per la bozza, ma la prosa non passa 1.1x"
+        },
+        {
+          "n": 76,
+          "stato": "aperta",
+          "testo": "perché la bozza con la memoria a 4 bit indovina più spesso di quella a 16 bit (18 contro 3)?"
         }
       ],
       "file": [
-        "src/gen/lookup.c"
+        "src/gen/lookup.c",
+        "tools/draft_probe.c"
       ],
       "comandi": [
-        "sh tools/ab_spec.sh <gguf> <binario> bench/prompts/code.txt 8"
+        "sh tools/ab_spec.sh <gguf> <binario> bench/prompts/code.txt 8",
+        "make draft-probe"
       ],
       "dipende": [
         "nucleo"
