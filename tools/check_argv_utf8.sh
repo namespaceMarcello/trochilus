@@ -12,7 +12,7 @@ trap cleanup_children EXIT
 trap 'exit 130' INT TERM
 bin="$1"
 vocab="$2"
-ids=$("$bin" tokenize -m "$vocab" -p "città è perché" 2>&1)
+ids=$("$bin" tokenize -m "$vocab" -p "città è perché" 2>&1)  # italian-ok: the test input
 rc=$?
 if [ $rc -eq 126 ]; then
     echo "== argv UTF-8: SKIPPED, Smart App Control blocked the new exe (docs/LESSONS.md #12)"

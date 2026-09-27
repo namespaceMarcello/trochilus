@@ -1477,7 +1477,7 @@ static int forward_layer(olmoe_model *m, olmoe_session *s, int64_t L, const int3
     tr_prof_end(prof, TR_PROF_ROUTER, t);
     tr_prof_count(prof, TR_PROF_ROUTER, mat_bytes(&layer->gate_inp), 0);
 
-    /* the shared store's turn (Esperti M1): acquire this layer's non-empty experts (missing
+    /* the shared store's turn (Experts (M1)): acquire this layer's non-empty experts (missing
      * ones read from disk here) and refresh every expert's data pointer, NULL for the ones
      * not in RAM -- a wrong read then crashes instead of reading stale bytes. */
     if (olmoe_refresh_experts(m, s, L) != 0) return -1;

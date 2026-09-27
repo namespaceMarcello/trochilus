@@ -5,7 +5,7 @@ time it computes, plus the ceiling of overlapping the two.
 
     ceiling = total / max(disk, compute)
 
-The ceiling is an upper bound of a reader nobody has written yet -- modello, non misura -- while
+The ceiling is an upper bound of a reader nobody has written yet -- model, not measured -- while
 the two halves it is built from are measured. Round 0 is dropped as warm-up, like every other
 session; every number is the median over the rounds left, with min, max and spread.
 
@@ -19,11 +19,11 @@ import sys
 ORDER = ["p512b100", "p512b50", "p512b50off", "p2048b100", "p2048b50", "p2048b50aa", "p2048b50off",
          "p2048b50one"]
 NAMES = {
-    "p512b100": "prompt 512, residente",
+    "p512b100": "prompt 512, resident",
     "p512b50": "prompt 512, budget 50%",
-    "p2048b100": "prompt 2048, residente",
+    "p2048b100": "prompt 2048, resident",
     "p2048b50": "prompt 2048, budget 50%",
-    "p2048b50one": "prompt 2048, 50%, 1 passata",
+    "p2048b50one": "prompt 2048, 50%, 1 pass",
     "p512b50off": "prompt 512, 50%, no prefetch",
     "p2048b50off": "prompt 2048, 50%, no prefetch",
     "p2048b50aa": "prompt 2048, 50%, A/A",
@@ -58,8 +58,8 @@ def main(argv):
         print("prefill_overlap_report: no profile in", out)
         return 1
 
-    print(f"{'modo':<26}{'prefill s':>10}{'disco s':>9}{'calcolo s':>11}{'MiB letti':>11}"
-          f"{'GB/s':>7}{'tetto':>8}{'spread':>8}{'n':>3}")
+    print(f"{'mode':<26}{'prefill s':>10}{'disk s':>9}{'compute s':>11}{'MiB read':>11}"
+          f"{'GB/s':>7}{'ceiling':>8}{'spread':>8}{'n':>3}")
     for key in ORDER:
         if key not in runs:
             continue
@@ -73,10 +73,10 @@ def main(argv):
         print(f"{NAMES[key]:<26}{tot:>10.2f}{disk:>9.2f}{comp:>11.2f}{mib:>11.0f}"
               f"{gbs:>7.2f}{ceiling:>7.2f}x{spread([r[0] for r in rows]):>7.1f}%{len(rows):>3}")
 
-    print("\nControllo: sui modi residenti il disco deve essere ~0, e la differenza fra i due")
-    print("budget alla stessa lunghezza deve valere quanto il disco che la zona dichiara.")
-    print("Il «tetto» e' un limite superiore (modello, non misura): con un lettore perfetto e")
-    print("nessuna contesa il prefill non puo' scendere sotto max(disco, calcolo).")
+    print("\nCheck: in the resident modes the disk must be ~0, and the difference between the two")
+    print("budgets at the same length must be worth the disk time the zone declares.")
+    print("The \"ceiling\" is an upper bound (model, not measured): with a perfect reader and")
+    print("no contention the prefill cannot go below max(disk, compute).")
     return 0
 
 

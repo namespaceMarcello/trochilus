@@ -1536,3 +1536,19 @@ Check: `make check`; `sh tools/ab_env.sh build/trochilus.exe 12 "on=TR_BF16_EXAC
   `tools/mutate_idle.sh` 16 mutations.
 Check: `make check`; `BENCH_BUILD=build/<dir> sh tools/bench_native.sh bench_q4x --idle 8`; `TR_POOL_HINT=2
 AB_INPROC_OUT=build/<name> sh tools/ab_inproc.sh build/trochilus.exe idle 12`.
+
+### 2026-09-27 — Everything in English, and a check that keeps it so
+
+The translation of 2026-09-22 finished (LESSONS #257): `docs/MEASUREMENTS.md`'s remaining Italian bodies
+(~530 lines, every number, table row and heading unchanged: `tools/check_translation.py`), `docs/LESSONS.md` rows
+21-99, the status page (`docs/status.json` and `docs/glossary.json`: keys, states, ids and texts, the aliases
+matched to the English words; `tools/status_html.py`: identifiers, classes, labels, the page now
+`build/status/index.html`), `tools/lint.py`'s messages and hot-path labels (the `hot-ok` name `stringa` is now
+`string`, its one use in `kernels_x86.c`), the backslash hook and `.claude/settings.json`'s status lines,
+`prefill_overlap_report.py`, `requirements-oracle.txt`, the Dockerfile's header, `check_measurements.py` without
+the Italian tags (its self-test cases in English), one comment in `olmoe.c`.
+- Checks: `tools/lint.py` `check_english` (every file git lists: no line that reads as Italian, `italian-ok` for
+  the ones Italian on purpose) and `check_status_json` (#258: three questions were plain strings, the page showed
+  "#undefined"; states, shapes and references now checked, red on the committed data).
+Check: `tools/.venv/Scripts/python.exe tools/lint.py`; `tools/.venv/Scripts/python.exe tools/status_html.py`, then
+open `build/status/index.html`; `make check`.

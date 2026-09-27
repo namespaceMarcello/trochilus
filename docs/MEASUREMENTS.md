@@ -148,25 +148,25 @@ doubles. With it, A/A remeasured 8 rounds: **0.953×** when model invents (earli
 with our 4-token kernel structure int8 VNNI 512-bit dot is **1.8-2.3×** our x4 float, llama.cpp
 ahead 1.57× one thread. Int8 not exact: whether to write it and how as explicit mode, Marcello
 decides | — | — |
-| 28 | ~~Il divario di prefill che resta con llama.cpp dov'è, se non è nell'int8?~~ Era nell'int8 (domanda 21). La strada esatta «più token nei registri» è misurata e non rende: una riga contro 8 token dà 1.13× a n=1024, **0.79×** a 2048 e 0.93× a 4096 (§Revisione) | — | — |
+| 28 | ~~Where is the prefill gap that remains with llama.cpp, if not in int8?~~ It was in int8 (question 21). The exact "more tokens in registers" path is measured and does not pay off: one row against 8 tokens gives 1.13× at n=1024, **0.79×** at 2048 and 0.93× at 4096 (§Adversarial review) | — | — |
 
-| 29 | ~~Quanto vale una variante SIMD per **F16**?~~ **49×** sul kernel (`make bench`, n=2048: 466 M el/s lo scalare, 22.8 G el/s AVX2 con F16C, 22.7 AVX-512; prima ogni tier faceva i 466-824 dello scalare). La conversione half→float è esatta, quindi resta bit-identico (`tests/test_kernels.c`, anche con subnormali, infiniti e NaN). Scritta il 2026-09-19 perché il controllo nuovo, `tests/test_tier_used.c`, pretende che **ogni tipo** di peso passi per i kernel del tier (LESSONS #78) | — | — |
-| 30 | ~~La parte seriale del prefill (copia per esperto, scrittura della KV, norme, RoPE) si può dividere per token?~~ **Sì** (§Prefill su prompt lunghi): valeva l'8% del prefill a 512 e il 5-6% a 4000, contando la scelta del router (57 ms su 512 token) che stava dentro la zona `router`. Divisa sul pool per token (almeno 8 a pezzo) passa da 121 a 48 ms a 512 e da 880 a 353 a 4000: norme e RoPE si dividono per 6, le copie in memoria (righe per gli esperti, scrittura della KV: 27 → 19 ms) solo per 2 e per 1.1-1.4, perché lì il limite è scrivere in RAM. Con l'int8 (domanda 21) il peso di ciò che resta raddoppia | — | — |
-| 34 | **Chiusa come «no» il 2026-09-19 (Marcello)**: 2.1% stimato a contesto 4000, sotto la soglia delle misure; si riapre se un modello con contesti oltre 4000 la porta sopra. ~~Larghezza per zona~~: l'attenzione del decode su tutto il pool e il resto sulla larghezza del decode (esatto: il contratto del pool). Potenziale misurato per zona (§Decode a contesto lungo): a contesto 4000 l'attenzione fa 21.6 ms su 16 thread e 22.6 su 8, mentre esperti e proiezioni su 16 perdono 1.3 ms; tenendo il meglio dei due si toglie **1.0 ms su 48.1 (2.1%)**, a 2048 0.24 ms su 36.4 (0.7%) | `tr_pool_set_active` attorno alla zona `attention` nelle passate corte; serve una soglia più bassa del 3.8% di questa notte (più giri, o 200 token generati invece di 48) | cresce col contesto: oltre 4000 l'attenzione supera metà del token. Sotto la soglia oggi, quindi non scritta |
-| 35 | Cosa resta sotto il tetto nel decode, dal lato esatto? `attn_out_proj` legge a 43-52 GB/s dove le altre moltiplicazioni stanno a 52-55 (0.2-0.3 ms per token); le zone senza byte (norme, RoPE, copia per esperto, attivazione, somma, scelta del token) valgono **1.1 ms per token**, il 4.4% a contesto corto; l'attenzione legge a 47 GB/s dove la sola lettura degli stessi byte fa 52-56 (il calcolo di prodotto, softmax e somma pesata vale il 12% della zona) | profilo per zona con le zone piccole divise; `bench_mem kv` con il kernel a pezzi | in tutto il 6-11% che separa i 48-51 GB/s del decode dai 54 della RAM |
-| 36 | **KV a 16 bit** (non esatta, decide Marcello): di quanto si spostano i logit? Guadagno stimato dai byte (§Decode a contesto lungo): +5% a contesto 512, +16-19% a 2048, +26-31% a 4000, e metà memoria della KV | modo dichiarato e spento di default; contro il modo esatto sul modello vero: KL media e primo token uguale su ≥ 1000 posizioni di codice fino a contesto 4000 (`trochilus logits` nei due modi, `tools/compare_llamacpp.py` calcola già la KL: llama.cpp sta a 9e-3), token greedy uguali su 1000 generati (soglia della domanda 17: ≥ 99%), e nessun valore di K o V oltre il massimo dei 16 bit (65504) | è la sola leva grande che resta al decode a contesto lungo: dopo la KV per testa l'attenzione legge già alla banda della RAM |
-| 37 | ~~**`expf` nostro**: il softmax (attenzione, router) e l'attivazione degli esperti chiamavano `expf` della libreria C, 30 ns a chiamata con MinGW e altri bit con glibc~~ **Scritto lo scalare il 2026-09-19** (`tr_expf`, §`tr_expf`): arrotondato correttamente su tutti i 4 278 190 082 float per prova esaustiva in `make check` (gcc e clang), 3.5 ns a chiamata, nessuna chiamata alla libreria dentro; su Windows gli stessi bit di prima (logit identici al byte), su Linux KL 3.9e-13 e 1000 token su 1000 uguali, e gli stessi byte del build di emulazione; **Windows e Linux ora danno gli stessi logit al byte**. Prefill **1.03-1.08× a 512, 1.20-1.23× a 2048, 1.29-1.31× a 4000**, decode 1.02-1.10× (stimati 1.12 / 1.23 / 1.27× e +5-10%). Resta il SIMD: domanda 39 | — | — |
-| 38 | L'attenzione a gruppi con **GQA** e oltre 4096 token (Qwen3-Coder: 32 teste di query su 4 di chiavi): un gruppo oggi sono 16 token di **una** testa di query; le 8 teste che condividono chiavi e valori potrebbero stare nello stesso gruppo e leggerli una volta sola. E a 16-32 mila token chiavi e valori di una testa (16-32 MB) non stanno in nessuna cache: lì la lettura ripetuta, che a 4000 va dall'1% al 21-39% della zona secondo la run, diventa il grosso | `make bench-attn` con le forme del modello nuovo e `--heads`/`--group`; prefill a 8, 16, 32 mila token quando il modello c'è | il coding usa contesti lunghi; a 4000 il gruppo da 4, 16 o 64 va uguale, più su non è detto |
-| 39 | **Chiusa come «no» il 2026-09-19 (Marcello)**: 1.01-1.04× stimato sta alla soglia del rumore, per circa 200 righe col pezzo più delicato del progetto; lo scalare ha già preso quasi tutto. ~~`tr_expf` in SIMD, sì o no~~ (numeri in §`tr_expf` punto 7). Dopo lo scalare restano, nel prefill a 512 / 2048 / 4000, softmax dell'attenzione per circa 9 / 130 / 610 ms e `expert_act` per 25 / 108 / 218 ms. Stima con un esponenziale AVX-512 a 1.0-1.3 ns per elemento: prefill **1.01× / 1.03× / 1.04×**, decode +1-2%; costo circa 200 righe, il pezzo delicato (gather dalla tabella, maschera per le corsie che non passano il test, identità al bit con lo scalare provata su tutti i float per ogni tier) | uno schizzo nel banco (`tests/bench_expf.c`) darebbe il costo vero per elemento prima di decidere; poi voce `exp` nella tabella dei kernel, `make bench-expf` per tier, `prefill_context.sh change` | lo scalare ha preso quasi tutto: a 4000 token il guadagno stimato è vicino alla soglia di una buona sessione (3%) |
-| 40 | ~~Le **tabelle RoPE** di Windows e di Linux sono le stesse voce per voce?~~ **Sì**, misurato il 2026-09-19 (`sh tools/platform_bits.sh`, §`tr_expf` punto 5): su 4096 posizioni × 64 coppie i `cos` e i `sin` **in double** delle due librerie differiscono nello 0.83-0.85% delle voci (2175 e 2216 su 262 144: glibc e MinGW arrotondano diversamente l'ultima cifra del double), `pow` mai (64 su 64 arrotondati correttamente su tutte e due), e **nessuna** delle 524 288 voci in float differisce: l'arrotondamento a float assorbe la differenza. Con `tr_expf` il motore dà quindi **gli stessi byte sulle due piattaforme** fino al contesto di addestramento di OLMoE | — | — |
-| 41 | **Perché il disco dà 1.5 GB/s, un terzo della sua scheda (Micron 2400, 4.5 GB/s)?** Tre ipotesi: la cifratura del volume di Windows (si legge con `manage-bde -status C:` da amministratore), il QLC senza DRAM su letture sparse, la richiesta sincrona da 2 MiB (provare richieste più grandi e sovrapposte). Vale il triplo dei token al secondo di M1 con la cache al 50%. **2026-09-20: il volume è cifrato** (`manage-bde`: BitLocker ON, XTS-AES 128, quindi in software). Non è provato che sia la causa, né la sola: durante le letture il processo System passa da 0.79 a 0.94 processori (`tools/background_load.ps1`, `build/disk/run3.txt`), nessun core è saturo, quindi se il limite è lì è di latenza e non di calcolo. La prova vera chiede un volume non cifrato sullo stesso disco, e **la cifratura non si toglie per una misura**: i PC con Windows 11 escono cifrati di fabbrica, quindi ~1.5 GB/s **è** il bersaglio, e il piano automatico di M1 misura il disco che trova | `bench_disk --block` a 16 e 64 MiB; più richieste in volo per lettore; lo stesso banco su un disco esterno o una partizione non cifrata, se capita | dopo il primo M1 che gira: prima il percorso esatto, poi la banda |
-| 43 | **Da che velocità di disco in su il precaricamento rende, e con quanti candidati?** Il modello a tempo dice: a 1.5 GB/s no (k=8 neutro, k=12 −40%), a 4.3 GB/s k=8 dà l'11-15% (§M1 punto 6) — modello, non misura: un disco, una lettura per volta  — e il decode ha ormai poco da nascondere: lontano dal prompt sbaglia 0.03-0.14 unità per token (§M1 misurato), quindi se il precaricamento serve è nel **prompt** | con M1 che gira: `--expert-budget` al 50%, precaricamento spento e con k=8, su questo disco e su uno veloce (o sul file nella cache del sistema, che rende 12-26 GB/s); soglia nel piano automatico | dopo il primo M1 |
-| 42 | **Come si prevede il primo layer?** La previsione col router del layer dopo prende il 92-95% ovunque tranne che al layer 0 (75-80%, domanda 13) | dalla traccia: gli esperti del layer 0 scelti per token uguale (dipendono quasi solo dall'embedding?); in alternativa il layer 0 sta sempre in RAM (64 esperti = 408 MiB, il 6% del modello) | progetto di M1 |
-| 44 | ~~Il comportamento del modello sul codice è un grafo piccolo e deterministico?~~ **No, in tutti e quattro i sensi** (Marcello, 2026-09-20; chiusa il 2026-09-20 notte con i cinque testi della prova funzionale). Dalla traccia che c'è (OLMoE-1B-7B, `code-1000`, 1204 token; calcolo una tantum sulla traccia, non ancora nel report): **piccolo no**: usate 1012 unità su 1024, l'89% già dopo 100 token; il 25% più usato copre il 68% delle attivazioni, il 50% l'88%, il 75% il 97%; entropia d'uso 5.1 bit su 6 per layer. **Statico no**: un grafo di co-occorrenze fra layer imparato sui primi 900 token indovina il 53.7% degli esperti del layer dopo sui 300 seguenti (frequenza sola: 40.3%; il router sullo stato vivo: 82-86%); nessun percorso intero si ripete (0 su 1204), il singolo insieme di 8 sì (32%); 3.6 esperti su 8 in comune col token prima (caso: 1.0), che è ciò che l'LRU sfrutta. Coerente col pin dall'uso che perde contro l'LRU (domanda 14) e con la loss di bilanciamento con cui i MoE si addestrano. Limiti: un modello generalista, un prompt, un linguaggio | mancano, con le soglie scritte **prima**: (1) id dei token nella traccia → stesso token, stessi esperti? (la versione «tabella» dell'ipotesi, plausibile al layer 0); (2) 4-6 tracce (file e linguaggi diversi, e prosa di controllo) → la sovrapposizione delle unità calde codice-codice supera quella codice-prosa?; (3) margine fra l'8° e il 9° esperto (probabilità nella traccia); (4) la prova che decide, funzionale e non di routing: **mascherare** gli esperti fuori dal X% più usato e misurare token uguali e KL contro il modello intero su codice mai visto (modo di sola misura) **Soglie scritte prima di misurare (2026-09-20, sì di Marcello)**: *piccolo* = il 25% delle unità copre ≥ 99% delle attivazioni su codice; *grafo del codice* = la sovrapposizione (Jaccard) del 25% più caldo fra due tracce di codice supera di ≥ 0.20 quella fra codice e prosa; *tabella* = stesso id di token → stesso insieme di esperti al layer 0 in ≥ 95% delle ripetizioni (gli altri layer si riportano); *funzionale* = con il 50% delle unità mascherate (le meno usate su un **altro** file di codice) il token greedy coincide in ≥ 99% delle posizioni e la KL media è ≤ 1e-2 su codice mai visto (il metro del progetto per un modo non esatto: llama.cpp sta a 9e-3). Una soglia mancata falsifica quella parte dell'ipotesi per OLMoE-1B-7B; per dirlo «dei modelli» serve almeno un secondo modello | **Risposta (§Il comportamento sul codice…)**: piccolo no, tabella no, statico no, funzionale no (già sul testo della maschera: 93.9% dei token col 50% spento); una **regione del codice** sì (Jaccard 0.68-0.77 fra C, Python e shell, 0.07-0.09 con la prosa inglese), e l'uso ordina gli esperti 13-50 volte meglio del caso **dentro il codice** e per niente fuori (sulla prosa inglese la maschera per uso fa come quella a caso). Prova funzionale su cinque testi su cinque: col 50% spento il token coincide nel 93.9 / 92.8 / 86.0 / 81.4% (testo della maschera, altro C, Python, shell). Resta un secondo modello |
-| 45 | **Il costo del primo prompt si può togliere, o solo nascondere?** Sotto budget ogni avvio rilegge il modello intero: 4.7 s misurati a 2048 token, e sono il divario che resta col modello residente (12.41 contro 7.47 s). **Attenzione al meccanismo**: ricaricare all'avvio un elenco delle unità che erano in RAM non toglie niente — rileggerle dal disco *è* quel tempo, e con la lettura diretta il sistema non ha copie da regalarci. Si toglie in un modo solo, **tenendo i byte in RAM fra un avvio e l'altro** (un processo che resta acceso, domanda 49); altrimenti si **nasconde** dietro il tempo dell'uomo (domanda 48) | il secondo avvio con l'archivio vivo contro uno a freddo, stesso prompt: prefill e mancati dei primi 100 token | è il divario che resta fra budget parziale e modello residente |
-| 46 | ~~Perché il decode sotto budget migliora con la lunghezza della generazione?~~ **È l'archivio, non un warm-up** (2026-09-21, §M1 misurato): col modello residente il tempo per token non cambia da 200 a 1000 (34.64 → 33.48, dentro lo spread), sotto budget sì (26.53 → 29.84 al 25%). Un costo fisso di ~0.35 s al 50% e ~0.84 s al 25%, che i mancati in più dei primi token spiegano solo per ~115 ms. **Resta**: dove va il resto | profilo per zone dei primi 64 token contro token lontani dal prompt, stesso budget | dice se c'è una leva nella LRU dopo il prompt, e quale numero promettere con metà modello in RAM |
-| 47 | ~~Il prefill sotto budget legge gli esperti una volta per prompt?~~ **Adesso sì** (ordine per layer, 2026-09-21: 6 273 MiB e 12.41 s a 2048, **1.89×**). Prima: una volta per passata (2026-09-21, §Il prefill legge il modello una volta per passata). Il prompt si elabora a blocchi di 512 token (`OLMOE_DEFAULT_BATCH`) e ogni passata percorre tutti i layer, quindi sotto budget rilegge la tabella intera: a 2048 token **22 880 MiB invece di 6 528**, 3.65×, e cresce col prompt. Con una passata sola (`-b 2048`) il prefill fa 11.27 s invece di 23.51 (**2.09×**) e l'ultima riga di logit è identica al byte | il tempo dell'ordine per layer quando ci sarà, e la stessa misura a 4000 token (otto passate) | la leva più grossa del prefill sotto budget, e non costa precisione |
-| 48 | **Quanto del primo prompt si nasconde dietro il tempo che l'utente impiega a scrivere?** Una fase di preparazione dichiarata (idea di Marcello, 2026-09-21): appena la sessione si apre, e prima che il prompt arrivi, il motore comincia a leggere gli esperti e lo dice («leggo il modello, 6.5 GiB»). Non elimina i 4.7 s, li mette dove non danno fastidio; costa nessun bit di precisione e non serve un processo nuovo. Da decidere: cosa leggere per primo quando ancora non si sa il prompt (l'ordine dei layer è quello giusto, il layer 0 serve per primo) | tempo fra l'apertura e il primo token, con e senza la lettura anticipata, su un prompt che arriva dopo 5, 15 e 30 secondi | è la leva più economica: nessuna struttura nuova |
+| 29 | ~~How much is a SIMD variant for **F16** worth?~~ **49×** on the kernel (`make bench`, n=2048: 466 M el/s the scalar, 22.8 G el/s AVX2 with F16C, 22.7 AVX-512; before, every tier ran at the scalar's 466-824). The half→float conversion is exact, so it stays bit-identical (`tests/test_kernels.c`, also with subnormals, infinities and NaN). Written 2026-09-19 because the new check, `tests/test_tier_used.c`, requires that **every type** of weight pass through the tier's kernels (LESSONS #78) | — | — |
+| 30 | ~~Can the prefill's serial part (per-expert copy, KV write, norms, RoPE) be split by token?~~ **Yes** (§Prefill on long prompts): it cost 8% of the prefill at 512 and 5-6% at 4000, counting the router's choice (57 ms over 512 tokens) that sat inside the `router` zone. Split on the pool per token (at least 8 per piece) it goes from 121 to 48 ms at 512 and from 880 to 353 at 4000: norms and RoPE divide by 6, the memory copies (rows for the experts, KV write: 27 → 19 ms) only by 2 and by 1.1-1.4, because there the limit is writing to RAM. With int8 (question 21) the weight of what remains doubles | — | — |
+| 34 | **Closed as "no" on 2026-09-19 (Marcello)**: 2.1% estimated at context 4000, below the measurement threshold; it reopens if a model with contexts past 4000 pushes it above. ~~Width per zone~~: the decode's attention over the whole pool and the rest over the decode's width (exact: the pool's contract). Potential measured per zone (§Decode at long context and RAM bandwidth): at context 4000 attention takes 21.6 ms on 16 threads and 22.6 on 8, while experts and projections on 16 lose 1.3 ms; keeping the best of the two removes **1.0 ms of 48.1 (2.1%)**, at 2048 0.24 ms of 36.4 (0.7%) | `tr_pool_set_active` around the `attention` zone in short passes; needs a threshold lower than tonight's 3.8% (more runs, or 200 tokens generated instead of 48) | grows with context: past 4000 attention exceeds half the token. Below the threshold today, so not written |
+| 35 | What is left under the ceiling in the decode, on the exact side? `attn_out_proj` reads at 43-52 GB/s where the other multiplications sit at 52-55 (0.2-0.3 ms per token); the zones with no bytes (norms, RoPE, per-expert copy, activation, sum, token choice) cost **1.1 ms per token**, 4.4% at short context; attention reads at 47 GB/s where reading the same bytes alone gives 52-56 (the dot product, softmax and weighted sum cost 12% of the zone) | profile per zone with the small zones split; `bench_mem kv` with the kernel in pieces | in all the 6-11% that separates the decode's 48-51 GB/s from RAM's 54 |
+| 36 | **16-bit KV** (not exact, Marcello decides): by how much do the logits move? Gain estimated from the bytes (§Decode at long context and RAM bandwidth): +5% at context 512, +16-19% at 2048, +26-31% at 4000, and half the KV's memory | a declared mode, off by default; against the exact mode on the real model: average KL and first token equal on ≥ 1000 code positions up to context 4000 (`trochilus logits` in both modes, `tools/compare_llamacpp.py` already computes the KL: llama.cpp sits at 9e-3), greedy tokens equal on 1000 generated (question 17's threshold: ≥ 99%), and no K or V value beyond 16 bits' maximum (65504) | it is the only big lever left to the decode at long context: past the KV per head, attention already reads at RAM's bandwidth |
+| 37 | ~~**Our own `expf`**: the softmax (attention, router) and the experts' activation called the C library's `expf`, 30 ns a call with MinGW and different bits with glibc~~ **Scalar written on 2026-09-19** (`tr_expf`, §`tr_expf`): correctly rounded on all 4 278 190 082 floats by exhaustive proof in `make check` (gcc and clang), 3.5 ns a call, no library call inside; on Windows the same bits as before (logits identical to the byte), on Linux KL 3.9e-13 and 1000 of 1000 tokens equal, and the same bytes as the emulation build; **Windows and Linux now give the same logits to the byte**. Prefill **1.03-1.08× at 512, 1.20-1.23× at 2048, 1.29-1.31× at 4000**, decode 1.02-1.10× (estimated 1.12 / 1.23 / 1.27× and +5-10%). SIMD remains: question 39 | — | — |
+| 38 | Grouped attention with **GQA** past 4096 tokens (Qwen3-Coder: 32 query heads over 4 key heads): a group today is 16 tokens of **one** query head; the 8 heads that share keys and values could sit in the same group and read them only once. And at 16-32 thousand tokens a head's keys and values (16-32 MB) fit in no cache: there the repeated read, which at 4000 ranges from 1% to 21-39% of the zone depending on the run, becomes the bulk | `make bench-attn` with the new model's shapes and `--heads`/`--group`; prefill at 8, 16, 32 thousand tokens once the model exists | coding uses long contexts; at 4000 a group of 4, 16 or 64 performs the same, beyond that is not known |
+| 39 | **Closed as "no" on 2026-09-19 (Marcello)**: 1.01-1.04× estimated sits at the noise threshold, for about 200 lines in the project's most delicate piece; the scalar has already taken almost everything. ~~`tr_expf` in SIMD, yes or no~~ (numbers in §`tr_expf` point 7). After the scalar, in the prefill at 512 / 2048 / 4000, the attention's softmax remains at about 9 / 130 / 610 ms and `expert_act` at 25 / 108 / 218 ms. Estimate with an AVX-512 exponential at 1.0-1.3 ns per element: prefill **1.01× / 1.03× / 1.04×**, decode +1-2%; cost about 200 lines, the delicate piece (table gather, mask for lanes that fail the test, bit identity with the scalar proven on every float for every tier) | a sketch in the bench (`tests/bench_expf.c`) would give the real per-element cost before deciding; then an `exp` entry in the kernel table, `make bench-expf` per tier, `prefill_context.sh change` | the scalar has taken almost everything: at 4000 tokens the estimated gain is close to a good session's threshold (3%) |
+| 40 | ~~Are Windows's and Linux's **RoPE tables** the same entry by entry?~~ **Yes**, measured on 2026-09-19 (`sh tools/platform_bits.sh`, §`tr_expf` point 5): over 4096 positions × 64 pairs the two libraries' `cos` and `sin` **in double** differ in 0.83-0.85% of entries (2175 and 2216 of 262 144: glibc and MinGW round the double's last digit differently), `pow` never (64 of 64 correctly rounded on both), and **none** of the 524 288 entries in float differ: rounding to float absorbs the difference. With `tr_expf` the engine therefore gives **the same bytes on both platforms** up to OLMoE's training context | — | — |
+| 41 | **Why does the disk give 1.5 GB/s, a third of its card's spec (Micron 2400, 4.5 GB/s)?** Three hypotheses: Windows's volume encryption (read with `manage-bde -status C:` as administrator), QLC with no DRAM on sparse reads, the synchronous 2 MiB request (try larger, overlapped requests). Worth three times M1's tokens per second with the cache at 50%. **2026-09-20: the volume is encrypted** (`manage-bde`: BitLocker ON, XTS-AES 128, so in software). It is not proven to be the cause, nor the only one: during reads the System process goes from 0.79 to 0.94 processors (`tools/background_load.ps1`, `build/disk/run3.txt`), no core is saturated, so if the limit is there it is latency, not compute. The real test needs an unencrypted volume on the same disk, and **encryption is not removed for a measurement**: Windows 11 PCs ship encrypted from the factory, so ~1.5 GB/s **is** the target, and M1's automatic plan measures the disk it finds | `bench_disk --block` at 16 and 64 MiB; more requests in flight per reader; the same bench on an external disk or an unencrypted partition, if one turns up | after the first M1 run: the exact path first, then the bandwidth |
+| 43 | **From what disk speed up does prefetching pay off, and with how many candidates?** The time model says: at 1.5 GB/s no (k=8 neutral, k=12 −40%), at 4.3 GB/s k=8 gives 11-15% (§M1 point 6) — model, not measured: one disk, one read at a time — and the decode by now has little to hide: far from the prompt it misses by 0.03-0.14 units per token (§M1 measured: what experts really cost from disk), so if prefetching helps it is in the **prompt** | with M1 running: `--expert-budget` at 50%, prefetching off and with k=8, on this disk and on a fast one (or on the file in the system cache, which gives 12-26 GB/s); threshold in the automatic plan | after the first M1 |
+| 42 | **How is the first layer predicted?** Prediction with the next layer's router takes 92-95% everywhere except at layer 0 (75-80%, question 13) | from the trace: layer 0's experts chosen equal per token (do they depend almost only on the embedding?); alternatively layer 0 always stays in RAM (64 experts = 408 MiB, 6% of the model) | M1's project |
+| 44 | ~~Is the model's behavior on code a small, deterministic graph?~~ **No, in all four senses** (Marcello, 2026-09-20; closed on the night of 2026-09-20 with the five texts of the functional proof). From the trace at hand (OLMoE-1B-7B, `code-1000`, 1204 tokens; one-off computation on the trace, not yet in the report): **small, no**: 1012 of 1024 units used, 89% already after 100 tokens; the top 25% used covers 68% of activations, the top 50% 88%, the top 75% 97%; usage entropy 5.1 of 6 bits per layer. **Static, no**: a cross-layer co-occurrence graph learned on the first 900 tokens guesses 53.7% of the next layer's experts on the following 300 (frequency alone: 40.3%; the router on the live state: 82-86%); no whole path repeats (0 of 1204), the single set of 8 does (32%); 3.6 of 8 experts shared with the previous token (chance: 1.0), which is what the LRU exploits. Consistent with the usage pin that loses against the LRU (question 14) and with the balancing loss MoEs are trained with. Limits: one general-purpose model, one prompt, one language | missing, with the thresholds written **beforehand**: (1) token ids in the trace → same token, same experts? (the "table" version of the hypothesis, plausible at layer 0); (2) 4-6 traces (different files and languages, and control prose) → does the overlap of hot units code-to-code exceed code-to-prose?; (3) the margin between the 8th and 9th expert (probability in the trace); (4) the proof that decides, functional and not about routing: **masking** the experts outside the top X% used and measuring equal tokens and KL against the whole model on code never seen (measurement-only mode) **Thresholds written before measuring (2026-09-20, Marcello's yes)**: *small* = the top 25% of units covers ≥ 99% of activations on code; *code graph* = the overlap (Jaccard) of the hottest 25% between two code traces exceeds that between code and prose by ≥ 0.20; *table* = same token id → same set of experts at layer 0 in ≥ 95% of repeats (the other layers are reported); *functional* = with 50% of the units masked (the least used, on **another** code file) the greedy token matches in ≥ 99% of positions and the average KL is ≤ 1e-2 on code never seen (the project's yardstick for a non-exact mode: llama.cpp sits at 9e-3). A missed threshold falsifies that part of the hypothesis for OLMoE-1B-7B; to say it "of models" needs at least a second model | **Answer (§Is code behavior a small, deterministic graph?)**: small no, table no, static no, functional no (already on the mask's own text: 93.9% of tokens with 50% off); one **region of code** yes (Jaccard 0.68-0.77 between C, Python and shell, 0.07-0.09 with English prose), and usage orders the experts 13-50 times better than chance **inside code** and not at all outside it (on English prose the usage mask performs like a random one). Functional proof on five texts out of five: with 50% off the token matches in 93.9 / 92.8 / 86.0 / 81.4% (mask's own text, other C, Python, shell). A second model remains |
+| 45 | **Can the first prompt's cost be removed, or only hidden?** Under budget, every start rereads the whole model: 4.7 s measured at 2048 tokens, and that is the gap that remains against the resident model (12.41 vs 7.47 s). **Watch the mechanism**: reloading at startup a list of the units that were in RAM removes nothing — rereading them from disk *is* that time, and with direct reads the system has no copies to give us for free. It is removed only one way, **keeping the bytes in RAM between one start and the next** (a process that stays up, question 49); otherwise it is **hidden** behind the human's own time (question 48) | the second start with the live store against a cold one, same prompt: prefill and the first 100 tokens' misses | it is the gap that remains between a partial budget and the resident model |
+| 46 | ~~Why does the decode under budget improve with the length of generation?~~ **It is the store, not a warm-up** (2026-09-21, §M1 measured: what experts really cost from disk): with the resident model the time per token does not change from 200 to 1000 (34.64 → 33.48, within the spread), under budget it does (26.53 → 29.84 at 25%). A fixed cost of ~0.35 s at 50% and ~0.84 s at 25%, which the first tokens' extra misses explain for only ~115 ms. **Remains**: where the rest goes | zone profile of the first 64 tokens against tokens far from the prompt, same budget | says whether there is a lever in the LRU past the prompt, and what number to promise with half the model in RAM |
+| 47 | ~~Does the prefill under budget read the experts once per prompt?~~ **Now yes** (per-layer order, 2026-09-21: 6 273 MiB and 12.41 s at 2048, **1.89×**). Before: once per pass (2026-09-21, §Prefill reads model once per pass). The prompt is processed in blocks of 512 tokens (`OLMOE_DEFAULT_BATCH`) and every pass walks all the layers, so under budget it rereads the whole table: at 2048 tokens **22 880 MiB instead of 6 528**, 3.65×, growing with the prompt. With a single pass (`-b 2048`) the prefill takes 11.27 s instead of 23.51 (**2.09×**) and the last logit row is identical to the byte | the per-layer order's timing once it exists, and the same measurement at 4000 tokens (eight passes) | the prefill's biggest lever under budget, and it costs no precision |
+| 48 | **How much of the first prompt hides behind the time the user spends typing?** A declared preparation phase (Marcello's idea, 2026-09-21): as soon as the session opens, and before the prompt arrives, the engine starts reading the experts and says so ("reading the model, 6.5 GiB"). It does not remove the 4.7 s, it puts them where they do not bother anyone; it costs no bit of precision and needs no new process. To decide: what to read first when the prompt is still unknown (the layer order is the right one, layer 0 is needed first) | time between opening and the first token, with and without the early read, on a prompt that arrives after 5, 15 and 30 seconds | it is the cheapest lever: no new structure |
 | 49 | ~~Does a process that stays up between sessions pay for what it costs?~~ **At full budget yes, at half budget little** (measured 2026-09-23, §The engine kept between commands). `trochilus serve` (built 2026-09-23, Marcello's go) keeps pool, model and store; `generate`, `logits`, `run` and `chat` run in it when its endpoint answers, byte for byte the same output (`tests/test_serve.c`). First prompt of 2048 tokens: **full budget 12.79 → 7.81 s** (the 4.98 s load gone, prefill unchanged); **half budget 13.00 → 12.04 s** (0.926×, A/A 1.020×), 139 misses fewer of 1 157. Prediction written before measuring: full loses the load (held); half gains little because the sweep evicts what the next sweep needs first, misses warm = cold (held in the mechanism, off by 12% in the misses) | where the 139 fewer misses come from (per-phase misses: prefill and decode apart); a sweep-resistant eviction at half budget (model: up to ~511 units kept, ~2.5 s) | the gap to the resident model is gone where the model fits; below budget the lever is the eviction policy |
 | 50 | **How much disk does Adaptive-K take away, and what does it change?** (Marcello's source, docs/ORIGINS.md §Sources not yet studied): a token uses fewer than 8 experts when the router is confident, the lowest-weight ones dropped until the kept ones hold a share p of the router's weight. Prediction, written first: at p = 0.9 about 5-6 experts a token, misses at half budget down 20-35%, KL against the exact mode small but not 0; the token changed in a few % of positions | route trace (`--route-trace`): per p, experts kept per token and their weight (no engine change); then a declared mode (env or flag, never the default) at half budget through `tools/ab_modes.sh` (misses, prefill, decode) and KL against the exact mode (`tools/mask_quality.sh`) | under a partial budget every expert skipped is a unit not read from disk: a lever on M1's bottleneck, if the quality holds |
 | 51 | ~~Can the decode's attention run on the GPU with the same bits, and what does it give at long context?~~ **Premise measured 2026-09-24** (§The decode's attention on the GPU: the premise): 0 of 25 344 head outputs differ; 185 µs a layer at 2048 and 319 at 4000 with keep-warm and zero copy (CPU 704 and 1415), 1.29× and 1.57× projected; **in the engine 1.31–1.32× at 2048 and 1.54–1.58× at 4000** with the measured width (§The decode's attention on the GPU, in the engine). (2026-09-24, after the skip family closed, §Skipping cached positions exactly). Prediction, written first: bits identical if every float op carries an explicit `.rn` and `tr_expf` is ported whole (its double arithmetic too); per layer (16 heads) at 2048 the kernels ~150 µs (32 MiB at ~220 GB/s) and the round trip (copies of q, k, v in and the output out, launch, sync, WDDM) 30–60 µs, so 180–210 µs against the CPU's 704: the token 36.8 → ~28.7 ms (**1.28×**); at 4000 the attention 22.6 → ~5.4 ms, the token 48.1 → ~31 ms (**~1.55×**) | `tests/bench_gpu_attn.c`: the driver loaded at run time, the kernels as PTX; every query of the six dumps of `make attn-probe` against the CPU's bits, a mutation seen red; per layer at 2048 and 4000 the kernels alone, the round trip, a plain streaming read (median of ≥ 50) | the one exact lever left of the size of the KV's bytes: the same bytes read 4-5× faster, and more the longer the context |
@@ -282,13 +282,13 @@ Notes:
 
 `tr_matmul` q8_0 1024×2048 (one expert matrix, 1 token): 1 thread 0.100 ms, 16 threads 0.146 ms.
 
-Letture:
-- AVX-512 va quasi quanto AVX2: il limite è la **catena delle somme**. Ogni corsia somma un
-  prodotto dopo l'altro, e una somma aspetta la precedente (~3-4 cicli di clock): 16 corsie danno
-  al massimo 16 elementi ogni 3-4 cicli, con registri da 256 o da 512 bit. Più corsie romperebbero
-  la definizione scalare (numeri diversi): da valutare solo se un thread singolo torna il limite.
-- Sulla carta 16 thread da 20 000 M el/s supererebbero la banda della RAM (~80 GB/s); sul modello
-  on real model: traffic stops at 22 GB/s because threads don't pay (section below).
+Notes:
+- AVX-512 runs almost as fast as AVX2: the limit is the **chain of sums**. Each lane sums one
+  product after another, and a sum waits on the previous one (~3-4 clock cycles): 16 lanes give
+  at most 16 elements every 3-4 cycles, with 256- or 512-bit registers. More lanes would break
+  the scalar definition (different numbers): worth evaluating only if a single thread becomes the limit.
+- On paper 16 threads at 20 000 M el/s would exceed RAM's bandwidth (~80 GB/s); on the real model:
+  traffic stops at 22 GB/s because threads don't pay (section below).
 - On an expert matrix 16 threads are **slower** than one: waking the pool costs more than
   the work (0.1 ms). Confirmed on real model (section below).
 
@@ -702,75 +702,76 @@ help, and the default (threads = physical cores) is right.
 
 ## Speculation from prompt — how much it helps and hurts (2026-09-17)
 
-Container, volume `trochilus-models`, OLMoE-1B-7B Q8_0 intero, `run -f <prompt> -n 200`,
-`--spec 0` e `--spec k` **alternati run per run** (`tools/ab_spec.sh`, LESSONS #46), mediana di 3
-giri dopo uno di riscaldamento. Il testo generato è identico in ogni giro: lo script si ferma se
-non lo è. Nessun pin dei thread e misure in container: rifatte native e col pin in §Bozza adattiva,
-dove il costo di una riga in più risulta circa 3 volte quello scritto qui sotto (13.7-17.6 ms
-misurati per zona contro 5.2; LESSONS #59).
+Container, volume `trochilus-models`, whole OLMoE-1B-7B Q8_0, `run -f <prompt> -n 200`,
+`--spec 0` and `--spec k` **alternated run by run** (`tools/ab_spec.sh`, LESSONS #46), median of 3
+runs after one warm-up. The generated text is identical on every run: the script stops if it is
+not. No thread pinning and measurements in a container: redone native and with pinning in §Adaptive
+draft: what one more row really costs, where the cost of one more row comes out about 3 times what
+is written below (13.7-17.6 ms measured per zone against 5.2; LESSONS #59).
 
-| Prompt | Bozza | Decode tok/s (min-max) | Bozze accettate | Contro `--spec 0` |
+| Prompt | Draft | Decode tok/s (min-max) | Drafts accepted | Against `--spec 0` |
 |---|---|---|---|---|
-| `bench/prompts/code-edit.txt` (il file è già nel prompt, va riscritto con una modifica) | 0 | 29.1 (27.1-30.7) | — | — |
+| `bench/prompts/code-edit.txt` (the file is already in the prompt, to be rewritten with a change) | 0 | 29.1 (27.1-30.7) | — | — |
 | | 2 | 32.5 (31.4-33.5) | 120/160 = 75% | **1.11×** |
 | | 8 | **41.3** (41.0-43.2) | 170/264 = 64% | **1.42×** |
-| `bench/prompts/code.txt` (codice nuovo, il modello non ricopia niente) | 0 | 29.6 (28.5-31.8) | — | — |
+| `bench/prompts/code.txt` (new code, the model copies nothing) | 0 | 29.6 (28.5-31.8) | — | — |
 | | 8 | 18.4 (18.4-19.5) | 57/435 = 13% | **0.62×** |
-| stesso prompt, 4 thread | 0 | 29.1 (28.7-29.4) | — | — |
+| same prompt, 4 threads | 0 | 29.1 (28.7-29.4) | — | — |
 | | 8 | 16.3 (16.2-16.4) | 57/435 = 13% | **0.56×** |
 
-Letture:
-- **Sul lavoro di codice vero la leva c'è**: quando il testo da produrre è già nel prompt (riscrivere
-  un file con una modifica, il caso per cui la leva è stata scelta), la bozza da 8 dà **1.42×** con
-  il 64% di token accettati, e i token sono gli stessi.
-- **Quando il modello inventa, si perde**: 13% accettate e 0.62×. Una passata da 1 + k posizioni
-  costa ~34 ms di pesi più ~5.2 ms per riga in più (34 ms a una riga, 76 ms a nove): il pareggio è
-  intorno al **15% di bozze accettate**, e sotto quella soglia si paga.
-- Il costo per riga in più (~5.2 ms) è lo stesso lavoro per elemento del prefill, quindi il pin dei
-  thread ai core fisici lo abbassa: dopo quel passo la soglia di pareggio scende e la bozza lunga
-  conviene più spesso. Da rimisurare lì.
-- Conseguenza: `--spec` resta **spento di default** finché la bozza non si accorcia da sola dopo un
-  rifiuto (llama.cpp lo fa). Con la bozza adattiva il caso peggiore diventa «come senza».
+Notes:
+- **On real code work the lever is there**: when the text to produce is already in the prompt
+  (rewriting a file with a change, the case the lever was chosen for), the 8-row draft gives
+  **1.42×** with 64% of tokens accepted, and the tokens are the same.
+- **When the model invents, it loses**: 13% accepted and 0.62×. A pass of 1 + k positions costs
+  ~34 ms of weights plus ~5.2 ms per extra row (34 ms at one row, 76 ms at nine): break-even is
+  around **15% of drafts accepted**, and below that threshold it costs more.
+- The cost per extra row (~5.2 ms) is the same per-element work as the prefill, so pinning threads
+  to physical cores lowers it: after that step the break-even threshold falls and the long draft
+  pays off more often. To be remeasured there.
+- Consequence: `--spec` stays **off by default** until the draft shortens itself after a rejection
+  (llama.cpp does this). With the adaptive draft, the worst case becomes "like without".
 
 ## Adaptive draft: what one more row really costs (2026-09-18)
 
-Windows **nativo**, macchina ferma, pin al core (il default), 16 thread, `run -f <prompt> -n 200`,
-`--spec 0` e `--spec 8` **alternati run per run** (`tools/ab_spec.sh`), mediana di 3 giri dopo uno
-di riscaldamento, testo identico in ogni giro. `--spec-fixed` sceglie la bozza fissa. Le due righe
-«con pausa» sono la **rimisura a 8 giri con controllo A/A** (`tools/ab_modes.sh`, §Revisione): i 3
-giri di prima davano 1.15× (28.63 → 32.98) e 1.01× (27.49 → 27.76), e il secondo era sbagliato.
+Windows **native**, still machine, pinned to core (the default), 16 threads, `run -f <prompt> -n
+200`, `--spec 0` and `--spec 8` **alternated run by run** (`tools/ab_spec.sh`), median of 3 runs
+after one warm-up, identical text on every run. `--spec-fixed` picks the fixed draft. The two
+"with pause" rows are the **remeasure at 8 runs with an A/A control** (`tools/ab_modes.sh`,
+§Adversarial review): the earlier 3 runs gave 1.15× (28.63 → 32.98) and 1.01× (27.49 → 27.76), and
+the second one was wrong.
 
-| Prompt | Politica della bozza | `--spec 0` | `--spec 8` | | Accettate | Bozza media |
+| Prompt | Draft policy | `--spec 0` | `--spec 8` | | Accepted | Average draft |
 |---|---|---|---|---|---|---|
-| `code-edit.txt` (il file è già nel prompt) | fissa 8 | 27.99 | **37.61** | **1.34×** | 64.4% | 8.00 |
-| | adattiva, solo si accorcia | 26.96 | 32.81 | 1.22× | 70.9% | 2.86 |
-| | adattiva con pausa (oggi), 8 giri con A/A | 31.87 | 37.45 | **1.175×** | 69.4% | 2.34 |
-| `code.txt` (codice nuovo) | fissa 8 | 29.65 | 17.67 | **0.60×** | 13.1% | 3.04 |
-| | adattiva, solo si accorcia | 29.61 | 26.22 | 0.89× | 41.3% | 0.70 |
-| | adattiva con pausa (oggi), 8 giri con A/A | 32.67 | 31.15 | **0.953×** | 42.4% | 0.38 |
+| `code-edit.txt` (the file is already in the prompt) | fixed 8 | 27.99 | **37.61** | **1.34×** | 64.4% | 8.00 |
+| | adaptive, shortens only | 26.96 | 32.81 | 1.22× | 70.9% | 2.86 |
+| | adaptive with pause (today), 8 runs with A/A | 31.87 | 37.45 | **1.175×** | 69.4% | 2.34 |
+| `code.txt` (new code) | fixed 8 | 29.65 | 17.67 | **0.60×** | 13.1% | 3.04 |
+| | adaptive, shortens only | 29.61 | 26.22 | 0.89× | 41.3% | 0.70 |
+| | adaptive with pause (today), 8 runs with A/A | 32.67 | 31.15 | **0.953×** | 42.4% | 0.38 |
 
-Il costo di una riga in più, ricavato dai passaggi stampati (ms per passata = 1000 · token / tok·s⁻¹
-/ passaggi, meno i ~35 ms di una passata da un token, diviso la bozza media): **15 ms** con bozza
-fissa 8, **20 ms** con bozza media 2.3, **27 ms** con bozza media 0.4. Misurato poi per zona
-(§Revisione): **17.6 ms** se è la sola riga in più, **13.7 ms** l'una se sono otto, contro i 31.3
-di una passata.
+The cost of one more row, derived from the printed passes (ms per pass = 1000 · tokens / tok/s
+/ passes, minus the ~35 ms of a one-token pass, divided by the average draft): **15 ms** with a
+fixed draft of 8, **20 ms** with an average draft of 2.3, **27 ms** with an average draft of 0.4.
+Measured then per zone (§Adversarial review): **17.6 ms** if it is the only extra row, **13.7 ms**
+each if there are eight, against a pass's 31.3.
 
-Letture:
-- **Su un MoE una riga in più non è quasi gratis, come sarebbe su un modello denso.** Il decode
-  costa perché legge i pesi degli 8 esperti scelti in ogni strato; il token in bozza ne sceglie
-  altri, e la passata legge anche quelli. Una riga in più costa così mezza passata o più, e il
-  pareggio sta al **44-56% di bozze accettate** (costo della riga / costo della passata, misurati
-  per zona in §Revisione; la stima dai tok/s diceva 60-75%), non al 15% che diceva la misura fatta
-  in container (LESSONS #59). È anche il motivo per cui la bozza lunga rende solo dove il testo è
-  già nel prompt: lì gli esperti scelti sono gli stessi, perché i token sono gli stessi.
-- **Accorciare la bozza non bastava**: con il 41% di accettate si perdeva ancora l'11%. Fermarla del
-  tutto dopo una bozza tutta sbagliata (pausa 1, 3, 7, 15 passi, capped 16) porta il caso peggiore a
-  **0.95×** (rimisura con A/A: −4.7%, sopra la soglia, 8 giri su 8; i 3 giri di prima dicevano
-  1.01×) e lascia il caso buono a **1.175×**. «Come senza» **non è raggiunto**: accendere `--spec`
-  di default vuol dire accettare −5% dove il modello inventa per +17.5% dove ricopia. La domanda
-  25 resta chiusa (la pausa è misurata), la scelta del default è di Marcello.
-- La bozza fissa resta la più veloce dove il modello ricopia (1.34×): chi sa che sta riscrivendo un
-  file può ancora chiedere `--spec 8 --spec-fixed`.
+Notes:
+- **On a MoE one more row is not nearly free, the way it would be on a dense model.** The decode
+  costs because it reads the weights of the 8 experts chosen in each layer; the draft token
+  chooses others, and the pass reads those too. One more row thus costs half a pass or more, and
+  break-even sits at **44-56% of drafts accepted** (row cost / pass cost, measured per zone in
+  §Adversarial review; the tok/s estimate said 60-75%), not the 15% the container measurement said
+  (LESSONS #59). This is also why the long draft only pays off where the text is already in the
+  prompt: there the experts chosen are the same, because the tokens are the same.
+- **Shortening the draft was not enough**: at 41% accepted, 11% was still lost. Stopping entirely
+  after a fully wrong draft (pause 1, 3, 7, 15 steps, capped at 16) brings the worst case to
+  **0.95×** (A/A remeasure: −4.7%, above the threshold, 8 of 8 runs; the earlier 3 runs said
+  1.01×) and leaves the good case at **1.175×**. "Like without" is **not reached**: turning
+  `--spec` on by default means accepting −5% where the model invents for +17.5% where it copies.
+  Question 25 stays closed (the pause is measured), the default's choice is Marcello's.
+- The fixed draft stays the fastest where the model copies (1.34×): whoever knows they are
+  rewriting a file can still ask for `--spec 8 --spec-fixed`.
 
 ## Kernel: one weight row vs 4 tokens (2026-09-17)
 
@@ -779,11 +780,11 @@ elements per second **per input row**:
 
 | Kernel | n=1024 | n=2048 | n=4096 |
 |---|---|---|---|
-| dot_row q8_0 (una riga, un token) | 20 525 | 21 154 | 21 517 |
-| dot_row q8_0 x4 (una riga, 4 token) | 41 467 | 44 169 | 36 898 |
-| dot_f32 (riferimento in float) | 31 421 | 31 653 | 29 153 |
+| dot_row q8_0 (one row, one token) | 20 525 | 21 154 | 21 517 |
+| dot_row q8_0 x4 (one row, 4 tokens) | 41 467 | 44 169 | 36 898 |
+| dot_f32 (float reference) | 31 421 | 31 653 | 29 153 |
 
-`tr_matmul` su una matrice 1024×2048 q8_0 (forma di una proiezione di esperto), ms per token:
+`tr_matmul` on a 1024×2048 q8_0 matrix (shape of an expert projection), ms per token:
 
 | Thread | 1 token | 64 token |
 |---|---|---|
@@ -792,36 +793,36 @@ elements per second **per input row**:
 | 8 | 0.014 | 0.008 |
 | 16 | 0.014 | 0.009 |
 
-Letture:
-- Il kernel a 4 token vale **2.1×** sul prodotto scalare e batte anche `dot_f32`: il peso q8_0 si
-  legge e si converte una volta per quattro prodotti, e occupa un quarto dei byte di un float.
-- La matrice intera guadagna meno del kernel (1.7× a 1 thread): lì pesano anche i byte letti.
-- Da 1 a 16 thread la stessa matrice rende 6.5×, non 16: a 16 thread la macchina è al limite di
-  potenza (domanda 20).
+Notes:
+- The 4-token kernel is worth **2.1×** on the dot product and even beats `dot_f32`: the q8_0
+  weight is read and converted once for four products, and occupies a quarter of a float's bytes.
+- The whole matrix gains less than the kernel (1.7× at 1 thread): there the bytes read weigh in too.
+- From 1 to 16 threads the same matrix gives 6.5×, not 16: at 16 threads the machine is at its
+  power limit (question 20).
 
 ## Speed levers: what research says (2026-09-17)
 
 Numbers from sources, on other machines: point the direction, don't promise. Exact = same
 numbers; declared = different numbers, difference to measure on real model before adopting.
 
-| # | Leva | Tipo | Guadagno riportato | Per noi |
+| # | Lever | Type | Reported gain | For us |
 |---|---|---|---|---|
-| 1 | SIMD sul prodotto riga × vettore | esatto | — | fatto: 10× sul kernel |
-| 2 | Attivazioni in int8 + VNNI (`VPDPBUSD`), come llama.cpp per Q8_0 | dichiarato | llama.cpp usa questa strada per Q8_0 | alto: meno byte e meno lavoro per elemento |
-| 3 | Prefill a blocchi (più token nella stessa moltiplicazione) | esatto | prefill lineare nel lotto ([discussione #18030](https://github.com/ggml-org/llama.cpp/discussions/18030)) | fatto con la 4: prefill 4.3× a 16 thread, decode invariato |
-| 4 | Token raggruppati per esperto nel prefill | esatto | nessun numero isolato | fatto con la 3 |
-| 5 | Pesi riordinati a blocchi di righe (repack 8×8) | esatto | +53% prefill, ~0% decode su Zen 5 ([PR #9532](https://github.com/ggml-org/llama.cpp/pull/9532)) | dopo 3-4 |
-| 6 | Cache blocking (Goto/BLIS) | esatto | base di 3-5 ([Goto 2008](https://www.cs.utexas.edu/~flame/pubs/GotoTOMS_revision.pdf)) | solo con più token insieme |
-| 7 | tinyBLAS di llamafile | esatto | prefill 1.3-4×, decode poco ([PR #6414](https://github.com/ggml-org/llama.cpp/pull/6414)) | idee per 3-5 |
-| 8 | Decodifica speculativa | esatto (greedy) | 2-3× ([arXiv 2211.17192](https://arxiv.org/abs/2211.17192)) | serve un modello bozza; per il coding si può usare il testo del prompt |
-| 9 | Salto dell'esperto debole | dichiarato | 1.2-1.3×, -3 punti di qualità ([arXiv 2402.14800](https://arxiv.org/abs/2402.14800)) | solo opzionale, con misura di qualità |
-| 10 | Sparsità delle attivazioni (PowerInfer) | dichiarato | 2.9× ([arXiv 2312.12456](https://arxiv.org/abs/2312.12456)) | serve un predittore addestrato per modello |
-| — | Tabelle (T-MAC, bitnet.cpp), AMX, huge pages, NUMA | — | — | non per noi: pesi a 1-4 bit, solo Intel, carico di I/O, un solo socket |
+| 1 | SIMD on the row × vector product | exact | — | done: 10× on the kernel |
+| 2 | int8 + VNNI activations (`VPDPBUSD`), as llama.cpp does for Q8_0 | declared | llama.cpp uses this path for Q8_0 | high: fewer bytes and less work per element |
+| 3 | Batched prefill (more tokens in the same multiplication) | exact | prefill linear in the batch ([discussion #18030](https://github.com/ggml-org/llama.cpp/discussions/18030)) | done with 4: prefill 4.3× at 16 threads, decode unchanged |
+| 4 | Tokens grouped by expert in the prefill | exact | no isolated number | done with 3 |
+| 5 | Weights reordered in row blocks (8×8 repack) | exact | +53% prefill, ~0% decode on Zen 5 ([PR #9532](https://github.com/ggml-org/llama.cpp/pull/9532)) | after 3-4 |
+| 6 | Cache blocking (Goto/BLIS) | exact | base of 3-5 ([Goto 2008](https://www.cs.utexas.edu/~flame/pubs/GotoTOMS_revision.pdf)) | only with more tokens together |
+| 7 | llamafile's tinyBLAS | exact | prefill 1.3-4×, decode little ([PR #6414](https://github.com/ggml-org/llama.cpp/pull/6414)) | ideas for 3-5 |
+| 8 | Speculative decoding | exact (greedy) | 2-3× ([arXiv 2211.17192](https://arxiv.org/abs/2211.17192)) | needs a draft model; for coding the prompt's own text can be used |
+| 9 | Skipping the weak expert | declared | 1.2-1.3×, -3 quality points ([arXiv 2402.14800](https://arxiv.org/abs/2402.14800)) | optional only, with a quality measurement |
+| 10 | Activation sparsity (PowerInfer) | declared | 2.9× ([arXiv 2312.12456](https://arxiv.org/abs/2312.12456)) | needs a predictor trained per model |
+| — | Tables (T-MAC, bitnet.cpp), AMX, huge pages, NUMA | — | — | not for us: 1-4 bit weights, Intel only, I/O-bound, a single socket |
 
-Cache del 7940HX: L1d 32 KB e L2 1 MB per core, L3 32 MB per ciascuno dei due gruppi da 8 core.
-Una riga di esperto (2 KB) e il vettore (8 KB) stanno già in L1: nel decode un peso si legge una
-volta per token, e non c'è niente da tenere in cache. Il blocking conta quando più token
-riusano le stesse righe (leve 3-6).
+7940HX cache: L1d 32 KB and L2 1 MB per core, L3 32 MB for each of the two 8-core groups.
+An expert row (2 KB) and the vector (8 KB) already fit in L1: in the decode a weight is read once
+per token, and there is nothing to keep in cache. Blocking matters when several tokens reuse the
+same rows (levers 3-6).
 
 ## Adversarial review (2026-09-18)
 
@@ -832,175 +833,173 @@ spread (kernel on one core, alternating runs) or **no stopwatch** (counters, rep
 what follows is a product speed measurement except the last section (**Native A/A remeasure**),
 which is native and machine idle.
 
-**Invarianti: reggono.** `trochilus logits` su 40-70 token, 3 tier (`TR_CPU_MAX` scalar, avx2,
-avx512) × 3 numeri di thread (1, 5, 16) × 3 passate (`-b` 1, 7, 512): 27 file per modello,
-identici al byte sulle righe confrontabili, per i tre modelli minuscoli (f32, f16, q8_0) e per
-OLMoE vero tagliato a 2 layer (201 216 byte per riga). I test del modello passano anche sotto
-`scalar` e `avx2`. Ora è un controllo: `make tier-check`. Tokenizer: 90 000 stringhe costruite
-per rompere (tempeste di segni combinanti, jamo, ogni spazio Unicode, contrazioni, token aggiunti
-incollati a segni e spazi) × 2 modi contro HF `tokenizers`: 0 differenze, e 12 000 decodifiche
-uguali.
+**Invariants: they hold.** `trochilus logits` on 40-70 tokens, 3 tiers (`TR_CPU_MAX` scalar, avx2,
+avx512) × 3 thread counts (1, 5, 16) × 3 passes (`-b` 1, 7, 512): 27 files per model, identical to
+the byte on the comparable rows, for the three tiny models (f32, f16, q8_0) and for the real
+OLMoE cut to 2 layers (201 216 bytes per row). The model tests pass under `scalar` and `avx2` too.
+It is now a check: `make tier-check`. Tokenizer: 90 000 strings built to break it (storms of
+combining marks, jamo, every Unicode space, contractions, added tokens glued to marks and
+spaces) × 2 modes against HF `tokenizers`: 0 differences, and 12 000 equal decodings.
 
-**Attivazioni int8, seconda misura** (domanda 21, LESSONS #65). `make bench`, sezione «one row,
-by»: i quattro kernel girano alternati sulla stessa riga, 9 run da 40 ms, un core. Nanosecondi
-per riga di input e rapporto col nostro kernel; il float x8 è verificato identico al bit al x4,
-gli int8 contro il loro dot in C puro.
+**int8 activations, second measurement** (question 21, LESSONS #65). `make bench`, "one row, by"
+section: the four kernels run alternated on the same row, 9 runs of 40 ms, one core. Nanoseconds
+per input row and ratio to our kernel; float x8 is verified bit-identical to x4, the int8 ones
+against their plain-C dot.
 
 | kernel | n=1024 | n=2048 | n=4096 |
 |---|---|---|---|
-| `dot_row q8_0 x4` float, AVX-512 (il nostro) | 25.6 ns | 47.6 ns | 114.1 ns |
-| int8 VNNI x4, 256 bit, trucco del segno di ggml | 1.64× | 1.62× | 1.96× |
-| int8 VNNI x4, 512 bit, due blocchi per istruzione | **1.83×** | **1.79×** | **2.26×** |
-| float x8, esatto (la strada «blocchi più larghi») | 1.13× | **0.79×** | 0.93× |
+| `dot_row q8_0 x4` float, AVX-512 (ours) | 25.6 ns | 47.6 ns | 114.1 ns |
+| int8 VNNI x4, 256 bit, ggml's sign trick | 1.64× | 1.62× | 1.96× |
+| int8 VNNI x4, 512 bit, two blocks per instruction | **1.83×** | **1.79×** | **2.26×** |
+| float x8, exact (the "wider blocks" path) | 1.13× | **0.79×** | 0.93× |
 
-Spread 3-8% per riga; con clang 1.78× / 1.84× / 2.13× e 1.15× / 0.79× / 0.91×. Letture:
-- Il prefill è al 90% moltiplicazioni e llama.cpp è avanti 1.57× a un thread: è l'int8, quasi
-  per intero. Il float x8 a n=2048 (la larghezza di OLMoE) **perde**: 8 righe di attivazioni
-  float sono 64 KB e la L1 ne tiene 32; in int8 sono 16 KB.
-- Limite della misura: è un kernel su un core con tutto in cache; sul prefill intero il guadagno
-  sarà più basso (resta il 10% non matmul, e la quantizzazione delle attivazioni). E l'int8
-  **non è esatto**: i logit del prefill non sarebbero più quelli del token per token. Può
-  esistere solo come modo dichiarato; la decisione è di Marcello.
+Spread 3-8% per row; with clang 1.78× / 1.84× / 2.13× and 1.15× / 0.79× / 0.91×. Notes:
+- The prefill is 90% multiplications and llama.cpp is ahead 1.57× at one thread: it is int8,
+  almost entirely. Float x8 at n=2048 (OLMoE's width) **loses**: 8 rows of float activations are
+  64 KB and L1 holds 32; in int8 they are 16 KB.
+- Limit of the measurement: it is a kernel on one core with everything in cache; on the whole
+  prefill the gain will be lower (the 10% non-matmul remains, and the activations' quantization).
+  And int8 **is not exact**: the prefill's logits would no longer be the token-by-token ones. It
+  can only exist as a declared mode; the decision is Marcello's.
 
-**Quanto legge una riga di bozza** (domanda 12, LESSONS #67). Contatore `weight_bytes` del
-profiler diviso per le passate: deterministico, modello vero, 200 token, `generate --spec k`.
+**How much a draft row reads** (question 12, LESSONS #67). The profiler's `weight_bytes` counter
+divided by the passes: deterministic, real model, 200 tokens, `generate --spec k`.
 
-| prompt | bozza | righe/passata | MiB di pesi/passata | MiB per riga in più | esperti nuovi per layer (su 8) |
+| prompt | draft | rows/pass | MiB of weights/pass | MiB per extra row | new experts per layer (of 8) |
 |---|---|---|---|---|---|
-| tutti | 0 | 1.00 | 1200.4 | — | — |
-| `code-edit` | fissa 1 | 2.00 | 1675.8 | 475 | 4.7 |
-| `code-edit` | fissa 8 | 9.00 | 3221.3 | 253 | 2.5 |
-| `code-edit` | fissa 15 | 16.00 | 3891.0 | 179 | 1.8 |
-| `code-edit` | adattiva | 3.34 | 2001.0 | 342 | 3.4 |
-| `code` | fissa 1 | 1.46 | 1404.9 | 445 | 4.4 |
-| `code` | fissa 8 | 4.04 | 1916.7 | 236 | 2.3 |
-| `code` | adattiva | 1.38 | 1337.6 | 361 | 3.5 |
+| all | 0 | 1.00 | 1200.4 | — | — |
+| `code-edit` | fixed 1 | 2.00 | 1675.8 | 475 | 4.7 |
+| `code-edit` | fixed 8 | 9.00 | 3221.3 | 253 | 2.5 |
+| `code-edit` | fixed 15 | 16.00 | 3891.0 | 179 | 1.8 |
+| `code-edit` | adaptive | 3.34 | 2001.0 | 342 | 3.4 |
+| `code` | fixed 1 | 1.46 | 1404.9 | 445 | 4.4 |
+| `code` | fixed 8 | 4.04 | 1916.7 | 236 | 2.3 |
+| `code` | adaptive | 1.38 | 1337.6 | 361 | 3.5 |
 
-Un esperto sono 6.375 MiB (tre matrici Q8_0 da 2048×1024). A 36 GB/s, 253 MiB sono 7 ms dei 15
-di una riga in più: la lettura degli esperti nuovi spiega **metà** del costo, non tutto. Nello
-stesso profilo (tempi in container, solo indicativi) una riga in più costa 4-5.6 ms anche nelle
-zone dense (`qkv_proj`, `attn_out_proj`, `lm_head`), dove non c'è nessun peso nuovo da leggere.
-La parte a tempo è misurata nativa più sotto (**Quanto costa una riga di bozza, a zone**): negli
-esperti sta il 61-91% del costo, e le zone dense pesano solo con le bozze lunghe.
+One expert is 6.375 MiB (three 2048×1024 Q8_0 matrices). At 36 GB/s, 253 MiB is 7 ms of the 15 of
+one more row: reading the new experts explains **half** the cost, not all of it. In the same
+profile (times in a container, indicative only) one more row costs 4-5.6 ms even in the dense
+zones (`qkv_proj`, `attn_out_proj`, `lm_head`), where there is no new weight to read. The timed
+part is measured native further below (**How much a draft row costs, by zone**): 61-91% of the
+cost sits in the experts, and the dense zones only weigh in with long drafts.
 
-**Le costanti della pausa, senza cronometro** (LESSONS #60, #67). Che una bozza venga accettata
-dipende solo dai token, e i token sono gli stessi con ogni politica: ogni politica si può
-rigiocare sulla continuazione registrata. Il replay riproduce alla riga i contatori del motore
-(77 passate, 180 bozze, 125 accettate su `code-edit`; 172, 65, 28 su `code`). Tempo = passate ×
-35 ms + righe di bozza × C; guadagno su `--spec 0` per C = 15 e 20 ms:
+**The pause's constants, without a stopwatch** (LESSONS #60, #67). Whether a draft gets accepted
+depends only on the tokens, and the tokens are the same under every policy: every policy can be
+replayed on the recorded continuation. The replay reproduces the engine's counters exactly (77
+passes, 180 drafts, 125 accepted on `code-edit`; 172, 65, 28 on `code`). Time = passes × 35 ms +
+draft rows × C; gain over `--spec 0` for C = 15 and 20 ms:
 
-| politica (bozza 8) | `code-edit` passate / bozze | C=15 | C=20 | `code` passate / bozze | C=15 | C=20 |
+| policy (draft 8) | `code-edit` passes / drafts | C=15 | C=20 | `code` passes / drafts | C=15 | C=20 |
 |---|---|---|---|---|---|---|
-| fissa | 33 / 264 | 1.37× | 1.09× | 143 / 435 | 0.61× | 0.51× |
-| adattiva, solo si accorcia | 66 / 189 | 1.36× | 1.15× | 155 / 109 | 0.99× | 0.92× |
-| pausa 1, 3, 7, 15, 16 (oggi) | 77 / 180 | 1.30× | 1.11× | 172 / 66 | 1.00× | 0.95× |
-| pausa 1, 3, 7, 15, 31, 16 (l'errore #60) | 77 / 180 | 1.30× | 1.11× | 172 / 65 | 1.00× | 0.96× |
-| pausa 1, 2, 4, 8, 16 | 71 / 183 | 1.34× | 1.14× | 165 / 83 | 1.00× | 0.94× |
-| pausa 2, 5, 11, 16 | 78 / 169 | 1.33× | 1.15× | 168 / 65 | 1.02× | 0.97× |
-| pausa sempre 4 | 77 / 168 | 1.34× | 1.16× | 173 / 68 | 0.99× | 0.94× |
+| fixed | 33 / 264 | 1.37× | 1.09× | 143 / 435 | 0.61× | 0.51× |
+| adaptive, shortens only | 66 / 189 | 1.36× | 1.15× | 155 / 109 | 0.99× | 0.92× |
+| pause 1, 3, 7, 15, 16 (today) | 77 / 180 | 1.30× | 1.11× | 172 / 66 | 1.00× | 0.95× |
+| pause 1, 3, 7, 15, 31, 16 (error #60) | 77 / 180 | 1.30× | 1.11× | 172 / 65 | 1.00× | 0.96× |
+| pause 1, 2, 4, 8, 16 | 71 / 183 | 1.34× | 1.14× | 165 / 83 | 1.00× | 0.94× |
+| pause 2, 5, 11, 16 | 78 / 169 | 1.33× | 1.15× | 168 / 65 | 1.02× | 0.97× |
+| pause always 4 | 77 / 168 | 1.34× | 1.16× | 173 / 68 | 0.99× | 0.94× |
 
-Letture: le costanti spostano il 2-3%, meno di quanto una misura a tempo su questa macchina
-possa vedere; restano quelle. Il caso peggiore «1.01×» misurato nativo su 3 giri corrisponde a
-C ≈ 15 ms; con C = 20-22 (il valore che la stessa sezione ricava per le bozze corte) il replay
-dà 0.94-0.96×. La domanda «`--spec` acceso di default» va decisa su una misura con più giri e
-un controllo A/A (`tools/ab_modes.sh`, LESSONS #66): fatta, è il blocco **Rimisura nativa** più
-sotto, e dà **0.953×**.
+Notes: the constants shift 2-3%, less than a timed measurement on this machine can see; they stay
+as they are. The worst case "1.01×" measured native over 3 runs corresponds to C ≈ 15 ms; with
+C = 20-22 (the value the same section derives for short drafts) the replay gives 0.94-0.96×. The
+question of "`--spec` on by default" must be decided on a measurement with more runs and an A/A
+control (`tools/ab_modes.sh`, LESSONS #66): done, it is the **Native remeasure** block further
+below, and it gives **0.953×**.
 
-**Il pool con più di un pool** (LESSONS #61-#63). Programma di prova, Linux: `H1` chiamante
-prima `[0-31]`, dopo due pool creati e distrutti nell'ordine di nascita `[0,1]`; `H2` processo
-ristretto a `[0,2]`, pool da 4: worker 2 e 3 su `[0]`; `H3` worker 1 di due pool vivi entrambi
-su `[2,3]`; `H4` pool interno da 2, id del worker arrivato al body: 3. H1 e H2 corretti e sotto
-test; H3 e H4 restano un debito dichiarato in `threads.h`.
+**The pool with more than one pool** (LESSONS #61-#63). Test program, Linux: `H1` caller first
+`[0-31]`, then two pools created and destroyed in birth order `[0,1]`; `H2` process restricted to
+`[0,2]`, pool of 4: workers 2 and 3 on `[0]`; `H3` worker 1 of two live pools both on `[2,3]`; `H4`
+inner pool of 2, worker id reaching the body: 3. H1 and H2 correct and under test; H3 and H4
+remain a declared debt in `threads.h`.
 
-**Rimisura nativa con controllo A/A** (LESSONS #66 e #67; `sh tools/remeasure.sh`, ogni run in
-`build/remeasure/`). Windows nativo, macchina ferma: lo script ferma i 9 container degli altri
-progetti e li riavvia alla fine. Binario del commit 87297b4, OLMoE-1B-7B Q8_0, 16 thread dove non
-è detto altro. `tools/ab_modes.sh`: 8 giri dopo uno di riscaldamento, il primo modo del giro
-ruota, un modo dato due volte fa da controllo A/A. Mediana (min-max), rapporto col primo modo.
+**Native remeasure with an A/A control** (LESSONS #66 and #67; `sh tools/remeasure.sh`, each run
+in `build/remeasure/`). Native Windows, still machine: the script stops the 9 other projects'
+containers and restarts them at the end. Binary of commit 87297b4, OLMoE-1B-7B Q8_0, 16 threads
+unless stated otherwise. `tools/ab_modes.sh`: 8 runs after one warm-up, the round's first mode
+rotates, a mode given twice acts as an A/A control. Median (min-max), ratio to the first mode.
 
-| misura | modo | prefill tok/s | | decode tok/s | |
+| measurement | mode | prefill tok/s | | decode tok/s | |
 |---|---|---|---|---|---|
-| 1. `--spec`, caso peggiore: `run -f code.txt -n 200` | `--spec 0` | 215.1 (210.1-221.9) | — | 32.67 (31.93-33.00) | — |
-| | `--spec 0`, copia A/A | 217.6 (212.2-227.4) | 1.012× | 32.39 (31.72-33.26) | 0.991× |
+| 1. `--spec`, worst case: `run -f code.txt -n 200` | `--spec 0` | 215.1 (210.1-221.9) | — | 32.67 (31.93-33.00) | — |
+| | `--spec 0`, A/A copy | 217.6 (212.2-227.4) | 1.012× | 32.39 (31.72-33.26) | 0.991× |
 | | `--spec 8` | 219.2 (211.6-227.6) | 1.019× | 31.15 (30.68-31.44) | **0.953×** |
-| 2. `--spec`, caso buono: `run -f code-edit.txt -n 200` | `--spec 0` | 229.2 (221.2-232.5) | — | 31.87 (31.06-32.22) | — |
+| 2. `--spec`, good case: `run -f code-edit.txt -n 200` | `--spec 0` | 229.2 (221.2-232.5) | — | 31.87 (31.06-32.22) | — |
 | | `--spec 8` | 229.4 (222.8-232.8) | 1.001× | 37.45 (36.98-38.09) | **1.175×** |
-| 3. pin: `generate -p 512 -n 24` | al core (2, il default) | 242.9 (234.7-246.7) | — | 31.26 (30.54-32.02) | — |
-| | al core, copia A/A | 241.0 (235.3-246.1) | 0.992× | 31.11 (30.24-31.58) | 0.995× |
-| | al processore (1) | 223.3 (185.3-240.4) | **0.919×** | 30.74 (29.63-31.35) | 0.984× |
-| | nessuno (0) | 190.8 (187.7-193.1) | **0.785×** | 31.82 (30.98-32.38) | 1.018× |
-| 4. thread: `generate -p 512 -n 48` | 16 | 242.5 (236.3-247.0) | — | 31.70 (30.37-31.89) | — |
-| | 16, copia A/A | 240.9 (236.9-243.2) | 0.994× | 31.00 (30.39-32.10) | 0.978× |
+| 3. pin: `generate -p 512 -n 24` | to core (2, the default) | 242.9 (234.7-246.7) | — | 31.26 (30.54-32.02) | — |
+| | to core, A/A copy | 241.0 (235.3-246.1) | 0.992× | 31.11 (30.24-31.58) | 0.995× |
+| | to processor (1) | 223.3 (185.3-240.4) | **0.919×** | 30.74 (29.63-31.35) | 0.984× |
+| | none (0) | 190.8 (187.7-193.1) | **0.785×** | 31.82 (30.98-32.38) | 1.018× |
+| 4. threads: `generate -p 512 -n 48` | 16 | 242.5 (236.3-247.0) | — | 31.70 (30.37-31.89) | — |
+| | 16, A/A copy | 240.9 (236.9-243.2) | 0.994× | 31.00 (30.39-32.10) | 0.978× |
 | | 8 | 170.9 (165.5-172.6) | **0.705×** | 34.67 (33.94-35.04) | **1.094×** |
 
-**Il rumore A/A della sessione** (due modi identici, differenza fra le mediane): decode 0.9%,
-0.5%, 2.2%; prefill 1.2%, 0.8%, 0.6%. Lo stesso decode a 16 thread dà 0.5% nel blocco 3 e 2.2%
-nel blocco 4: una coppia A/A sola è essa stessa una misura rumorosa. La soglia usata qui è il
-**peggiore A/A della sessione per quella fase** (decode 2.2%, prefill 1.2%), e una differenza
-conta solo se la supera contro **tutte e due** le copie del controllo. Sotto: «non distinguibile».
+**The session's A/A noise** (two identical modes, difference between medians): decode 0.9%, 0.5%,
+2.2%; prefill 1.2%, 0.8%, 0.6%. The same decode at 16 threads gives 0.5% in block 3 and 2.2% in
+block 4: a single A/A pair is itself a noisy measurement. The threshold used here is the
+**session's worst A/A for that phase** (decode 2.2%, prefill 1.2%), and a difference only counts
+if it exceeds this against **both** copies of the control. Below that: "not distinguishable".
 
-Letture:
-- **Caso peggiore di `--spec`: 0.95×, non 1.01×.** −4.7% contro `--spec 0` e −3.8% contro la sua
-  copia (soglia 2.2%), intervalli disgiunti, `--spec 8` sotto tutte e due in 8 giri su 8.
-  Contatori: 172 passate, 28/66 bozze accettate (42.4%), bozza media 0.38. La pausa porta la
-  perdita da 0.60× a 0.95×, non la toglie: la condizione «caso peggiore come senza» **non è
-  soddisfatta**. Sul prefill +1.9% e +0.8% contro le due copie: non distinguibile.
-- **Caso buono: 1.175×** (era 1.15× su 3 giri), intervalli disgiunti; 77 passate, 125/180 bozze
-  accettate (69.4%), bozza media 2.34. Prefill 1.001×: non distinguibile.
-- **Pin al core contro nessun pin: prefill 1.27×** (1.26× dalla copia), intervalli disgiunti.
-  Decode −1.8% e −2.2% dalle due copie, a cavallo della soglia: **non distinguibile**.
-- **Pin al core contro pin al processore: la differenza è nel prefill, non nel decode.** Il
-  prefill del pin al processore sta a −8.1% e −7.3% (soglia 1.2%), sotto il pin al core in 8 giri
-  su 8, ed è instabile: spread 24.7% (185-240) contro 5.0%. Decode −1.6% e −1.2%: **non
-  distinguibile**. Il «−17-18% sul decode» del pin al processore (3 giri, §Il pin dei thread)
-  **non si riproduce**: contro nessun pin è −3.4% (sopra la soglia, 7 giri su 8, intervalli
-  sovrapposti). Il percorso a un pool e 16 thread è lo stesso nei due binari (il diff di
-  `threads.c` in 87297b4 tocca il chiamante con più pool e i worker senza slot): la differenza
-  non viene dal codice. La causa non è stata cercata; quella misura aveva 3 giri, ordine fisso e
-  nessun A/A.
-- **Il decode vuole 8 thread: 1.09× contro 16 e 1.12× contro la sua copia** (soglia 2.2%),
-  intervalli disgiunti (33.9-35.0 contro 30.4-32.1), 8 giri su 8. Il prefill vuole 16: 1.42×
-  contro 8. Conferma la premessa della domanda 26, che prima stava dentro lo spread.
+Notes:
+- **`--spec`'s worst case: 0.95×, not 1.01×.** −4.7% against `--spec 0` and −3.8% against its own
+  copy (threshold 2.2%), disjoint intervals, `--spec 8` below both in 8 of 8 runs. Counters: 172
+  passes, 28/66 drafts accepted (42.4%), average draft 0.38. The pause takes the loss from 0.60×
+  to 0.95×, it does not remove it: the condition "worst case like without" is **not met**. On the
+  prefill +1.9% and +0.8% against the two copies: not distinguishable.
+- **Good case: 1.175×** (it was 1.15× over 3 runs), disjoint intervals; 77 passes, 125/180 drafts
+  accepted (69.4%), average draft 2.34. Prefill 1.001×: not distinguishable.
+- **Pin to core against no pin: prefill 1.27×** (1.26× from the copy), disjoint intervals. Decode
+  −1.8% and −2.2% from the two copies, straddling the threshold: **not distinguishable**.
+- **Pin to core against pin to processor: the difference is in the prefill, not in the decode.**
+  The processor-pinned prefill sits at −8.1% and −7.3% (threshold 1.2%), below the core-pinned one
+  in 8 of 8 runs, and it is unstable: spread 24.7% (185-240) against 5.0%. Decode −1.6% and −1.2%:
+  **not distinguishable**. The processor pin's "−17-18% on decode" (3 runs, §Thread pinning to
+  physical cores) **does not reproduce**: against no pin it is −3.4% (above the threshold, 7 of 8
+  runs, overlapping intervals). The path to one pool and 16 threads is the same in both binaries
+  (87297b4's diff to `threads.c` touches the caller with several pools and workers with no slot):
+  the difference does not come from the code. The cause was not sought; that measurement had 3
+  runs, a fixed order and no A/A.
+- **The decode wants 8 threads: 1.09× against 16 and 1.12× against its own copy** (threshold
+  2.2%), disjoint intervals (33.9-35.0 against 30.4-32.1), 8 of 8 runs. The prefill wants 16:
+  1.42× against 8. Confirms question 26's premise, which before sat inside the spread.
 
-**Quanto costa una riga di bozza, a zone** (domanda 12, la metà a tempo; LESSONS #67). Stessa
-sessione: `generate --tokens <code-edit> -n 200 --profile-json`, tre modi alternati per 3 giri
-(`--spec 0`, `--spec 1 --spec-fixed`, `--spec 8 --spec-fixed`). Millisecondi per passata, mediana
-(min-max). «Dense» sono `qkv_proj`, `attn_out_proj`, `lm_head`; «esperti» sono `expert_gate_up`
-ed `expert_down`. Il costo di una riga in più è la differenza con la passata da una riga dello
-stesso giro, divisa per le righe in più. Senza A/A, ma i tre giri di ogni modo stanno entro lo 0.9%.
+**How much a draft row costs, by zone** (question 12, the timed half; LESSONS #67). Same session:
+`generate --tokens <code-edit> -n 200 --profile-json`, three modes alternated for 3 runs
+(`--spec 0`, `--spec 1 --spec-fixed`, `--spec 8 --spec-fixed`). Milliseconds per pass, median
+(min-max). "Dense" are `qkv_proj`, `attn_out_proj`, `lm_head`; "experts" are `expert_gate_up` and
+`expert_down`. The cost of one more row is the difference with the one-row pass of the same run,
+divided by the extra rows. Without A/A, but every mode's three runs stay within 0.9%.
 
-| righe per passata | ms per passata | dense | esperti | MiB di pesi |
+| rows per pass | ms per pass | dense | experts | MiB of weights |
 |---|---|---|---|---|
 | 1 | 31.27 (31.20-31.34) | 9.23 | 16.37 | 1200.4 |
 | 2 | 48.84 (48.55-48.89) | 9.16 | 32.35 | 1675.8 |
 | 9 | 141.06 (140.10-141.33) | 42.25 | 83.42 | 3221.3 |
 
-| una riga in più costa | totale | esperti | dense | attenzione | MiB di esperti nuovi |
+| one more row costs | total | experts | dense | attention | MiB of new experts |
 |---|---|---|---|---|---|
-| se è la sola (2 righe) | **17.6 ms** (17.4-17.6) | 16.0 (91%) | −0.1 | 1.1 | 475 |
-| se sono otto (9 righe) | **13.7 ms** (13.6-13.8) | 8.4 (61%) | 4.1 (30%) | 0.5 | 253 |
+| if it is the only one (2 rows) | **17.6 ms** (17.4-17.6) | 16.0 (91%) | −0.1 | 1.1 | 475 |
+| if there are eight (9 rows) | **13.7 ms** (13.6-13.8) | 8.4 (61%) | 4.1 (30%) | 0.5 | 253 |
 
-Letture:
-- Una riga di bozza costa **più di mezza passata** quando è la sola (17.6 ms su 31.3) e 13.7 ms
-  l'una quando sono otto. Prima era ricavato dai tok/s (15-27 ms, §Bozza adattiva); ora è misurato
-  per zona. Il pareggio è costo della riga / costo della passata: **56% di bozze accettate** per le
-  bozze corte, **44%** per quelle da otto. Torna coi due prompt: 42.4% accettate perde (0.953×),
-  69.4% guadagna (1.175×).
-- **Il costo sta negli esperti**: il 91% con una riga in più, il 61% con otto. Ai due punti
-  misurati il tempo degli esperti per riga segue i MiB di esperti nuovi contati sopra (475 MiB in
-  16.0 ms, 253 in 8.4: 29.8 e 30.2 MiB/ms). Il costo di una bozza si attacca dal lato dei pesi
-  (quali esperti si leggono), non del calcolo: chiude la domanda 12. Limite: per MiB gli esperti
-  nuovi costano 1.65 volte quelli della passata da una riga (816 MiB in 16.4 ms, 49.8 MiB/ms), e
-  il perché non è misurato.
-- **Le moltiplicazioni dense sono gratis per la prima riga in più** (−0.1 ms: il kernel a 4 token
-  legge la riga di pesi una volta sola) e costano 4.1 ms per riga a nove righe: i 4-5.6 ms visti
-  in container valgono per le bozze lunghe, non per le corte.
-- **Il replay regge alla prova del cronometro**: passate × 31.3 ms + righe di bozza × 17.6 ms dà
-  0.95-0.96× per la politica di oggi su `code` (172 passate, 66 righe, contro 199-200 passate
-  senza bozza); la misura a tempo del blocco 1 dà 0.953× e 0.962× contro le due copie. Con gli
-  stessi costi nessuna delle politiche della tabella del replay arriva a 1.00× su `code` (la
-  migliore, pausa 2, 5, 11, 16, dà 0.97-0.98×): le costanti della pausa non bastano, la leva è il
-  costo della riga.
+Notes:
+- A draft row costs **more than half a pass** when it is the only one (17.6 ms of 31.3) and 13.7
+  ms each when there are eight. Before it was derived from tok/s (15-27 ms, §Adaptive draft: what
+  one more row really costs); now it is measured per zone. Break-even is row cost / pass cost:
+  **56% of drafts accepted** for short drafts, **44%** for eight-row ones. This matches the two
+  prompts: 42.4% accepted loses (0.953×), 69.4% gains (1.175×).
+- **The cost sits in the experts**: 91% with one more row, 61% with eight. At the two measured
+  points the experts' time per row follows the MiB of new experts counted above (475 MiB in 16.0
+  ms, 253 in 8.4: 29.8 and 30.2 MiB/ms). A draft's cost attaches on the weights' side (which
+  experts are read), not the compute's: this closes question 12. Limit: per MiB the new experts
+  cost 1.65 times those of the one-row pass (816 MiB in 16.4 ms, 49.8 MiB/ms), and the reason is
+  not measured.
+- **The dense multiplications are free for the first extra row** (−0.1 ms: the 4-token kernel
+  reads the weight row only once) and cost 4.1 ms per row at nine rows: the 4-5.6 ms seen in the
+  container hold for long drafts, not short ones.
+- **The replay holds up to the stopwatch test**: passes × 31.3 ms + draft rows × 17.6 ms gives
+  0.95-0.96× for today's policy on `code` (172 passes, 66 rows, against 199-200 passes with no
+  draft); the timed measurement of block 1 gives 0.953× and 0.962× against the two copies. With
+  the same costs, none of the replay table's policies reaches 1.00× on `code` (the best, pause 2,
+  5, 11, 16, gives 0.97-0.98×): the pause's constants are not enough, the lever is the row's cost.
 
 ## Threads per phase (2026-09-18)
 
@@ -1009,138 +1008,141 @@ other projects and restarts at end), OLMoE-1B-7B Q8_0, pinned to cores, `tools/a
 8 rounds after one warmup, first mode of round rotates, A/A control. Median (min-max), ratio
 to first mode. Each run in `build/threads_phase/`.
 
-**1. Quanti thread vuole ogni fase** (`sh tools/threads_phase.sh sweep`: un solo `-t` per tutte e
-due le fasi, binario del commit b231b28, `generate -p <contesto> -n 48`).
+**1. How many threads each phase wants** (`sh tools/threads_phase.sh sweep`: a single `-t` for
+both phases, binary of commit b231b28, `generate -p <context> -n 48`).
 
-| contesto | thread | prefill tok/s | | decode tok/s | |
+| context | threads | prefill tok/s | | decode tok/s | |
 |---|---|---|---|---|---|
 | 512 | 16 | 231.2 (228.7-237.4) | — | 30.77 (29.31-31.67) | — |
-| | 16, copia A/A | 233.4 (228.5-236.3) | 1.009× | 30.70 (30.39-31.12) | 0.998× |
+| | 16, A/A copy | 233.4 (228.5-236.3) | 1.009× | 30.70 (30.39-31.12) | 0.998× |
 | | 12 | 210.5 (204.5-212.2) | 0.910× | 31.50 (30.34-31.79) | 1.024× |
 | | 8 | 168.4 (167.5-170.6) | 0.728× | 33.79 (33.36-34.67) | **1.098×** |
 | | 4 | 92.1 (91.5-92.8) | 0.398× | 34.39 (33.34-34.97) | **1.118×** |
 | 2048 | 16 | 186.5 (183.2-188.0) | — | 24.06 (22.19-24.45) | — |
-| | 16, copia A/A | 187.2 (184.9-189.8) | 1.004× | 23.91 (23.42-24.51) | 0.994× |
+| | 16, A/A copy | 187.2 (184.9-189.8) | 1.004× | 23.91 (23.42-24.51) | 0.994× |
 | | 12 | 166.4 (162.3-170.2) | 0.892× | 23.20 (21.72-24.05) | 0.964× |
 | | 8 | 134.9 (133.2-137.2) | 0.723× | 24.65 (24.17-25.12) | **1.025×** |
 | | 4 | 74.3 (73.8-74.4) | 0.398× | 23.77 (23.32-24.27) | 0.988× |
 
-Soglia, il peggiore A/A della sessione: decode 0.6%, prefill 0.9%.
+Threshold, the session's worst A/A: decode 0.6%, prefill 0.9%.
 
-- **Il prefill vuole tutti i thread**, a ogni contesto: 16 contro 8 fa 1.37× a 512 e 1.38× a 2048.
-- **Il decode a contesto 512**: 8 e 4 thread battono 16 del 9.8% e dell'11.8% (10.1% e 12.0% contro
-  la copia), con intervalli disgiunti da quello dei 16. Fra loro 4 è avanti dell'1.8%, con gli
-  intervalli uno dentro l'altro (33.3-35.0 e 33.4-34.7). 12 rende il 2.4%.
-- **A contesto 2048** 8 è il solo numero sopra la soglia contro tutte e due le copie (+2.5%, +3.1%).
-  4 torna indietro (−1.2% e −0.6%: non distinguibile da 16, e −3.6% da 8) e 12 è il peggiore
-  (−3.6%, −3.0%).
-- **Scelta: n = 8**, il solo numero sopra la soglia a tutti e due i contesti. 4 vince di poco dove
-  il contesto è corto e perde dove è lungo, e nel coding il contesto è lungo (LESSONS #70).
-- Perché: il decode legge 1.2 GB di pesi per token e 4 thread riempiono già il bus (34 tok/s sono
-  41 GB/s); oltre quel punto ogni thread in più aggiunge solo attesa alla barriera di ogni
-  `parallel_for`. Col contesto cresce l'attenzione, che è calcolo e si divide per testa: lì i
-  thread in più tornano a servire, e l'ottimo si sposta da 4-6 verso 8. (Corretto il 2026-09-19,
-  §Decode a contesto lungo: il bus si riempie a ~54 GB/s, non a 41, e l'attenzione non era calcolo
-  ma lettura della KV a salti; con la KV per testa a contesto 4000 la sessione sceglie 16 thread in
-  13 run su 16.)
+- **The prefill wants all the threads**, at every context: 16 against 8 gives 1.37× at 512 and
+  1.38× at 2048.
+- **The decode at context 512**: 8 and 4 threads beat 16 by 9.8% and 11.8% (10.1% and 12.0%
+  against the copy), with intervals disjoint from that of 16. Between them 4 is ahead by 1.8%,
+  with the intervals nested inside each other (33.3-35.0 and 33.4-34.7). 12 gives 2.4%.
+- **At context 2048** 8 is the only number above the threshold against both copies (+2.5%, +3.1%).
+  4 falls back (−1.2% and −0.6%: not distinguishable from 16, and −3.6% from 8) and 12 is the
+  worst (−3.6%, −3.0%).
+- **Choice: n = 8**, the only number above the threshold at both contexts. 4 wins by a little
+  where the context is short and loses where it is long, and in coding the context is long
+  (LESSONS #70).
+- Why: the decode reads 1.2 GB of weights per token and 4 threads already fill the bus (34 tok/s
+  is 41 GB/s); past that point every extra thread only adds waiting at each `parallel_for`'s
+  barrier. As the context grows, attention grows too, and it is compute that splits per head:
+  there the extra threads start to help again, and the optimum shifts from 4-6 toward 8.
+  (Corrected on 2026-09-19, §Decode at long context and RAM bandwidth: the bus fills at ~54 GB/s,
+  not 41, and attention was not compute but the KV read in jumps; with the KV per head at context
+  4000 the session chooses 16 threads in 13 of 16 runs.)
 
-**2. Il decode a larghezza forzata** (motore nuovo, `--decode-threads n`: prompt sempre su 16
-thread, passate corte sui primi n slot; contesto 512; sessione con la regola al 2%, che conta solo
-per l'ultima riga). Il prefill sta fra 233.6 e 236.7 tok/s in tutti i modi (A/A 1.3%): la
-larghezza del decode non lo tocca.
+**2. The decode at forced width** (new engine, `--decode-threads n`: the prompt always on 16
+threads, short passes on the first n slots; context 512; session with the 2% rule, which only
+counts for the last row). The prefill sits between 233.6 and 236.7 tok/s in every mode (A/A 1.3%):
+the decode's width does not touch it.
 
-| decode su | decode tok/s | |
+| decode on | decode tok/s | |
 |---|---|---|
 | 16 | 30.88 (29.75-31.60) | — |
-| 16, copia A/A | 31.13 (30.56-31.75) | 1.008× |
+| 16, A/A copy | 31.13 (30.56-31.75) | 1.008× |
 | 12 | 31.63 (30.16-32.63) | 1.025× |
 | 8 | 34.07 (33.54-34.81) | **1.103×** |
 | 6 | 34.63 (31.41-35.19) | **1.122×** |
 | 4 | 33.84 (33.29-34.67) | **1.096×** |
-| misurata dalla sessione (8 in 7 run, 4 in una) | 33.82 (32.04-34.15) | **1.095×** |
+| measured by the session (8 in 7 runs, 4 in one) | 33.82 (32.04-34.15) | **1.095×** |
 
-Fra 4 e 8 thread la curva è piatta (33.8-34.6, differenze sotto la soglia della sessione, 1.4%) e
-cade sopra gli 8. `-t 16 --decode-threads 8` va come `-t 8` (34.07 contro 33.79 dello sweep): i
-worker lasciati fuori dormono e non costano.
+Between 4 and 8 threads the curve is flat (33.8-34.6, differences below the session's threshold,
+1.4%) and drops past 8. `-t 16 --decode-threads 8` performs like `-t 8` (34.07 against the sweep's
+33.79): the workers left out sleep and cost nothing.
 
-**3. La regola del default è una misura, non un numero.** Quanti thread riempiono il bus è un
-fatto della macchina (canali di memoria, banda per core), e da una macchina sola non si ricava
-una formula che valga sulle altre: `min(core, 8)` e `core/2` danno tutti e due 8 qui, e sbagliano
-in direzioni opposte su un portatile a 4 core e su una macchina a molti canali. Quindi ogni
-sessione misura la sua: le prime 9 passate da un token girano a turno su tutto il pool, su metà e
-su un quarto (16, 8, 4), tre volte ciascuna; tiene il tempo migliore di ogni larghezza e sceglie
-la più ampia entro l'1% dalla più veloce; rimisura ogni 1024 token, perché l'ottimo si sposta col
-contesto. Una passata è «corta» fino a 4 righe (quelle che il kernel a 4 token copre con una sola
-lettura della riga di pesi); le altre usano tutto il pool. `--decode-threads n` forza la larghezza
-e non misura niente. Token identici al bit per costruzione (il contratto del pool) e per prova:
+**3. The default's rule is a measurement, not a number.** How many threads fill the bus is a fact
+of the machine (memory channels, bandwidth per core), and from a single machine no formula can be
+derived that holds on the others: `min(core, 8)` and `core/2` both give 8 here, and they err in
+opposite directions on a 4-core laptop and on a machine with many channels. So every session
+measures its own: the first 9 one-token passes run in turn on the whole pool, on half and on a
+quarter (16, 8, 4), three times each; it keeps the best time of each width and picks the widest
+within 1% of the fastest; it remeasures every 1024 tokens, because the optimum shifts with the
+context. A pass is "short" up to 4 rows (those the 4-token kernel covers with a single read of
+the weight row); the others use the whole pool. `--decode-threads n` forces the width and measures
+nothing. Tokens identical to the bit by construction (the pool's contract) and by proof:
 `tests/test_phase.c`, `tests/test_base.c`, `make tier-check`.
 
-Il margine è stato misurato tre volte, contando quale larghezza sceglie ogni run (colonna `width`
-di `ab_modes.sh`, 16 run per contesto):
+The margin was measured three times, counting which width each run picks (`ab_modes.sh`'s `width`
+column, 16 runs per context):
 
-| margine | scelte a 512 | scelte a 2048 | decode dopo/prima a 512 | a 2048 |
+| margin | picks at 512 | picks at 2048 | decode after/before at 512 | at 2048 |
 |---|---|---|---|---|
-| 3% | 8 in 15, 4 in 1 | **16 in 10**, 8 in 6 | 1.096× e 1.091× | 0.996× e 1.012× |
-| 2% | 8 in 15, 4 in 1 | 16 in 5, 8 in 11 | 1.081× e 1.092× | 1.014× e 1.026× |
-| **1%** (adottato) | 8 in 11, 4 in 5 | 16 in 2, **8 in 14** | 1.085× e 1.088× | **1.027× e 1.019×** |
+| 3% | 8 in 15, 4 in 1 | **16 in 10**, 8 in 6 | 1.096× and 1.091× | 0.996× and 1.012× |
+| 2% | 8 in 15, 4 in 1 | 16 in 5, 8 in 11 | 1.081× and 1.092× | 1.014× and 1.026× |
+| **1%** (adopted) | 8 in 11, 4 in 5 | 16 in 2, **8 in 14** | 1.085× and 1.088× | **1.027× and 1.019×** |
 
-A 2048 le run che scelgono 8 fanno 24.0-25.1 tok/s e quelle che scelgono 16 fanno 23.4-23.8: ogni
-scelta sbagliata costa il 4%, e succede perché il tempo migliore di tre passate ha un rumore del
-2% circa, quanto la distanza fra 16 e 8 a quel contesto (LESSONS #71). Con l'1% a 512 la scelta
-cade su 4 una volta su tre: lì 4 e 8 vanno uguale, e la rimisura ogni 1024 token la riporta su 8
-quando il contesto cresce. Uno stimatore più robusto è la domanda 31.
+At 2048 the runs that pick 8 give 24.0-25.1 tok/s and those that pick 16 give 23.4-23.8: every
+wrong pick costs 4%, and it happens because the best time of three passes has about 2% noise, the
+same as the distance between 16 and 8 at that context (LESSONS #71). With 1% at 512 the pick falls
+on 4 one time in three: there 4 and 8 perform the same, and the remeasure every 1024 tokens
+brings it back to 8 as the context grows. A more robust estimator is question 31.
 
-**4. `--spec 8` col motore nuovo** (`run -f <prompt> -n 200 --spec 8 -t 16`; «16 righe» è
-`TR_DECODE_ROWS=16`: ogni passata di verifica sulla larghezza del decode, non solo quelle fino a 4
-righe). Regola al 2%.
+**4. `--spec 8` with the new engine** (`run -f <prompt> -n 200 --spec 8 -t 16`; "16 rows" is
+`TR_DECODE_ROWS=16`: every verify pass at the decode's width, not just those up to 4 rows). 2%
+rule.
 
-| prompt | modo | decode tok/s | |
+| prompt | mode | decode tok/s | |
 |---|---|---|---|
-| `code-edit` (la bozza viene accettata) | prima | 37.11 (36.63-37.51) | — |
-| | prima, copia A/A | 37.03 (36.73-37.79) | 0.998× |
-| | dopo | 37.91 (36.60-38.29) | 1.021× |
-| | dopo, 16 righe | 37.75 (36.54-38.49) | 1.017× |
-| `code` (il modello inventa) | prima | 31.01 (30.55-31.58) | — |
-| | prima, copia A/A | 30.98 (30.13-31.41) | 0.999× |
-| | dopo | 33.00 (32.55-33.41) | **1.064×** |
-| | dopo, 16 righe | 33.05 (32.45-33.51) | **1.066×** |
+| `code-edit` (the draft is accepted) | before | 37.11 (36.63-37.51) | — |
+| | before, A/A copy | 37.03 (36.73-37.79) | 0.998× |
+| | after | 37.91 (36.60-38.29) | 1.021× |
+| | after, 16 rows | 37.75 (36.54-38.49) | 1.017× |
+| `code` (the model invents) | before | 31.01 (30.55-31.58) | — |
+| | before, A/A copy | 30.98 (30.13-31.41) | 0.999× |
+| | after | 33.00 (32.55-33.41) | **1.064×** |
+| | after, 16 rows | 33.05 (32.45-33.51) | **1.066×** |
 
-- Dove la bozza viene accettata le passate hanno quasi tutte più di 4 righe e girano come prima:
-  +2.1%, a cavallo della soglia. Dove il modello inventa le passate sono corte e prendono il
-  guadagno del decode: **+6.4%**, intervalli disgiunti. In quel caso la sessione sceglie 4 thread
-  in 8 run su 8.
-- **Il confine a 4 o a 16 righe non si distingue** (−0.4% e +0.2%): resta a 4, che lascia le
-  passate lunghe di verifica esattamente come erano (nessun rischio dove il calcolo conta di più).
-- Il rapporto fra `--spec 8` e `--spec 0` sul caso peggiore non è stato rimisurato: tutti e due
-  ora prendono il guadagno del decode stretto, il primo il 6.4% e il secondo il 9% circa.
+- Where the draft is accepted the passes almost all have more than 4 rows and run as before:
+  +2.1%, straddling the threshold. Where the model invents the passes are short and take the
+  decode's narrow-width gain: **+6.4%**, disjoint intervals. In that case the session picks 4
+  threads in 8 of 8 runs.
+- **The boundary at 4 or 16 rows cannot be distinguished** (−0.4% and +0.2%): it stays at 4, which
+  leaves the long verify passes exactly as they were (no risk where compute matters more).
+- The ratio between `--spec 8` and `--spec 0` on the worst case was not remeasured: both now take
+  the narrow decode's gain, the first 6.4% and the second about 9%.
 
-**5. Prima e dopo** (`sh tools/threads_phase.sh change build/trochilus-before.exe`: il binario di
-b231b28 contro il motore nuovo con la regola all'1%, tutti e due a `-t 16`, ognuno con la sua
-copia A/A, più il motore nuovo con `--decode-threads 8`; `generate -p <contesto> -n 48`).
+**5. Before and after** (`sh tools/threads_phase.sh change build/trochilus-before.exe`: b231b28's
+binary against the new engine with the 1% rule, both at `-t 16`, each with its own A/A copy, plus
+the new engine with `--decode-threads 8`; `generate -p <context> -n 48`).
 
-| contesto | binario | prefill tok/s | | decode tok/s | |
+| context | binary | prefill tok/s | | decode tok/s | |
 |---|---|---|---|---|---|
-| 512 | prima | 235.3 (227.3-238.6) | — | 30.82 (30.03-31.29) | — |
-| | prima, copia A/A | 233.8 (229.5-236.7) | 0.994× | 30.71 (29.76-31.64) | 0.996× |
-| | dopo | 233.6 (227.0-236.1) | 0.993× | 33.45 (32.46-34.19) | **1.085×** |
-| | dopo, copia A/A | 235.7 (230.7-239.1) | 1.002× | 33.53 (32.85-34.13) | **1.088×** |
-| | dopo, `--decode-threads 8` | 236.3 (233.4-237.7) | 1.004× | 33.50 (31.91-34.41) | **1.087×** |
-| 2048 | prima | 193.4 (189.7-194.0) | — | 23.79 (23.45-24.43) | — |
-| | prima, copia A/A | 192.5 (191.3-195.8) | 0.995× | 23.55 (23.29-24.47) | 0.990× |
-| | dopo | 192.6 (189.3-193.7) | 0.996× | 24.43 (24.09-24.79) | **1.027×** |
-| | dopo, copia A/A | 192.8 (190.8-194.2) | 0.997× | 24.24 (23.34-25.04) | **1.019×** |
-| | dopo, `--decode-threads 8` | 193.3 (192.2-194.1) | 0.999× | 24.98 (24.14-25.21) | **1.050×** |
+| 512 | before | 235.3 (227.3-238.6) | — | 30.82 (30.03-31.29) | — |
+| | before, A/A copy | 233.8 (229.5-236.7) | 0.994× | 30.71 (29.76-31.64) | 0.996× |
+| | after | 233.6 (227.0-236.1) | 0.993× | 33.45 (32.46-34.19) | **1.085×** |
+| | after, A/A copy | 235.7 (230.7-239.1) | 1.002× | 33.53 (32.85-34.13) | **1.088×** |
+| | after, `--decode-threads 8` | 236.3 (233.4-237.7) | 1.004× | 33.50 (31.91-34.41) | **1.087×** |
+| 2048 | before | 193.4 (189.7-194.0) | — | 23.79 (23.45-24.43) | — |
+| | before, A/A copy | 192.5 (191.3-195.8) | 0.995× | 23.55 (23.29-24.47) | 0.990× |
+| | after | 192.6 (189.3-193.7) | 0.996× | 24.43 (24.09-24.79) | **1.027×** |
+| | after, A/A copy | 192.8 (190.8-194.2) | 0.997× | 24.24 (23.34-25.04) | **1.019×** |
+| | after, `--decode-threads 8` | 193.3 (192.2-194.1) | 0.999× | 24.98 (24.14-25.21) | **1.050×** |
 
-Soglia della sessione: decode 1.0%, prefill 0.6%.
+Session threshold: decode 1.0%, prefill 0.6%.
 
-- **Decode a contesto 512: 1.085× e 1.088×** (1.089× e 1.092× contro la copia), intervalli
-  disgiunti (32.5-34.2 contro 29.8-31.6). Il default misurato va come la larghezza forzata.
-- **Decode a contesto 2048: 1.027× e 1.019×** (1.037× e 1.029× contro la copia), sopra la soglia
-  contro tutte e due le copie; con 8 forzato **1.050×**. La metà che manca al default sta nelle 2
-  run su 16 che scelgono 16 e nelle 9 passate di misura (3 su 16 thread e 3 su 4, tutte e due più
-  lente di 8 a questo contesto) su 47.
-- **Prefill: non distinguibile** a nessuno dei due contesti (da −0.7% a +0.4%).
-- Su una risposta di 48 token la misura pesa; su una di 200 sono 9 passate su 200, e poi 9 ogni 1024.
+- **Decode at context 512: 1.085× and 1.088×** (1.089× and 1.092× against the copy), disjoint
+  intervals (32.5-34.2 against 29.8-31.6). The measured default performs like the forced width.
+- **Decode at context 2048: 1.027× and 1.019×** (1.037× and 1.029× against the copy), above the
+  threshold against both copies; with 8 forced **1.050×**. The half that the default is missing
+  sits in the 2 of 16 runs that pick 16 and in the 9 measurement passes (3 on 16 threads and 3 on
+  4, both slower than 8 at this context) out of 47.
+- **Prefill: not distinguishable** at either context (from −0.7% to +0.4%).
+- On a 48-token reply the measurement weighs in; on a 200-token one it is 9 passes out of 200, and
+  then 9 every 1024.
 
 ## Decode at long context and RAM bandwidth (2026-09-19)
 
@@ -1153,101 +1155,106 @@ machine warmed by 4000-token prompt isn't always same context, and one mode and 
 follow same context. «Before» = binary at commit 6734910; «After» = KV with one head's positions
 in a row (below). Tables from `tools/decode_context_report.py speed | model | zones`.
 
-**1. La banda della RAM** (`make bench-mem`, `tests/bench_mem.c`: 2 GiB letti dai thread del pool,
-pinnati come nel motore; mediana di 7; due run nella stessa notte, a due ore di distanza, concordi
-entro il 5-10%). GB/s:
+**1. RAM's bandwidth** (`make bench-mem`, `tests/bench_mem.c`: 2 GiB read by the pool's threads,
+pinned as in the engine; median of 7; two runs on the same night, two hours apart, agreeing within
+5-10%). GB/s:
 
-| lettura | 1 thread | 2 | 4 | 6 | 8 | 12 | 16 |
+| read | 1 thread | 2 | 4 | 6 | 8 | 12 | 16 |
 |---|---|---|---|---|---|---|---|
-| in fila | 24.8 | 47.8 | 57.6 | 52.7 | 53.0 | 52.5 | 53.0 |
-| sparsa, blocchi da 2 MiB (una matrice di un esperto) | 24.6 | 49.1 | 57.0 | 56.2 | 54.7 | 53.2 | 52.0 |
-| sparsa, blocchi da 256 KiB | 24.0 | 37.3 | 54.4 | 55.3 | 53.7 | 52.0 | 49.9 |
-| sparsa, pagine da 4 KiB | 7.2 | 14.0 | 29.1 | 33.5 | 39.1 | 36.6 | 34.2 |
-| il matmul del motore, Q8_0, 8 matrici da esperto a caso per chiamata | 19.1 | 32.9 | 58.1 | 53.0 | 46.3 | 50.4 | 50.0 |
+| sequential | 24.8 | 47.8 | 57.6 | 52.7 | 53.0 | 52.5 | 53.0 |
+| sparse, 2 MiB blocks (one expert's matrix) | 24.6 | 49.1 | 57.0 | 56.2 | 54.7 | 53.2 | 52.0 |
+| sparse, 256 KiB blocks | 24.0 | 37.3 | 54.4 | 55.3 | 53.7 | 52.0 | 49.9 |
+| sparse, 4 KiB pages | 7.2 | 14.0 | 29.1 | 33.5 | 39.1 | 36.6 | 34.2 |
+| the engine's matmul, Q8_0, 8 random expert matrices per call | 19.1 | 32.9 | 58.1 | 53.0 | 46.3 | 50.4 | 50.0 |
 
-- **Il tetto è ~54 GB/s** (52-58) e si raggiunge con 4 thread; un thread ne tira 22-25. Non sono
-  gli 83 GB/s teorici della DDR5-5200 a due canali, e non sono i «41 GB/s» scritti finora: quelli
-  erano la velocità del motore del 17/09 (senza pin, senza thread per fase), non un limite della RAM.
-- **Leggere sparso non costa**, finché i pezzi sono grandi: blocchi da 2 MiB o da 256 KiB vanno come
-  la lettura in fila. Gli esperti scelti a caso non pagano niente per essere sparsi. Costa leggere a
-  pagine sparse (7 GB/s a un thread, 34-41 da 6 in su): è il caso della KV di prima, sotto.
-- Il matmul del motore a un thread è limitato dal calcolo (19 GB/s); da 4 thread in su tira tutta
-  la banda (46-58, la riga più rumorosa: spread fino al 30%).
+- **The ceiling is ~54 GB/s** (52-58) and is reached with 4 threads; one thread pulls 22-25. This
+  is not the two-channel DDR5-5200's theoretical 83 GB/s, and it is not the "41 GB/s" written so
+  far: that was the engine's speed on 09/17 (no pinning, no threads per phase), not a RAM limit.
+- **Reading sparse costs nothing**, as long as the pieces are large: 2 MiB or 256 KiB blocks
+  perform like the sequential read. Randomly chosen experts pay nothing for being sparse. It costs
+  to read at sparse pages (7 GB/s at one thread, 34-41 from 6 up): that is the earlier KV's case,
+  below.
+- The engine's matmul at one thread is compute-bound (19 GB/s); from 4 threads up it pulls the
+  full bandwidth (46-58, the noisiest row: spread up to 30%).
 
-**2. Un token di attenzione sui due modi di tenere la KV** (`bench_mem kv <posizioni>`: cache con la
-forma di OLMoE, 16 layer × 16 teste × 128, f32, K e V, 1 GiB; fra un layer e l'altro 64 MiB di altra
-memoria passano nelle cache, come i pesi nel motore; kernel vero `tr_attention_head`). «Righe» è il
-modo di prima, `[posizione][testa]`: una testa legge 512 byte ogni 8 KiB, una pagina nuova a ogni
-posizione. «Teste» è `[testa][posizione]`: una testa legge le sue posizioni in fila. 8 thread, ms per
-token (GB/s di KV):
+**2. One token of attention on the two ways of keeping the KV** (`bench_mem kv <positions>`: a
+cache shaped like OLMoE's, 16 layers × 16 heads × 128, f32, K and V, 1 GiB; between one layer and
+the next 64 MiB of other memory pass through the caches, like the weights in the engine; real
+kernel `tr_attention_head`). "Rows" is the earlier way, `[position][head]`: a head reads 512 bytes
+every 8 KiB, a new page at every position. "Heads" is `[head][position]`: a head reads its
+positions in a row. 8 threads, ms per token (KV's GB/s):
 
-| posizioni | righe | teste | | teste, 16 thread | sola lettura degli stessi byte: righe / teste |
+| positions | rows | heads | | heads, 16 threads | reading the same bytes alone: rows / heads |
 |---|---|---|---|---|---|
 | 512 | 4.17 (32.1) | 2.90 (46.3) | **1.44×** | 2.69 (49.9) | 21.5 / 52.9 GB/s |
 | 2048 | 15.93 (33.7) | 11.52 (46.6) | **1.38×** | 10.61 (50.6) | 20.0 / 54.1 GB/s |
 | 4000 | 29.54 (35.5) | 22.01 (47.6) | **1.34×** | 20.97 (50.0) | 19.6 / 53.7 GB/s |
 
-Gli stessi byte, letti a salti, passano a 20-22 GB/s; in fila a 53-54, cioè al tetto. Col kernel vero
-la differenza è 32-35 contro 46-48 GB/s (nella prima run della notte a 4000 le righe facevano 28.0).
+The same bytes, read in jumps, pass at 20-22 GB/s; in a row at 53-54, that is, at the ceiling. With
+the real kernel the difference is 32-35 against 46-48 GB/s (in the night's first run at 4000 rows
+gave 28.0).
 
-**3. Il decode ai quattro contesti, prima e dopo** (tok/s, mediana (min-max) di 8, poi dopo/prima
-contro le due copie).
+**3. The decode at the four contexts, before and after** (tok/s, median (min-max) of 8, then
+after/before against both copies).
 
-Con `--decode-threads 8` (`speed-d8`; soglia della sessione, il peggiore A/A: decode 3.8%, prefill 2.8%):
+With `--decode-threads 8` (`speed-d8`; session threshold, worst A/A: decode 3.8%, prefill 2.8%):
 
-| contesto | prima | prima, copia A/A | dopo | dopo, copia A/A | dopo / prima |
+| context | before | before, A/A copy | after | after, A/A copy | after / before |
 |---|---|---|---|---|---|
-| 32 | 38.00 (37.31-38.69) | 37.95 (35.65-39.01) | 38.30 (35.64-39.58) | 39.55 (37.20-40.09) | 1.008-1.042×: non distinguibile (A/A 3.3%) |
+| 32 | 38.00 (37.31-38.69) | 37.95 (35.65-39.01) | 38.30 (35.64-39.58) | 39.55 (37.20-40.09) | 1.008-1.042×: not distinguishable (A/A 3.3%) |
 | 512 | 32.30 (31.15-34.16) | 33.52 (32.58-34.14) | 35.48 (34.25-36.49) | 35.47 (33.15-36.33) | **1.058-1.098×** |
 | 2048 | 24.18 (23.68-24.61) | 24.30 (22.92-25.03) | 27.32 (25.34-27.88) | 27.62 (26.73-27.95) | **1.124-1.142×** |
 | 4000 | 17.91 (15.66-18.50) | 18.16 (16.87-18.42) | 20.84 (19.83-21.33) | 21.04 (20.46-21.32) | **1.147-1.175×** |
 
-Col default, la larghezza misurata dalla sessione (`speed-auto`; soglia decode 3.6%, prefill 4.8%;
-sessione più rumorosa dell'altra, spread 9-29% contro 4-16%: l'altra finestra di Claude lavorava, senza
-container; le mediane concordano con la tabella sopra):
+With the default, the width measured by the session (`speed-auto`; decode threshold 3.6%, prefill
+4.8%; a noisier session than the other, spread 9-29% against 4-16%: another Claude window was
+working, with no container; the medians agree with the table above):
 
-| contesto | prima | prima, copia A/A | dopo | dopo, copia A/A | dopo / prima | larghezze scelte (dopo, 16 run) |
+| context | before | before, A/A copy | after | after, A/A copy | after / before | widths chosen (after, 16 runs) |
 |---|---|---|---|---|---|---|
-| 32 | 38.05 | 37.55 | 38.83 | 38.63 | 1.015-1.034×: non distinguibile | 4 in 13, 8 in 3 |
-| 512 | 32.16 | 32.77 | 33.13 | 32.47 | 0.991-1.030×: non distinguibile | 4 in 8, 8 in 4, 16 in 4 |
+| 32 | 38.05 | 37.55 | 38.83 | 38.63 | 1.015-1.034×: not distinguishable | 4 in 13, 8 in 3 |
+| 512 | 32.16 | 32.77 | 33.13 | 32.47 | 0.991-1.030×: not distinguishable | 4 in 8, 8 in 4, 16 in 4 |
 | 2048 | 22.27 | 22.75 | 25.93 | 26.20 | **1.140-1.176×** | 8 in 10, 16 in 6 |
 | 4000 | 17.09 | 16.86 | 19.44 | 20.13 | **1.137-1.195×** | 16 in 13, 8 in 3 |
 
-Il prefill, negli stessi run (tok/s, `speed-d8`): a 512 **non distinguibile** (234.9 e 234.9 prima,
-232.9 e 235.5 dopo); a 2048 **1.096-1.109×** (185.7 → 204.8); a 4000 **1.392-1.430×** (119.4 → 166.1).
-Anche l'attenzione del prompt legge una testa alla volta: la sua zona passa da 17.8 a 8.5 s su 4000
-token (dal 52% al 34% del prefill) e da 3.15 a 1.86 s su 2048. La scrittura della KV, ora testa per
-testa, costa 25.7 ms su un prompt da 512 invece di 15.7 (domanda 30).
+The prefill, in the same runs (tok/s, `speed-d8`): at 512 **not distinguishable** (234.9 and 234.9
+before, 232.9 and 235.5 after); at 2048 **1.096-1.109×** (185.7 → 204.8); at 4000 **1.392-1.430×**
+(119.4 → 166.1). The prompt's attention also reads one head at a time: its zone goes from 17.8 to
+8.5 s over 4000 tokens (from 52% to 34% of the prefill) and from 3.15 to 1.86 s at 2048. The KV
+write, now head by head, costs 25.7 ms on a 512-token prompt instead of 15.7 (question 30).
 
-**4. L'ipotesi di STATO: regge la forma, non i numeri.** L'ipotesi era `tok/s = banda / (pesi + KV
-per token × contesto)` con 41 GB/s, 1.2 GB di pesi e 262 KB di KV per token di contesto. Il decode è
-davvero byte diviso banda, ma le bande **erano due**, e nessuna era 41:
+**4. STATUS's hypothesis: the shape holds, the numbers don't.** The hypothesis was
+`tok/s = bandwidth / (weights + KV per token × context)` with 41 GB/s, 1.2 GB of weights and 262 KB
+of KV per context token. The decode really is bytes divided by bandwidth, but there were **two**
+bandwidths, and neither was 41:
 
-| contesto (a metà risposta) | misurato prima | formula a 41 GB/s | byte al secondo, prima | misurato dopo | formula a 48.2 GB/s | byte al secondo, dopo |
+| context (mid-reply) | measured before | formula at 41 GB/s | bytes per second, before | measured after | formula at 48.2 GB/s | bytes per second, after |
 |---|---|---|---|---|---|---|
 | 56 | 37.97 | 33.11 (−13%) | 47.0 GB/s | 38.91 | 38.91 | 48.2 GB/s |
 | 536 | 33.00 | 30.06 (−9%) | 45.0 | 35.48 | 35.32 (−0.5%) | 48.4 |
 | 2072 | 24.19 | 23.21 (−4%) | 42.7 | 27.50 | 27.27 (−0.8%) | 48.6 |
 | 4024 | 18.04 | 17.99 (−0.3%) | 41.1 | 20.91 | 21.15 (+1.2%) | 47.7 |
 
-(`--decode-threads 8`, un modo e la sua copia insieme: 16 run per punto.)
+(`--decode-threads 8`, one mode and its copy together: 16 runs per point.)
 
-- **Prima**: la retta per i quattro punti dice 26.2 ms a contesto zero e 7.29 ms ogni 1000 token di
-  contesto, cioè i pesi letti a **47 GB/s** e la KV a **36 GB/s** (31.6 col default). La KV si
-  leggeva più piano dei pesi, il contrario della prima ipotesi di STATO («la KV si legge a banda più
-  alta»). La formula a 41 GB/s tornava a 4000 **per caso**: troppo bassa sui pesi, troppo alta sulla
-  KV, i due errori si compensano solo lì.
-- **Dopo**: 25.2 ms e 5.57 ms ogni 1000 token, pesi a 48.6 e KV a **47.1 GB/s**: una banda sola.
-  `tok/s = 48.2 / (1.2236 + 0.000262 × contesto)` (GB) sbaglia al più dell'1.2% a ogni contesto.
-- Su un modello con GQA la KV per token è più piccola e il calo col contesto si accorcia in
-  proporzione; la formula resta quella.
+- **Before**: the line through the four points says 26.2 ms at zero context and 7.29 ms every 1000
+  context tokens, that is, the weights read at **47 GB/s** and the KV at **36 GB/s** (31.6 with the
+  default). The KV was read slower than the weights, the opposite of STATUS's first hypothesis
+  ("the KV reads at higher bandwidth"). The 41 GB/s formula came out right at 4000 **by chance**:
+  too low on the weights, too high on the KV, the two errors cancel only there.
+- **After**: 25.2 ms and 5.57 ms every 1000 tokens, weights at 48.6 and KV at **47.1 GB/s**: a
+  single bandwidth. `tok/s = 48.2 / (1.2236 + 0.000262 × context)` (GB) is off by at most 1.2% at
+  every context.
+- On a model with GQA the KV per token is smaller and the falloff with context shortens
+  proportionally; the formula stays the same.
 
-**5. Dove va il token, per zona** (`tools/profile_suite.py` su `bench/scenarios-decode-context.json`,
-mediana di 5, `--decode-threads 8`; il «prima» è il gemello del binario di prima compilato coi byte
-per zona, stesso layout; i due profili non sono alternati, quindi fra prima e dopo contano solo le
-differenze grandi). ms per token, e GB/s letti dentro la zona:
+**5. Where the token goes, by zone** (`tools/profile_suite.py` on
+`bench/scenarios-decode-context.json`, median of 5, `--decode-threads 8`; "before" is the twin of
+the earlier binary compiled with per-zone bytes, same layout; the two profiles are not alternated,
+so between before and after only the large differences count). ms per token, and GB/s read inside
+the zone:
 
-| zona | MiB per token | prima, a 32 / 512 / 2048 / 4000 | dopo, a 32 / 512 / 2048 / 4000 |
+| zone | MiB per token | before, at 32 / 512 / 2048 / 4000 | after, at 32 / 512 / 2048 / 4000 |
 |---|---|---|---|
 | `attention` | 14 / 134 / 518 / 1006 | 0.64 / 4.36 / 15.79 / **30.53** ms (22.9 / 32.3 / 34.4 / 34.6 GB/s) | 0.48 / 2.90 / 11.52 / **22.64** ms (30.5 / 48.4 / 47.1 / 46.6 GB/s) |
 | `expert_gate_up` | 544 | 10.6-10.9 ms (52.2-53.6) | 10.5-10.8 ms (52.6-54.5) |
@@ -1256,694 +1263,715 @@ differenze grandi). ms per token, e GB/s letti dentro la zona:
 | `lm_head` | 104 | 2.0-2.1 ms (52.7-53.7) | 2.0-2.1 ms (53.2-54.8) |
 | `attn_out_proj` | 68 | 2.0-2.2 ms (32.5-36.2) | 1.4-1.6 ms (43.2-52.0) |
 | `router` | 8 | 0.24-0.26 ms | 0.23-0.24 ms |
-| zone senza byte (norme, RoPE, scrittura KV, copia per esperto, attivazione, somma, scelta) | — | 1.06-1.10 ms | 1.09-1.15 ms |
+| zones with no bytes (norms, RoPE, KV write, per-expert copy, activation, sum, choice) | — | 1.06-1.10 ms | 1.09-1.15 ms |
 | **token** | 1214 / 1334 / 1718 / 2206 | 26.8 / 29.6 / 41.4 / **56.3** ms (47.5 / 47.3 / 43.5 / 41.1 GB/s) | 25.0 / 27.5 / 36.4 / **48.1** ms (50.9 / 50.9 / 49.5 / 48.1 GB/s) |
 
-- **Le moltiplicazioni sui pesi stavano già al tetto** (50-55 GB/s su 54): lì non c'è niente da
-  prendere senza leggere meno byte. Sotto il tetto c'era **solo l'attenzione** (32-35 GB/s), e con
-  lei `attn_out_proj`, la zona che viene subito dopo (32-36 GB/s: le letture a salti le lasciavano
-  TLB e cache da rifare).
-- **Dopo, l'attenzione legge a 47-48 GB/s**: a 4000 token −7.9 ms su 56.3.
-- **Quanto manca al tetto della RAM**: il decode muove **48-51 GB/s su ~54**, il 6-11%. Quel che
-  resta dal lato esatto è piccolo e sparso (domanda 35): 1.1 ms di zone senza byte, l'attenzione a 47
-  invece di 52-56 (il calcolo vale il 12% della zona), `attn_out_proj`. Da qui in poi si va più
-  forte solo leggendo **meno byte**.
-- **8 thread o 16 per l'attenzione** (dopo, contesto 4000): su 16 la zona fa 21.6 ms invece di 22.6,
-  ma esperti e proiezioni perdono 1.3 ms e il token va uguale (48.4 contro 48.1). Una larghezza per
-  zona prenderebbe 1.0 ms su 48.1 (2.1%; a 2048 lo 0.7%): sotto la soglia di questa notte, non
-  scritta (domanda 34).
+- **The multiplications on the weights were already at the ceiling** (50-55 GB/s of 54): there is
+  nothing to gain there without reading fewer bytes. Below the ceiling there was **only
+  attention** (32-35 GB/s), and with it `attn_out_proj`, the zone right after it (32-36 GB/s: the
+  jumping reads left it TLB and cache misses to redo).
+- **After, attention reads at 47-48 GB/s**: at 4000 tokens −7.9 ms of 56.3.
+- **How far from RAM's ceiling**: the decode moves **48-51 GB/s of ~54**, 6-11%. What is left on
+  the exact side is small and scattered (question 35): 1.1 ms of zones with no bytes, attention at
+  47 instead of 52-56 (the compute is worth 12% of the zone), `attn_out_proj`. From here on, going
+  faster means reading **fewer bytes**.
+- **8 or 16 threads for attention** (after, context 4000): on 16 the zone takes 21.6 ms instead of
+  22.6, but experts and projections lose 1.3 ms and the token performs the same (48.4 against
+  48.1). A width per zone would take 1.0 ms of 48.1 (2.1%; at 2048, 0.7%): below tonight's
+  threshold, not written (question 34).
 
-**6. La leva esatta: le posizioni di una testa in fila** (`src/kv/kv.h`). La KV era
-`[layer][posizione][testa]`: a ogni token generato ogni testa leggeva 512 byte ogni 8 KiB, una pagina
-nuova a ogni posizione, e il prefetcher non aveva niente da seguire. Ora è
-`[layer][testa][posizione]`: due flussi in fila per testa, le chiavi e poi i valori. Cambia dove sta
-un numero, non il numero: stesse chiamate a `dot_f32` e `axpy_f32` sugli stessi float nello stesso
-ordine. Prova: `tests/test_kv.c` (il layout e le scritture; 5 mutazioni su 5 viste dai test, tre da
-`test_kv`, tutte dall'oracolo), `make check`, e sul modello vero lo stadio `exact` di
-`tools/decode_context.sh`: logit identici al byte al binario di prima su 600 posizioni un token per
-passata (120 MB) e a passate da 64 su 8 thread, token identici dopo un prompt da 4000.
+**6. The exact lever: one head's positions in a row** (`src/kv/kv.h`). The KV was
+`[layer][position][head]`: for every token generated, every head read 512 bytes every 8 KiB, a new
+page at every position, and the prefetcher had nothing to follow. It is now
+`[layer][head][position]`: two streams in a row per head, the keys and then the values. It changes
+where a number sits, not the number: the same calls to `dot_f32` and `axpy_f32` on the same floats
+in the same order. Proof: `tests/test_kv.c` (the layout and the writes; 5 of 5 mutations seen by
+the tests, three from `test_kv`, all from the oracle), `make check`, and on the real model
+`tools/decode_context.sh`'s `exact` stage: logits identical to the byte against the earlier binary
+over 600 positions at one token per pass (120 MB) and at passes of 64 on 8 threads, tokens
+identical after a 4000-token prompt.
 
-**7. Le leve non esatte: i numeri per decidere.** Dopo la KV per testa l'attenzione legge alla banda
-della RAM: per andare più forte a contesto lungo restano solo meno byte. Stime dai byte, con la zona
-`attention` di oggi (2.90 / 11.52 / 22.64 ms a 512 / 2048 / 4000) e il 12% della zona che è calcolo e
-non si dimezza (per gli 8 bit, fra il 12% e il doppio: c'è la decodifica):
+**7. The non-exact levers: the numbers to decide with.** Past the KV per head, attention reads at
+RAM's bandwidth: to go faster at long context only fewer bytes remain. Estimates from the bytes,
+with today's `attention` zone (2.90 / 11.52 / 22.64 ms at 512 / 2048 / 4000) and the 12% of the
+zone that is compute and does not halve (for 8 bits, between 12% and double: there is decoding):
 
-| leva | byte di KV | decode a 512 | a 2048 | a 4000 | memoria della KV a 4096 |
+| lever | KV bytes | decode at 512 | at 2048 | at 4000 | KV memory at 4096 |
 |---|---|---|---|---|---|
-| oggi, f32 (esatta) | 262 KB per token di contesto | 36.4 tok/s | 27.5 | 20.8 | 1.07 GB |
-| KV a 16 bit | metà | ~38 (+5%) | ~32 (+16-19%) | ~26-27 (+26-31%) | 0.54 GB |
-| KV a 8 bit (blocchi tipo Q8_0) | 27% | ~39 (+6-7%) | ~33-34 (+20-25%) | ~28-30 (+33-43%) | 0.28 GB |
+| today, f32 (exact) | 262 KB per context token | 36.4 tok/s | 27.5 | 20.8 | 1.07 GB |
+| 16-bit KV | half | ~38 (+5%) | ~32 (+16-19%) | ~26-27 (+26-31%) | 0.54 GB |
+| 8-bit KV (Q8_0-style blocks) | 27% | ~39 (+6-7%) | ~33-34 (+20-25%) | ~28-30 (+33-43%) | 0.28 GB |
 
-Come si misurerebbe la qualità è scritto nella domanda 36 (KL e primo token contro il modo esatto sul
-modello vero, token greedy uguali, nessun valore oltre il massimo dei 16 bit). Riferimento: llama.cpp,
-che tiene la KV a 16 bit **e** le attivazioni a 8, sta a KL 9e-3 da noi. Non implementate: decide
-Marcello. Il confronto col decode di llama.cpp a contesto lungo (domanda 19) va rifatto adesso: il suo
-vantaggio lì era anche questo.
+How quality would be measured is written in question 36 (KL and first token against the exact mode
+on the real model, greedy tokens equal, no value beyond 16 bits' maximum). Reference: llama.cpp,
+which keeps the KV at 16 bits **and** the activations at 8, sits at KL 9e-3 from us. Not
+implemented: Marcello decides. The comparison with llama.cpp's decode at long context (question
+19) needs redoing now: its advantage there was also this.
 
 ## Prefill on long prompts (2026-09-19)
 
-Punto 4 dei prossimi passi, domande 7 e 30. Windows nativo, macchina ferma, OLMoE-1B-7B Q8_0, 16
-thread, pin al core. Tre finestre di `tools/prefill_context.sh`: `measure` alle 05:27 (il binario del
-commit 06f8e30 da solo: microbenchmark, velocità con A/A, profilo; 21 minuti), `bench` alle 07:55
-(solo il microbenchmark, col kernel nuovo) e `change build/trochilus-before.exe` alle 10:13 (prima
-contro dopo; 40 minuti). Ogni run sta in `build/prefill_context/`; le
-tabelle escono da `tools/prefill_context_report.py attn | zones` e da
-`tools/decode_context_report.py speed`. I prompt da 512, 2048 e 4000 stanno nella **stessa
-sessione** di `tools/ab_modes.sh` (8 giri dopo uno di riscaldamento, `generate -p <prompt> -n 48 -t
-16`), in un ordine che mette ogni lunghezza dopo ogni altra; un modo e la sua copia A/A non seguono
-mai la stessa lunghezza.
+Point 4 of the next steps, questions 7 and 30. Native Windows, still machine, OLMoE-1B-7B Q8_0, 16
+threads, pinned to core. Three windows of `tools/prefill_context.sh`: `measure` at 05:27 (the
+06f8e30 binary alone: microbenchmark, speed with A/A, profile; 21 minutes), `bench` at 07:55 (only
+the microbenchmark, with the new kernel) and `change build/trochilus-before.exe` at 10:13 (before
+against after; 40 minutes). Each run sits in `build/prefill_context/`; the tables come from
+`tools/prefill_context_report.py attn | zones` and from `tools/decode_context_report.py speed`. The
+512, 2048 and 4000-token prompts sit in the **same session** as `tools/ab_modes.sh` (8 rounds after
+one warm-up, `generate -p <prompt> -n 48 -t 16`), in an order that puts every length after every
+other; a mode and its A/A copy never follow the same length.
 
-**1. L'attenzione di un prompt, smontata** (`make bench-attn`, `tests/bench_attn.c`: un layer, 16
-teste da 128, KV `[testa][posizione]`, passate da 512 token come nel motore, 64 MiB di altra memoria
-letti fra una passata e l'altra; mediana di 5). «Una query alla volta» è il kernel del motore
-(`tr_attention_head`): per ogni token i prodotti con tutte le sue chiavi, il softmax della riga, la
-somma pesata dei valori. «A gruppi» è lo stesso calcolo con 16 query contro un blocco di 64 chiavi
-(e poi di valori) mentre il blocco è in cache; «x4» aggiunge una query contro 4 chiavi nei registri.
-Ogni variante a gruppi stampa l'hash di tutte le uscite del prompt: **gli stessi bit** del kernel del
-motore, a ogni lunghezza. 16 thread e 16 teste, ms per layer (ns di thread per coppia
-query-posizione). Tre run nella stessa giornata (05:27, 07:55, 10:43), le ultime due anche col kernel
-scritto nel motore (`tr_attention_group`): a 512 e a 2048 concordano entro il 4-13%; a 4000 la prima
-dice una cosa e le altre due un'altra (431.9 e 428.2 ms), e in tabella ci sono la prima e la terza:
+**1. A prompt's attention, taken apart** (`make bench-attn`, `tests/bench_attn.c`: one layer, 16
+heads of 128, KV `[head][position]`, 512-token passes as in the engine, 64 MiB of other memory read
+between one pass and the next; median of 5). "One query at a time" is the engine's kernel
+(`tr_attention_head`): for every token the products with all its keys, the row's softmax, the
+weighted sum of the values. "Grouped" is the same computation with 16 queries against a block of 64
+keys (and then of values) while the block is in cache; "x4" adds one query against 4 keys in
+registers. Every grouped variant prints a hash of all the prompt's outputs: **the same bits** as
+the engine's kernel, at every length. 16 threads and 16 heads, ms per layer (ns of thread per
+query-position pair). Three runs on the same day (05:27, 07:55, 10:43), the last two also with the
+kernel written into the engine (`tr_attention_group`): at 512 and 2048 they agree within 4-13%; at
+4000 the first says one thing and the other two another (431.9 and 428.2 ms), and the table has the
+first and the third:
 
-| | prompt 512 | 2048 | 4000, run delle 05:27 | 4000, run delle 10:43 |
+| | prompt 512 | 2048 | 4000, 05:27 run | 4000, 10:43 run |
 |---|---|---|---|---|
-| una query alla volta, tutto | 5.95 (45.3) | 104.1 (49.6) | 518.2 (64.8) | 428.2 (53.5) |
-| — senza il softmax | 2.56 | 44.2 | 342.0 | 184.5 |
-| — solo i prodotti (legge K) | 1.27 (9.7) | 20.2 (9.6) | 79.1 (9.9) | 85.4 (10.7) |
-| — solo il softmax | 4.27 (32.6) | 69.6 (33.2) | 266.7 (33.3) | 278.8 (34.8) |
-| — solo la somma pesata (legge V) | 1.36 (10.4) | 19.3 (9.2) | 140.0 (17.5) | 82.6 (10.3) |
-| a gruppi, tutto | 6.32 | 109.9 | 382.7 | 396.9 |
-| a gruppi, senza il softmax | 2.60 | 35.6 | 141.9 | 156.7 |
-| a gruppi + x4 (prototipo nel banco), tutto | 5.49 | 95.1 | 355.2 | 370.6 |
-| a gruppi + x4, senza il softmax | 1.53 | 22.8 | 101.2 | 92.1 |
-| **il kernel del motore, `tr_attention_group`**, contro «una query alla volta» della stessa run (07:55 / 10:43) | 1.06× / 0.95×: non distinguibile | **1.12× / 1.16×** | — | **1.15× / 1.15×** (376.4 e 373.3 ms; 1.38× sulla run delle 05:27) |
+| one query at a time, all | 5.95 (45.3) | 104.1 (49.6) | 518.2 (64.8) | 428.2 (53.5) |
+| — without the softmax | 2.56 | 44.2 | 342.0 | 184.5 |
+| — products only (reads K) | 1.27 (9.7) | 20.2 (9.6) | 79.1 (9.9) | 85.4 (10.7) |
+| — softmax only | 4.27 (32.6) | 69.6 (33.2) | 266.7 (33.3) | 278.8 (34.8) |
+| — weighted sum only (reads V) | 1.36 (10.4) | 19.3 (9.2) | 140.0 (17.5) | 82.6 (10.3) |
+| grouped, all | 6.32 | 109.9 | 382.7 | 396.9 |
+| grouped, without the softmax | 2.60 | 35.6 | 141.9 | 156.7 |
+| grouped + x4 (bench prototype), all | 5.49 | 95.1 | 355.2 | 370.6 |
+| grouped + x4, without the softmax | 1.53 | 22.8 | 101.2 | 92.1 |
+| **the engine's kernel, `tr_attention_group`**, against "one query at a time" of the same run (07:55 / 10:43) | 1.06× / 0.95×: not distinguishable | **1.12× / 1.16×** | — | **1.15× / 1.15×** (376.4 and 373.3 ms; 1.38× on the 05:27 run) |
 
-Per 16 layer il kernel di prima fa 95, 1665 e 6850-8291 ms: la zona `attention` del profilo ne
-misura 116, 1883 e 7420. Un thread solo con una testa sola (le cache tutte per sé) fa **42.7, 43.0
-e 42.6 ns per coppia**: a un thread la lunghezza non conta, e il tempo è 73% softmax, 14% prodotti,
-12% somma pesata; lì il kernel del motore vale 1.05-1.09× (è il solo x4). Gruppo da 4, 16 o 64 query
-e blocco da 16, 64 o 256 posizioni a 4000: 352-387 ms, tutti dentro lo spread (2-15%): si tiene 16 × 64.
+Over 16 layers the earlier kernel takes 95, 1665 and 6850-8291 ms: the profile's `attention` zone
+measures 116, 1883 and 7420. A single thread with a single head (all caches to itself) takes
+**42.7, 43.0 and 42.6 ns per pair**: at one thread the length does not matter, and the time is 73%
+softmax, 14% products, 12% weighted sum; there the engine's kernel is worth 1.05-1.09× (it is x4
+alone). A group of 4, 16 or 64 queries and a block of 16, 64 or 256 positions at 4000: 352-387 ms,
+all within the spread (2-15%): 16 × 64 is kept.
 
-**2. L'ipotesi: vera a metà.** L'ipotesi era: «a 4000 token l'attenzione del prompt vale il 34% e
-legge 2 TB in 8.5 s, quasi tutto da cache: ogni token rilegge le stesse chiavi e gli stessi valori».
-Il 34% c'è (31-35% in due profili) e i 2 TB anche (283 GB/s nella zona: cache, non RAM). Ma la
-lettura ripetuta **non è il grosso**:
+**2. The hypothesis: half true.** The hypothesis was: "at 4000 tokens the prompt's attention costs
+34% and reads 2 TB in 8.5 s, almost all from cache: every token rereads the same keys and the same
+values". The 34% is there (31-35% in two profiles) and so are the 2 TB (283 GB/s in the zone:
+cache, not RAM). But the repeated read **is not the bulk**:
 
-| della zona `attention`, 16 thread | prompt 512 | 2048 | 4000, run delle 05:27 | 4000, run delle 07:55 e delle 10:43 |
+| of the `attention` zone, 16 threads | prompt 512 | 2048 | 4000, 05:27 run | 4000, 07:55 and 10:43 runs |
 |---|---|---|---|---|
-| softmax (`expf`, massimo, somma, divisione) | 72% | 61-70% | 51% | 63-65% |
-| prodotti e somma pesata, con chiavi e valori in cache | 28% | 30-34% | 27% | 36-37% |
-| chiavi e valori riletti a ogni token | niente | 0-8% | **21-39%** | **0-6%** |
+| softmax (`expf`, max, sum, division) | 72% | 61-70% | 51% | 63-65% |
+| products and weighted sum, with keys and values in cache | 28% | 30-34% | 27% | 36-37% |
+| keys and values reread at every token | nothing | 0-8% | **21-39%** | **0-6%** |
 
-(Il softmax è la sua riga; la lettura ripetuta è ciò che resta tolti softmax e «a gruppi senza
-softmax», oppure «una query alla volta» meno «a gruppi» senza softmax: le fasi misurate da sole non
-si sommano esattamente, lo spread a 16 thread arriva al 20%.) Fino a 2048 token chiavi e valori di
-una testa (2 MB) stanno nelle cache e rileggerli non costa. A 4000 sono 4 MB per testa: 64 MB per i
-16 thread contro 64 MB di L3, **proprio sul bordo**, e quanto si paga dipende da cos'altro sta in L3
-in quel momento: un quarto della zona nella prima run, quasi niente nelle altre due (il motore, che
-fra un'attenzione e l'altra fa passare i pesi, sta in mezzo: 464 ms per layer). A gruppi il tempo
-**non dipende più da questo**: 355, 349 e 371 ms nelle tre run. Oltre i 4000 token il bordo è
-superato per tutti (domanda 38).
+(The softmax is its own row; the repeated read is what remains after removing the softmax and
+"grouped without softmax", or "one query at a time" minus "grouped" without softmax: the phases
+measured alone do not sum exactly, the spread at 16 threads reaches 20%.) Up to 2048 tokens a
+head's keys and values (2 MB) fit in the caches and rereading them costs nothing. At 4000 they are
+4 MB per head: 64 MB for the 16 threads against L3's 64 MB, **right on the edge**, and how much it
+costs depends on what else sits in L3 at that moment: a quarter of the zone in the first run, almost
+nothing in the other two (the engine, which lets the weights pass through between one attention and
+the next, sits in between: 464 ms per layer). Grouped, the time **no longer depends on this**: 355,
+349 and 371 ms in the three runs. Past 4000 tokens the edge is crossed for everyone (question 38).
 
-Il grosso è il **softmax**, cioè `expf` della libreria C: **30 ns a chiamata** con MinGW
-(`tests/bench_expf.c`; istruzioni x87), contro **2.3 ns** di glibc nel container, sulla stessa
-macchina. Lo stesso `expf` è quasi tutta la zona `expert_act` (il 5-7% del prefill, 39 ns per
-elemento). È la sola funzione della zona calda che non è nostra: vedi il punto 6.
+The bulk is the **softmax**, that is, the C library's `expf`: **30 ns a call** with MinGW
+(`tests/bench_expf.c`; x87 instructions), against glibc's **2.3 ns** in the container, on the same
+machine. The same `expf` is almost all of the `expert_act` zone (5-7% of the prefill, 39 ns per
+element). It is the only function in the hot zone that is not ours: see point 6.
 
-**3. Il prefill prima, e la sua parte seriale** (binario del commit 06f8e30; tok/s, mediana
-(min-max) di 8; zone dal profilo, mediana di 5, `bench/scenarios-prefill-context.json`):
+**3. The prefill before, and its serial part** (binary of commit 06f8e30; tok/s, median (min-max)
+of 8; zones from the profile, median of 5, `bench/scenarios-prefill-context.json`):
 
 | | prompt 512 | 2048 | 4000 |
 |---|---|---|---|
 | prefill, tok/s | 231.7 (230.2-235.7) | 203.9 (200.7-206.9) | 169.5 (147.2-173.0) |
-| la sua copia A/A | 233.3 (0.7%) | 202.9 (0.5%) | 168.1 (0.8%) |
-| tempo del prompt, ms | 2175 | 10157 | 23639 |
+| its A/A copy | 233.3 (0.7%) | 202.9 (0.5%) | 168.1 (0.8%) |
+| prompt time, ms | 2175 | 10157 | 23639 |
 | `attention` | 116 (5.3%) | 1883 (18.5%) | 7420 (31.4%) |
-| moltiplicazioni (esperti, q/k/v, uscita, `lm_head`) | 1682 (77%) | 6767 (67%) | 13291 (56%) |
+| multiplications (experts, q/k/v, output, `lm_head`) | 1682 (77%) | 6767 (67%) | 13291 (56%) |
 | `expert_act` (`expf`) | 161 (7.3%) | 656 (6.5%) | 1295 (5.4%) |
 | `router` | 80 (3.6%) | 324 (3.2%) | 627 (2.6%) |
-| **lavoro di un token solo, su un thread**: norme, RoPE, scrittura della KV, righe per gli esperti, embedding | **121 (5.6%)** | **455 (4.5%)** | **880 (3.7%)** |
-| — di cui scrittura della KV testa per testa | 27.4 | 85.7 | 160.5 |
-| — di cui righe copiate per gli esperti | 38.4 | 142.4 | 281.5 |
-| — di cui norme di q e k / norme dei layer / RoPE | 21.4 / 20.5 / 12.7 | 87.9 / 83.2 / 52.1 | 172.9 / 156.4 / 102.3 |
+| **work for a single token, on one thread**: norms, RoPE, KV write, rows for the experts, embedding | **121 (5.6%)** | **455 (4.5%)** | **880 (3.7%)** |
+| — of which KV write, head by head | 27.4 | 85.7 | 160.5 |
+| — of which rows copied for the experts | 38.4 | 142.4 | 281.5 |
+| — of which q and k norms / layer norms / RoPE | 21.4 / 20.5 / 12.7 | 87.9 / 83.2 / 52.1 | 172.9 / 156.4 / 102.3 |
 
-La parte seriale non è solo quella: dentro `router` la scelta degli esperti token per token gira
-su un thread, e lo scenario a **un thread** lo dice (prompt 512: `router` 415 ms a un thread, 80 a
-16: circa 57 ms non si dividono). E l'altra metà della zona era un kernel mancante: la matrice del
-router è **F32**, e le righe F32 giravano sul ciclo scalare in ogni tier (0.11 GB/s nella zona;
-LESSONS #78). In tutto il lavoro su un thread solo valeva l'**8%** del prefill a 512 e il 5-6% a 4000.
+The serial part is not only that: inside `router` the token-by-token choice of experts runs on one
+thread, and the **one-thread** scenario says so (prompt 512: `router` 415 ms at one thread, 80 at
+16: about 57 ms do not split). And the other half of the zone was a missing kernel: the router's
+matrix is **F32**, and F32 rows ran on the scalar loop in every tier (0.11 GB/s in the zone;
+LESSONS #78). In all, the single-thread work cost **8%** of the prefill at 512 and 5-6% at 4000.
 
-**4. Le tre leve esatte.** Ognuna cambia dove e quando si fa un calcolo, mai il calcolo: stesse
-chiamate di kernel sugli stessi float nello stesso ordine per ogni uscita.
+**4. The three exact levers.** Each changes where and when a computation happens, never the
+computation: the same kernel calls on the same floats in the same order for every output.
 
-- **Attenzione a gruppi** (`tr_attention_group`, `src/kernels/kernels.c`): 16 token consecutivi di una
-  testa sono un gruppo; un blocco di 64 posizioni incontra tutte le query del gruppo mentre sta in
-  cache, 4 posizioni per carico della query (`dot_f32_x4`) e 4 valori per carico dell'uscita
-  (`axpy_f32_x4`); poi il softmax di ogni riga; poi i valori, allo stesso modo. Chiavi e valori si
-  leggono una volta per gruppo: il profiler conta **31 MiB di KV per token a 4000 invece di 500**
-  (a 2048: 16 invece di 256). Il decode è un gruppo da una query: un solo percorso.
-- **Il lavoro di un token solo sul pool**: embedding, norme, norme di q e k, RoPE, scrittura della
-  KV, somma del residuo, scelta del router (uno scratch per worker), righe per gli esperti; almeno 8
-  token a pezzo, quindi una passata corta resta sul thread che chiama, come prima.
-- **Le righe F32 col kernel del tier**: la matrice del router non passa più dal ciclo scalare.
+- **Grouped attention** (`tr_attention_group`, `src/kernels/kernels.c`): 16 consecutive tokens of a
+  head form a group; a block of 64 positions meets all the group's queries while it sits in cache,
+  4 positions per query load (`dot_f32_x4`) and 4 values per output load (`axpy_f32_x4`); then each
+  row's softmax; then the values, the same way. Keys and values are read once per group: the
+  profiler counts **31 MiB of KV per token at 4000 instead of 500** (at 2048: 16 instead of 256).
+  The decode is a group of one query: a single path.
+- **The single-token work on the pool**: embedding, norms, q and k norms, RoPE, KV write, residual
+  sum, router choice (one scratch per worker), rows for the experts; at least 8 tokens per piece, so
+  a short pass stays on the calling thread, as before.
+- **F32 rows with the tier's kernel**: the router's matrix no longer goes through the scalar loop.
 
-Prova: `tests/test_kernels.c` (x4 contro scalare e contro 4 chiamate, 525 gruppi contro
-`tr_attention_head` query per query), `test_prefill` con un prompt da 141 token, `test_hot` sotto
-ThreadSanitizer, 20 mutazioni su 20 viste (`tools/mutate_prefill.sh`), `make check`; e sul modello
-vero lo stadio `exact`: logit **identici al byte** al binario di prima su 600 posizioni un token per
-passata (120 MB, 16 thread), a passate da 64 su 8 thread, su un prompt da 4000 a passate da 512 e da
-100 su 16 thread (l'ultima riga uguale nelle due forme), e gli stessi token dopo un prompt da 4000.
+Proof: `tests/test_kernels.c` (x4 against scalar and against 4 calls, 525 groups against
+`tr_attention_head` query by query), `test_prefill` with a 141-token prompt, `test_hot` under
+ThreadSanitizer, 20 of 20 mutations seen (`tools/mutate_prefill.sh`), `make check`; and on the real
+model the `exact` stage: logits **identical to the byte** against the earlier binary over 600
+positions at one token per pass (120 MB, 16 threads), at passes of 64 on 8 threads, on a 4000-token
+prompt at passes of 512 and of 100 on 16 threads (the last row equal in both forms), and the same
+tokens after a 4000-token prompt.
 
-**5. Prima e dopo** (`sh tools/prefill_context.sh change build/trochilus-before.exe`; tok/s, mediana
-(min-max) di 8; soglia della sessione, il peggiore A/A: **prefill 2.1%, decode 2.4%**; «dopo» è la
-seconda copia del binario nuovo, LESSONS #81, hash in `build/prefill_context/binaries.sha256`):
+**5. Before and after** (`sh tools/prefill_context.sh change build/trochilus-before.exe`; tok/s,
+median (min-max) of 8; session threshold, worst A/A: **prefill 2.1%, decode 2.4%**; "after" is the
+second copy of the new binary, LESSONS #81, hash in `build/prefill_context/binaries.sha256`):
 
-| prefill | prima | prima, copia | dopo | dopo, copia | dopo / prima |
+| prefill | before | before, copy | after | after, copy | after / before |
 |---|---|---|---|---|---|
 | prompt 512 | 228.7 (222.5-236.1) | 230.2 | 240.9 (222.2-247.2) | 246.1 | **1.047-1.076×** |
 | 2048 | 197.8 (184.5-201.2) | 197.6 | 211.3 (202.1-219.4) | 213.3 | **1.069-1.079×** |
 | 4000 | 160.1 (156.9-164.1) | 161.2 | 181.7 (178.8-182.5) | 179.6 | **1.114-1.135×** |
 
-Il decode dopo quei prompt **non è distinguibile**: 33.0 contro 33.1 tok/s a 512 (1.000-1.013×),
-25.7 contro 25.6 a 2048 (0.973-1.005×), 19.9 contro 19.9 a 4000 (0.972-1.001×). (In questa sessione
-il binario di prima fa 160 tok/s a 4000 dove al mattino ne faceva 169: la macchina era appena uscita
-da due ore di standby, LESSONS #82. Conta il confronto dentro la sessione.)
+The decode after those prompts **is not distinguishable**: 33.0 against 33.1 tok/s at 512
+(1.000-1.013×), 25.7 against 25.6 at 2048 (0.973-1.005×), 19.9 against 19.9 at 4000
+(0.972-1.001×). (In this session the earlier binary gives 160 tok/s at 4000 where in the morning it
+gave 169: the machine had just come out of two hours of standby, LESSONS #82. The comparison within
+the session is what counts.)
 
-Per zona (profilo del mattino contro profilo del binario nuovo, ms del prompt):
+Per zone (morning profile against the new binary's profile, ms of the prompt):
 
-| | 512: prima | dopo | 2048: prima | dopo | 4000: prima | dopo |
+| | 512: before | after | 2048: before | after | 4000: before | after |
 |---|---|---|---|---|---|---|
 | `attention` | 115.9 | 106.2 | 1883 | 1688 | 7420 | 6568 (**1.13×**) |
 | `router` | 79.7 | **6.2** | 323.5 | **21.8** | 626.9 | **45.2** |
-| lavoro di un token solo | 121.2 | 48.2 | 454.6 | 174.2 | 880.1 | 353.1 |
-| — norme di q e k, norme dei layer, RoPE | 54.6 | 8.9 | 223.2 | 34.1 | 431.6 | 70.2 |
-| — righe per gli esperti | 38.4 | 19.5 | 142.4 | 67.4 | 281.5 | 133.2 |
-| — scrittura della KV | 27.4 | 19.3 | 85.7 | 71.8 | 160.5 | 147.4 |
-| tutto il prompt | 2175 | 2071 | 10157 | 9503 | 23639 | 22044 |
+| single-token work | 121.2 | 48.2 | 454.6 | 174.2 | 880.1 | 353.1 |
+| — q and k norms, layer norms, RoPE | 54.6 | 8.9 | 223.2 | 34.1 | 431.6 | 70.2 |
+| — rows for the experts | 38.4 | 19.5 | 142.4 | 67.4 | 281.5 | 133.2 |
+| — KV write | 27.4 | 19.3 | 85.7 | 71.8 | 160.5 | 147.4 |
+| whole prompt | 2175 | 2071 | 10157 | 9503 | 23639 | 22044 |
 
-Le norme e la RoPE, che sono calcolo, si dividono per 6; le righe per gli esperti e la scrittura
-della KV, che sono copie in memoria, solo per 2 e per 1.1-1.4: lì il limite è scrivere in RAM, non
-il thread. Il `router` va 13 volte più veloce: 57 ms erano la scelta su un thread, il resto il
-kernel scalare. Le moltiplicazioni non sono state toccate (nel profilo del dopo valgono il 2-3% in
-più: un'altra sessione, non un effetto).
+The norms and RoPE, which are compute, divide by 6; the rows for the experts and the KV write,
+which are memory copies, only by 2 and by 1.1-1.4: there the limit is writing to RAM, not the
+thread. `router` runs 13 times faster: 57 ms were the choice on one thread, the rest the scalar
+kernel. The multiplications were not touched (in the after profile they cost 2-3% more: a
+different session, not an effect).
 
-Dopo, a 4000 token l'attenzione è il **30%** del prefill e dentro c'è quasi solo il softmax (4.3 s
-su 6.6): dal lato esatto nell'attenzione resta poco. Il prossimo pezzo è `expf` (punto 6).
+After, at 4000 tokens attention is **30%** of the prefill and inside it is almost only the softmax
+(4.3 s of 6.6): little is left on the exact side in attention. The next piece is `expf` (point 6).
 
-**6. Le leve non esatte: i numeri per decidere.** Non implementate.
+**6. The non-exact levers: the numbers to decide with.** Not implemented.
 
-- **`expf` nostro** (domanda 37). Oggi `expf` è della libreria C: 30.2 ns a chiamata su Windows
-  (MinGW), 2.3 ns nel container (glibc). `tests/bench_expf.c` lo confronta, su **tutti i 4 278 190 082
-  float** che non sono NaN, con l'esponenziale in doppia precisione arrotondato a float, che è il
-  valore arrotondato correttamente (salvo una manciata di casi su 4 miliardi):
+- **Our own `expf`** (question 37). Today `expf` is the C library's: 30.2 ns a call on Windows
+  (MinGW), 2.3 ns in the container (glibc). `tests/bench_expf.c` compares it, over **all 4 278 190 082
+  non-NaN floats**, with the double-precision exponential rounded to float, which is the correctly
+  rounded value (barring a handful of cases out of 4 billion):
 
-  | libreria | costo di `expf` | risultati diversi dall'arrotondamento corretto | nel campo del softmax (−104…0) |
+  | library | `expf`'s cost | results differing from correct rounding | in the softmax's range (−104…0) |
   |---|---|---|---|
-  | MinGW-w64 (Windows nativo) | 30.2 ns | **0** | **0** |
-  | glibc 2.39 (container) | 2.3 ns | 170 648 (0.004%), sempre di un'unità sull'ultima cifra | 97 052 (0.009%) |
+  | MinGW-w64 (native Windows) | 30.2 ns | **0** | **0** |
+  | glibc 2.39 (container) | 2.3 ns | 170 648 (0.004%), always by one unit in the last digit | 97 052 (0.009%) |
 
-  Due conseguenze. (a) **Oggi Windows e Linux non danno gli stessi bit**: su un prompt da 4000 il
-  softmax chiama `expf` due miliardi di volte, e glibc ne arrotonda male circa una su diecimila. (b) Un `expf`
-  scritto da noi che arrotonda correttamente (C scalare come definizione, varianti AVX identiche al
-  bit, come ogni altro kernel) darebbe **su Windows gli stessi bit di oggi**, per prova esaustiva
-  (lo stesso `bench_expf` col nostro al posto del riferimento: 0 differenze su 2^32), e su Linux
-  cambierebbe lo 0.004% delle chiamate di un'unità sull'ultima cifra, rendendo le due piattaforme
-  identiche. «Cambia i bit» vale quindi solo per Linux, e lì in meglio. Guadagno stimato col softmax
-  a 2-3 ns per elemento invece di 32 e `expert_act` a un decimo:
+  Two consequences. (a) **Today Windows and Linux do not give the same bits**: on a 4000-token
+  prompt the softmax calls `expf` two billion times, and glibc rounds about one in ten thousand of
+  them wrong. (b) An `expf` we write ourselves that rounds correctly (scalar C as the definition,
+  AVX variants bit-identical, like every other kernel) would give **the same bits as today on
+  Windows**, by exhaustive proof (the same `bench_expf` with ours in place of the reference: 0
+  differences over 2^32), and on Linux it would change 0.004% of calls by one unit in the last
+  digit, making the two platforms identical. "It changes the bits" therefore only holds for Linux,
+  and there for the better. Estimated gain with the softmax at 2-3 ns per element instead of 32 and
+  `expert_act` at a tenth:
 
   | | prompt 512 | 2048 | 4000 |
   |---|---|---|---|
-  | softmax dell'attenzione, ms del prefill | 83 | 1262 | 3821 |
+  | attention's softmax, ms of the prefill | 83 | 1262 | 3821 |
   | `expert_act`, ms | 161 | 656 | 1295 |
-  | prefill stimato, sul binario di prima | **1.11×** | **1.21×** | **1.25×** |
-  | prefill stimato, sul binario di dopo (2071 / 9503 / 22044 ms) | **1.12×** | **1.23×** | **1.27×** |
-  | decode stimato (softmax + `expert_act` per token: 1.4 / 2.8 / 4.5 ms su 27.9 / 36.4 / 47.5) | +5% | +8% | +10% |
+  | estimated prefill, on the earlier binary | **1.11×** | **1.21×** | **1.25×** |
+  | estimated prefill, on the later binary (2071 / 9503 / 22044 ms) | **1.12×** | **1.23×** | **1.27×** |
+  | estimated decode (softmax + `expert_act` per token: 1.4 / 2.8 / 4.5 ms of 27.9 / 36.4 / 47.5) | +5% | +8% | +10% |
 
-  Come si misurerebbe la qualità: `bench_expf` sulle due piattaforme (0 differenze su Windows è la
-  condizione per chiamarla esatta); stadio `exact` di `tools/prefill_context.sh` prima contro dopo
-  su Windows (atteso: identico al byte); su Linux KL e primo token contro il binario di prima su
-  1000 posizioni e oracoli invariati. Il rischio è nello scriverlo (un `expf` arrotondato
-  correttamente vuole una strada lenta per i casi vicini a metà fra due float), non nel misurarlo.
-- **KV a 16 bit**: al prefill non serve più. Con l'attenzione a gruppi chiavi e valori si leggono una
-  volta ogni 16 token, e la lettura ripetuta era il solo pezzo della zona legato ai byte. Resta una
-  leva del **decode** a contesto lungo (domanda 36: +16-31% a 2048-4000).
-- **int8/VNNI nelle moltiplicazioni** (domande 21 e 33): le moltiplicazioni sono il 77% del prefill
-  a 512 e il 56% a 4000; col kernel a 1.8-2.3× (§Attivazioni int8) il prefill andrebbe **1.5-1.8×** a
-  512 e **1.3-1.5×** a 4000. Non è esatto: la decisione resta quella del punto 3 di STATO.
+  How quality would be measured: `bench_expf` on both platforms (0 differences on Windows is the
+  condition for calling it exact); `tools/prefill_context.sh`'s `exact` stage before against after
+  on Windows (expected: identical to the byte); on Linux, KL and first token against the earlier
+  binary over 1000 positions and unchanged oracles. The risk is in writing it (a correctly rounded
+  `expf` needs a slow path for cases near halfway between two floats), not in measuring it.
+- **16-bit KV**: no longer needed for the prefill. With grouped attention, keys and values are read
+  once every 16 tokens, and the repeated read was the only byte-bound piece of the zone. It remains
+  a lever for the **decode** at long context (question 36: +16-31% at 2048-4000).
+- **int8/VNNI in the multiplications** (questions 21 and 33): the multiplications are 77% of the
+  prefill at 512 and 56% at 4000; with the kernel at 1.8-2.3× (§int8 activations, second
+  measurement) the prefill would run **1.5-1.8×** at 512 and **1.3-1.5×** at 4000. It is not exact:
+  the decision remains STATUS's point 3.
 
-**7. `expf` nostro: preparato, non scritto** (domanda 37; decide Marcello). **Poi scritto, lo stesso
-giorno: lo scalare, coi numeri misurati, sta in §`tr_expf`.** I tre numeri chiesti allora:
+**7. Our own `expf`: prepared, not written** (question 37; Marcello decides). **Later written, the
+same day: the scalar, with the measured numbers, sits in §`tr_expf`.** The three numbers asked for
+then:
 
-- **Il test sui 2^32 float è pronto**, e ha già girato su un prototipo. `make bench-expf` confronta
-  un candidato con l'`expf` della libreria e col riferimento su tutti i float; il candidato si dà
-  alla compilazione (`EXTRA_CFLAGS=-DTR_EXPF_CANDIDATE=tr_expf` quando il motore ne avrà uno). Senza,
-  prova uno schizzo che sta **nel banco, non nel motore**: 25 righe di C scalare, tabella di 64
-  valori di 2^(j/64), polinomio di grado 5 in double, e un test di arrotondamento (se un errore di
-  2^-50 non può spostare il float, il risultato è certo; altrimenti strada lenta).
+- **The test over the 2^32 floats is ready**, and it has already run on a prototype. `make
+  bench-expf` compares a candidate with the library's `expf` and with the reference over every
+  float; the candidate is given at compile time (`EXTRA_CFLAGS=-DTR_EXPF_CANDIDATE=tr_expf` once
+  the engine has one). Without it, a sketch is tried that sits **in the bench, not in the engine**:
+  25 lines of scalar C, a table of 64 values of 2^(j/64), a degree-5 polynomial in double, and a
+  rounding test (if an error of 2^-50 cannot move the float, the result is certain; otherwise a
+  slow path).
 
-  | | costo a chiamata | diversi dalla libreria | diversi dal riferimento | strada lenta |
+  | | cost per call | different from the library | different from the reference | slow path |
   |---|---|---|---|---|
-  | Windows (MinGW): libreria / schizzo | 30.2 ns / **3.7 ns** | **0 su 4 278 190 082** | 0 | 8 argomenti |
-  | Linux (glibc): libreria / schizzo | 2.5 ns / 3.8 ns | 170 648 (dove glibc sbaglia) | 0 | 8 argomenti |
+  | Windows (MinGW): library / sketch | 30.2 ns / **3.7 ns** | **0 of 4 278 190 082** | 0 | 8 arguments |
+  | Linux (glibc): library / sketch | 2.5 ns / 3.8 ns | 170 648 (where glibc is wrong) | 0 | 8 arguments |
 
-  Il riferimento stesso è provato: `bench_expf --hard` scrive i 369 argomenti il cui esponenziale
-  in double cade entro 2^-45 da un confine di arrotondamento (gli stessi sulle due piattaforme), e
-  `tools/expf_hard_cases.py` li ricalcola a 200 bit: **0 errori**. Quindi l'`expf` di MinGW è
-  arrotondato correttamente su tutti i float, e «zero differenze dalla libreria» è una prova, non
-  un campione. Lo schizzo scalare è già 8 volte più veloce della libreria su Windows; la versione
-  AVX-512 (8 double per registro) è stimata a 0.8-1 ns per elemento.
-- **La KL su Linux contro il binario di prima** (`tools/expf_quality.sh` nel container: il motore
-  compilato con ogni `expf` sostituito dal valore arrotondato correttamente, per emulazione, contro
-  il binario normale; modello vero, prompt `code-edit.txt` più 1000 token generati, 1411 posizioni a
-  un token per passata): nessuna riga di logit identica al byte, differenza massima fra due logit
-  **2.3e-5** (su un campo di 65.8), **KL media 3.9e-13, massima 1.5e-11**, **0 posizioni** che
-  scelgono un altro token, **1000 token su 1000** uguali nella generazione greedy. (llama.cpp sta a
-  9e-3 da noi: dieci ordini di grandezza sopra.) Su Windows non c'è niente da misurare: gli stessi bit.
-- **Il costo di scriverlo**: circa **450 righe di C e 40 di Python**, una sessione di lavoro.
+  The reference itself is proven: `bench_expf --hard` writes the 369 arguments whose double
+  exponential falls within 2^-45 of a rounding boundary (the same on both platforms), and
+  `tools/expf_hard_cases.py` recomputes them at 200 bits: **0 errors**. So MinGW's `expf` is
+  correctly rounded over every float, and "zero differences from the library" is a proof, not a
+  sample. The scalar sketch is already 8 times faster than the library on Windows; the AVX-512
+  version (8 doubles per register) is estimated at 0.8-1 ns per element.
+- **The KL on Linux against the earlier binary** (`tools/expf_quality.sh` in the container: the
+  engine compiled with every `expf` replaced by the correctly rounded value, by emulation, against
+  the normal binary; real model, `code-edit.txt` prompt plus 1000 generated tokens, 1411 positions
+  at one token per pass): no logit row identical to the byte, maximum difference between two logits
+  **2.3e-5** (over a range of 65.8), **average KL 3.9e-13, maximum 1.5e-11**, **0 positions**
+  choosing a different token, **1000 of 1000 tokens** equal in greedy generation. (llama.cpp sits at
+  9e-3 from us: ten orders of magnitude above.) On Windows there is nothing to measure: the same
+  bits.
+- **The cost of writing it**: about **450 lines of C and 40 of Python**, one work session.
 
-  | pezzo | righe | difficoltà |
+  | piece | lines | difficulty |
   |---|---|---|
-  | `tr_expf` scalare, la definizione: casi speciali, riduzione esatta (ln2/64 in due pezzi), polinomio, scala, test di arrotondamento | 70 | media: è lo schizzo, con la tabella da costanti e non da `exp2` |
-  | tabella di 64 double arrotondati correttamente, generata con mpmath | 64 + 40 di Python | bassa |
-  | strada lenta: gli argomenti che non passano il test sono **8 su 4 miliardi**, quindi una tabella di eccezioni verificata a 200 bit (o 40 righe di double-double) | 20 | bassa, ma va riprovata per esaustione a ogni modifica |
-  | varianti AVX2 (4 double) e AVX-512 (8 double) identiche al bit allo scalare: gather dalla tabella, scala con interi, maschera per la strada lenta, code | 140 | medio-alta: è il pezzo delicato |
-  | voce `exp` nella tabella dei kernel, softmax e SwiGLU che la usano (uno scratch sullo stack per l'attivazione) | 60 | media |
-  | test: tier contro scalare su ogni lunghezza e sui valori speciali, variante sbagliata che il test deve vedere, `bench-expf` col candidato dentro `make check` (15 s: la prova esaustiva a ogni cancello) | 110 | bassa |
+  | scalar `tr_expf`, the definition: special cases, exact reduction (ln2/64 in two pieces), polynomial, scaling, rounding test | 70 | medium: it is the sketch, with the table from constants rather than from `exp2` |
+  | table of 64 correctly rounded doubles, generated with mpmath | 64 + 40 of Python | low |
+  | slow path: the arguments that fail the test are **8 of 4 billion**, so a table of exceptions verified at 200 bits (or 40 lines of double-double) | 20 | low, but must be reproven exhaustively at every change |
+  | AVX2 (4 doubles) and AVX-512 (8 doubles) variants bit-identical to the scalar: table gather, integer scaling, mask for the slow path, tails | 140 | medium-high: this is the delicate piece |
+  | `exp` entry in the kernel table, softmax and SwiGLU that use it (one stack scratch for the activation) | 60 | medium |
+  | tests: tier against scalar at every length and on special values, a broken variant the test must catch, `bench-expf` with the candidate inside `make check` (15 s: the exhaustive proof at every gate) | 110 | low |
 
-  Il rischio non è la qualità (la prova è esaustiva e dura 15 secondi) ma il tempo del pezzo SIMD. Cosa
-  si guadagna è al punto 6: prefill 1.12× / 1.23× / 1.27×, decode +5-10%, e Windows e Linux con gli
-  stessi bit.
+  The risk is not quality (the proof is exhaustive and takes 15 seconds) but the SIMD piece's time.
+  What is gained is in point 6: prefill 1.12× / 1.23× / 1.27×, decode +5-10%, and Windows and Linux
+  with the same bits.
 
-**8. Come si rifà.** Ogni lunghezza è uno scenario di `bench/scenarios-prefill-context.json` (512,
-2048 e 4000 a 16 thread, 512 a un thread) e ogni misura è un comando:
+**8. How to redo it.** Every length is a scenario of `bench/scenarios-prefill-context.json` (512,
+2048 and 4000 at 16 threads, 512 at one thread) and every measurement is a command:
 
-| misura | comando | dura |
+| measurement | command | takes |
 |---|---|---|
-| l'attenzione smontata (punti 1-2) | `make bench-attn`, o a macchina ferma `sh tools/prefill_context.sh bench` | 3 minuti |
-| `expf`: libreria, candidato, tutti i 2^32 float (punti 6-7) | `make bench-expf`, nativo e nel container; `build/tests/bench_expf.exe --hard <file>` e `tools/expf_hard_cases.py <file>` per i casi al confine | 15 s |
-| cosa cambierebbe un `expf` corretto su Linux (punto 7) | `tools/expf_quality.sh` nel container, col volume dei modelli | 6 minuti |
-| velocità con A/A e zone di un binario (punto 3) | `sh tools/prefill_context.sh measure` | 21 minuti |
-| logit al byte, prima contro dopo con A/A, banco, zone (punto 5) | `sh tools/prefill_context.sh change <binario prima>` | 40 minuti |
-| solo le zone | `make profile SCENARIOS=bench/scenarios-prefill-context.json` | 6 minuti |
-| le tabelle | `tools/prefill_context_report.py attn` e `zones`, `tools/decode_context_report.py speed` | — |
-| i test vedono gli errori? | `tools/mutate_prefill.sh` nel container | 45 minuti |
+| the attention taken apart (points 1-2) | `make bench-attn`, or on a still machine `sh tools/prefill_context.sh bench` | 3 minutes |
+| `expf`: library, candidate, all 2^32 floats (points 6-7) | `make bench-expf`, native and in the container; `build/tests/bench_expf.exe --hard <file>` and `tools/expf_hard_cases.py <file>` for the boundary cases | 15 s |
+| what a correct `expf` would change on Linux (point 7) | `tools/expf_quality.sh` in the container, with the models volume | 6 minutes |
+| speed with A/A and a binary's zones (point 3) | `sh tools/prefill_context.sh measure` | 21 minutes |
+| logits to the byte, before against after with A/A, bench, zones (point 5) | `sh tools/prefill_context.sh change <before binary>` | 40 minutes |
+| zones only | `make profile SCENARIOS=bench/scenarios-prefill-context.json` | 6 minutes |
+| the tables | `tools/prefill_context_report.py attn` and `zones`, `tools/decode_context_report.py speed` | — |
+| do the tests see the errors? | `tools/mutate_prefill.sh` in the container | 45 minutes |
 
 
 ## Clean machine remeasure (2026-09-19)
 
-Quattro processi `yes`, residui di una prova del 17/09, sono rimasti al 100% di un core l'uno sotto
-**ogni misura nativa del 18 e del 19/09** (LESSONS #84). Rimisurato il 19/09 dalle 16:09 alle 17:52,
-senza di loro, ciò da cui era stato scelto il default del motore: thread per fase e decode a
-contesto lungo. Binario con `tr_expf` (hash in `build/prefill_context/binaries.sha256`), 8 giri,
-A/A, ogni run in `build/threads_phase/` e `build/decode_context/`; le sessioni coi `yes` restano in
-`build/threads_phase-with-yes/` e `build/decode_context-with-yes/`. Ogni sessione dichiara nel log
-il **carico di fondo** (LESSONS #85): il processo `System` del kernel tiene da solo 0.7-0.9 core,
-sempre; è un fatto di questa macchina e sta sotto ogni numero di questo documento.
+Four `yes` processes, left over from a test on 09/17, sat at 100% of one core each under **every
+native measurement of 09/18 and -19** (LESSONS #84). Remeasured on 09/19 from 16:09 to 17:52,
+without them, the very things the engine's default had been chosen from: threads per phase and
+decode at long context. Binary with `tr_expf` (hash in `build/prefill_context/binaries.sha256`), 8
+rounds, A/A, each run in `build/threads_phase/` and `build/decode_context/`; the sessions with the
+`yes` processes stay in `build/threads_phase-with-yes/` and `build/decode_context-with-yes/`. Every
+session declares in its log the **background load** (LESSONS #85): the kernel's `System` process
+alone holds 0.7-0.9 core, always; it is a fact of this machine and sits under every number in this
+document.
 
-| sessione | ora | carico di fondo prima → dopo (processori logici occupati, di cui `System`) | peggiore A/A |
+| session | time | background load before → after (logical processors busy, of which `System`) | worst A/A |
 |---|---|---|---|
-| larghezze forzate a 512 (`threads_phase.sh widths`) | 16:09 | 3.82 (0.84; `svchost` 1.23, indicizzatore di Windows) → 2.14 (0.72) | decode 2.6% |
-| decode a 16 contro 8 thread, quattro contesti (`decode_context.sh widths`) | 16:19 | 2.01 (0.78) → 1.17 (0.71) | decode 4.6% |
-| automatico contro 8, banda della RAM, zone (`decode_context.sh measure`) | 16:51 | 1.25 (0.75) → 0.98 (0.73) | decode 2.5% |
-| sweep dei thread (`threads_phase.sh sweep`) | 17:30 | 0.99 (0.71) → 1.02 (0.74) | decode 2.7%, prefill 4.1% |
+| forced widths at 512 (`threads_phase.sh widths`) | 16:09 | 3.82 (0.84; `svchost` 1.23, Windows indexer) → 2.14 (0.72) | decode 2.6% |
+| decode at 16 against 8 threads, four contexts (`decode_context.sh widths`) | 16:19 | 2.01 (0.78) → 1.17 (0.71) | decode 4.6% |
+| automatic against 8, RAM bandwidth, zones (`decode_context.sh measure`) | 16:51 | 1.25 (0.75) → 0.98 (0.73) | decode 2.5% |
+| thread sweep (`threads_phase.sh sweep`) | 17:30 | 0.99 (0.71) → 1.02 (0.74) | decode 2.7%, prefill 4.1% |
 
-**Il rumore del giorno è un fatto, non un difetto da nascondere**: con Marcello alla macchina, un'altra
-finestra al lavoro e l'indicizzatore di Windows, le prime sessioni hanno spread del 15-30% fra minimo
-e massimo e non distinguono differenze sotto il 5%; la sera, a macchina lasciata sola, l'A/A torna
-all'1-3%. Le sessioni strette del 18/09 erano strette perché notturne, non grazie ai `yes`. Le
-misure che decidono si fanno di notte, e ora si possono lasciare sole (orfani rifiutati, guardia
-sulla CPU prima di ogni run, carico dichiarato).
+**The day's noise is a fact, not a flaw to hide**: with Marcello at the machine, another window
+working and the Windows indexer, the earlier sessions have 15-30% spread between minimum and
+maximum and cannot distinguish differences below 5%; in the evening, with the machine left alone,
+A/A returns to 1-3%. The tight sessions of 09/18 were tight because they ran at night, not thanks
+to the `yes` processes. Measurements that decide are made at night, and now they can be left alone
+(orphans rejected, a CPU guard before every run, load declared).
 
-**1. La banda della RAM** (`bench_mem ram`, lettura in fila; domanda 4):
+**1. RAM's bandwidth** (`bench_mem ram`, sequential read; question 4):
 
-| thread | 1 | 2 | 4 | 6 | 8 | 12 | 16 |
+| threads | 1 | 2 | 4 | 6 | 8 | 12 | 16 |
 |---|---|---|---|---|---|---|---|
-| coi `yes` (19/09 mattina), GB/s | 22.4 | 42.7 | 54.0 | 54.0 | 52.3 | 51.0 | 51.5 |
-| macchina pulita, GB/s | 26.2 | 52.2 | **57.3** | **57.6** | 55.7 | 54.4 | 49.5 |
+| with `yes` (09/19 morning), GB/s | 22.4 | 42.7 | 54.0 | 54.0 | 52.3 | 51.0 | 51.5 |
+| clean machine, GB/s | 26.2 | 52.2 | **57.3** | **57.6** | 55.7 | 54.4 | 49.5 |
 
-Il tetto è **~57 GB/s, non 54**, si tocca con 4-6 thread e oltre **cala**: il decode, che è lettura
-di memoria, con più lettori non ha niente da guadagnare. È il perché di tutto quello che segue.
+The ceiling is **~57 GB/s, not 54**, reached with 4-6 threads and past that it **drops**: the
+decode, which is a memory read, gains nothing from more readers. This is why everything below
+follows.
 
-**2. Il decode a larghezza forzata, 16 contro 8 thread** (tok/s, mediana di 8; ogni modo con la sua
-copia; rapporto di 8 su 16 contro tutte e due le copie):
+**2. The decode at forced width, 16 against 8 threads** (tok/s, median of 8; every mode with its
+own copy; ratio of 8 to 16 against both copies):
 
-| contesto | 16 thread | 8 thread | 8 / 16 | A/A | coi `yes` |
+| context | 16 threads | 8 threads | 8 / 16 | A/A | with `yes` |
 |---|---|---|---|---|---|
 | 32 | 38.5 / 37.7 | 40.2 / 39.3 | 1.02-1.07× | 1.9% / 2.4% | — |
 | 512 | 34.6 / 34.3 | 34.7 / 35.0 | **1.00-1.02×** | 0.9% / 1.0% | **1.10×** |
 | 2048 | 27.1 / 25.9 | 28.1 / 26.9 | 0.99-1.09× | 4.6% / 4.3% | 1.03-1.05× |
 | 4000 | 21.1 / 21.5 | 21.6 / 22.2 | 1.01-1.06× | 1.9% / 2.9% | — |
 
-Con la soglia della sessione (4.6%) 8 e 16 **non sono distinguibili a nessun contesto**; 8 è avanti
-dello 0-7% nominale e non è mai dietro. Il «+10% a 8 thread» del 18/09 era l'effetto dei quattro
-core presi: 16 thread fissati ai core pagavano il thread più lento, 8 no.
+With the session's threshold (4.6%) 8 and 16 **are not distinguishable at any context**; 8 is ahead
+by a nominal 0-7% and never behind. The 09/18 "+10% at 8 threads" was the effect of the four cores
+taken: 16 threads pinned to cores paid for the slowest thread, 8 did not.
 
-**3. L'automatico contro 8 thread, e cosa sceglie** (la sessione più quieta; soglia 2.5%). «Scelte»:
-quante volte su 8 run la sessione ha scelto ogni larghezza, e fra parentesi quanti cambi da una run
-alla successiva (`tools/decode_context_report.py speed`), per il modo e per la sua copia:
+**3. The automatic against 8 threads, and what it picks** (the quietest session; threshold 2.5%).
+"Picks": how many times out of 8 runs the session picked each width, and in parentheses how many
+changes from one run to the next (`tools/decode_context_report.py speed`), for the mode and for its
+copy:
 
-| contesto | automatico | 8 forzati | 8 / automatico | scelte, macchina pulita | scelte, coi `yes` (19/09 mattina) |
+| context | automatic | 8 forced | 8 / automatic | picks, clean machine | picks, with `yes` (09/19 morning) |
 |---|---|---|---|---|---|
 | 32 | 40.7 / 41.1 | 40.6 / 40.6 | 0.99-1.00× | 7×4 1×8 (1) · 7×4 1×8 (1) | 7×4 1×8 (1) · 6×4 2×8 (3) |
 | 512 | **36.9** / 36.1 | 34.8 / 34.6 | **0.94-0.96×** | 7×4 1×8 (1) · 6×4 1×8 1×16 (3) | 6×4 2×8 (4) · 2×4 2×8 4×16 (4) |
 | 2048 | 28.5 / 27.7 | 28.1 / 28.6 | 0.99-1.03× | 8×8 (0) · 7×8 1×16 (2) | 6×8 2×16 (3) · 4×8 4×16 (5) |
 | 4000 | 22.7 / 22.1 | 22.4 / 22.6 | 0.99-1.02× | 7×8 1×16 (2) · 5×8 3×16 (3) | 1×8 7×16 (2) · 2×8 6×16 (2) |
 
-A 512 l'automatico, che sceglie quasi sempre **4 thread**, batte 8 del 4-6%, sopra la soglia contro
-tutte e due le copie: a contesto corto il decode vuole 4 thread, a contesto lungo 8, e 16 non vince
-mai. Il verso della conclusione del 18/09 («pochi thread») era giusto; la misura era gonfiata.
-Le larghezze forzate a 512 della prima sessione (rumorosa) dicono lo stesso: 16 thread 33.1 (copia
-32.3), 12 31.1, 8 31.1, 6 33.1, 4 33.1, automatico 33.6 (scelte 4×4 1×8 3×16, 3 cambi); coi `yes`
-erano 30.9, 31.6, 34.1, 34.6, 33.8 e 33.8.
+At 512 the automatic, which almost always picks **4 threads**, beats 8 by 4-6%, above the threshold
+against both copies: at short context the decode wants 4 threads, at long context 8, and 16 never
+wins. The direction of 09/18's conclusion ("few threads") was right; the measurement was inflated.
+The forced widths at 512 from the first (noisy) session say the same: 16 threads 33.1 (copy 32.3),
+12 31.1, 8 31.1, 6 33.1, 4 33.1, automatic 33.6 (picks 4×4 1×8 3×16, 3 changes); with `yes` they
+were 30.9, 31.6, 34.1, 34.6, 33.8 and 33.8.
 
-**Lo stimatore tira a sorte** (LESSONS #88, domanda 31). Le scelte cambiano da una run all'altra: poco a
-macchina quieta (una run su otto), molto appena c'è rumore (4×4 1×8 3×16), e succedeva già coi `yes`,
-dove a 2048 cambiava 3-5 volte su 8: la velocità mediana non lo mostrava, perché dove le larghezze si
-equivalgono una scelta instabile non costa. Il margine (la più ampia entro l'**1%** dalla più veloce,
-su tre passate da un token) è sotto il rumore di quelle passate (2-5%), ed era stato stretto dal 3%
-all'1% **sulla macchina coi core presi**, dove 16 thread perdevano davvero. Va riscritto lo stimatore,
-non il default: margine dal rumore misurato, più giri se non decide, isteresi nelle rimisure, e a
-parità la larghezza **stretta**, che su macchina pulita non perde mai e sotto il carico di altri vale
-il 10%.
+**The estimator is drawing lots** (LESSONS #88, question 31). The picks change from one run to the
+next: little on a quiet machine (one run in eight), a lot as soon as there is noise (4×4 1×8 3×16),
+and it already happened with `yes`, where at 2048 it changed 3-5 times out of 8: the median speed
+did not show it, because where widths are equivalent an unstable pick costs nothing. The margin
+(the widest within **1%** of the fastest, over three one-token passes) is below those passes' noise
+(2-5%), and it had been tightened from 3% to 1% **on the machine with the cores taken**, where 16
+threads really did lose. The estimator needs rewriting, not the default: a margin from measured
+noise, more rounds if it does not decide, hysteresis on remeasures, and on a tie the **narrower**
+width, which never loses on a clean machine and is worth 10% under other load.
 
-**4. Lo sweep dei thread** (`-t n` per tutte e due le fasi; il decode sceglie da sé la larghezza
-dentro il pool, scritta fra parentesi; tok/s):
+**4. The thread sweep** (`-t n` for both phases; the decode picks its own width inside the pool,
+written in parentheses; tok/s):
 
 | `-t` | 512: prefill | decode | 2048: prefill | decode |
 |---|---|---|---|---|
-| 16 | 316.8 (copia 303.7) | 37.4 (4) | 308.5 (copia 305.8) | 29.5 (8) |
+| 16 | 316.8 (copy 303.7) | 37.4 (4) | 308.5 (copy 305.8) | 29.5 (8) |
 | 12 | 287.0 | 37.3 (6) | 265.7 | 29.3 (6) |
 | 8 | 213.1 | 36.7 (4) | 196.7 | 28.0 (8) |
 | 4 | 112.5 | 32.3 | 104.5 | 24.6 |
 
-Il prefill vuole tutto il pool (da 8 a 16 thread 1.49× a 512 e 1.57× a 2048); il decode va uguale
-con ogni pool purché la larghezza scelta sia 4-8. Con `-t 4` lo stimatore prova anche 2 e 1 thread:
-in una run da 48 token quelle sei passate lente pesano il 14-17%, quindi quel numero è il costo del
-sondaggio, non il regime (un altro argomento per la domanda 31: non sondare larghezze sotto 4).
+The prefill wants the whole pool (from 8 to 16 threads 1.49× at 512 and 1.57× at 2048); the decode
+performs the same with any pool as long as the picked width is 4-8. With `-t 4` the estimator also
+tries 2 and 1 threads: in a 48-token run those six slow passes weigh 14-17%, so that number is the
+probing's cost, not the regime (another argument for question 31: do not probe widths below 4).
 
-**5. Il modello del decode** (`decode_context_report.py model`, automatico): **24.5 ms a contesto zero
-più 5.0 ms ogni 1000 token di contesto** (la KV letta a 52 GB/s); 41.0 / 36.6 / 28.4 / 22.5 tok/s a
-contesto 32 / 512 / 2048 / 4000, cioè il 3-8% in più della mattina coi `yes` (38.9 / 35.5 / 27.5 /
-20.9 a 8 thread). Il decode muove 50-51 GB/s su 57: dal lato esatto resta il 10-12%.
+**5. The decode's model** (`decode_context_report.py model`, automatic): **24.5 ms at zero context
+plus 5.0 ms every 1000 context tokens** (the KV read at 52 GB/s); 41.0 / 36.6 / 28.4 / 22.5 tok/s at
+context 32 / 512 / 2048 / 4000, that is, 3-8% more than the morning with `yes` (38.9 / 35.5 / 27.5 /
+20.9 at 8 threads). The decode moves 50-51 GB/s of 57: 10-12% remains on the exact side.
 
-**6. Come si rifà**, a macchina lasciata sola: `sh tools/threads_phase.sh widths`, `sh
-tools/decode_context.sh widths` (16 contro 8 ai quattro contesti, 40 minuti), `sh
-tools/decode_context.sh measure`, `sh tools/threads_phase.sh sweep`; le tabelle con
-`tools/decode_context_report.py speed <file>` (scelte e cambi compresi) e `model`.
+**6. How to redo it**, with the machine left alone: `sh tools/threads_phase.sh widths`, `sh
+tools/decode_context.sh widths` (16 against 8 at the four contexts, 40 minutes), `sh
+tools/decode_context.sh measure`, `sh tools/threads_phase.sh sweep`; the tables with
+`tools/decode_context_report.py speed <file>` (picks and changes included) and `model`.
 
 
 ## `tr_expf`: our exponential, scalar (2026-09-19)
 
-Domanda 37, primo tempo: **solo lo scalare**, che è la definizione. Il SIMD è una decisione a parte
-(punto 7). Velocità misurate sulla macchina pulita della sezione sopra, dalle 17:58 alle 18:39:
-carico di fondo 1.10 → 0.98 processori occupati (0.68-0.71 del `System`), A/A peggiore 3.0% sul
-prefill e 1.9% sul decode; ogni run in `build/prefill_context/`, hash in `binaries.sha256` («prima» è
-il binario del commit ef3cb99). Le due sessioni del giorno fatte prima, una coi `yes` accesi
-(spread 24-57%) e una interrotta, restano in `build/prefill_context-expf-noisy/` e `-interrupted/`.
+Question 37, first half: **the scalar only**, which is the definition. SIMD is a separate decision
+(point 7). Speeds measured on the clean machine from the section above, from 17:58 to 18:39:
+background load 1.10 → 0.98 processors busy (0.68-0.71 from `System`), worst A/A 3.0% on the
+prefill and 1.9% on the decode; every run in `build/prefill_context/`, hash in `binaries.sha256`
+("before" is the binary of commit ef3cb99). The two earlier sessions of the day, one with `yes`
+running (spread 24-57%) and one interrupted, stay in `build/prefill_context-expf-noisy/` and
+`-interrupted/`.
 
-**1. La funzione** (`src/kernels/expf.c`). exp(x) = 2^(k/64) · exp(r), k = round(x · 64/ln2), r = x −
-k · ln2/64 con ln2/64 in due pezzi (il primo esatto per ogni k), tutto in double: 64 valori di
-2^(j/64), un polinomio di Taylor di grado 5, e un **test di arrotondamento**: se y·(1 − 2^-50) e
-y·(1 + 2^-50) arrotondano allo stesso float, exp(x) arrotonda lì. Gli argomenti che lo falliscono sono
-**8 su 4 278 190 082** e stanno in una tabella di eccezioni con l'esponenziale calcolato a 200 bit (e
-a 400: uguale). Un argomento che fallisse il test senza essere in tabella darebbe un NaN: un
-arrotondamento che nessuno ha provato non esce dalla funzione come numero. Dentro non c'è nessuna
-chiamata alla libreria C, e nessuna costante viene da una libreria: le scrive `tools/gen_expf_table.py`
-con mpmath (`src/kernels/expf_table.h`, confrontato col suo generatore da `tools/lint.py`, LESSONS
-#83). Le 8 eccezioni le trovano uguali tre strade: il C su Windows (MinGW gcc 15.2), il C su Linux
-(gcc 13.3), e un mirror numpy bit a bit della strada veloce su tutti i float in campo
-(`gen_expf_table.py --scan`, 4 minuti). Softmax (attenzione e router) e SwiGLU la usano;
-`tools/lint.py` rifiuta `expf(` e `exp(` nella zona calda.
+**1. The function** (`src/kernels/expf.c`). exp(x) = 2^(k/64) · exp(r), k = round(x · 64/ln2), r = x
+− k · ln2/64 with ln2/64 in two pieces (the first exact for every k), all in double: 64 values of
+2^(j/64), a degree-5 Taylor polynomial, and a **rounding test**: if y·(1 − 2^-50) and y·(1 + 2^-50)
+round to the same float, exp(x) rounds there. The arguments that fail it are **8 of 4 278 190 082**
+and sit in an exception table with the exponential computed at 200 bits (and at 400: the same). An
+argument that failed the test without being in the table would give a NaN: a rounding nobody has
+proven does not leave the function as a number. Inside there is no call to the C library, and no
+constant comes from a library: `tools/gen_expf_table.py` writes them with mpmath
+(`src/kernels/expf_table.h`, checked against its generator by `tools/lint.py`, LESSONS #83). The 8
+exceptions are found to agree by three paths: C on Windows (MinGW gcc 15.2), C on Linux (gcc 13.3),
+and a bit-for-bit numpy mirror of the fast path over every float in range
+(`gen_expf_table.py --scan`, 4 minutes). Softmax (attention and router) and SwiGLU use it;
+`tools/lint.py` rejects `expf(` and `exp(` in the hot zone.
 
-**2. La prova è esaustiva** (`make bench-expf`: tutti i 2^32 float contro il riferimento, che è
-provato a 200 bit sui 369 casi al confine; in `make check` con gcc e con clang):
+**2. The proof is exhaustive** (`make bench-expf`: all 2^32 floats against the reference, which is
+proven at 200 bits on the 369 boundary cases; in `make check` with gcc and with clang):
 
-| | costo a chiamata, libreria / `tr_expf` | diversi dalla libreria | diversi dal riferimento | non provati | tempo |
+| | cost per call, library / `tr_expf` | different from the library | different from the reference | unproven | time |
 |---|---|---|---|---|---|
-| Windows (MinGW-w64) | 29.9 ns / **3.5 ns** | **0 su 4 278 190 082** | **0** | 0 | 18 s |
-| Linux (glibc), gcc | 2.4 ns / 3.8 ns | 170 648 (dove glibc sbaglia) | **0** | 0 | 7 s |
+| Windows (MinGW-w64) | 29.9 ns / **3.5 ns** | **0 of 4 278 190 082** | **0** | 0 | 18 s |
+| Linux (glibc), gcc | 2.4 ns / 3.8 ns | 170 648 (where glibc is wrong) | **0** | 0 | 7 s |
 | Linux (glibc), clang | 4.0 ns / 4.1 ns | 170 648 | **0** | 0 | 6 s |
 
-Rosso prima: con la tabella delle eccezioni vuota, 8 NaN e `check: FAILED`. `tools/mutate_expf.sh`:
-**17 mutazioni su 17 viste** da almeno un controllo (test rapido `tests/test_expf.c`, prova esaustiva,
-confronto col generatore, lint della zona calda). Tre cose che le mutazioni insegnano. (a) Tre costanti
-spostate di un'unità sull'ultima cifra (2^(1/64), 1/6, il pezzo basso di ln2/64) **non cambiano nessun
-risultato** su 4 miliardi di float: le vede solo il confronto dell'header col generatore. (b) Col
-margine del test a 2^-60 (che in double vuol dire nessun margine) i risultati restano **tutti giusti**:
-il double della strada veloce arrotonda già al float giusto ovunque. Test e tabella non correggono
-numeri: rendono la prova strutturale, perché un cambio che sposta un risultato lascia argomenti non
-provati o voci di tabella morte (8, in quella mutazione), che il controllo conta, invece di un
-arrotondamento sbagliato in silenzio. (c) Softmax o SiLU rimessi sull'`expf` della libreria: su Linux
-li vede `test_expf` (il softmax e il SiLU sono la loro definizione con `tr_expf`, bit a bit), ovunque
-il lint; su Windows i bit sono gli stessi e resta il lint.
+Red first: with an empty exception table, 8 NaNs and `check: FAILED`. `tools/mutate_expf.sh`:
+**17 of 17 mutations seen** by at least one check (the quick test `tests/test_expf.c`, the
+exhaustive proof, the comparison against the generator, the hot zone's lint). Three things the
+mutations teach. (a) Three constants shifted by one unit in the last digit (2^(1/64), 1/6, ln2/64's
+low piece) **change no result** over 4 billion floats: only the header-against-generator comparison
+catches them. (b) With the test's margin at 2^-60 (which for double means no margin at all) the
+results stay **all correct**: the fast path's double already rounds to the right float everywhere.
+The test and the table do not correct numbers: they make the proof structural, because a change
+that shifts a result leaves unproven arguments or dead table entries (8, in that mutation), which
+the check counts, instead of a silently wrong rounding. (c) Softmax or SiLU put back on the
+library's `expf`: on Linux `test_expf` catches it (softmax and SiLU are their definition with
+`tr_expf`, bit for bit), the lint catches it everywhere; on Windows the bits are the same and the
+lint remains.
 
-**3. Su Windows gli stessi bit di prima.** Stadio `exact` di `tools/prefill_context.sh`, contro il
-binario del commit precedente, passato tre volte nel giorno: logit **identici al byte** su 600
-posizioni un token per passata (120 MB, 16 thread), a passate da 64 su 8 thread, su un prompt da 4000
-a passate da 512 e da 100, e gli stessi token dopo un prompt da 4000.
+**3. On Windows the same bits as before.** `tools/prefill_context.sh`'s `exact` stage, against the
+previous commit's binary, run three times during the day: logits **identical to the byte** over 600
+positions at one token per pass (120 MB, 16 threads), at passes of 64 on 8 threads, on a 4000-token
+prompt at passes of 512 and of 100, and the same tokens after a 4000-token prompt.
 
-**4. Su Linux cambia quanto previsto, e solo l'esponenziale** (`tools/expf_quality.sh` nel container,
-modello vero, prompt `code-edit.txt` più 1000 token generati, 1411 posizioni). Contro il binario di
-prima (`build/linux-before`, sull'`expf` di glibc): nessuna riga identica al byte, differenza massima
-fra due logit **2.3e-5** su un campo di 65.8, **KL media 3.9e-13, massima 1.5e-11, 0 posizioni** che
-scelgono un altro token, **1000 token su 1000** uguali. Contro il build di emulazione (il commit di
-prima con ogni `expf` sostituito da `(float)exp((double)x)`, `tools/cr_expf_emul.h`): **1411 righe su
-1411 identiche al byte** e gli stessi token, ed è un controllo (lo script esce 1 se no): nel motore è
-cambiato l'esponenziale e nient'altro.
+**4. On Linux it changes as predicted, and only the exponential** (`tools/expf_quality.sh` in the
+container, real model, `code-edit.txt` prompt plus 1000 generated tokens, 1411 positions). Against
+the earlier binary (`build/linux-before`, on glibc's `expf`): no row identical to the byte, maximum
+difference between two logits **2.3e-5** over a range of 65.8, **average KL 3.9e-13, maximum
+1.5e-11, 0 positions** choosing a different token, **1000 of 1000 tokens** equal. Against the
+emulation build (the earlier commit with every `expf` replaced by `(float)exp((double)x)`,
+`tools/cr_expf_emul.h`): **1411 of 1411 rows identical to the byte** and the same tokens, and it is
+a check (the script exits 1 if not): in the engine only the exponential changed, nothing else.
 
-**5. Windows e Linux danno gli stessi byte** (`sh tools/platform_bits.sh`): logit identici al byte
-fra il binario nativo e quello del container sulle fixture minuscole F32, F16 e Q8_0 (120 posizioni) e
-sul **modello vero a 2 layer su 1000 posizioni (201 MB)**. Il sospetto sulla tabella RoPE (`pow`, `cos`
-e `sin` della libreria C, in double, arrotondati a float: il solo posto rimasto dove i numeri vengono
-da una libreria) è misurato voce per voce (`tests/dump_rope.c`, `tools/rope_table_compare.py`; la
-seconda copia dello strumento, LESSONS #81, perché Smart App Control bloccava la prima): su 4096
-posizioni × 64 coppie i **double** di `cos` e `sin` differiscono fra le due librerie nello 0.8% delle
-voci (2175 coseni, 2216 seni su 262 144), `pow` mai, e i **float** della tabella del motore **mai**:
-l'arrotondamento a float assorbe l'ultima cifra del double. Domanda 40 chiusa: fino al contesto di
-addestramento di OLMoE le due piattaforme calcolano sugli stessi numeri.
+**5. Windows and Linux give the same bytes** (`sh tools/platform_bits.sh`): logits identical to the
+byte between the native binary and the container's on the tiny F32, F16 and Q8_0 fixtures (120
+positions) and on the **real 2-layer model over 1000 positions (201 MB)**. The suspicion about the
+RoPE table (the C library's `pow`, `cos` and `sin`, in double, rounded to float: the only place left
+where numbers come from a library) is measured entry by entry (`tests/dump_rope.c`,
+`tools/rope_table_compare.py`; the tool's second copy, LESSONS #81, because Smart App Control
+blocked the first): over 4096 positions × 64 pairs the **doubles** of `cos` and `sin` differ between
+the two libraries in 0.8% of entries (2175 cosines, 2216 sines of 262 144), `pow` never, and the
+engine table's **floats never**: rounding to float absorbs the double's last digit. Question 40
+closed: up to OLMoE's training context the two platforms compute on the same numbers.
 
-**6. Prima e dopo** (tok/s, mediana (min-max) di 8; decode forzato a 8 thread nei due binari, perché
-la larghezza scelta dalla sessione oscilla, domanda 31; soglia: prefill 3.0%, decode 1.9%):
+**6. Before and after** (tok/s, median (min-max) of 8; decode forced to 8 threads in both binaries,
+because the width chosen by the session oscillates, question 31; threshold: prefill 3.0%, decode
+1.9%):
 
-| | prima | prima, copia | dopo | dopo, copia | dopo / prima | stima (§Prefill su prompt lunghi, punto 6) |
+| | before | before, copy | after | after, copy | after / before | estimate (§Prefill on long prompts, point 6) |
 |---|---|---|---|---|---|---|
 | prefill, prompt 512 | 296.3 (271.6-313.7) | 290.8 | 305.5 (298.7-349.7) | 314.6 | 1.03-1.08× | 1.12× |
 | 2048 | 249.4 (239.4-261.5) | 252.7 | 303.2 (297.8-321.9) | 307.8 | **1.20-1.23×** | 1.23× |
 | 4000 | 210.9 (204.2-218.5) | 214.0 | 276.1 (267.8-281.3) | 276.5 | **1.29-1.31×** | 1.27× |
-| decode dopo 512 | 35.1 (34.8-36.1) | 35.1 | 36.0 (35.2-36.5) | 35.9 | **1.02-1.03×** | +5% |
-| dopo 2048 | 28.0 (27.6-28.2) | 27.5 | 29.3 (28.6-30.0) | 29.4 | **1.05-1.07×** | +8% |
-| dopo 4000 | 21.4 (21.1-21.8) | 21.2 | 23.2 (22.9-23.4) | 23.3 | **1.08-1.10×** | +10% |
+| decode after 512 | 35.1 (34.8-36.1) | 35.1 | 36.0 (35.2-36.5) | 35.9 | **1.02-1.03×** | +5% |
+| after 2048 | 28.0 (27.6-28.2) | 27.5 | 29.3 (28.6-30.0) | 29.4 | **1.05-1.07×** | +8% |
+| after 4000 | 21.4 (21.1-21.8) | 21.2 | 23.2 (22.9-23.4) | 23.3 | **1.08-1.10×** | +10% |
 
-A 512 il prefill è sopra la soglia contro tre copie su quattro (1.031× contro la quarta): «fra 1.03 e
-1.08×». Per zona (profilo dei due binari nella stessa sessione, ms del prompt):
+At 512 the prefill is above the threshold against three of four copies (1.031× against the fourth):
+"between 1.03 and 1.08×". Per zone (profile of both binaries in the same session, ms of the
+prompt):
 
-| | 512: prima | dopo | 2048: prima | dopo | 4000: prima | dopo |
+| | 512: before | after | 2048: before | after | 4000: before | after |
 |---|---|---|---|---|---|---|
 | `attention` | 92.3 | 40.5 | 1537 | 591 | 5960 | 2331 (**2.56×**) |
 | `expert_act` | 138.2 | 24.6 | 594.9 | 108.0 | 1201 | 218.4 (**5.5×**) |
 | `router` | 5.0 | 4.0 | 19.6 | 16.4 | 41.8 | 34.8 |
-| tutto il prompt | 1802 | 1644 (1.10×) | 8236 | 6825 (1.21×) | 19087 | 14693 (1.30×) |
+| whole prompt | 1802 | 1644 (1.10×) | 8236 | 6825 (1.21×) | 19087 | 14693 (1.30×) |
 
-Il softmax passa da 32-35 a **4.4-6.6 ns per elemento** (`make bench-attn`) e da 61-73% a 22-31%
-dell'attenzione. A un thread il prefill a 512 va 1.15× (25.2 → 28.9 tok/s).
+The softmax goes from 32-35 to **4.4-6.6 ns per element** (`make bench-attn`) and from 61-73% to
+22-31% of the attention. At one thread the prefill at 512 runs 1.15× (25.2 → 28.9 tok/s).
 
-**7. Il SIMD: i numeri per decidere** (non scritto). Dopo lo scalare, nel prefill a 512 / 2048 / 4000
-restano: softmax dell'attenzione circa 9 / 130 / 610 ms (il 22-27% di una zona che vale il 2.5 / 8.7 /
-15.9% del prompt) e `expert_act` 24.6 / 108 / 218 ms (l'1.5%). Con un esponenziale AVX-512 stimato a
-1.0-1.3 ns per elemento (8 double per registro; su Zen 4 i 512 bit sono due passate da 256 e il gather
-costa) e il resto del softmax vettoriale, softmax e attivazione scenderebbero del 65-70%: prefill
-stimato **1.01× / 1.03× / 1.04×**, decode +1-2%. Costo: circa 200 righe (varianti AVX2 e AVX-512
-identiche al bit allo scalare, gather dalla tabella, maschera per le corsie che non passano il test e
-code; voce `exp` nella tabella dei kernel con uno scratch per l'attivazione; la prova esaustiva per ogni
-tier, 7 s l'una nel cancello). Lo scalare ha preso quasi tutto: a 4000 token il guadagno che resta è
-sotto la soglia di una buona sessione. Decide Marcello (domanda 39).
+**7. SIMD: the numbers to decide with** (not written). After the scalar, in the prefill at 512 /
+2048 / 4000 there remains: the attention's softmax at about 9 / 130 / 610 ms (22-27% of a zone
+worth 2.5 / 8.7 / 15.9% of the prompt) and `expert_act` at 24.6 / 108 / 218 ms (1.5%). With an
+AVX-512 exponential estimated at 1.0-1.3 ns per element (8 doubles per register; on Zen 4 the 512
+bits are two 256-bit passes and the gather costs) and the rest of the softmax vectorized, softmax
+and activation would drop by 65-70%: estimated prefill **1.01× / 1.03× / 1.04×**, decode +1-2%.
+Cost: about 200 lines (AVX2 and AVX-512 variants bit-identical to the scalar, table gather, mask for
+lanes that fail the test, and tails; an `exp` entry in the kernel table with a scratch for the
+activation; the exhaustive proof for every tier, 7 s each at the gate). The scalar has taken almost
+everything: at 4000 tokens the gain left is below a good session's threshold. Marcello decides
+(question 39).
 
-**8. Come si rifà.**
+**8. How to redo it.**
 
-| misura | comando | dura |
+| measurement | command | takes |
 |---|---|---|
-| la prova su tutti i float, e il costo a chiamata | `make bench-expf`, nativo e nel container | 7-18 s |
-| le costanti dal generatore; le eccezioni ritrovate da zero | `tools/gen_expf_table.py [--check]`; `--scan` | 1 s; 4 minuti |
-| i controlli vedono gli errori? | `sh tools/mutate_expf.sh` nel container | 8 minuti |
-| Linux: KL e token contro il binario di prima, byte contro l'emulazione | `sh tools/expf_quality.sh` nel container, col volume dei modelli | 8 minuti |
-| Windows e Linux, gli stessi byte? | `sh tools/platform_bits.sh` | 3 minuti |
-| logit al byte, prima e dopo con A/A, banco, zone | `GEN_EXTRA="--decode-threads 8" PROF_BEFORE=<prima> sh tools/prefill_context.sh change <prima>` | 45 minuti |
+| the proof over every float, and the cost per call | `make bench-expf`, native and in the container | 7-18 s |
+| the constants from the generator; the exceptions found again from scratch | `tools/gen_expf_table.py [--check]`; `--scan` | 1 s; 4 minutes |
+| do the checks see the errors? | `sh tools/mutate_expf.sh` in the container | 8 minutes |
+| Linux: KL and tokens against the earlier binary, bytes against the emulation | `sh tools/expf_quality.sh` in the container, with the models volume | 8 minutes |
+| Windows and Linux, the same bytes? | `sh tools/platform_bits.sh` | 3 minutes |
+| logits to the byte, before and after with A/A, bench, zones | `GEN_EXTRA="--decode-threads 8" PROF_BEFORE=<before> sh tools/prefill_context.sh change <before>` | 45 minutes |
 
 
 ## M1, before writing code: routing and disk (2026-09-19/20)
 
-Domande 13-16. Una traccia del routing sul modello vero e un banco del disco; nessun cronometro sul
-motore, quindi nessuna dipendenza dallo stimatore della larghezza non ancora validato.
+Questions 13-16. A routing trace on the real model and a disk bench; no stopwatch on the engine, so
+no dependency on the width estimator, not yet validated.
 
-**La traccia.** `trochilus run --route-trace <file>` registra, per ogni token e ogni layer, gli 8
-esperti scelti e due previsioni dei 16 più probabili del layer dopo, col router del layer dopo:
-`pred_in` sullo stato che entra nel FFN del layer corrente (noto **prima** che girino i suoi
-esperti), `pred_out` sull'uscita del layer passata per la `ffn_norm` del layer dopo (noto solo a
-layer finito). Spenta non costa niente e non cambia un byte. `tests/test_route.c` la prova esatta su
-modelli sintetici (con l'uscita dell'attenzione a zero `pred_out` **è** la scelta del layer dopo; con
-il router del layer 0 generato come quello del layer 1 `pred_in` **è** la scelta del layer 0), cinque
-mutazioni viste rosse (`tools/mutate_route.sh`). Run: OLMoE-1B-7B Q8_0, `bench/prompts/code-1000.txt`
-(904 token di codice nostro), 300 token generati, nel container (si contano esperti, non secondi).
-Tabelle da `tools/route_trace_report.py build/route/code-1000.bin`.
+**The trace.** `trochilus run --route-trace <file>` records, for every token and every layer, the 8
+experts chosen and two predictions of the next layer's top 16, with the next layer's router:
+`pred_in` on the state entering the current layer's FFN (known **before** its experts run),
+`pred_out` on the layer's output passed through the next layer's `ffn_norm` (known only once the
+layer is finished). Off, it costs nothing and changes no byte. `tests/test_route.c` proves it exact
+on synthetic models (with the attention's output zeroed, `pred_out` **is** the next layer's choice;
+with layer 0's router generated as layer 1's, `pred_in` **is** layer 0's choice), five mutations
+seen red (`tools/mutate_route.sh`). Run: OLMoE-1B-7B Q8_0, `bench/prompts/code-1000.txt` (904 tokens
+of our own code), 300 tokens generated, in the container (experts are counted, not seconds). Tables
+from `tools/route_trace_report.py build/route/code-1000.bin`.
 
-Domanda 13, quota degli esperti scelti dal layer L+1 che stavano fra i primi K previsti:
+Question 13, the share of layer L+1's chosen experts that were among the top K predicted:
 
 | | `pred_in` 8 | 12 | 16 | `pred_out` 8 | 12 | 16 |
 |---|---|---|---|---|---|---|
-| tutti i token | 82.4% | 92.4% | 95.8% | 86.1% | 94.9% | 97.2% |
-| solo prompt | 81.4% | 91.7% | 95.3% | 85.5% | 94.5% | 97.0% |
-| solo generati | 85.2% | 94.5% | 97.1% | 88.0% | 96.0% | 97.8% |
-| layer peggiore (L=0) | 63.2% | 74.6% | 82.0% | 67.7% | 79.7% | 85.7% |
+| all tokens | 82.4% | 92.4% | 95.8% | 86.1% | 94.9% | 97.2% |
+| prompt only | 81.4% | 91.7% | 95.3% | 85.5% | 94.5% | 97.0% |
+| generated only | 85.2% | 94.5% | 97.1% | 88.0% | 96.0% | 97.8% |
+| worst layer (L=0) | 63.2% | 74.6% | 82.0% | 67.7% | 79.7% | 85.7% |
 
-La soglia era «almeno l'80% prevedendone al massimo 12»: **passata** (92-96%), e già con la
-previsione presa **prima** degli esperti, che lascia al disco il tempo di un layer intero; aspettare
-l'uscita del layer dà 2-3 punti in più e metà del tempo. Il primo layer è l'eccezione (75-80%): chi
-lo prevede è l'embedding, non un layer.
+The threshold was "at least 80% predicting at most 12": **passed** (92-96%), and already with the
+prediction taken **before** the experts run, which leaves the disk a whole layer's worth of time;
+waiting for the layer's output gives 2-3 more points and half the time. The first layer is the
+exception (75-80%): what predicts it is the embedding, not a layer.
 
-Domanda 14, cache di unità (layer, esperto) simulata su tutta la traccia (modello superato dalla misura: §M1 misurato), contata sui soli token
-generati; un esperto di un layer sono 6.375 MiB (tre matrici Q8_0), il modello ne ha 1024:
+Question 14, a cache of units (layer, expert) simulated over the whole trace (model superseded by
+measurement: §M1 measured: what experts really cost from disk), counted on the generated tokens
+only; a layer's expert is 6.375 MiB (three Q8_0 matrices), the model has 1024:
 
-| cache | LRU: mancati per token | LRU: MiB per token | pin dall'uso nel prompt: mancati | MiB |
+| cache | LRU: misses per token | LRU: MiB per token | usage pin from the prompt: misses | MiB |
 |---|---|---|---|---|
 | 25% (256) | 54.6 | 347.9 | 58.3 | 371.7 |
 | 50% (512) | 22.4 | 143.0 | 35.0 | 222.9 |
 | 75% (768) | 5.0 | 32.2 | 14.7 | 93.8 |
 
-Un token usa 128 unità (8 × 16): con metà modello in RAM ne mancano 22. **Il pin statico dall'uso
-perde contro l'LRU a ogni capacità** (a 75% legge il triplo): il piano di M1 diceva «pin dall'uso»,
-e su questa traccia è la scelta peggiore delle due.
+A token uses 128 units (8 × 16): with half the model in RAM, 22 are missed. **The static usage pin
+loses to the LRU at every capacity** (at 75% it reads three times as much): M1's plan said "usage
+pin", and on this trace it is the worse of the two choices.
 
-Domanda 15, streaming per layer interi (ogni token tocca ogni layer): 5106 / 3404 / 1702 MiB per
-token con il 25 / 50 / 75% dei layer in RAM, **15-53 volte** lo streaming per esperti. Chiusa: per
-esperti.
+Question 15, streaming whole layers (every token touches every layer): 5106 / 3404 / 1702 MiB per
+token with 25 / 50 / 75% of the layers in RAM, **15-53 times** streaming by experts. Closed: by
+experts.
 
-**La lettura diretta, sul modello vero in nativo** (2026-09-20, una run per modo, non una misura:
-serve solo a dire che la catena regge fuori dal container e fuori dai modelli minuscoli). Budget
-3264 MiB, prompt 8, 2 token: `experts: 511 of 1024 units in RAM (3264 MiB, direct), 109 hits, 584
-misses, 3723 MiB read in 2.96 s`, e con `TR_EXPERT_DIRECT=0` gli stessi colpiti, mancati e MiB in
-3.41 s. Due cose: **3723 MiB in 2.96 s sono 1258 MiB/s**, cioè la banda del disco misurata da
-`make bench-disk` (~1.4 GB/s a blocchi da 2 MiB) e non quella della RAM, quindi si sta leggendo
-davvero dal disco anche su un volume cifrato; e gli slot sono **511 contro 512**, perché in diretta
-ognuno porta un settore di margine per parte (3 × 4 KiB su 6.4 MiB: lo 0.2%).
+**The direct read, on the real model, native** (2026-09-20, one run per mode, not a measurement:
+it only serves to say the chain holds up outside the container and outside the tiny models). Budget
+3264 MiB, prompt 8, 2 tokens: `experts: 511 of 1024 units in RAM (3264 MiB, direct), 109 hits, 584
+misses, 3723 MiB read in 2.96 s`, and with `TR_EXPERT_DIRECT=0` the same hits, misses and MiB in
+3.41 s. Two things: **3723 MiB in 2.96 s is 1258 MiB/s**, that is, the disk's bandwidth as measured
+by `make bench-disk` (~1.4 GB/s at 2 MiB blocks) and not RAM's, so it really is reading from disk
+even on an encrypted volume; and the slots are **511 against 512**, because in direct mode each one
+carries a margin sector on each side (3 × 4 KiB over 6.4 MiB: 0.2%).
 
-**Il costo di una chiamata di lettura** (LESSONS #94, misurato il 2026-09-20 in nativo,
-`bench_event_overhead` in `tests/bench_disk.c`): su Windows `tr_file_pread` crea e chiude un evento
-a ogni chiamata. Su un blocco da 4 KiB già in cache, 20 000 giri: **2.54-2.61 µs** contro
-**2.11-2.20 µs** con un evento tenuto vivo, cioè 0.41-0.44 µs a chiamata su tre run. Una lettura da
-2 MiB su questo disco è 1.4 ms: lo 0.03%. Non si cambia.
+**The cost of a read call** (LESSONS #94, measured on 2026-09-20 natively,
+`bench_event_overhead` in `tests/bench_disk.c`): on Windows `tr_file_pread` creates and closes an
+event on every call. On a 4 KiB block already in cache, 20 000 rounds: **2.54-2.61 µs** against
+**2.11-2.20 µs** with an event kept alive, that is, 0.41-0.44 µs per call over three runs. A 2 MiB
+read on this disk is 1.4 ms: 0.03%. Not changed.
 
-**Il disco** (domanda 16). `make bench-disk` (`tests/bench_disk.c`): blocchi grandi quanto una
-matrice di un esperto (2.125 MiB) e quanto tre (6.375 MiB), a posizioni casuali allineate del file
-del modello (6.85 GiB), aperto senza la cache del sistema (`FILE_FLAG_NO_BUFFERING`; `O_DIRECT` su
-Linux), con 1-16 lettori; prima di ogni numero il lettore diretto e `tr_file_pread` devono dare gli
-stessi byte. Nativo, macchina ferma (`tools/machine_still.sh`), due sessioni, mediana di 5 run
-ciascuna (`build/disk/run1.txt`, `run2.txt`); NVMe Micron 2400 da 1 TB (QLC, senza DRAM).
+**The disk** (question 16). `make bench-disk` (`tests/bench_disk.c`): blocks the size of one
+expert's matrix (2.125 MiB) and of three (6.375 MiB), at random aligned positions of the model file
+(6.85 GiB), opened without the system cache (`FILE_FLAG_NO_BUFFERING`; `O_DIRECT` on Linux), with
+1-16 readers; before every number the direct reader and `tr_file_pread` must give the same bytes.
+Native, still machine (`tools/machine_still.sh`), two sessions, median of 5 runs each
+(`build/disk/run1.txt`, `run2.txt`); 1 TB NVMe Micron 2400 (QLC, no DRAM).
 
-| blocco | 1 lettore | 4 | 8 | 16 | spread |
+| block | 1 reader | 4 | 8 | 16 | spread |
 |---|---|---|---|---|---|
 | 2.125 MiB | 1396 / 1454 MB/s | 1489 / 1471 | 1504 / 1514 | 1373 | 8-16% |
 | 6.375 MiB | 1641 / 1718 | 1749 / 1696 | 1666 / 1723 | 1614 | 7-20% |
 
-Attraverso la cache del sistema (`tr_file_pread`, 8 lettori): la prima lettura 1.66-1.93 GB/s, la
-seconda degli stessi blocchi **12-26 GB/s** (è una copia dalla RAM).
+Through the system cache (`tr_file_pread`, 8 readers): the first read 1.66-1.93 GB/s, the second
+read of the same blocks **12-26 GB/s** (it is a copy from RAM).
 
-1. **Il disco dà ~1.5 GB/s e i lettori non contano**: uno solo prende quanto otto, sedici perdono.
-   Il «pool di I/O» di M1 non serve per la banda: bastano 1-2 thread, e servono solo a non fermare
-   il calcolo. Tre matrici in fila rendono il 15% in più di tre letture separate.
-2. **1.5 GB/s è un terzo della scheda del disco** (4.5 GB/s in lettura sequenziale). Non si sa
-   perché: cifratura del volume, QLC senza DRAM su letture sparse, o la richiesta sincrona da 2 MiB.
-   Domanda 41.
-3. **Token al secondo attesi** (decode a 8 thread ~28-36 ms di calcolo per token; 1 MB = 10^6 byte,
-   1.5 GB/s = 1430 MiB/s): con la cache al 50% si leggono 143 MiB = 100 ms per token, cioè **7-8
-   tok/s** se lettura e calcolo si sommano e **10 tok/s** se si sovrappongono del tutto (la
-   previsione della domanda 13 serve a questo); al 75% 22 ms, **17-20 tok/s** sommati e il solo calcolo
-   (28-36) se sovrapposti; al 25% 243 ms, **3.6-4.1 tok/s**. Il criterio era «per esperti se almeno 5 tok/s al 50%»: **passato**.
-4. La cache del sistema rende 12-26 GB/s su ciò che ha già letto, ma non si governa (né quanto
-   tiene né cosa butta): il budget di RAM di M1 resta nostro, e la lettura va fatta senza passare
-   due volte dalla RAM (o diretta, o nostra: da decidere nel progetto).
-5. Limiti della misura: una sola traccia (codice, 904 + 300 token) e un solo modello, con esperti
-   piccoli (8 attivi su 64); il prompt è contato token per token, mentre un prefill a blocchi tocca
-   quasi tutti gli esperti di ogni layer in una passata (per il prompt lo streaming per esperti vale
-   quanto leggere tutto il modello una volta).
-6. **Con questo disco il precaricamento non rende, e con 12 candidati fa danno.** Il report simula
-   la stessa LRU col precaricamento dei primi k di `pred_in` (per token generato, cache al 50%):
-   gli stalli scendono da 22.4 a 7.2 (k=8) e 5.5 (k=12), ma le letture salgono da 22.4 a 29.9 e
-   49.8, perché 5 e 21 sono di esperti che poi non servono. Il disco è il collo, quindi conta il
-   totale letto, non gli stalli. **Modello a tempo** (modello, non misura: un disco, una lettura per
-   volta a 4.46 ms per unità, 33 ms di calcolo per token; `route_trace_report.py`, provato a mano
-   in `--check` e con quattro mutazioni rosse):
+1. **The disk gives ~1.5 GB/s and readers don't matter**: one alone gets as much as eight, sixteen
+   lose. M1's "I/O pool" is not for bandwidth: 1-2 threads are enough, and they only serve to keep
+   compute from stalling. Three matrices in a row give 15% more than three separate reads.
+2. **1.5 GB/s is a third of the disk's spec** (4.5 GB/s sequential read). It is not known why:
+   volume encryption, QLC with no DRAM on sparse reads, or the synchronous 2 MiB request. Question
+   41.
+3. **Expected tokens per second** (decode at 8 threads ~28-36 ms of compute per token; 1 MB = 10^6
+   bytes, 1.5 GB/s = 1430 MiB/s): with the cache at 50%, 143 MiB are read = 100 ms per token, that
+   is, **7-8 tok/s** if reading and compute add up and **10 tok/s** if they fully overlap (this is
+   what question 13's prediction is for); at 75%, 22 ms, **17-20 tok/s** summed and compute alone
+   (28-36) if overlapped; at 25%, 243 ms, **3.6-4.1 tok/s**. The criterion was "by experts if at
+   least 5 tok/s at 50%": **passed**.
+4. The system cache gives 12-26 GB/s on what it has already read, but it cannot be governed (neither
+   how much it keeps nor what it drops): M1's RAM budget stays ours, and the read must be done
+   without passing through RAM twice (either direct, or ours: to be decided in the project).
+5. Limits of the measurement: a single trace (code, 904 + 300 tokens) and a single model, with small
+   experts (8 active of 64); the prompt is counted token by token, while a batched prefill touches
+   almost every expert of every layer in one pass (for the prompt, streaming by experts costs as
+   much as reading the whole model once).
+6. **With this disk, prefetching does not pay, and with 12 candidates it hurts.** The report's
+   simulation (model, not measured) of the same LRU with prefetching of `pred_in`'s top k (per
+   generated token, cache at 50%): stalls drop from 22.4 to 7.2 (k=8) and 5.5 (k=12), but reads
+   rise from 22.4 to 29.9 and 49.8, because 5 and 21 are experts that then are not needed. The disk
+   is the bottleneck, so what counts is the total read, not the stalls. **Time model** (model, not
+   measured: one disk, one read at a time at 4.46 ms per unit, 33 ms of compute per token;
+   `route_trace_report.py`, hand-checked with `--check` and with four mutations seen red):
 
-   | cache | senza | k=8 | k=12 | k=16 | | disco 3× (4.3 GB/s): senza | k=8 | k=12 |
+   | cache | without | k=8 | k=12 | k=16 | | disk 3× (4.3 GB/s): without | k=8 | k=12 |
    |---|---|---|---|---|---|---|---|---|
    | 25% | 3.6 tok/s | 3.5 | 2.2 | 1.6 | | 8.8 | 10.0 | 6.4 |
    | 50% | 7.5 | 7.0 | 4.5 | 3.0 | | 15.1 | 17.4 | 12.7 |
    | 75% | 18.0 | 18.1 | 13.0 | 9.0 | | 24.7 | 26.9 | 24.6 |
 
-   La soglia della domanda 13 («80% con 12 candidati») misurava la cosa sbagliata: la previsione è
-   buona, ma ogni candidato in più è una lettura, e la lettura è ciò che manca. Il primo M1 è
-   **LRU e letture a richiesta, senza precaricamento**; il precaricamento (k = gli 8 più probabili,
-   mai di più) resta un'opzione che il piano automatico accende solo su un disco veloce, dove vale
-   l'11-15%. Domanda 43.
+   Question 13's threshold ("80% with 12 candidates") measured the wrong thing: the prediction is
+   good, but every extra candidate is a read, and the read is what is missing. The first M1 is
+   **LRU and on-demand reads, with no prefetching**; prefetching (k = the top 8 most likely, never
+   more) remains an option the automatic plan turns on only on a fast disk, where it is worth
+   11-15%. Question 43.
 
 ## M1 measured: what experts really cost from disk (2026-09-20 night)
 
-Il motore vero, Windows nativo, macchina ferma (carico di fondo 1.0-1.4 processori su 16, quasi
-tutto il processo System), `sh tools/experts_budget.sh measure | misses | long | direct`. Prompt di
-512 token, larghezza del decode **forzata a 8** (lo stimatore non è validato, punto 0), lettura
-diretta verificata prima di ogni sessione, ordine a rotazione e una copia A/A per ogni modo
-(`tools/ab_modes.sh`). Il modello ha 1024 unità (layer, esperto) da 6.375 MiB: 6528 MiB in tutto.
+The real engine, native Windows, still machine (background load 1.0-1.4 processors of 16, almost
+all the System process), `sh tools/experts_budget.sh measure | misses | long | direct`. A 512-token
+prompt, decode width **forced to 8** (the estimator is not validated, point 0), direct read
+verified before every session, rotating order and one A/A copy per mode (`tools/ab_modes.sh`). The
+model has 1024 units (layer, expert) of 6.375 MiB: 6528 MiB in all.
 
-**1. Velocità ai quattro budget** (mediana di 6, 64 token generati; fra parentesi la copia A/A):
+**1. Speed at the four budgets** (median of 6, 64 tokens generated; the A/A copy in parentheses):
 
-| budget | decode tok/s | vs 100% | prefill tok/s | miss della run | MiB letti |
+| budget | decode tok/s | vs 100% | prefill tok/s | run's misses | MiB read |
 |---|---|---|---|---|---|
-| 100% (residente) | 35.45 (35.66) | 1.00× | 306.9 (319.4) | — | — |
+| 100% (resident) | 35.45 (35.66) | 1.00× | 306.9 (319.4) | — | — |
 | 75% | 29.56 (29.32) | 0.83× | 80.5 (80.9) | 1009 | 6432 |
 | 50% | 24.27 (24.25) | 0.68× | 82.3 (82.1) | 1106 | 7051 |
 | 25% | 20.56 (20.64) | 0.58× | 84.0 (83.5) | 1204 | 7676 |
 
-**Il dirupo è fra residente e non residente, non fra i budget.** Il prefill fa 306.9 tok/s se il
-modello è in RAM e 80-84 con qualunque budget parziale — il 75% non aiuta più del 25%, perché il
-prompt legge comunque tutto il modello: 6432-7676 MiB contro i 6528 minimi (ogni unità una volta).
-Sono ~4.3 s di disco a 1.5 GB/s, pagati **una volta per sessione**. Il budget decide il decode.
+**The cliff is between resident and non-resident, not between the budgets.** The prefill runs at
+306.9 tok/s if the model is in RAM and at 80-84 with any partial budget — 75% does not help more
+than 25%, because the prompt reads the whole model regardless: 6432-7676 MiB against the minimum
+6528 (every unit once). That is ~4.3 s of disk at 1.5 GB/s, paid **once per session**. The budget
+decides the decode.
 
-**2. Quanto costa un token generato** (differenza fra due lunghezze di generazione, così il prompt
-esce dal conto; i contatori non si muovono da run a run, spread 0.0%):
+**2. How much a generated token costs** (difference between two generation lengths, so the prompt
+drops out of the count; the counters do not move from run to run, 0.0% spread):
 
-| budget | 72 contro 8 token: miss/token | MiB/token | 1000 contro 200: miss/token | MiB/token |
+| budget | 72 against 8 tokens: misses/token | MiB/token | 1000 against 200: misses/token | MiB/token |
 |---|---|---|---|---|
 | 75% | 0.1 | 0.5 | — | — |
 | 50% | 0.3 | 1.8 | 0.03 | 0.2 |
 | 25% | 0.6 | 3.7 | 0.14 | 0.9 |
 
-**La simulazione della domanda 14 (modello superato dalla misura) diceva 22.4 miss e 143 MiB per token al 50%: il motore ne fa
-0.3 subito dopo il prompt e 0.03 lontano dal prompt**, cioè 70-700 volte meno. Non è un errore di
-conto: quella simulazione (modello superato dalla misura) contava i miss su una generazione lunga di 1000 token partendo da una cache
-qualunque, mentre il motore arriva al decode con la LRU appena riempita dal prompt — che ha toccato
-quasi ogni unità. Le ultime 512 (o 256) unità toccate sono esattamente quelle che servono, e più la
-generazione va avanti **meno** sbaglia, non di più (LESSONS #98).
+**Question 14's simulation (model superseded by measurement) said 22.4 misses and 143 MiB per token
+at 50%: the engine gives 0.3 right after the prompt and 0.03 far from the prompt**, that is, 70-700
+times fewer. It is not a counting error: that simulation (model superseded by measurement) counted
+misses over a 1000-token generation starting from an arbitrary cache, while the engine reaches the
+decode with the LRU just filled by the prompt — which has touched almost every unit. The last 512
+(or 256) units touched are exactly the ones needed, and the further generation goes the **less** it
+misses, not more (LESSONS #98).
 
-**3. Il decode migliora con la lunghezza della generazione**, e il colpevole è l'archivio:
+**3. The decode improves with the length of generation**, and the store is the reason:
 
-| budget | 64 token | 200 token | 1000 token | ms/token in più a 200 | costo fisso |
+| budget | 64 tokens | 200 tokens | 1000 tokens | extra ms/token at 200 | fixed cost |
 |---|---|---|---|---|---|
-| 100% (residente) | 35.45 | 34.64 | 33.48 | **−1.0** | **nessuno** |
+| 100% (resident) | 35.45 | 34.64 | 33.48 | **−1.0** | **none** |
 | 50% | 24.27 | 29.21 | 30.79 | +1.75 | ~0.35 s |
 | 25% | 20.56 | 26.53 | 29.84 | +4.18 | ~0.84 s |
 
-La sessione che decide è quella del 2026-09-21 notte, con dentro il **budget pieno**: col modello
-residente il tempo per token non migliora affatto passando da 200 a 1000 (anzi peggiora di 1 ms,
-dentro uno spread del 4-7%). Quindi il costo fisso **non** è scaldamento dei kernel, né il primo
-token, né il nostro metro: compare solo quando si legge dal disco e cresce quanto più il budget è
-stretto. È l'archivio che si riassesta dopo il prompt, e una fase di preparazione all'avvio non lo
-può nascondere, perché succede *dopo* il prompt.
+The deciding session is the one from the night of 2026-09-21, with the **full budget** inside: with
+the resident model the time per token does not improve at all going from 200 to 1000 (it actually
+worsens by 1 ms, within a 4-7% spread). So the fixed cost is **not** kernel warm-up, nor the first
+token, nor our own yardstick: it appears only when reading from disk and grows the tighter the
+budget is. It is the store resettling after the prompt, and a startup preparation phase cannot hide
+it, because it happens *after* the prompt.
 
-I mancati in più dei primi token ne spiegano una parte (al 25%: 27 unità in più nei primi 200
-token, 172 MiB, ~115 ms su ~840). Il resto è da trovare con un profilo per zone dei primi 64 token
-contro quelli lontani dal prompt: domanda 46, ristretta a questo.
+The first tokens' extra misses explain part of it (at 25%: 27 extra units in the first 200 tokens,
+172 MiB, ~115 ms of ~840). The rest is to be found with a per-zone profile of the first 64 tokens
+against tokens far from the prompt: question 46, narrowed to this.
 
-**4. La lettura diretta contro la cache del sistema** (budget 50%, mediana di 6, stessi miss e
-stessi MiB nei due modi: cambia solo da dove arrivano i byte):
+**4. Direct read against the system cache** (budget 50%, median of 6, same misses and same MiB in
+both modes: only where the bytes come from changes):
 
 | | prefill tok/s | decode tok/s |
 |---|---|---|
@@ -1951,198 +1979,202 @@ stessi MiB nei due modi: cambia solo da dove arrivano i byte):
 | `buffered` (`TR_EXPERT_DIRECT=0`) | 197.0 | 32.6 |
 | | **2.42×** | **1.35×** |
 
-Con 7 GiB letti e 31 GiB di RAM la cache del sistema tiene tutto il modello: «buffered» misura la
-RAM, non il disco. Per questo `experts_budget.sh` si rifiuta di partire se la riga `experts:` non
-dice `direct` — senza quella guardia ogni numero di M1 sarebbe gonfiato di 2.4× sul prompt.
+With 7 GiB read and 31 GiB of RAM the system cache holds the whole model: "buffered" measures RAM,
+not the disk. This is why `experts_budget.sh` refuses to start if the `experts:` line does not say
+`direct` — without that guard every M1 number would be inflated 2.4× on the prompt.
 
 ## Prefill reads model once per pass (2026-09-21)
 
-Domanda 47, nata dalla domanda della sovrapposizione I/O-calcolo: quanto del prefill è attesa del
-disco e quanto calcolo. Il profilo separa le due cose (zona `weight_read`), e il conto ha trovato
-dell'altro. `sh tools/prefill_overlap.sh 5` (mediana di 5 giri più uno di riscaldamento, ordine a
-rotazione, macchina ferma a 1.07-1.19 processori su 16, binario `build/native2` perché Smart App
-Control bloccava il primo, LESSONS #81):
+Question 47, born from the question of I/O-compute overlap: how much of the prefill is disk wait
+and how much is compute. The profile separates the two (the `weight_read` zone), and the count
+found something else. `sh tools/prefill_overlap.sh 5` (median of 5 rounds plus one warm-up,
+rotating order, still machine at 1.07-1.19 processors of 16, binary `build/native2` because Smart
+App Control blocked the first, LESSONS #81):
 
-| modo | prefill s | disco s | calcolo s | MiB letti | GB/s | tetto sovrapposizione |
+| mode | prefill s | disk s | compute s | MiB read | GB/s | overlap ceiling |
 |---|---|---|---|---|---|---|
-| prompt 512, residente | 1.65 | 0.00 | 1.65 | 0 | — | — |
+| prompt 512, resident | 1.65 | 0.00 | 1.65 | 0 | — | — |
 | prompt 512, budget 50% | 6.11 | 4.44 | 1.68 | 6 031 | 1.33 | 1.38× |
-| prompt 2048, residente | 7.11 | 0.00 | 7.11 | 0 | — | — |
+| prompt 2048, resident | 7.11 | 0.00 | 7.11 | 0 | — | — |
 | prompt 2048, budget 50% | 23.51 | 16.26 | 7.24 | **22 880** | 1.37 | 1.45× |
-| prompt 2048, budget 50%, **una passata** (`-b 2048`) | **11.27** | 4.60 | 6.67 | **6 273** | 1.33 | 1.69× |
+| prompt 2048, budget 50%, **one pass** (`-b 2048`) | **11.27** | 4.60 | 6.67 | **6 273** | 1.33 | 1.69× |
 
-Spread 0.7-8.7%. Il «tetto della sovrapposizione» è `totale / max(disco, calcolo)`: **modello, non
-misura**, è il limite di un lettore che non esiste ancora.
+Spread 0.7-8.7%. The "overlap ceiling" is `total / max(disk, compute)`: **model, not measured**,
+it is the limit of a reader that does not exist yet.
 
-**Il controllo torna al centesimo**: a 512 il prefill sotto budget meno il residente fa
-`6.11 − 1.68 = 4.43` contro i 4.44 s che la zona dichiara, e sui modi residenti il disco è 0.00.
-La contabilità del profilo è esatta, e il disco va a 1.33-1.37 GB/s come dice `make bench-disk`.
+**The count checks out to the cent**: at 512, the under-budget prefill minus the resident one gives
+`6.11 − 1.68 = 4.43` against the 4.44 s the zone declares, and on the resident modes the disk is
+0.00. The profile's accounting is exact, and the disk runs at 1.33-1.37 GB/s as `make bench-disk`
+says.
 
-**Il difetto**: 22 880 MiB sono **3.5 volte** la tabella degli esperti (6 528 MiB). Il prompt si
-elabora a blocchi di 512 token (`OLMOE_DEFAULT_BATCH` in `src/models/olmoe.c`) e **ogni passata
-percorre tutti i layer**: sotto budget la LRU non può tenere il modello fra una passata e l'altra,
-quindi ogni passata rilegge tutto. 2048 / 512 = 4 passate, 3.65× i byte. A 4000 token sono otto.
+**The defect**: 22 880 MiB is **3.5 times** the experts' table (6 528 MiB). The prompt is processed
+in blocks of 512 tokens (`OLMOE_DEFAULT_BATCH` in `src/models/olmoe.c`) and **every pass walks all
+the layers**: under budget the LRU cannot keep the model between one pass and the next, so every
+pass rereads everything. 2048 / 512 = 4 passes, 3.65× the bytes. At 4000 tokens it is eight.
 
-**Esatto, e già dimostrabile senza toccare codice**: con `-b 2048` i byte scendono a 6 273 MiB
-(una volta sola, più il margine dei settori) e il prefill passa da 23.51 a 11.27 s. `logits -b 512`
-e `logits -b 2048` sullo stesso prompt danno l'**ultima riga identica al byte** (201 216 byte,
-`cmp`), che è quello che le due forme hanno in comune: la passata non cambia i numeri, cambia
-quante volte si legge il disco.
+**Exact, and already provable without touching code**: with `-b 2048` the bytes drop to 6 273 MiB
+(once only, plus the sectors' margin) and the prefill goes from 23.51 to 11.27 s. `logits -b 512`
+and `logits -b 2048` on the same prompt give the **last row identical to the byte** (201 216 bytes,
+`cmp`), which is what the two forms have in common: the pass does not change the numbers, it
+changes how many times the disk is read.
 
-**Il calcolo non peggiora con la passata grande**: 6.67 s contro 7.24 a quattro passate (e 7.11 il
-residente). Quindi il motivo per non alzare `-b` e basta **non sono i kernel, è la memoria**: le
-attivazioni, la KV e lo scratch di una passata crescono col numero di token, e a 4000 o 32000 una
-passata unica non sta in RAM.
+**The compute does not worsen with the large pass**: 6.67 s against 7.24 at four passes (and 7.11
+resident). So the reason not to simply raise `-b` is **not the kernels, it is memory**: the
+activations, the KV and one pass's scratch grow with the number of tokens, and at 4000 or 32000 a
+single pass does not fit in RAM.
 
-**La cura è l'ordine per layer, scritta il 2026-09-21** (`src/models/olmoe.c`: il corpo di un
-layer estratto in `forward_layer`, e `forward_prompt_layer_major` che per ogni layer percorre tutte
-le passate del prompt; lo stato nascosto dell'intero prompt sta in `s->x_all`, allocato alla
-creazione della sessione e solo quando l'archivio è parziale — nella zona calda non si alloca).
-Ogni esperto si legge una volta per prompt tenendo i blocchi piccoli; a budget pieno il percorso è
-quello di prima, invariato.
+**The cure is the per-layer order, written on 2026-09-21** (`src/models/olmoe.c`: a layer's body
+extracted into `forward_layer`, and `forward_prompt_layer_major`, which for every layer walks all
+the prompt's passes; the hidden state of the whole prompt sits in `s->x_all`, allocated when the
+session is created and only when the store is partial — nothing is allocated in the hot zone).
+Every expert is read once per prompt while keeping the blocks small; at full budget the path is the
+earlier one, unchanged.
 
-| prompt 2048, budget 50% | prima | dopo | |
+| prompt 2048, budget 50% | before | after | |
 |---|---|---|---|
-| MiB letti | 22 880 | **6 273** | 3.65× meno |
+| MiB read | 22 880 | **6 273** | 3.65× fewer |
 | prefill | 23.51 s | **12.41 s** | **1.89×** |
-| calcolo | 7.24 s | 7.73 s | non distinguibile |
+| compute | 7.24 s | 7.73 s | not distinguishable |
 
-Mediana di 5 giri più uno di riscaldamento, spread 11.4%, macchina ferma (0.94-1.37 processori su
-16). Nella stessa sessione `-b 2048` (una passata) dà 12.03 s e gli stessi 6 273 MiB: le due forme
-coincidono entro il 3%, cioè l'ordine per layer arriva al tetto dell'esperimento senza far crescere
-le attivazioni. A prompt 512 (una passata sola) niente cambia: 6.27 s contro 6.11, dentro lo spread.
+Median of 5 rounds plus one warm-up, spread 11.4%, still machine (0.94-1.37 processors of 16). In
+the same session `-b 2048` (one pass) gives 12.03 s and the same 6 273 MiB: the two forms agree
+within 3%, that is, the per-layer order reaches the experiment's ceiling without growing the
+activations. At prompt 512 (already a single pass) nothing changes: 6.27 s against 6.11, within the
+spread.
 
-Il controllo che chiude la lezione #99 è `tests/test_stream.c` §`once_per_prompt`: 36 token in
-passate da 12 sull'archivio minimo, le unità lette devono stare entro `n_units + n_slots`. Visto
-rosso prima del fix (33 lette, 16 in tabella) e verde dopo. **Con `--route-trace` attivo si resta
-sull'ordine di prima**: la traccia numera le righe da `n_tokens`, che avanza solo dopo l'ultimo
-layer, quindi in ordine per layer i blocchi si sovrascriverebbero; è un modo di sola misura e non
-vale un secondo modo di contare.
+The check that closes lesson #99 is `tests/test_stream.c` §`once_per_prompt`: 36 tokens in passes
+of 12 on the minimal store, the units read must stay within `n_units + n_slots`. Seen red before
+the fix (33 read, 16 in the table) and green after. **With `--route-trace` active the earlier order
+stays in place**: the trace numbers rows from `n_tokens`, which advances only after the last layer,
+so in per-layer order the blocks would overwrite each other; it is a measurement-only mode and is
+not worth a second way of counting.
 
-**Le leve del prefill sotto budget, in ordine di resa** (le prime due si moltiplicano):
+**The levers of the under-budget prefill, in order of payoff** (the first two multiply):
 
-| leva | guadagno | costo |
+| lever | gain | cost |
 |---|---|---|
-| esperti letti una volta per prompt (ordine per layer) | **2.09×** a 2048, di più sui prompt lunghi | esatto, nessuno |
-| archivio che sopravvive alla sessione (domanda 45) | toglie il disco dalla seconda sessione in poi | un demone |
-| sovrapporre disco e calcolo | 1.38-1.69×, tetto (modello, non misura) | un lettore, un thread |
-| riordino del file per co-attivazione (mbolt, MIT) | ≤ 1.15× qui | un formato nostro |
+| experts read once per prompt (per-layer order) | **2.09×** at 2048, more on long prompts | exact, none |
+| a store that survives the session (question 45) | removes the disk from the second session on | a daemon |
+| overlapping disk and compute | 1.38-1.69×, ceiling (model, not measured) | a reader, a thread |
+| file reordering by co-activation (mbolt, MIT) | ≤ 1.15× here | a format of our own |
 
-Su mbolt (`github.com/doramirdor/mbolt`): esiste, MIT, e il suo README dichiara 2.23× **sulle
-letture** e 1.55× end-to-end su Qwen3-Next-80B, 512 esperti per layer, con il modello più grande
-della RAM. Dice anche dove smette di rendere: «~4 MB slices cap gains at 1.3×» e «greatest benefit
-at deep offload (≳ 2.5× RAM ratio)». I nostri esperti sono 6.375 MiB e il modello sta in 7 GiB su
-31 di RAM: siamo fuori dal suo campo, e il nostro `bench-disk` (1.4-1.5 GB/s a blocchi da 2.125
-MiB contro 1.6-1.75 da 6.375) mette il tetto a ~1.15×. Non misurato da noi: è lettura, non misura.
+On mbolt (`github.com/doramirdor/mbolt`): it exists, MIT, and its README claims 2.23× **on reads**
+and 1.55× end-to-end on Qwen3-Next-80B, 512 experts per layer, with the model larger than RAM. It
+also says where it stops paying off: "~4 MB slices cap gains at 1.3×" and "greatest benefit at deep
+offload (≳ 2.5× RAM ratio)". Our experts are 6.375 MiB and the model fits in 7 GiB of 31 of RAM: we
+are outside its range, and our `bench-disk` (1.4-1.5 GB/s at 2.125 MiB blocks against 1.6-1.75 at
+6.375) puts the ceiling at ~1.15×. Not measured by us: it is a reading, not a measurement.
 
 ## Is code behavior a small, deterministic graph? (2026-09-20)
 
-Domanda 44 (Marcello), con le soglie scritte prima di misurare (riga 44 di §Da misurare). Sei
-tracce del routing su OLMoE-1B-7B Q8_0, 300 token generati ciascuna, nel container (si contano
-esperti, non secondi): quattro di codice nostro (`code-1000` C, `trace-c2` C, `trace-py` Python,
-`trace-sh` shell; 842-904 token di prompt) e due di prosa di controllo (`trace-prose-it`, un pezzo
-di questo progetto in italiano, 941 token; `trace-prose-en`, un testo inglese sui colibrì, 583
-token e 265 generati). Traccia versione 2: anche l'id di ogni token e il margine del router
-(probabilità dell'ultimo esperto scelto e del migliore escluso), esatti per prova
-(`tests/test_route.c`: al layer 0 l'escluso di un modello con 2 esperti per token **è** l'ultimo
-scelto dello stesso modello con 3). Tabelle da `tools/route_graph_report.py` (`--check` calcolato
-a mano, mutazioni in `tools/mutate_reports.py`); file in `build/route/`.
+Question 44 (Marcello), with the thresholds written before measuring (row 44 of §Open questions:
+what to measure). Six routing traces on OLMoE-1B-7B Q8_0, 300 tokens generated each, in the
+container (experts are counted, not seconds): four of our own code (`code-1000` C, `trace-c2` C,
+`trace-py` Python, `trace-sh` shell; 842-904 prompt tokens) and two control prose ones
+(`trace-prose-it`, a piece of this project in Italian, 941 tokens; `trace-prose-en`, an English text
+about hummingbirds, 583 tokens and 265 generated). Trace version 2: also every token's id and the
+router's margin (probability of the last expert chosen and of the best excluded one), exact by
+proof (`tests/test_route.c`: at layer 0 the excluded expert of a model with 2 experts per token
+**is** the last one chosen by the same model with 3). Tables from `tools/route_graph_report.py`
+(`--check` computed by hand, mutations in `tools/mutate_reports.py`); files in `build/route/`.
 
-| | code-1000 | c2 | py | sh | prosa it | prosa en |
+| | code-1000 | c2 | py | sh | prose it | prose en |
 |---|---|---|---|---|---|---|
-| unità usate, di 1024 | 1012 | 998 | 1006 | 1011 | 1013 | 1018 |
-| il 25% più usato copre | 68.1% | 73.2% | 72.5% | 70.0% | 60.9% | 51.7% |
-| il 50% più usato copre | 87.7% | 92.5% | 91.2% | 87.7% | 83.6% | 79.2% |
-| unità per il 99% delle attivazioni | 84.9% | 75.6% | 81.8% | 84.0% | 85.6% | 89.5% |
-| grafo statico di co-occorrenze, primi 8 (il router vivo: 82-86%) | 53.7% | 64.2% | 64.8% | 54.3% | 59.3% | 51.3% |
-| sola frequenza, primi 8 (caso: 12.5%) | 40.2% | 51.9% | 54.2% | 40.0% | 37.7% | 20.7% |
-| stesso id di token → stesso insieme, layer 0 / media / ultimo | 14% / 11% / 12% | 16 / 14 / 16 | 13 / 11 / 14 | 9 / 10 / 14 | 6 / 9 / 27 | 3 / 6 / 8 |
-| idem, Jaccard medio, layer 0 / media | 0.51 / 0.60 | 0.51 / 0.64 | 0.46 / 0.62 | 0.42 / 0.62 | 0.40 / 0.56 | 0.33 / 0.51 |
-| esperti in comune col token prima, di 8 (caso 1.0) | 3.6 | 3.9 | 3.9 | 4.0 | 3.3 | 3.0 |
-| percorsi interi ripetuti | 0 | 0 | 0 | 0 | 0 | 0 |
-| margine del router, mediana (quota della probabilità dell'ultimo scelto) | 5.1% | | | | | 6.3% |
+| units used, of 1024 | 1012 | 998 | 1006 | 1011 | 1013 | 1018 |
+| top 25% used covers | 68.1% | 73.2% | 72.5% | 70.0% | 60.9% | 51.7% |
+| top 50% used covers | 87.7% | 92.5% | 91.2% | 87.7% | 83.6% | 79.2% |
+| units for 99% of activations | 84.9% | 75.6% | 81.8% | 84.0% | 85.6% | 89.5% |
+| static co-occurrence graph, top 8 (the live router: 82-86%) | 53.7% | 64.2% | 64.8% | 54.3% | 59.3% | 51.3% |
+| frequency alone, top 8 (chance: 12.5%) | 40.2% | 51.9% | 54.2% | 40.0% | 37.7% | 20.7% |
+| same token id → same set, layer 0 / average / last | 14% / 11% / 12% | 16 / 14 / 16 | 13 / 11 / 14 | 9 / 10 / 14 | 6 / 9 / 27 | 3 / 6 / 8 |
+| same, average Jaccard, layer 0 / average | 0.51 / 0.60 | 0.51 / 0.64 | 0.46 / 0.62 | 0.42 / 0.62 | 0.40 / 0.56 | 0.33 / 0.51 |
+| experts shared with the previous token, of 8 (chance 1.0) | 3.6 | 3.9 | 3.9 | 4.0 | 3.3 | 3.0 |
+| whole paths repeated | 0 | 0 | 0 | 0 | 0 | 0 |
+| router margin, median (share of the last chosen expert's probability) | 5.1% | | | | | 6.3% |
 
-Sovrapposizione del 25% più caldo fra due tracce (Jaccard; fra parentesi la quota delle
-attivazioni della seconda che cade nell'insieme caldo della prima):
+Overlap of the hottest 25% between two traces (Jaccard; in parentheses the share of the second
+trace's activations that fall in the first's hot set):
 
-| | c2 | py | sh | prosa it | prosa en |
+| | c2 | py | sh | prose it | prose en |
 |---|---|---|---|---|---|
 | code-1000 | 0.75 (71%) | 0.73 (70%) | 0.68 (68%) | 0.34 (45%) | 0.09 (19%) |
 | c2 | | 0.77 (71%) | 0.72 (68%) | 0.33 (45%) | 0.07 (17%) |
 | py | | | 0.74 (68%) | 0.37 (48%) | 0.08 (17%) |
-| prosa it | | | | | 0.16 (24%) |
+| prose it | | | | | 0.16 (24%) |
 
-Col 50% più caldo: codice-codice 0.72-0.77 (85-90% delle attivazioni dentro), codice-prosa inglese
+With the hottest 50%: code-to-code 0.72-0.77 (85-90% of activations inside), code-to-English-prose
 0.28 (46%).
 
-1. **Piccolo: no.** Soglia «il 25% delle unità copre il 99%»: copre il 68-73% sul codice, e per il
-   99% serve il 76-85% del modello. Ogni traccia tocca il 97-99% delle unità in mille token.
-2. **Tabella: no, nemmeno al layer 0.** Soglia «stesso id → stesso insieme nel 95% dei casi»: 9-16%
-   sul codice (Jaccard 0.42-0.51). Lo stesso token prende esperti diversi secondo il contesto già
-   al primo layer, dove fra l'embedding e il router c'è solo un'attenzione.
-3. **Statico: no.** Un grafo di co-occorrenze senza stato indovina il 54-65% del layer dopo, il
-   router sullo stato vivo l'82-86%; nessun percorso intero si ripete, in nessuna traccia. E le
-   scelte sono strette: metà sono decise da meno del 5% della probabilità dell'ultimo esperto
-   scelto (mediana 5.1%), quindi il grafo discreto è anche fragile a piccole perturbazioni.
-4. **Una regione del codice: sì, netta.** Soglia «codice-codice supera codice-prosa di almeno 0.20»:
-   0.68-0.77 contro 0.07-0.09 con la prosa inglese, e 0.31-0.37 con la prosa tecnica italiana
-   (che di codice parla). C, Python e shell scaldano le stesse unità; il testo sui colibrì quasi
-   nessuna di quelle. Il codice è anche più concentrato della prosa (25% → 68-73% contro 52-61%) e
-   più prevedibile dalla sola frequenza (40-54% contro 21%). È specializzazione per dominio, non
-   un grafo piccolo: l'insieme caldo di un file copre solo il 68-71% delle attivazioni di un altro.
-5. Per il motore: l'LRU resta la scelta giusta dentro una sessione (3.6-4.0 esperti su 8 in
-   comune col token prima); la regione del codice dice che una cache **calda fra sessioni di
-   codice** parte già col 68-71% di ciò che serve (domanda 45), e non dice niente su quanto del
-   modello si possa togliere: quello lo dice solo la prova funzionale qui sotto.
-6. Limiti: un modello generalista da 64 esperti, sei testi, 300 token generati a traccia, prompt
-   fatti di codice nostro; «deterministico» qui vuol dire prevedibile senza lo stato, non
-   ripetibile (ripetibile lo è per costruzione).
+1. **Small: no.** Threshold "the top 25% of units covers 99%": it covers 68-73% on code, and for
+   99% it needs 76-85% of the model. Every trace touches 97-99% of the units within a thousand
+   tokens.
+2. **Table: no, not even at layer 0.** Threshold "same id → same set in 95% of cases": 9-16% on
+   code (Jaccard 0.42-0.51). The same token picks different experts depending on context already at
+   the first layer, where between the embedding and the router there is only one attention.
+3. **Static: no.** A stateless co-occurrence graph guesses 54-65% of the next layer, the router on
+   the live state 82-86%; no whole path repeats, in any trace. And the choices are tight: half are
+   decided by less than 5% of the last chosen expert's probability (median 5.1%), so the discrete
+   graph is also fragile to small perturbations.
+4. **A region of code: yes, clearly.** Threshold "code-to-code exceeds code-to-prose by at least
+   0.20": 0.68-0.77 against 0.07-0.09 with English prose, and 0.31-0.37 with Italian technical prose
+   (which talks about code). C, Python and shell heat the same units; the text about hummingbirds
+   almost none of them. Code is also more concentrated than prose (25% → 68-73% against 52-61%) and
+   more predictable from frequency alone (40-54% against 21%). It is domain specialization, not a
+   small graph: one file's hot set covers only 68-71% of another's activations.
+5. For the engine: the LRU remains the right choice within a session (3.6-4.0 of 8 experts shared
+   with the previous token); the region of code says that a cache **warm across code sessions**
+   already starts with 68-71% of what is needed (question 45), and says nothing about how much of
+   the model can be dropped: only the functional proof below says that.
+6. Limits: a general-purpose 64-expert model, six texts, 300 tokens generated per trace, prompts
+   made of our own code; "deterministic" here means predictable without the state, not repeatable
+   (it is repeatable by construction).
 
-**La prova funzionale** (`sh tools/mask_quality.sh`: esperti spenti con `--expert-mask`, modo di sola
-misura; maschera = le unità fuori dal 75 / 50 / 25% più usato in `code-1000`, e per controllo lo
-stesso numero estratto a caso; logit di ogni posizione contro il modello intero). **Cinque testi su
-cinque** (2026-09-20 notte, `build/mask/quality.txt`): `code-1000` è il caso **più favorevole** (è
-quello da cui la maschera è ricavata, 904 posizioni), `trace-c2` un file C mai visto (860),
-`trace-py` Python (842), `trace-sh` shell (875), `trace-prose-en` prosa inglese (583), cioè il
-controllo fuori dominio:
+**The functional proof** (`sh tools/mask_quality.sh`: experts turned off with `--expert-mask`,
+measurement-only mode; mask = the units outside the top 75 / 50 / 25% used in `code-1000`, and for
+control the same number picked at random; logits at every position against the whole model).
+**Five texts out of five** (night of 2026-09-20, `build/mask/quality.txt`): `code-1000` is the
+**most favorable** case (it is the one the mask is derived from, 904 positions), `trace-c2` a C
+file never seen (860), `trace-py` Python (842), `trace-sh` shell (875), `trace-prose-en` English
+prose (583), that is, the out-of-domain control:
 
-| unità tenute | | per uso: KL media | token diverso | a caso: KL media | token diverso |
+| units kept | | by usage: average KL | different token | random: average KL | different token |
 |---|---|---|---|---|---|
-| 75% (256 spente) | code-1000 | 0.0154 | 29 (3.2%) | 0.598 | 178 (19.7%) |
+| 75% (256 off) | code-1000 | 0.0154 | 29 (3.2%) | 0.598 | 178 (19.7%) |
 | | trace-c2 | 0.0198 | 30 (3.5%) | 0.702 | 209 (24.3%) |
 | | trace-py | 0.0539 | 63 (7.5%) | 0.877 | 246 (29.2%) |
 | | trace-sh | 0.084 | 83 (9.5%) | 1.26 | 319 (36.5%) |
 | | trace-prose-en | 1.01 | 212 (36.4%) | 0.865 | 226 (38.8%) |
-| 50% (512 spente) | code-1000 | 0.0902 | 55 (6.1%) | 4.58 | 663 (73.3%) |
+| 50% (512 off) | code-1000 | 0.0902 | 55 (6.1%) | 4.58 | 663 (73.3%) |
 | | trace-c2 | 0.103 | 62 (7.2%) | 4.70 | 644 (74.9%) |
 | | trace-py | 0.276 | 118 (14.0%) | 5.02 | 713 (84.7%) |
 | | trace-sh | 0.384 | 163 (18.6%) | 5.05 | 759 (86.7%) |
 | | trace-prose-en | 2.41 | 350 (60.0%) | 4.43 | 486 (83.4%) |
-| 25% (755 spente) | code-1000 | 0.309 | 121 (13.4%) | 8.27 | 880 (97.3%) |
+| 25% (755 off) | code-1000 | 0.309 | 121 (13.4%) | 8.27 | 880 (97.3%) |
 | | trace-c2 | 0.334 | 117 (13.6%) | 8.39 | 848 (98.6%) |
 | | trace-py | 0.691 | 199 (23.6%) | 8.84 | 822 (97.6%) |
 | | trace-sh | 0.976 | 264 (30.2%) | 8.47 | 867 (99.1%) |
 | | trace-prose-en | 6.37 | 550 (94.3%) | 6.35 | 549 (94.2%) |
 
-7. **Funzionale: no.** Soglia «col 50% spento, stesso token nel 99% delle posizioni e KL ≤ 1e-2»:
-   93.9% e KL 0.090 sul testo stesso della maschera, 92.8% e 0.103 su un file C mai visto, e sugli
-   altri due linguaggi si scende (86.0% e 0.276 in Python, 81.4% e 0.384 in shell); nemmeno tenendo
-   il 75% si passa (96.8 / 96.5 / 92.5 / 90.5%, KL 0.015-0.084). Il grafo piccolo non c'è nemmeno
-   nel senso debole: per tenere il comportamento servono quasi tutti gli esperti.
-8. **La maschera regge sul C mai visto, si consuma sugli altri linguaggi.** Col 50% spento il token
-   coincide nel 93.9% (testo della maschera), 92.8% (altro C), 86.0% (Python), 81.4% (shell): la
-   regione del punto 4 esiste ma ha un centro, e più ci si allontana dal C più costa. Non è memoria
-   del testo (fra i due C c'è un punto percentuale), è distanza dal linguaggio da cui la maschera
-   viene.
-9. **Ma l'uso dice moltissimo su quali esperti servono**: a parità di unità spente, la maschera per
-   uso sposta l'uscita 13-50 volte meno di quella a caso (KL 0.09-0.38 contro 4.6-5.1 col 50%
-   spento, su tutti e tre i linguaggi). Non è un grafo piccolo, è una graduatoria ripida: il modello
-   regge male la perdita degli esperti giusti e quasi per niente quella degli esperti sbagliati.
-10. **Fuori dal dominio la graduatoria non vale più niente**, ed è il controllo che serviva: sulla
-    prosa inglese la maschera per uso fa come quella a caso (col 75% tenuto 36.4% contro 38.8% di
-    token diversi; col 25%, 94.3% contro 94.2%; KL 6.37 contro 6.35). Gli esperti caldi sul codice
-    non sono «i migliori esperti», sono quelli del codice: una cache scaldata su un dominio è un
-    guadagno per quel dominio e zero per un altro (domanda 45).
+7. **Functional: no.** Threshold "with 50% off, same token in 99% of positions and KL ≤ 1e-2":
+   93.9% and KL 0.090 on the mask's own text, 92.8% and 0.103 on a C file never seen, and on the
+   other two languages it drops (86.0% and 0.276 in Python, 81.4% and 0.384 in shell); not even
+   keeping 75% passes (96.8 / 96.5 / 92.5 / 90.5%, KL 0.015-0.084). The small graph is not there
+   even in the weak sense: keeping the behavior needs almost every expert.
+8. **The mask holds on unseen C, wears out on the other languages.** With 50% off the token matches
+   in 93.9% (the mask's own text), 92.8% (other C), 86.0% (Python), 81.4% (shell): the region from
+   point 4 exists but has a center, and the further from C, the more it costs. It is not memory of
+   the text (between the two C files there is one percentage point), it is distance from the
+   language the mask comes from.
+9. **But usage says a great deal about which experts are needed**: for the same number of units
+   off, the usage mask moves the output 13-50 times less than the random one (KL 0.09-0.38 against
+   4.6-5.1 with 50% off, across all three languages). It is not a small graph, it is a steep
+   ranking: the model tolerates losing the right experts poorly and losing the wrong ones almost
+   not at all.
+10. **Outside the domain the ranking is worth nothing anymore**, and this is the control that was
+    needed: on English prose the usage mask performs like the random one (with 75% kept, 36.4%
+    against 38.8% of different tokens; with 25%, 94.3% against 94.2%; KL 6.37 against 6.35). The
+    hot experts on code are not "the best experts", they are code's experts: a cache warmed on one
+    domain is a gain for that domain and zero for another (question 45).
 
 ## The gate: where its time goes (2026-09-22)
 
@@ -5216,35 +5248,35 @@ token by the zones (the calls' gain, the serial steps' loss):
 
 ## Attempts
 
-| Data | Cosa | Prima | Dopo | Spread | Esito |
+| Date | What | Before | After | Spread | Outcome |
 |---|---|---|---|---|---|
-| 2026-09-17 | `dot_row q8_0` AVX-512, bit-identico | 1 957 M el/s | 19 837 M el/s | 15% / 22% | tenuto: attivo di default sulle CPU AVX-512 |
-| 2026-09-17 | `dot_row q8_0` AVX2, bit-identico | 1 957 M el/s | 19 532 M el/s | 15% / 5% | tenuto: attivo sulle CPU AVX2 senza AVX-512 |
-| 2026-09-17 | OLMoE-1B-7B Q8_0 decode, kernel AVX-512 | 6.87 tok/s (16 thread) | 21.08 tok/s (8 thread) | una run | tenuto; 16 thread 17.72: il default dei thread va rivisto |
-| 2026-09-17 | pool di thread: attesa attiva 2 ms, uno slot per thread (Linux/Docker) | matmul esperto 16 thread 0.376 ms | 0.014 ms | 9% / 16% | tenuto; da misurare su Windows nativo e sul modello vero (mediana di 5) |
-| 2026-09-17 | OLMoE-1B-7B Q8_0 decode, pool nuovo (Windows nativo, mediana di 5) | 21.08 tok/s (8 thread, una run) | 27.02 tok/s (8 thread) | 2.4% | tenuto; 16 thread = 8 thread (26.90) |
-| 2026-09-17 | rope da tabella, attivazioni in parallelo, attenzione per testa + `axpy_f32` AVX-512 (logit identici al bit) | 26.34 tok/s (16 thread) | 32.78 tok/s (16 thread) | 1.4% / 2.8% | tenuto; 4 thread = 16 thread (32.93): limite della memoria |
-| 2026-09-17 | prefill a blocchi in C esatto: passate da 512 token, token per esperto, matrici a blocchi di 16 token, logit solo dell'ultimo (logit identici al bit) | prefill 30.1 tok/s (16 thread, prompt 512) | 196.9 tok/s col kernel a 4 token | 14% / 27% | tenuto; decode invariato; scala 1.16× da 8 a 16 thread (domanda 20) |
-| 2026-09-17 | riga q8_0 decompressa una volta per blocco di token in uno scratch per worker, poi `dot_f32` (esatto per contratto) | prefill 144 tok/s (16 thread) | 140 tok/s | 6% / 6% | **scartato**: nessun guadagno (legge 4 byte per elemento invece di 1, e la misura non era alternata); l'idea buona è tenere il peso compresso e dividerlo fra più token (riga sotto) |
-| 2026-09-17 | kernel `dot_row_x4`: una riga di pesi contro 4 token nei registri (scalare, AVX2, AVX-512), risultati identici al bit a `dot_row` | prefill 124 tok/s (16 thread, run alternate) | 180 tok/s | 12% / 16% | tenuto; da solo il kernel vale 2.1× (44 contro 21 G elementi/s) |
-| 2026-09-17 | accumulatori del kernel a 4 token in un array `__m512 acc[4]` invece che in registri con nome | — | — | — | **scartato**: il compilatore li tiene sullo stack e il guadagno sparisce (LESSONS #45) |
-| 2026-09-17 | blocco di token di `tr_matmul` a 32, 64, 128 invece di 16 | prefill 180.5 tok/s (16 thread, tile 16) | 176.9 / 183.3 / 172.5 | 10-13% | scartato: tutto dentro il rumore, resta 16 |
-| 2026-09-18 | una riga di pesi contro **8** token (float, identico al bit a x4), solo nel banco | x4: 25.6 / 47.6 / 114.1 ns per riga (n = 1024 / 2048 / 4096) | 1.13× / 0.79× / 0.93× | 3-8% | **scartato**: a n=2048 le attivazioni di 8 righe (64 KB) escono dalla L1 (§Revisione) |
-| 2026-09-18 | dot int8 VNNI con la struttura del x4 (256 bit col trucco del segno; 512 bit a due blocchi), solo nel banco, non esatto | x4 float come sopra | 256 bit 1.64× / 1.62× / 1.96×; 512 bit **1.83× / 1.79× / 2.26×** | 3-8% | misurato, non adottato: l'int8 non è bit-identico, può essere solo un modo dichiarato. Decisione aperta (§Revisione, LESSONS #65) |
-| 2026-09-18 | tetto della pausa della bozza adattiva corretto (31 → 16) | replay esatto: 172 passate, 65 righe di bozza (`code`) | 172 passate, 66 righe | — | tenuto: è una correzione, non una leva; le costanti spostano ±2-3% (§Revisione) |
-| 2026-09-18 | thread per fase: prompt su tutto il pool, passate corte (fino a 4 righe) sui primi n slot, n misurato dalla sessione (16/8/4, la più ampia entro l'1% dalla più veloce, di nuovo ogni 1024 token), `--decode-threads` lo forza; token identici al bit | decode 30.82 tok/s a contesto 512, 23.79 a 2048 (16 thread) | 33.45 (**1.085×**) e 24.43 (**1.027×**); con 8 forzato 33.50 e 24.98 (1.050×); prefill invariato; `--spec 8` caso peggiore 1.064× | A/A 1.0% | **tenuto**, acceso di default. Margine del 3% e del 2% misurati e scartati (a 2048 tenevano 16 thread in 10 e in 5 run su 16); confine a 16 righe invece di 4: non distinguibile (§Thread per fase) |
-| 2026-09-19 | KV con le posizioni di una testa in fila (`[layer][testa][posizione]`, `src/kv/`), logit identici al byte | decode a contesto 512 / 2048 / 4000: 32.30 / 24.18 / 17.91 tok/s (8 thread forzati) | 35.48 (**1.06-1.10×**) / 27.32 (**1.12-1.14×**) / 20.84 (**1.15-1.18×**); prefill a 2048 **1.10×**, a 4000 **1.39-1.43×**; a contesto 32 non distinguibile | A/A 3.8% | **tenuto**: la zona `attention` passa da 32-35 a 47-48 GB/s letti, su 54 della RAM (§Decode a contesto lungo) |
-| 2026-09-19 | larghezza per zona: l'attenzione del decode su 16 thread e il resto su 8 (esatto), stimata dalle zone di due profili | token a contesto 4000: 48.1 ms | 47.1 ms stimati (−2.1%); a 2048 −0.7% | A/A 3.8% | **non scritta**: sotto la soglia della sessione; domanda 34 |
-| 2026-09-19 | attenzione del prompt a gruppi di 16 token per testa, blocchi di 64 posizioni, `dot_f32_x4` e `axpy_f32_x4` (logit identici al byte) | zona `attention` a 512 / 2048 / 4000: 116 / 1883 / 7420 ms | 106 / 1688 / 6568 (1.09× / 1.12× / **1.13×**) | A/A 2.1% | **tenuto**; nel banco 1.15× a 4000, 1.38× quando la L3 è in affanno (§Prefill su prompt lunghi) |
-| 2026-09-19 | lavoro di un token solo sul pool (norme, RoPE, KV, router, righe per gli esperti) e righe F32 col kernel del tier | zone per token 121 / 455 / 880 ms, `router` 80 / 324 / 627 | 48 / 174 / 353 e 6 / 22 / 45 | A/A 2.1% | **tenuto**; con la riga sopra il prefill fa **1.05-1.08× / 1.07-1.08× / 1.11-1.14×** a 512 / 2048 / 4000, decode non distinguibile (A/A 2.4%) |
-| 2026-09-19 | righe di pesi **F16** con i kernel del tier (`vcvtph2ps`, conversione esatta), bit-identiche allo scalare; nate dal controllo `test_tier_used` (LESSONS #78) | `dot_row f16` 466 M el/s in ogni tier (n=2048) | 22.8 G el/s AVX2, 22.7 AVX-512 (**49×**) | 3-7% | **tenuto**; nessun modello F16 negli scenari: il numero è del kernel, non di un prefill |
-| 2026-09-19 | gruppo da 4 o 64 query, blocco da 16 o 256 posizioni invece di 16 × 64 (solo nel banco) | 355 ms per layer a 4000 | 352-387 | 2-15% | scartato: tutto dentro lo spread, resta 16 × 64 |
-| 2026-09-19 | **`tr_expf` scalare**, arrotondato correttamente su tutti i 2^32 float (prova esaustiva in `make check`), al posto dell'`expf` della libreria in softmax e SwiGLU; Windows: logit identici al byte; Linux: KL 3.9e-13, stessi byte dell'emulazione | prefill 296 / 249 / 211 tok/s a 512 / 2048 / 4000; decode a 8 thread 35.1 / 28.0 / 21.4; `attention` 92 / 1537 / 5960 ms, `expert_act` 138 / 595 / 1201 | 306-315 / 303-308 / 276; 36.0 / 29.3 / 23.2; 41 / 591 / 2331 e 25 / 108 / 218 | A/A 3.0% prefill, 1.9% decode | **tenuto**: prefill 1.03-1.08× / 1.20-1.23× / 1.29-1.31×, decode 1.02-1.10×; Windows e Linux ora danno gli stessi byte (§`tr_expf`) |
-| 2026-09-19 | `tr_expf` in SIMD (non scritto: i numeri per decidere) | dopo lo scalare, softmax 9 / 130 / 610 ms e `expert_act` 25 / 108 / 218 ms del prefill | stima: prefill 1.01× / 1.03× / 1.04×, decode +1-2%, circa 200 righe | — | **decide Marcello** (domanda 39): lo scalare ha preso quasi tutto |
-| 2026-09-19 | rimisura a macchina pulita di thread per fase e decode a contesto lungo (quattro `yes` dimenticati sotto le misure del 18-19/09, LESSONS #84) | decode a 512, 8 contro 16 thread: 1.10×; RAM ~54 GB/s | 1.00-1.02× (non distinguibile a nessun contesto); RAM ~57 GB/s con 4-6 thread; a 512 il decode vuole 4 thread | A/A 2.5-4.6% | conclusione corretta: pochi thread sì, il «+10%» no; lo stimatore della larghezza va riscritto (domanda 31, §Rimisura a macchina pulita) |
-| 2026-09-19 | stimatore della larghezza del decode riscritto (domanda 31, LESSONS #88): margine dal rumore misurato nelle passate stesse (non più un tetto fisso), scelta a coppie (mai il rumore di una terza larghezza), estensione fino a `TR_DECODE_TUNE_ROUNDS_MAX` sui due contendenti, nuova misura ad ogni classe di contesto e dopo `TR_DECODE_TUNE_REMEASURE_KEPT` passate mantenute con un cambio in sospeso, isteresi a due voti prima di cambiare scelta | — | — | — | test C verdi (`tests/test_phase.c`, `tools/mutate_tune.sh`); **da validare sul modello vero**, di notte a macchina tranquilla: nessun numero ancora |
-| 2026-09-24 | `dot_row q4_k` AVX-512: i 16 valori di un sotto-blocco calcolati una volta, `vpermps` sul nibble; bit-identico | Q8_0 15 970-17 479 M el/s | Q4_K 13 456-15 685 M el/s (0.84-0.90x per elemento, ~1.6x per byte) | 5-30% | tenuto: attivo sulle CPU AVX-512; decode del modello vero 1.5x il Q8_0 |
-| 2026-09-24 | `dot_row q4_k` AVX2 con la stessa tabella (due `vpermps` da 8 + `blendv`) contro la conversione | riga 11 390-11 946, x4 27 650-28 884 M el/s | riga 11 548-12 216 (+0.5-1.5%), x4 26 616-27 914 (-3.5%) | ~1% A/A | respinto: pari o peggio su Zen 4; resta la conversione |
+| 2026-09-17 | `dot_row q8_0` AVX-512, bit-identical | 1 957 M el/s | 19 837 M el/s | 15% / 22% | kept: on by default on AVX-512 CPUs |
+| 2026-09-17 | `dot_row q8_0` AVX2, bit-identical | 1 957 M el/s | 19 532 M el/s | 15% / 5% | kept: on for AVX2 CPUs without AVX-512 |
+| 2026-09-17 | OLMoE-1B-7B Q8_0 decode, AVX-512 kernel | 6.87 tok/s (16 threads) | 21.08 tok/s (8 threads) | one run | kept; 16 threads 17.72: the thread default needs revisiting |
+| 2026-09-17 | thread pool: 2 ms busy-wait, one slot per thread (Linux/Docker) | expert matmul 16 threads 0.376 ms | 0.014 ms | 9% / 16% | kept; to be measured on native Windows and the real model (median of 5) |
+| 2026-09-17 | OLMoE-1B-7B Q8_0 decode, new pool (native Windows, median of 5) | 21.08 tok/s (8 threads, one run) | 27.02 tok/s (8 threads) | 2.4% | kept; 16 threads = 8 threads (26.90) |
+| 2026-09-17 | rope from a table, activations in parallel, attention per head + `axpy_f32` AVX-512 (logits identical to the bit) | 26.34 tok/s (16 threads) | 32.78 tok/s (16 threads) | 1.4% / 2.8% | kept; 4 threads = 16 threads (32.93): memory limit |
+| 2026-09-17 | batched prefill in exact C: 512-token passes, tokens per expert, matrices in blocks of 16 tokens, logits only for the last one (logits identical to the bit) | prefill 30.1 tok/s (16 threads, prompt 512) | 196.9 tok/s with the 4-token kernel | 14% / 27% | kept; decode unchanged; scales 1.16× from 8 to 16 threads (question 20) |
+| 2026-09-17 | q8_0 row decompressed once per token block into a per-worker scratch, then `dot_f32` (exact by contract) | prefill 144 tok/s (16 threads) | 140 tok/s | 6% / 6% | **rejected**: no gain (reads 4 bytes per element instead of 1, and the measurement was not alternated); the good idea is keeping the weight compressed and splitting it across several tokens (row below) |
+| 2026-09-17 | `dot_row_x4` kernel: one weight row against 4 tokens in registers (scalar, AVX2, AVX-512), results identical to the bit to `dot_row` | prefill 124 tok/s (16 threads, alternated runs) | 180 tok/s | 12% / 16% | kept; alone the kernel is worth 2.1× (44 against 21 G elements/s) |
+| 2026-09-17 | the 4-token kernel's accumulators in an `__m512 acc[4]` array instead of named registers | — | — | — | **rejected**: the compiler keeps them on the stack and the gain disappears (LESSONS #45) |
+| 2026-09-17 | `tr_matmul`'s token block at 32, 64, 128 instead of 16 | prefill 180.5 tok/s (16 threads, tile 16) | 176.9 / 183.3 / 172.5 | 10-13% | rejected: all within the noise, stays at 16 |
+| 2026-09-18 | one weight row against **8** tokens (float, identical to the bit to x4), bench only | x4: 25.6 / 47.6 / 114.1 ns per row (n = 1024 / 2048 / 4096) | 1.13× / 0.79× / 0.93× | 3-8% | **rejected**: at n=2048 the 8 rows' activations (64 KB) fall out of L1 (§Adversarial review) |
+| 2026-09-18 | int8 VNNI dot with the x4 structure (256 bit with ggml's sign trick; 512 bit in two blocks), bench only, not exact | x4 float as above | 256 bit 1.64× / 1.62× / 1.96×; 512 bit **1.83× / 1.79× / 2.26×** | 3-8% | measured, not adopted: int8 is not bit-identical, it can only be a declared mode. Decision open (§Adversarial review, LESSONS #65) |
+| 2026-09-18 | adaptive draft's pause cap corrected (31 → 16) | exact replay: 172 passes, 65 draft rows (`code`) | 172 passes, 66 rows | — | kept: it is a correction, not a lever; the constants shift ±2-3% (§Adversarial review) |
+| 2026-09-18 | threads per phase: prompt on the whole pool, short passes (up to 4 rows) on the first n slots, n measured by the session (16/8/4, the widest within 1% of the fastest, remeasured every 1024 tokens), `--decode-threads` forces it; tokens identical to the bit | decode 30.82 tok/s at context 512, 23.79 at 2048 (16 threads) | 33.45 (**1.085×**) and 24.43 (**1.027×**); with 8 forced 33.50 and 24.98 (1.050×); prefill unchanged; `--spec 8` worst case 1.064× | A/A 1.0% | **kept**, on by default. 3% and 2% margins measured and rejected (at 2048 they kept 16 threads in 10 and in 5 of 16 runs); boundary at 16 rows instead of 4: not distinguishable (§Threads per phase) |
+| 2026-09-19 | KV with one head's positions in a row (`[layer][head][position]`, `src/kv/`), logits identical to the byte | decode at context 512 / 2048 / 4000: 32.30 / 24.18 / 17.91 tok/s (8 threads forced) | 35.48 (**1.06-1.10×**) / 27.32 (**1.12-1.14×**) / 20.84 (**1.15-1.18×**); prefill at 2048 **1.10×**, at 4000 **1.39-1.43×**; at context 32 not distinguishable | A/A 3.8% | **kept**: the `attention` zone goes from 32-35 to 47-48 GB/s read, of RAM's 54 (§Decode at long context and RAM bandwidth) |
+| 2026-09-19 | width per zone: the decode's attention on 16 threads and the rest on 8 (exact), estimated from two profiles' zones | token at context 4000: 48.1 ms | 47.1 ms estimated (−2.1%); at 2048 −0.7% | A/A 3.8% | **not written**: below the session's threshold; question 34 |
+| 2026-09-19 | the prompt's attention in groups of 16 tokens per head, 64-position blocks, `dot_f32_x4` and `axpy_f32_x4` (logits identical to the byte) | `attention` zone at 512 / 2048 / 4000: 116 / 1883 / 7420 ms | 106 / 1688 / 6568 (1.09× / 1.12× / **1.13×**) | A/A 2.1% | **kept**; in the bench 1.15× at 4000, 1.38× when L3 is under strain (§Prefill on long prompts) |
+| 2026-09-19 | single-token work on the pool (norms, RoPE, KV, router, rows for the experts) and F32 rows with the tier's kernel | zones per token 121 / 455 / 880 ms, `router` 80 / 324 / 627 | 48 / 174 / 353 and 6 / 22 / 45 | A/A 2.1% | **kept**; with the row above the prefill runs **1.05-1.08× / 1.07-1.08× / 1.11-1.14×** at 512 / 2048 / 4000, decode not distinguishable (A/A 2.4%) |
+| 2026-09-19 | **F16** weight rows with the tier's kernels (`vcvtph2ps`, exact conversion), bit-identical to the scalar; born from the `test_tier_used` check (LESSONS #78) | `dot_row f16` 466 M el/s in every tier (n=2048) | 22.8 G el/s AVX2, 22.7 AVX-512 (**49×**) | 3-7% | **kept**; no F16 model in the scenarios: the number is the kernel's, not a prefill's |
+| 2026-09-19 | a group of 4 or 64 queries, a block of 16 or 256 positions instead of 16 × 64 (bench only) | 355 ms per layer at 4000 | 352-387 | 2-15% | rejected: all within the spread, stays at 16 × 64 |
+| 2026-09-19 | **scalar `tr_expf`**, correctly rounded over all 2^32 floats (exhaustive proof in `make check`), in place of the library's `expf` in softmax and SwiGLU; Windows: logits identical to the byte; Linux: KL 3.9e-13, same bytes as the emulation | prefill 296 / 249 / 211 tok/s at 512 / 2048 / 4000; decode at 8 threads 35.1 / 28.0 / 21.4; `attention` 92 / 1537 / 5960 ms, `expert_act` 138 / 595 / 1201 | 306-315 / 303-308 / 276; 36.0 / 29.3 / 23.2; 41 / 591 / 2331 and 25 / 108 / 218 | A/A 3.0% prefill, 1.9% decode | **kept**: prefill 1.03-1.08× / 1.20-1.23× / 1.29-1.31×, decode 1.02-1.10×; Windows and Linux now give the same bytes (§`tr_expf`) |
+| 2026-09-19 | `tr_expf` in SIMD (not written: the numbers to decide with) | after the scalar, softmax 9 / 130 / 610 ms and `expert_act` 25 / 108 / 218 ms of the prefill | estimate: prefill 1.01× / 1.03× / 1.04×, decode +1-2%, about 200 lines | — | **Marcello decides** (question 39): the scalar has taken almost everything |
+| 2026-09-19 | clean-machine remeasure of threads per phase and decode at long context (four `yes` processes forgotten under the 09/18-19 measurements, LESSONS #84) | decode at 512, 8 against 16 threads: 1.10×; RAM ~54 GB/s | 1.00-1.02× (not distinguishable at any context); RAM ~57 GB/s with 4-6 threads; at 512 the decode wants 4 threads | A/A 2.5-4.6% | correct conclusion: few threads yes, the "+10%" no; the width estimator needs rewriting (question 31, §Clean machine remeasure) |
+| 2026-09-19 | decode width estimator rewritten (question 31, LESSONS #88): margin from the noise measured in the passes themselves (no longer a fixed ceiling), picking in pairs (never a third width's noise), extension up to `TR_DECODE_TUNE_ROUNDS_MAX` on the two contenders, a new measurement at every context class and after `TR_DECODE_TUNE_REMEASURE_KEPT` passes kept with a change pending, two-vote hysteresis before switching pick | — | — | — | C tests green (`tests/test_phase.c`, `tools/mutate_tune.sh`); **to be validated on the real model**, at night on a quiet machine: no number yet |
+| 2026-09-24 | `dot_row q4_k` AVX-512: a sub-block's 16 values computed once, `vpermps` on the nibble; bit-identical | Q8_0 15 970-17 479 M el/s | Q4_K 13 456-15 685 M el/s (0.84-0.90x per element, ~1.6x per byte) | 5-30% | kept: on for AVX-512 CPUs; the real model's decode 1.5x Q8_0 |
+| 2026-09-24 | `dot_row q4_k` AVX2 with the same table (two `vpermps` of 8 + `blendv`) against the conversion | row 11 390-11 946, x4 27 650-28 884 M el/s | row 11 548-12 216 (+0.5-1.5%), x4 26 616-27 914 (-3.5%) | ~1% A/A | rejected: level or worse on Zen 4; the conversion stays |
 | 2026-09-24 | `dot_row2_x4` AVX-512 (two weight rows against four input rows, eight accumulators; Q8_0, Q4_K, Q6_K), bit-identical; `tr_matmul` takes rows in pairs | whole matrix 1024x2048, 64 tokens: Q8_0 0.0607 / 0.0084 ms per token (1 / 16 cores); engine prefill Q8_0 200.6, Q4_K_M 211.0 tok/s | 0.0491 / 0.0065; prefill 252.9 / 241.3 and 236.7 / 233.8 | A/A 4.6% and 1.2% | kept: prefill 1.20-1.26x (Q8_0), 1.11-1.12x (Q4_K_M), decode unchanged |
 | 2026-09-24 | the sixteen Q6_K scales in SIMD instead of scalar (same single rounding) | whole matrix Q6_K, 1 core: 0.0551 (two rows) / 0.0602 (x4) ms per token | 0.0523 / 0.0590 | control Q8_0 0.0491 in both sessions | kept |
 | 2026-09-24 | a row decoded once per tile of 16 tokens, then the F32 x4 kernel (not built: measured the F32 x4 kernel alone) | Q8_0 x4 43 926 / 36 771 M/s (n 2048 / 4096) | F32 x4 44 779 / 33 135 | 3% | rejected: the matmul is bound by loading the input rows, not by decoding the weights |

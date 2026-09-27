@@ -170,7 +170,8 @@ Before delivering: `make check` green. On Windows correctness runs in Docker
   that is not low no conclusion is drawn (`docs/ARCHITECTURE.md` §Profiling, LESSONS #84-#88).
 - A file derived from colibri or ds4 states project, commit, path and modification in its header.
 - **Everything in the repository is written in English**: file names, code, comments, documents
-  under `docs/`. With Marcello the conversation stays in Italian.
+  under `docs/`, the status page; `tools/lint.py` checks it (LESSONS #257). With Marcello the
+  conversation stays in Italian.
 - Prefix `tr_` for public symbols; no global state per model (several models in one process).
 - Models, fixtures and binaries stay out of git (`.gitignore`).
 

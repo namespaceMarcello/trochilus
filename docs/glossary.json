@@ -1,271 +1,271 @@
 {
-  "nota": "Le parole che ricorrono nella mappa del progetto, spiegate da zero. Ogni voce: alias da riconoscere nel testo, titolo, spiegazione, e i termini collegati. Le usa tools/status_html.py.",
-  "voci": [
+  "note": "The words that recur in the project's map, explained from scratch. Each entry: aliases to recognize in the text, a title, an explanation, and related terms. Used by tools/status_html.py.",
+  "entries": [
     {
       "id": "token",
       "alias": ["token"],
-      "titolo": "Token",
-      "testo": "Il pezzetto di testo con cui il modello ragiona: di solito una parola corta, un pezzo di parola lunga, o un segno di punteggiatura. «inferenza» può essere due token, «il» uno. Il modello non vede lettere: vede una sequenza di numeri, uno per token.",
-      "vedi": ["prompt", "tokenizer"]
+      "title": "Token",
+      "text": "The piece of text the model reasons with: usually a short word, a chunk of a long word, or a punctuation mark. «inference» can be two tokens, «the» one. The model does not see letters: it sees a sequence of numbers, one per token.",
+      "see": ["prompt", "tokenizer"]
     },
     {
       "id": "tokenizer",
       "alias": ["tokenizer"],
-      "titolo": "Tokenizer",
-      "testo": "Il pezzo che traduce il testo in token e viceversa. Deve dare esattamente gli stessi numeri del tokenizer originale del modello: se sbaglia anche un pezzo, il modello legge una frase diversa da quella che hai scritto.",
-      "vedi": ["token"]
+      "title": "Tokenizer",
+      "text": "The piece that translates text into tokens and back. It must give exactly the same numbers as the model's original tokenizer: if it gets even a piece wrong, the model reads a different sentence than the one you wrote.",
+      "see": ["token"]
     },
     {
       "id": "prompt",
       "alias": ["prompt"],
-      "titolo": "Prompt",
-      "testo": "Tutto quello che dai in pasto al modello prima che cominci a rispondere: la domanda, il file che ha letto, la conversazione fin lì. Più è lungo, più lavoro c'è da fare prima della prima parola di risposta.",
-      "vedi": ["prefill", "contesto"]
+      "title": "Prompt",
+      "text": "Everything you feed the model before it starts answering: the question, the file it has read, the conversation so far. The longer it is, the more work there is before the first word of the answer.",
+      "see": ["prefill", "context"]
     },
     {
       "id": "prefill",
-      "alias": ["prefill", "prompt a blocchi"],
-      "titolo": "Prefill (la lettura del prompt)",
-      "testo": "La prima fase: il modello legge tutto il prompt in una volta e si costruisce la memoria di quel testo. Tutti i token insieme, quindi i core lavorano pieni ed è la fase «grassa». In Trochilus è anche la fase dove, se il modello non sta in RAM, si paga tutto il disco.",
-      "vedi": ["decode", "kv", "token"]
+      "alias": ["prefill", "prompt in blocks"],
+      "title": "Prefill (reading the prompt)",
+      "text": "The first phase: the model reads the whole prompt at once and builds the memory of that text. All the tokens together, so the cores work full and it is the «fat» phase. In Trochilus it is also the phase where, if the model does not fit in RAM, the whole disk cost is paid.",
+      "see": ["decode", "kv", "token"]
     },
     {
       "id": "decode",
-      "alias": ["decode", "generazione", "token generato", "token generati"],
-      "titolo": "Decode (la generazione)",
-      "testo": "La seconda fase: il modello produce un token per volta, e ognuno dipende da quello prima, quindi non si possono fare in parallelo. È lavoro «magro»: si rileggono tutti i pesi per sfornare una parola sola, per cui il collo di bottiglia è la velocità della memoria, non i core.",
-      "vedi": ["prefill", "banda", "tok-s"]
+      "alias": ["decode", "generation", "generated token", "generated tokens"],
+      "title": "Decode (generation)",
+      "text": "The second phase: the model produces one token at a time, and each one depends on the one before, so they cannot be done in parallel. It is «thin» work: all the weights get reread to produce a single word, so the bottleneck is memory speed, not the cores.",
+      "see": ["prefill", "bandwidth", "tok-s"]
     },
     {
-      "id": "contesto",
-      "alias": ["contesto"],
-      "titolo": "Contesto",
-      "testo": "Quanto testo il modello si tiene in testa in quel momento: prompt più risposta. Più cresce, più la memoria del contesto (la KV) diventa grossa e più ogni nuovo token costa, perché deve guardarsi indietro tutto.",
-      "vedi": ["kv", "attenzione"]
+      "id": "context",
+      "alias": ["context"],
+      "title": "Context",
+      "text": "How much text the model is holding in mind at that moment: prompt plus response. The bigger it grows, the bigger the context memory (the KV) becomes and the more every new token costs, because it has to look back over all of it.",
+      "see": ["kv", "attention"]
     },
     {
-      "id": "attenzione",
-      "alias": ["attenzione"],
-      "titolo": "Attenzione",
-      "testo": "Il meccanismo con cui, per scrivere il token nuovo, il modello guarda tutti i token di prima e decide a quali dare peso. È il motivo per cui capisce a cosa si riferisce un «lo» scritto venti righe sopra, ed è anche il motivo per cui un contesto lungo costa.",
-      "vedi": ["kv", "contesto"]
+      "id": "attention",
+      "alias": ["attention"],
+      "title": "Attention",
+      "text": "The mechanism by which, to write the new token, the model looks at every token before it and decides how much weight to give each. It is why the model understands what a «he» written twenty lines up refers to, and it is also why a long context costs so much.",
+      "see": ["kv", "context"]
     },
     {
       "id": "kv",
-      "alias": ["KV", "cache KV", "memoria del contesto"],
-      "titolo": "KV (la memoria del contesto)",
-      "testo": "Per ogni token già letto il modello si salva due vettori — chiave e valore, key e value — così non deve rifare i conti su tutto il testo a ogni parola nuova. È una specie di riassunto già masticato di ciò che ha visto. Cresce con il contesto e si legge tutta a ogni token, quindi come è messa in memoria conta parecchio.",
-      "vedi": ["attenzione", "contesto", "banda"]
+      "alias": ["KV", "KV cache", "context memory"],
+      "title": "KV (the context memory)",
+      "text": "For every token already read the model saves two vectors — key and value — so it does not have to redo the math over the whole text at every new word. It is a kind of already-chewed summary of what it has seen. It grows with the context and gets read in full at every token, so how it sits in memory matters a lot.",
+      "see": ["attention", "context", "bandwidth"]
     },
     {
       "id": "moe",
       "alias": ["MoE", "mixture of experts"],
-      "titolo": "MoE (modello a esperti)",
-      "testo": "Un modello fatto di tanti pezzi specializzati invece di un blocco unico. Per ogni token ne usa solo pochi — nel nostro caso 8 su 64 per layer — quindi è enorme sul disco ma fa i conti come uno piccolo. Il rovescio: non sai in anticipo quali pezzi ti serviranno.",
-      "vedi": ["esperto", "router", "layer"]
+      "title": "MoE (mixture-of-experts model)",
+      "text": "A model made of many specialized pieces instead of one single block. For each token it uses only a few — in our case 8 out of 64 per layer — so it is huge on disk but computes like a small one. The flip side: you do not know in advance which pieces you will need.",
+      "see": ["expert", "router", "layer"]
     },
     {
-      "id": "esperto",
-      "alias": ["esperto", "esperti", "unità"],
-      "titolo": "Esperto",
-      "testo": "Uno dei pezzi specializzati del modello: in pratica tre matrici di numeri. Nel nostro modello ce ne sono 64 per layer, 1024 in tutto, e ognuno pesa 6.375 MiB — sono loro a occupare quasi tutto il file del modello.",
-      "vedi": ["moe", "router", "layer"]
+      "id": "expert",
+      "alias": ["expert", "experts", "unit"],
+      "title": "Expert",
+      "text": "One of the model's specialized pieces: in practice three matrices of numbers. In our model there are 64 per layer, 1024 in all, and each weighs 6.375 MiB — they are what takes up almost all of the model file.",
+      "see": ["moe", "router", "layer"]
     },
     {
       "id": "router",
       "alias": ["router", "routing"],
-      "titolo": "Router",
-      "testo": "Il pezzo che, per ogni token e per ogni layer, sceglie quali 8 esperti usare. È piccolo e veloce, ma è lui a decidere cosa bisognerà andare a leggere dal disco: da qui l'idea di sbirciare in anticipo le sue scelte.",
-      "vedi": ["esperto", "moe"]
+      "title": "Router",
+      "text": "The piece that, for every token and every layer, picks which 8 experts to use. It is small and fast, but it is the one deciding what will need to be read from disk: hence the idea of peeking at its choices ahead of time.",
+      "see": ["expert", "moe"]
     },
     {
       "id": "layer",
       "alias": ["layer"],
-      "titolo": "Layer",
-      "testo": "Uno strato del modello. Il token attraversa gli strati uno dopo l'altro e a ogni passaggio la sua rappresentazione viene raffinata. Il nostro modello ne ha 16, e ogni strato ha i suoi 64 esperti.",
-      "vedi": ["esperto", "prefill"]
+      "title": "Layer",
+      "text": "One stratum of the model. The token passes through the layers one after another, and at each step its representation is refined. Our model has 16 of them, and each has its own 64 experts.",
+      "see": ["expert", "prefill"]
     },
     {
       "id": "logit",
       "alias": ["logit", "logits"],
-      "titolo": "Logit",
-      "testo": "I punteggi che il modello dà a ogni parola possibile prima di sceglierne una: 50 304 numeri, uno per ogni token del vocabolario. Sono il risultato grezzo, prima di qualunque scelta: se due versioni del motore danno logit identici, stanno facendo esattamente la stessa cosa.",
-      "vedi": ["al-byte", "oracolo"]
+      "title": "Logit",
+      "text": "The scores the model gives to every possible word before picking one: 50 304 numbers, one for each token in the vocabulary. They are the raw result, before any choice: if two versions of the engine give identical logits, they are doing exactly the same thing.",
+      "see": ["byte-exact", "oracle"]
     },
     {
-      "id": "al-byte",
-      "alias": ["identici al byte", "identico al byte", "bit-identico", "bit-identiche", "identiche al byte", "al byte"],
-      "titolo": "Identico al byte",
-      "testo": "Non «quasi uguale»: proprio gli stessi numeri, bit per bit. È il metro del progetto — una versione veloce di un calcolo si tiene solo se dà gli stessi bit di quella lenta. Così un'ottimizzazione non può peggiorare di nascosto la qualità delle risposte.",
-      "vedi": ["logit", "oracolo", "mutazione"]
+      "id": "byte-exact",
+      "alias": ["identical to the byte", "byte-identical", "bit-identical", "bit-identical to", "identical to the bit", "to the byte"],
+      "title": "Identical to the byte",
+      "text": "Not «roughly the same»: the exact same numbers, bit for bit. It is the project's yardstick — a fast version of a computation is kept only if it gives the same bits as the slow one. That way a speedup can never quietly worsen the quality of the answers.",
+      "see": ["logit", "oracle", "mutation"]
     },
     {
-      "id": "quantizzazione",
-      "alias": ["quantizzazione", "quantizzare", "Q8_0", "Q4_K", "Q6_K", "Q2_K", "K-quant", "in Q4", "quantizzati"],
-      "titolo": "Quantizzazione",
-      "testo": "Scrivere i pesi del modello con meno cifre per farli occupare meno spazio: da 4 byte a 1 (Q8_0), o meno ancora (Q4). Meno byte vuol dire meno disco da leggere e meno RAM, ma i numeri non sono più esatti, quindi le risposte possono cambiare un po'. Per questo nel progetto è un modo che si dichiara, mai il comportamento di default.",
-      "vedi": ["esperto", "gguf", "al-byte"]
+      "id": "quantization",
+      "alias": ["quantization", "quantize", "Q8_0", "Q4_K", "Q6_K", "Q2_K", "K-quant", "in Q4", "quantized"],
+      "title": "Quantization",
+      "text": "Writing the model's weights with fewer digits so they take up less space: from 4 bytes to 1 (Q8_0), or even less (Q4). Fewer bytes means less disk to read and less RAM, but the numbers are no longer exact, so the answers can shift a little. That is why in this project it is a mode you opt into, never the default behavior.",
+      "see": ["expert", "gguf", "byte-exact"]
     },
     {
       "id": "gguf",
       "alias": ["GGUF"],
-      "titolo": "GGUF",
-      "testo": "Il formato di file in cui sta un modello pronto da usare: un unico file con tutti i pesi e le informazioni per interpretarli. È lo standard nato con llama.cpp, e leggerlo è la porta d'ingresso del motore.",
-      "vedi": ["quantizzazione", "esperto"]
+      "title": "GGUF",
+      "text": "The file format a ready-to-use model comes in: a single file with all the weights and the information to interpret them. It is the standard born with llama.cpp, and reading it is the engine's front door.",
+      "see": ["quantization", "expert"]
     },
     {
       "id": "budget",
       "alias": ["budget", "expert-budget"],
-      "titolo": "Budget degli esperti",
-      "testo": "Quanta RAM diamo alla dispensa degli esperti. Budget pieno: il modello sta tutto in memoria. Budget a metà: metà in memoria, il resto si va a prendere sul disco quando serve. È così che un modello più grande della RAM può comunque girare.",
-      "vedi": ["lru", "esperto", "lettura-diretta"]
+      "title": "Expert budget",
+      "text": "How much RAM we give the experts' pantry. Full budget: the model sits entirely in memory. Half budget: half in memory, the rest fetched from disk when needed. This is how a model bigger than RAM can still run.",
+      "see": ["lru", "expert", "direct-read"]
     },
     {
       "id": "lru",
       "alias": ["LRU"],
-      "titolo": "LRU (chi non si usa, esce)",
-      "testo": "La regola con cui si decide chi buttare fuori quando la dispensa è piena: esce quello che non si usa da più tempo (Least Recently Used). Funziona perché il passato somiglia al futuro: due token vicini chiedono quasi sempre gli stessi esperti, 3.6 su 8 in media. È lo stesso criterio con cui tieni sulla scrivania i libri che stai consultando e rimetti gli altri sullo scaffale.",
-      "vedi": ["budget", "cache", "esperto"]
+      "title": "LRU (whoever is not used, leaves)",
+      "text": "The rule for deciding who to throw out when the pantry is full: out goes whoever has not been used the longest (Least Recently Used). It works because the past resembles the future: two nearby tokens almost always ask for the same experts, 3.6 out of 8 on average. It is the same rule by which you keep on your desk the books you are consulting and put the others back on the shelf.",
+      "see": ["budget", "cache", "expert"]
     },
     {
       "id": "cache",
       "alias": ["cache"],
-      "titolo": "Cache",
-      "testo": "Una scorta di roba tenuta vicina perché la si userà ancora. Qui ce ne sono di due tipi: la nostra dispensa di esperti in RAM, e quella che fa il sistema operativo per conto suo su ogni file letto. La seconda, nelle misure, è un problema: fa sembrare il disco veloce quanto la RAM.",
-      "vedi": ["lru", "lettura-diretta"]
+      "title": "Cache",
+      "text": "A stash of stuff kept close because it will be used again. There are two kinds here: our own pantry of experts in RAM, and the one the operating system keeps on its own for every file it reads. The second one, in measurements, is a problem: it makes the disk look as fast as RAM.",
+      "see": ["lru", "direct-read"]
     },
     {
-      "id": "lettura-diretta",
-      "alias": ["lettura diretta", "letture dirette", "direct", "cache del sistema"],
-      "titolo": "Lettura diretta",
-      "testo": "Chiedere al sistema operativo di leggere dal disco senza tenersi una copia per sé. Serve a due cose: non avere il modello due volte in RAM, e misurare il disco vero invece della sua copia in memoria — senza, il prompt sembrerebbe 2.42 volte più veloce di quello che è.",
-      "vedi": ["cache", "nvme"]
+      "id": "direct-read",
+      "alias": ["direct read", "direct reads", "direct", "system cache"],
+      "title": "Direct read",
+      "text": "Asking the operating system to read from disk without keeping a copy for itself. It serves two purposes: not having the model in RAM twice, and measuring the real disk instead of its copy in memory — without it, the prompt would look 2.42 times faster than it really is.",
+      "see": ["cache", "nvme"]
     },
     {
       "id": "nvme",
-      "alias": ["NVMe", "SSD", "disco"],
-      "titolo": "Disco NVMe",
-      "testo": "Il disco a stato solido del portatile. Veloce rispetto a un disco meccanico, lentissimo rispetto alla RAM: ~1.5 GB/s contro i ~57 GB/s della memoria, cioè quasi quaranta volte meno. Per questo, se il modello non sta in RAM, il disco diventa il collo di bottiglia di tutto.",
-      "vedi": ["banda", "lettura-diretta"]
+      "alias": ["NVMe", "SSD", "disk"],
+      "title": "NVMe disk",
+      "text": "The laptop's solid-state disk. Fast compared to a mechanical disk, extremely slow compared to RAM: ~1.5 GB/s against RAM's ~57 GB/s, that is, almost forty times less. That is why, if the model does not fit in RAM, the disk becomes the bottleneck of everything.",
+      "see": ["bandwidth", "direct-read"]
     },
     {
-      "id": "banda",
-      "alias": ["banda", "GB/s", "banda della RAM"],
-      "titolo": "Banda di memoria",
-      "testo": "Quanti byte al secondo si riescono a leggere. Conta più della potenza di calcolo in questo motore: generare un token vuol dire soprattutto trascinare pesi dalla memoria ai core, e i core finiscono per aspettare. La RAM di questa macchina fa ~57 GB/s, il disco ~1.5.",
-      "vedi": ["decode", "nvme"]
+      "id": "bandwidth",
+      "alias": ["bandwidth", "GB/s", "RAM bandwidth"],
+      "title": "Memory bandwidth",
+      "text": "How many bytes per second can be read. It matters more than raw compute power in this engine: generating a token mostly means dragging weights from memory to the cores, and the cores end up waiting. This machine's RAM does ~57 GB/s, the disk ~1.5.",
+      "see": ["decode", "nvme"]
     },
     {
       "id": "tok-s",
-      "alias": ["tok/s", "token al secondo"],
-      "titolo": "tok/s (token al secondo)",
-      "testo": "La velocità del motore. Nel prompt sono i token letti al secondo (centinaia), nella generazione i token prodotti al secondo (decine). Due numeri diversi che non si confrontano fra loro: leggere è molto più veloce che scrivere.",
-      "vedi": ["prefill", "decode"]
+      "alias": ["tok/s", "tokens per second"],
+      "title": "tok/s (tokens per second)",
+      "text": "The engine's speed. In the prompt it is tokens read per second (hundreds), in generation it is tokens produced per second (tens). Two different numbers that do not compare to each other: reading is much faster than writing.",
+      "see": ["prefill", "decode"]
     },
     {
       "id": "thread",
       "alias": ["thread", "core", "pool"],
-      "titolo": "Thread e core",
-      "testo": "I core sono le unità di calcolo del processore (questa macchina ne ha 16 veri), i thread sono i lavori che ci girano sopra. Il pool è la squadra di thread già pronti, per non pagare ogni volta il costo di svegliarli. Più thread non vuol dire sempre più veloce: nella generazione, oltre 8, aspettano tutti la memoria.",
-      "vedi": ["decode", "banda"]
+      "title": "Threads and cores",
+      "text": "Cores are the processor's compute units (this machine has 16 real ones), threads are the jobs that run on them. The pool is the team of threads already up and ready, so their wake-up cost is not paid every time. More threads does not always mean faster: in generation, past 8, they all end up waiting on memory.",
+      "see": ["decode", "bandwidth"]
     },
     {
       "id": "simd",
-      "alias": ["SIMD", "AVX-512", "AVX2", "vettoriali"],
-      "titolo": "SIMD (istruzioni vettoriali)",
-      "testo": "Istruzioni che fanno lo stesso conto su 8 o 16 numeri in un colpo solo, invece che uno per volta. È da lì che viene la maggior parte della velocità dei kernel. Ogni processore ne ha un set diverso, quindi il motore ne porta più versioni e sceglie a runtime.",
-      "vedi": ["kernel", "tier"]
+      "alias": ["SIMD", "AVX-512", "AVX2", "vector instructions"],
+      "title": "SIMD (vector instructions)",
+      "text": "Instructions that do the same math on 8 or 16 numbers in one go, instead of one at a time. That is where most of the kernels' speed comes from. Every processor has a different set of them, so the engine carries several versions and picks one at runtime.",
+      "see": ["kernel", "tier"]
     },
     {
       "id": "kernel",
       "alias": ["kernel"],
-      "titolo": "Kernel",
-      "testo": "Qui non è quello del sistema operativo: è una funzioncina che fa un conto ripetuto milioni di volte — moltiplicare una riga di pesi per un vettore. È il pezzo più caldo del motore, quello che si riscrive in SIMD o in assembly guadagnando anche 10-20 volte.",
-      "vedi": ["simd", "zona-calda"]
+      "title": "Kernel",
+      "text": "Not the operating system's kind here: it is a small function that does one computation repeated millions of times — multiplying a row of weights by a vector. It is the hottest piece of the engine, the one rewritten in SIMD or assembly for 10-20 times the speed.",
+      "see": ["simd", "hot-zone"]
     },
     {
       "id": "tier",
       "alias": ["tier"],
-      "titolo": "Tier",
-      "testo": "Il gradino di istruzioni che una CPU sa fare (scalare, AVX2, AVX-512). Il motore li prova tutti nei test e sceglie il migliore all'avvio, sulla macchina che trova: gira su un portatile nuovo come su uno di dieci anni fa, con lo stesso risultato.",
-      "vedi": ["simd", "kernel"]
+      "title": "Tier",
+      "text": "The rung of instructions a CPU can do (scalar, AVX2, AVX-512). The engine tries them all in its tests and picks the best one at startup, on whatever machine it finds: it runs on a brand-new laptop the same as on one ten years old, with the same result.",
+      "see": ["simd", "kernel"]
     },
     {
-      "id": "zona-calda",
-      "alias": ["zona calda", "zona", "zone"],
-      "titolo": "Zona calda / zone del profilo",
-      "testo": "«Zona calda» è il codice che gira a ogni token, dove non si alloca memoria e non si scrivono stringhe: lì anche una piccolezza costa. Le «zone» del profilo sono invece i pezzi in cui dividiamo il tempo (attenzione, esperti, router, lettura dei pesi) per sapere dove va.",
-      "vedi": ["profilo", "kernel"]
+      "id": "hot-zone",
+      "alias": ["hot zone", "zone", "zones"],
+      "title": "Hot zone / profile zones",
+      "text": "«Hot zone» is the code that runs on every token, where nothing is allocated and no strings are written: there, even a tiny thing costs. The profile's «zones», instead, are the pieces we split the time into (attention, experts, router, weight reads) to know where it goes.",
+      "see": ["profile", "kernel"]
     },
     {
-      "id": "profilo",
-      "alias": ["profilo", "profiler", "profilazione"],
-      "titolo": "Profilo",
-      "testo": "La misura di dove finisce il tempo dentro una run, zona per zona. Serve a non ottimizzare a naso: prima si guarda quale pezzo pesa, poi si tocca quello. È da un profilo che è saltato fuori che il prompt rilegge gli esperti a ogni passata.",
-      "vedi": ["zona-calda", "mediana"]
+      "id": "profile",
+      "alias": ["profile", "profiler", "profiling"],
+      "title": "Profile",
+      "text": "The measurement of where the time goes inside a run, zone by zone. It keeps optimization from being done by guesswork: first look at which piece weighs the most, then touch that one. It was a profile that revealed the prompt was rereading the experts at every pass.",
+      "see": ["hot-zone", "median"]
     },
     {
-      "id": "mediana",
-      "alias": ["mediana", "spread", "A/A"],
-      "titolo": "Mediana, spread, A/A",
-      "testo": "Come si misura in questo progetto: mai una run sola. Si fanno N run e si prende il valore di mezzo (mediana), si dichiara quanto ballano (spread), e si misura anche la stessa identica cosa due volte (A/A) per sapere qual è il rumore di fondo. Un guadagno conta solo se è più grande del rumore.",
-      "vedi": ["profilo", "macchina-ferma"]
+      "id": "median",
+      "alias": ["median", "spread", "A/A"],
+      "title": "Median, spread, A/A",
+      "text": "How measurement works in this project: never a single run. N runs are made and the middle value is taken (median), how much they swing is stated (spread), and the very same thing is also measured twice (A/A) to know the background noise. A gain only counts if it is bigger than the noise.",
+      "see": ["profile", "still-machine"]
     },
     {
-      "id": "macchina-ferma",
-      "alias": ["macchina ferma", "carico di fondo"],
-      "titolo": "Macchina ferma",
-      "testo": "Le misure si fanno quando il computer non sta facendo altro: niente container accesi, niente processi nostri rimasti in giro. Ogni sessione scrive nel log quanto era occupata la macchina, perché con il carico sbagliato i numeri mentono e le conclusioni pure.",
-      "vedi": ["mediana"]
+      "id": "still-machine",
+      "alias": ["still machine", "background load"],
+      "title": "Still machine",
+      "text": "Measurements are taken when the computer is not doing anything else: no containers running, no leftover processes of ours. Every session logs how busy the machine was, because with the wrong load the numbers lie, and so do the conclusions.",
+      "see": ["median"]
     },
     {
-      "id": "oracolo",
-      "alias": ["oracolo", "oracoli"],
-      "titolo": "Oracolo",
-      "testo": "Il confronto con la verità: gli stessi input dati a transformers (l'implementazione Python di riferimento) e al nostro motore, e i risultati devono coincidere. Gira su modelli minuscoli, generati apposta, così è veloce e sta dentro i test automatici.",
-      "vedi": ["al-byte", "logit"]
+      "id": "oracle",
+      "alias": ["oracle", "oracles"],
+      "title": "Oracle",
+      "text": "The comparison against the truth: the same inputs given to transformers (the Python reference implementation) and to our engine, and the results must match. It runs on tiny, purpose-built models, so it is fast and fits inside the automated tests.",
+      "see": ["byte-exact", "logit"]
     },
     {
-      "id": "mutazione",
-      "alias": ["mutazione", "mutazioni"],
-      "titolo": "Mutazione",
-      "testo": "Il test dei test: si rompe il codice apposta, in un punto preciso, e si guarda se qualche test se ne accorge. Se restano tutti verdi, quel test non stava controllando niente. È il modo per non avere una rete di sicurezza fatta di buchi.",
-      "vedi": ["al-byte", "oracolo"]
+      "id": "mutation",
+      "alias": ["mutation", "mutations"],
+      "title": "Mutation",
+      "text": "The test of the tests: the code is broken on purpose, at one precise spot, and we look at whether any test notices. If they all stay green, that test was not checking anything. It is how you avoid a safety net full of holes.",
+      "see": ["byte-exact", "oracle"]
     },
     {
       "id": "kl",
       "alias": ["KL"],
-      "titolo": "KL (quanto due modelli la pensano diversamente)",
-      "testo": "Un numero che dice quanto la previsione di un modello si discosta da quella di un altro sullo stesso testo. Zero: identici. Sotto 0.01: differenza trascurabile. Sopra 1: stanno dicendo cose diverse. Serve a giudicare i modi non esatti, dove i bit non coincidono per costruzione.",
-      "vedi": ["logit", "quantizzazione"]
+      "title": "KL (how differently two models think)",
+      "text": "A number telling how far one model's prediction diverges from another's on the same text. Zero: identical. Below 0.01: negligible difference. Above 1: they are saying different things. It is used to judge the inexact modes, where the bits do not match by construction.",
+      "see": ["logit", "quantization"]
     },
     {
-      "id": "speculazione",
-      "alias": ["speculazione", "speculativa", "--spec", "bozza"],
-      "titolo": "Decodifica speculativa",
-      "testo": "Invece di produrre un token alla volta, se ne tirano a indovinare diversi in blocco (per esempio copiandoli da un pezzo di testo già visto) e poi si verificano tutti insieme in una passata sola. Quelli giusti si tengono, gli altri si buttano: il risultato è identico, ma quando il testo si ripete — come nel codice — è più veloce.",
-      "vedi": ["decode", "prompt"]
+      "id": "speculation",
+      "alias": ["speculation", "speculative", "--spec", "draft"],
+      "title": "Speculative decoding",
+      "text": "Instead of producing one token at a time, several are guessed at once in a block (for instance copying them from a piece of text already seen) and then all checked together in a single pass. The right ones are kept, the rest thrown away: the result is identical, but when the text repeats — as in code — it is faster.",
+      "see": ["decode", "prompt"]
     },
     {
       "id": "sanitizer",
       "alias": ["sanitizer", "ASan", "TSan"],
-      "titolo": "Sanitizer",
-      "testo": "Versioni del programma compilate con dei controlli in più che fanno esplodere subito gli errori di memoria (ASan) o le corse fra thread (TSan). Sono lentissime, quindi non si spediscono: girano nei test, dove servono a scoprire i bug che altrimenti si presentano a caso mesi dopo.",
-      "vedi": ["mutazione"]
+      "title": "Sanitizer",
+      "text": "Versions of the program compiled with extra checks that make memory errors (ASan) or data races between threads (TSan) blow up right away. They are very slow, so they never ship: they run in the tests, where they catch bugs that would otherwise show up at random, months later.",
+      "see": ["mutation"]
     },
     {
       "id": "slot",
-      "alias": ["slot", "archivio"],
-      "titolo": "Archivio a slot",
-      "testo": "La dispensa vera e propria: un pezzo di RAM diviso in caselle della misura di un esperto, allocate una volta all'avvio. Quando serve un esperto che non c'è, lo si legge dal disco dentro una casella libera (o liberata dalla LRU). Nessuna allocazione durante la generazione: quella è zona calda.",
-      "vedi": ["lru", "budget", "zona-calda"]
+      "alias": ["slot", "store"],
+      "title": "Slot store",
+      "text": "The pantry itself: a chunk of RAM divided into slots the size of one expert, allocated once at startup. When an expert that is missing is needed, it is read from disk into a free slot (or one freed by the LRU). No allocation during generation: that is a hot zone.",
+      "see": ["lru", "budget", "hot-zone"]
     },
     {
-      "id": "passata",
-      "alias": ["passata", "passate", "blocco di 512", "blocchi di 512"],
-      "titolo": "Passata (blocco del prompt)",
-      "testo": "Il prompt non si elabora tutto insieme ma a gruppi di 512 token: ogni gruppo attraversa tutti i layer, poi tocca al gruppo dopo. È fatto così per non tenere in RAM troppi risultati intermedi — ed è proprio questo che, sotto budget, fa rileggere gli esperti dal disco a ogni gruppo.",
-      "vedi": ["prefill", "layer", "budget"]
+      "id": "pass",
+      "alias": ["pass", "passes", "block of 512", "blocks of 512"],
+      "title": "Pass (prompt block)",
+      "text": "The prompt is not processed all at once but in groups of 512 tokens: each group goes through every layer, then it is the next group's turn. It is done this way to avoid keeping too many intermediate results in RAM — and it is exactly this that, under budget, makes the experts get reread from disk at every group.",
+      "see": ["prefill", "layer", "budget"]
     }
   ]
 }

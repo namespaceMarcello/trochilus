@@ -50,10 +50,10 @@ def check_doc_limits():
     claude = ROOT / "CLAUDE.md"
     n = claude.read_text(encoding="utf-8").count("\n")
     if n > 200:
-        fail("struttura", f"CLAUDE.md has {n} lines (limit 200)")
+        fail("structure", f"CLAUDE.md has {n} lines (limit 200)")
     stato = ROOT / "docs" / "STATUS.md"
     if stato.stat().st_size > 40_000:
-        fail("struttura", f"docs/STATUS.md is {stato.stat().st_size} bytes (limit 40 KB)")
+        fail("structure", f"docs/STATUS.md is {stato.stat().st_size} bytes (limit 40 KB)")
 
 
 def check_no_future_dates():
@@ -77,9 +77,9 @@ def check_lessons_table():
     for row in rows:
         cells = [c.strip() for c in re.split(r"(?<!\\)\|", row.strip().strip("|"))]  # "\|" is a literal pipe
         if len(cells) != 8:
-            fail("registro", f"LESSONS row {cells[0]} has {len(cells)} columns, expected 8")
+            fail("register", f"LESSONS row {cells[0]} has {len(cells)} columns, expected 8")
         if cells[0] != str(expected):
-            fail("registro", f"LESSONS row numbered {cells[0]}, expected {expected}")
+            fail("register", f"LESSONS row numbered {cells[0]}, expected {expected}")
         expected = int(cells[0]) + 1
 
 
@@ -127,14 +127,14 @@ HOT_FILES = ["src/models/olmoe.c", "src/models/model.c", "src/kernels/kernels.c"
              "src/kernels/kernels_internal.h", "src/kernels/expf.c", "src/base/threads.c", "src/base/prof.h",
              "src/kv/kv.c", "src/kv/kv.h", "src/backend/gpu_attn.c", "src/backend/gpu_attn.h"]
 HOT_RULES = [
-    ("allocazione", re.compile(r"\b(malloc|calloc|realloc|free|tr_alloc_aligned|tr_free_aligned|"
+    ("allocation", re.compile(r"\b(malloc|calloc|realloc|free|tr_alloc_aligned|tr_free_aligned|"
                                r"_aligned_malloc|_aligned_free|posix_memalign|aligned_alloc)\s*\(")),
-    ("stringa o I/O", re.compile(r"\b(str[a-z]+|printf|fprintf|snprintf|sprintf|vsnprintf|puts|fputs|"
+    ("string or I/O", re.compile(r"\b(str[a-z]+|printf|fprintf|snprintf|sprintf|vsnprintf|puts|fputs|"
                                  r"fopen|fread|fwrite|getenv|tr_log|tr_file_\w+|tr_gguf_\w+)\s*\(")),
-    ("letterale stringa", re.compile(r'(")(?:[^"\\]|\\.)*"')),
-    ("matematica da tabellare", re.compile(r"\b(pow|powf|cos|cosf|sin|sinf|tan|tanf|log|logf|log2|log10)\s*\(")),
+    ("string literal", re.compile(r'(")(?:[^"\\]|\\.)*"')),
+    ("math to put in a table", re.compile(r"\b(pow|powf|cos|cosf|sin|sinf|tan|tanf|log|logf|log2|log10)\s*\(")),
     # the library's exponential: 30 ns a call with MinGW, and other bits with glibc (docs/MEASUREMENTS.md question 37)
-    ("esponenziale della libreria C (si usa tr_expf)", re.compile(r"\b(expf|exp|exp2f|exp2|expm1f|expm1)\s*\(")),
+    ("the C library's exponential (use tr_expf)", re.compile(r"\b(expf|exp|exp2f|exp2|expm1f|expm1)\s*\(")),
 ]
 HOT_BEGIN, HOT_END = "/* hot: begin */", "/* hot: end */"
 
@@ -148,12 +148,12 @@ def hot_problems(text):
     for i, raw in enumerate(text.split("\n"), 1):
         if HOT_BEGIN in raw:
             if inside:
-                problems.append((i, "zona calda aperta due volte"))
+                problems.append((i, "hot zone opened twice"))
             inside, regions = True, regions + 1
             continue
         if HOT_END in raw:
             if not inside:
-                problems.append((i, "fine di una zona calda mai aperta"))
+                problems.append((i, "end of a hot zone never opened"))
             inside = False
             continue
         if not inside:
@@ -167,17 +167,17 @@ def hot_problems(text):
             continue
         for label, rx in HOT_RULES:
             for m in rx.finditer(code):
-                name = m.group(1) if m.group(1) != '"' else "stringa"
+                name = m.group(1) if m.group(1) != '"' else "string"
                 if name in allowed:
                     used.add(name)
                 else:
                     problems.append((i, f"{label}: {name}"))
         for name in sorted(allowed - used):
-            problems.append((i, f"hot-ok per '{name}' ma la riga non lo usa più: togli l'eccezione"))
+            problems.append((i, f"hot-ok for '{name}' but the line no longer uses it: remove the exception"))
     if inside:
-        problems.append((len(text.split("\n")), "zona calda mai chiusa"))
+        problems.append((len(text.split("\n")), "hot zone never closed"))
     if regions == 0:
-        problems.append((1, "nessuna zona calda marcata"))
+        problems.append((1, "no hot zone marked"))
     return problems
 
 
@@ -201,12 +201,12 @@ def check_hot_zones():
     for n, (text, want) in enumerate(samples, 1):
         got = len(hot_problems(text))
         if got != want:
-            failures.append(f"[zona calda] il controllo è rotto: campione {n} dà {got} problemi invece di {want}")
+            failures.append(f"[hot path] the check is broken: sample {n} gives {got} problems instead of {want}")
             return
     for rel in HOT_FILES:
         path = ROOT / rel
         for line, msg in hot_problems(path.read_text(encoding="utf-8")):
-            failures.append(f"[zona calda, docs/ARCHITECTURE.md] {rel}:{line}: {msg}")
+            failures.append(f"[hot path, docs/ARCHITECTURE.md] {rel}:{line}: {msg}")
 
 
 # No global state per model (CLAUDE.md): a mutable static variable in src/ is shared by every
@@ -254,21 +254,21 @@ def check_global_state():
     for n, (text, want) in enumerate(samples, 1):
         got = len(global_problems(text))
         if got != want:
-            fail(28, f"il controllo dello stato globale è rotto: campione {n} dà {got} problemi invece di {want}")
+            fail(28, f"the global state check is broken: sample {n} gives {got} problems instead of {want}")
             return
     for path in sorted((ROOT / "src").rglob("*.[ch]")):
         rel = path.relative_to(ROOT).as_posix()
         for line, decl in global_problems(path.read_text(encoding="utf-8")):
-            fail(28, f"{rel}:{line}: variabile statica mutabile (stato globale): `{decl}`; "
-                     "se è un fatto del processo, annotala con /* global-ok: motivo */")
+            fail(28, f"{rel}:{line}: mutable static variable (global state): `{decl}`; "
+                     "if it is a fact of the process, annotate it with /* global-ok: reason */")
 
 
 def check_makefile_recipes_ascii():
     """#36: GNU make on Windows passes recipes to the shell in the local code page."""
     for n, line in enumerate((ROOT / "Makefile").read_text(encoding="utf-8").split("\n"), 1):
         if line.startswith("\t") and not line.isascii():
-            fail(36, f"Makefile:{n}: carattere non ASCII in una ricetta (su Windows arriva rovinato); "
-                     "mettilo in uno script in tools/")
+            fail(36, f"Makefile:{n}: non-ASCII character in a recipe (on Windows it arrives ruined); "
+                     "put it in a script in tools/")
 
 
 def check_shell_scripts_whole():
@@ -278,21 +278,21 @@ def check_shell_scripts_whole():
     for f in sorted((ROOT / "tools").glob("*.sh")):
         lines = [l for l in f.read_text(encoding="utf-8").split("\n") if l.strip()]
         if "main() {" not in lines or lines[-1] != 'main "$@"; exit':
-            fail(69, f"tools/{f.name}: il corpo va dentro main() {{ ... }} e l'ultima riga è "
-                     'main "$@"; exit (uno script modificato mentre gira si rompe)')
+            fail(69, f"tools/{f.name}: the body goes inside main() {{ ... }} and the last line is "
+                     'main "$@"; exit (a script edited while it runs breaks)')
 
 
 def cleanup_problems(text):
     """what a tools/*.sh lacks to end what it starts (tools/cleanup.lib)."""
     problems = []
     if not re.search(r"^\s*\. tools/(cleanup|measure_guard)\.lib\s*$", text, flags=re.M):
-        problems.append("non carica tools/cleanup.lib (o tools/measure_guard.lib, che la carica)")
+        problems.append("does not load tools/cleanup.lib (or tools/measure_guard.lib, which loads it)")
     if not re.search(r"^\s*trap \S+ EXIT\s*$", text, flags=re.M):
-        problems.append("manca `trap <pulizia> EXIT`")
+        problems.append("missing `trap <cleanup> EXIT`")
     if not re.search(r"^\s*trap 'exit 130' INT TERM\s*$", text, flags=re.M):
-        problems.append("manca `trap 'exit 130' INT TERM`: un segnale deve far finire lo script, e passare dal trap EXIT")
+        problems.append("missing `trap 'exit 130' INT TERM`: a signal must end the script, and go through the EXIT trap")
     if re.search(r"^\s*trap [^\n]*\bEXIT\b[^\n]*\b(INT|TERM)\b", text, flags=re.M):
-        problems.append("un trap solo per EXIT e per i segnali: dopo il segnale lo script proseguirebbe")
+        problems.append("one trap for both EXIT and the signals: after the signal the script would go on")
     return problems
 
 
@@ -312,7 +312,7 @@ def check_scripts_clean_up():
     for n, (text, want) in enumerate(samples, 1):
         got = len(cleanup_problems(text))
         if got != want:
-            fail(84, f"il controllo della pulizia degli script è rotto: campione {n} dà {got} problemi invece di {want}")
+            fail(84, f"the scripts' cleanup check is broken: sample {n} gives {got} problems instead of {want}")
             return
     for f in sorted((ROOT / "tools").glob("*.sh")):
         for msg in cleanup_problems(f.read_text(encoding="utf-8")):
@@ -344,12 +344,12 @@ def check_no_failure_into_tee():
     for n, (text, want) in enumerate(samples, 1):
         got = len(tee_problems(text))
         if got != want:
-            fail(90, f"il controllo delle pipe verso tee è rotto: campione {n} dà {got} problemi invece di {want}")
+            fail(90, f"the check on pipes to tee is broken: sample {n} gives {got} problems instead of {want}")
             return
     for f in sorted((ROOT / "tools").glob("*.sh")):
         for line in tee_problems(f.read_text(encoding="utf-8")):
-            fail(90, f"tools/{f.name}:{line}: una pipe verso tee inghiotte il fallimento di ciò che sta a sinistra; "
-                     "scrivi su file e mostra il file con cat")
+            fail(90, f"tools/{f.name}:{line}: a pipe to tee swallows the failure of what is on its left; "
+                     "write to a file and show the file with cat")
 
 
 def struct_malloc_problems(text):
@@ -377,12 +377,12 @@ def check_struct_calloc():
     for n, (text, want) in enumerate(samples, 1):
         got = len(struct_malloc_problems(text))
         if got != want:
-            fail(252, f"il controllo delle struct da malloc è rotto: campione {n} dà {got} problemi invece di {want}")
+            fail(252, f"the check on structs from malloc is broken: sample {n} gives {got} problems instead of {want}")
             return
     for path in sorted((ROOT / "src").rglob("*.c")):
         rel = path.relative_to(ROOT).as_posix()
         for line in struct_malloc_problems(path.read_text(encoding="utf-8")):
-            fail(252, f"{rel}:{line}: malloc(sizeof *x) lascia i campi a ciò che c'era nello heap: usa calloc(1, sizeof *x)")
+            fail(252, f"{rel}:{line}: malloc(sizeof *x) leaves the fields to whatever was on the heap: use calloc(1, sizeof *x)")
 
 
 def check_expf_table():
@@ -421,11 +421,138 @@ def check_readme_numbers():
             fail(218, f"README.md: '{num} {unit}' is in no line of docs/MEASUREMENTS.md")
 
 
+def english_problems(text):
+    """Line numbers of the lines that read as Italian: two or more distinct words that exist only in
+    Italian, outside inline code spans, on a line that does not carry `italian-ok`."""
+    problems = []
+    for i, line in enumerate(text.split("\n"), 1):
+        if "italian-ok" in line:
+            continue
+        words = {w.lower() for w in re.findall(r"[A-Za-zàèéìòùÀÈÉÌÒÙ]+", re.sub(r"`[^`]*`", " ", line))}
+        if len(words & ITALIAN_ONLY) >= 2:
+            problems.append(i)
+    return problems
+
+
+ITALIAN_ONLY = set((  # italian-ok: the word list itself
+    "della delle degli dello dalla dalle dagli nella nelle negli sulla sulle sugli alla alle agli stessa "  # italian-ok
+    "stesso stessi contro riga righe respinto respinta tenuto tenuta resta restano sempre ancora dove quando "  # italian-ok
+    "poi ogni dopo senza misurato misurata misurati passata passate questo questa questi quello quella perché "  # italian-ok
+    "quindi anche già più così cioè invece mentre sono viene vengono essere stato stata tutto tutti tutte "  # italian-ok
+    "niente nessun nessuna nessuno uguale uguali lettura letture scrittura calcolo calcoli esperto esperti "  # italian-ok
+    "pesi prova prove misura misure che è non"  # italian-ok
+).split())
+
+
+def check_english():
+    """#257: "everything in the repository is written in English" (2026-09-22) stayed a sentence for five
+    days: two documents half translated, the status page, the lint's and the hooks' messages still Italian.
+    Every text file of ours: no line that reads as Italian. Measurement inputs (bench/prompts), the
+    tokenizer's test texts and the translation tools are Italian on purpose."""
+    samples = [("Il prefill resta più lento della misura.", 1),  # italian-ok: the samples
+               ("The prefill stays slower than the measure.", 0),
+               ("the test input `città è perché` stays", 0), ("Il prefill resta più lento. # italian-ok", 0)]
+    for n, (text, want) in enumerate(samples):
+        got = len(english_problems(text))
+        if got != want:
+            fail(257, f"the English check is broken: sample {n} gives {got} problems instead of {want}")
+            return
+    import subprocess
+    skip = ("bench/prompts/", "bench/results/", "tests/tokenizer_bank.json", "tools/italian_map.py",
+            "tools/check_translation.py", "src/tokenizer/unicode_data.h")
+    suffixes = {".c", ".h", ".py", ".sh", ".lib", ".awk", ".json", ".txt", ".ps1", ".md", ".cjs", ".cu", ".ptx"}
+    # what the repository holds: the files git tracks (a local note under docs/ that .gitignore keeps out
+    # is not in it), plus the new ones not yet added
+    r = subprocess.run(["git", "ls-files", "--cached", "--others", "--exclude-standard"], cwd=ROOT,
+                       capture_output=True, text=True, encoding="utf-8")
+    if r.returncode != 0:
+        fail(257, "git ls-files failed: the English check needs git")
+        return
+    for rel in r.stdout.splitlines():
+        f = ROOT / rel
+        if rel.startswith(skip) or not f.is_file() or (f.suffix not in suffixes and f.name not in ("Makefile", "Dockerfile")):
+            continue
+        for line in english_problems(f.read_text(encoding="utf-8", errors="replace")):
+            fail(257, f"{rel}:{line}: reads as Italian (everything in the repository is written in English)")
+
+
+def status_problems(data, gloss):
+    """The status page's data problems: shapes, states the page knows, references that resolve."""
+    bad = []
+    states = set(data["states"])
+    if not states <= PAGE_STATES:
+        bad.append(f"states {sorted(states - PAGE_STATES)} have no label on the page ({sorted(PAGE_STATES)})")
+    milestones = {m["id"] for m in data["milestones"]}
+    blocks = {b["id"] for b in data["blocks"]}
+    for m in data["milestones"]:
+        if m["state"] not in states:
+            bad.append(f"milestone {m['id']}: state {m['state']!r}, not one of {sorted(states)}")
+    for b in data["blocks"]:
+        where = f"block {b['id']}"
+        if b["state"] not in states:
+            bad.append(f"{where}: state {b['state']!r}, not one of {sorted(states)}")
+        if b["milestone"] not in milestones:
+            bad.append(f"{where}: milestone {b['milestone']!r} does not exist")
+        bad += [f"{where}: depends on {d!r}, which is no block" for d in b["depends"] if d not in blocks]
+        for q in b["questions"]:
+            if not isinstance(q, dict) or q.get("state") not in ("open", "closed") or not q.get("text"):
+                bad.append(f"{where}: a question is not {{n, state: open|closed, text}}: {str(q)[:60]}")
+        for n in b["numbers"]:
+            if not isinstance(n, dict) or not n.get("v") or not re.fullmatch(r"20\d\d-\d\d-\d\d", n.get("d", "")):
+                bad.append(f"{where}: a number is not {{v, d: date}}: {str(n)[:60]}")
+    ids = {e["id"] for e in gloss["entries"]}
+    bad += [f"glossary {e['id']}: sees {s!r}, which is no entry" for e in gloss["entries"] for s in e.get("see", [])
+            if s not in ids]
+    return bad
+
+
+PAGE_STATES = {"done", "in-progress", "next", "open", "no"}  # tools/status_html.py's LABEL
+
+
+def check_status_json():
+    """#258: three questions of docs/status.json were plain strings instead of {n, state, text}, and the
+    status page showed them as "#undefined"; nothing read the data before the page did. Its shape, its
+    states and its references (a block's milestone, `depends`, the glossary's `see`) are checked here."""
+    import copy
+    import json
+
+    def sample(**change):
+        d = {"states": {"done": "", "open": ""}, "milestones": [{"id": "M0", "state": "done"}],
+             "blocks": [{"id": "a", "milestone": "M0", "state": "done", "depends": [],
+                         "questions": [{"n": 1, "state": "open", "text": "q"}], "numbers": [{"v": "1", "d": "2026-09-27"}]},
+                        {"id": "b", "milestone": "M0", "state": "open", "depends": ["a"], "questions": [], "numbers": []}]}
+        g = {"entries": [{"id": "x", "see": ["y"]}, {"id": "y", "see": []}]}
+        d, g = copy.deepcopy(d), copy.deepcopy(g)
+        for key, value in change.items():
+            if key == "question":
+                d["blocks"][0]["questions"].append(value)
+            elif key == "depends":
+                d["blocks"][1]["depends"].append(value)
+            elif key == "see":
+                g["entries"][1]["see"].append(value)
+            elif key == "state":
+                d["blocks"][1]["state"] = value
+        return d, g
+    samples = [(sample(), 0), (sample(question="83: a question written as a string"), 1),
+               (sample(question={"state": "open", "text": "no number: allowed"}), 0),
+               (sample(depends="gone"), 1), (sample(see="gone"), 1), (sample(state="aperto"), 1)]
+    for n, ((d, g), want) in enumerate(samples):
+        got = len(status_problems(d, g))
+        if got != want:
+            fail(258, f"the status data check is broken: sample {n} gives {got} problems instead of {want}")
+            return
+    data = json.loads((ROOT / "docs" / "status.json").read_text(encoding="utf-8"))
+    gloss = json.loads((ROOT / "docs" / "glossary.json").read_text(encoding="utf-8"))
+    for msg in status_problems(data, gloss):
+        fail(258, f"docs/status.json: {msg}")
+
+
 def main():
     for check in (check_docs_control_chars, check_line_endings, check_doc_limits, check_no_future_dates, check_lessons_table,
                   check_type_table, check_tests_no_tmpfile, check_hot_zones, check_global_state,
                   check_makefile_recipes_ascii, check_shell_scripts_whole, check_scripts_clean_up,
-                  check_no_failure_into_tee, check_struct_calloc, check_expf_table, check_readme_numbers):
+                  check_no_failure_into_tee, check_struct_calloc, check_expf_table, check_readme_numbers,
+                  check_english, check_status_json):
         check()
     for f in failures:
         print(f)

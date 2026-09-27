@@ -1,1039 +1,1043 @@
 {
-  "progetto": "Trochilus",
-  "sottotitolo": "motore di inferenza per modelli MoE in C, senza dipendenze",
-  "aggiornato": "2026-09-27",
-  "stati": {
-    "fatto": "finito e provato: test verdi in make check",
-    "in-corso": "ci stiamo lavorando adesso",
-    "prossimo": "deciso, misurato, non ancora scritto",
-    "aperto": "sappiamo che serve, non è deciso quando",
-    "no": "valutato e scartato, con la ragione"
+  "project": "Trochilus",
+  "subtitle": "inference engine for MoE models in C, no dependencies",
+  "updated": "2026-09-27",
+  "states": {
+    "done": "finished and proven: green tests in make check",
+    "in-progress": "we are working on it now",
+    "next": "decided, measured, not yet written",
+    "open": "we know it is needed, not decided when",
+    "no": "evaluated and dropped, with the reason"
   },
-  "tappe": [
+  "milestones": [
     {
       "id": "M0",
-      "titolo": "Fondamenta",
-      "sommario": "il motore esatto che gira su ogni CPU",
-      "stato": "fatto",
-      "criterio": "logit identici a transformers, 0 warning, sanitizer puliti"
+      "title": "Foundations",
+      "summary": "the exact engine that runs on every CPU",
+      "state": "done",
+      "criterion": "logits identical to transformers, 0 warnings, sanitizers clean"
     },
     {
       "id": "M1",
-      "titolo": "Esperti dal disco",
-      "sommario": "far girare un modello più grande della RAM",
-      "stato": "in-corso",
-      "criterio": "budget piccolo forzato → logit identici al byte; nessuna opzione necessaria"
+      "title": "Experts from disk",
+      "summary": "run a model larger than RAM",
+      "state": "in-progress",
+      "criterion": "small budget forced -> logits identical to the byte; no option needed"
     },
     {
       "id": "M2",
-      "titolo": "K-quant e assembly",
-      "sommario": "meno byte per peso: Q4_K, Q6_K, Q2_K, IQ2_XXS",
-      "stato": "in-corso",
-      "criterio": "kernel bit-identici allo scalare, microbenchmark"
+      "title": "K-quant and assembly",
+      "summary": "fewer bytes per weight: Q4_K, Q6_K, Q2_K, IQ2_XXS",
+      "state": "in-progress",
+      "criterion": "kernels bit-identical to the scalar one, microbenchmark"
     },
     {
       "id": "M3",
-      "titolo": "Modulo CUDA",
-      "sommario": "la GPU esatta: prima l'attenzione del decode, poi i pesi densi, poi gli esperti in VRAM",
-      "stato": "in-corso",
-      "criterio": "stessi byte della CPU; un modello più grande della RAM gira sul PC di riferimento"
+      "title": "CUDA module",
+      "summary": "the exact GPU: first the decode's attention, then the dense weights, then the experts in VRAM",
+      "state": "in-progress",
+      "criterion": "same bytes as the CPU; a model larger than RAM runs on the reference PC"
     },
     {
       "id": "M4",
-      "titolo": "DeepSeek V4 Flash",
-      "sommario": "una seconda famiglia di modelli",
-      "stato": "aperto",
-      "criterio": "oracolo minuscolo esatto; gira sul PC di riferimento"
+      "title": "DeepSeek V4 Flash",
+      "summary": "a second family of models",
+      "state": "open",
+      "criterion": "tiny exact oracle; runs on the reference PC"
     },
     {
       "id": "M5",
-      "titolo": "Leve del coding",
-      "sommario": "checkpoint KV su disco, server, decodifica speculativa",
-      "stato": "in-corso",
-      "criterio": "—"
+      "title": "Coding levers",
+      "summary": "KV checkpoint on disk, server, speculative decoding",
+      "state": "in-progress",
+      "criterion": "-"
     },
     {
       "id": "M6",
-      "titolo": "Vulkan e Metal",
-      "sommario": "le altre GPU, sempre come moduli",
-      "stato": "aperto",
-      "criterio": "stessi token della CPU"
+      "title": "Vulkan and Metal",
+      "summary": "the other GPUs, always as modules",
+      "state": "open",
+      "criterion": "same tokens as the CPU"
     }
   ],
-  "blocchi": [
+  "blocks": [
     {
-      "id": "nucleo",
-      "tappa": "M0",
-      "titolo": "Nucleo esatto",
-      "stato": "fatto",
-      "cosa": "Il motore che legge un file GGUF e genera testo, scritto in C senza librerie esterne. «Esatto» vuol dire che i numeri che produce sono identici a quelli di transformers, il riferimento Python: se sbagliamo, lo sappiamo subito invece di accorgercene dalle risposte strane.",
-      "numeri": [],
-      "domande": [],
-      "file": [
+      "id": "core",
+      "milestone": "M0",
+      "title": "Exact core",
+      "state": "done",
+      "what": "The engine that reads a GGUF file and generates text, written in C with no external libraries. «Exact» means the numbers it produces are identical to those of transformers, the Python reference: if we get it wrong, we know right away instead of noticing from strange answers.",
+      "numbers": [],
+      "questions": [],
+      "files": [
         "src/models/olmoe.c",
         "src/format/gguf.c",
         "src/tokenizer/"
       ],
-      "comandi": [
+      "commands": [
         "make oracle",
         "make oracle-real"
       ],
-      "dipende": []
+      "depends": []
     },
     {
       "id": "kernel",
-      "tappa": "M0",
-      "titolo": "Kernel SIMD + tier",
-      "stato": "fatto",
-      "cosa": "I conti pesanti (moltiplicazioni di matrici) scritti nelle istruzioni vettoriali della CPU, con una versione per ogni famiglia e la scelta a runtime. Ogni versione dà gli stessi bit della versione scalare, e il test lo verifica.",
-      "numeri": [
+      "milestone": "M0",
+      "title": "SIMD kernels + tier",
+      "state": "done",
+      "what": "The heavy math (matrix multiplications) written in the CPU's vector instructions, with one version per family and the choice made at runtime. Every version gives the same bits as the scalar version, and a test verifies it.",
+      "numbers": [
         {
-          "v": "i router di OLMoE sono valori bf16 salvati in F32 (ogni metà bassa a zero): al caricamento tenuti in bf16, allargati con uno shift nelle stesse corsie del prodotto F32, stessi bit per costruzione. Il router da 179-186 a 120-130 microsecondi a token (1.40-1.48x), circa lo 0.4% del token",
+          "v": "OLMoE's routers are bf16 values saved as F32 (every low half zero): kept in bf16 at load, widened with a shift into the same lanes as the F32 product, same bits by construction. The router from 179-186 to 120-130 microseconds a token (1.40-1.48x), about 0.4% of the token",
           "d": "2026-09-27"
         },
         {
-          "v": "domanda 66, il decode Q4_K letto come un genoma: la decodifica scalare delle scale era il 24% di una riga. Scale in vettore un blocco avanti e due righe di pesi per chiamata, stessi bit: in L1 1.25x e 1.38x; dalla RAM a 4 thread llama.cpp passa da 1.37x a 1.04x; il modello vero a 4 thread genera 50.4 token/s contro 50.2 di llama.cpp (prima 40.3): pari, ed esatti",
+          "v": "question 66, the Q4_K decode read as a genome: the scalar decoding of the scales was 24% of a row. Scales in vector one block ahead and two weight rows per call, same bits: in L1 1.25x and 1.38x; from RAM at 4 threads llama.cpp goes from 1.37x to 1.04x; the real model at 4 threads generates 50.4 tok/s against llama.cpp's 50.2 (was 40.3): even, and exact",
           "d": "2026-09-25"
         },
         {
-          "v": "la generazione, un token alla volta, contro i kernel di llama.cpp dalla RAM: in Q8_0 pari da 4 thread (0.97-1.06×, entrambi al tetto della memoria), loro 1.4-1.7× a un thread; in Q4_K loro 1.34-1.40× a 4 thread e pari da 8, perché il nostro calcolo esatto fa 9.3 GB/s per core. Tre kernel esatti provati e chiusi con un no (quattro righe insieme 0.5-0.9× dalla RAM)",
+          "v": "generation, one token at a time, against llama.cpp's kernels from RAM: on Q8_0 even at 4 threads (0.97-1.06x, both at the memory ceiling), theirs 1.4-1.7x at one thread; on Q4_K theirs 1.34-1.40x at 4 threads and even from 8, because our exact math does 9.3 GB/s per core. Three exact kernels tried and closed with a no (four rows together 0.5-0.9x from RAM)",
           "d": "2026-09-25"
         },
         {
-          "v": "più righe di pesi per ogni caricamento dei token (4 × 6 e 3 × 8): i conti puri vanno come oggi, ma nel matmul vero perdono il 6-16%; chiusa con un no, e il matmul non è frenato dal caricamento dei token come pensavamo",
+          "v": "more weight rows per token load (4 x 6 and 3 x 8): pure math goes as today, but in the real matmul loses 6-16%; closed with a no, the matmul is not held back by the token load as we thought",
           "d": "2026-09-25"
         },
         {
-          "v": "decodificare i pesi una volta per riga e poi F32 su tutti i token (l'idea di ik_llama.cpp, tenuta esatta): Q8_0 1.00-1.04×, Q4_K 1.1×, chiusa",
+          "v": "decoding the weights once per row and then F32 across all tokens (ik_llama.cpp's idea, kept exact): Q8_0 1.00-1.04x, Q4_K 1.1x, closed",
           "d": "2026-09-24"
         },
         {
-          "v": "i kernel di llama.cpp da soli, sulle nostre stesse forme, un core: sugli esperti Q8_0 i nostri sono 1.42× più veloci (102 contro 72 GFLOP/s); sulle proiezioni dense i loro 1.6× (interi a 8 bit), sul Q4_K riordinato 1.26-2.3×",
+          "v": "llama.cpp's kernels alone, on our own shapes, one core: on Q8_0 experts ours are 1.42x faster (102 against 72 GFLOP/s); on dense projections theirs 1.6x (8-bit integers), on reordered Q4_K 1.26-2.3x",
           "d": "2026-09-24"
         },
         {
-          "v": "due righe di pesi contro 8 token alla volta, e la somma finale delle corsie in SIMD: il matmul su un core da 87 a 102 GFLOP/s; prefill nativo 1.15-1.19× a 512 e 2048 token, 1.13-1.14× a 4000, generazione uguale, numeri identici al bit",
+          "v": "two weight rows against 8 tokens at a time, and the final lane sum in SIMD: the matmul on one core from 87 to 102 GFLOP/s; native prefill 1.15-1.19x at 512 and 2048 tokens, 1.13-1.14x at 4000, generation unchanged, numbers identical to the bit",
           "d": "2026-09-25"
         },
         {
-          "v": "due righe di pesi per ogni caricamento delle attivazioni: prefill 1.20-1.26× (Q8_0), 1.11× (Q4_K_M), generazione uguale, numeri identici al bit",
+          "v": "two weight rows per activation load: prefill 1.20-1.26x (Q8_0), 1.11x (Q4_K_M), generation unchanged, numbers identical to the bit",
           "d": "2026-09-24"
         },
         {
-          "v": "dot_row q8_0: da 1 957 a 19 837 M elementi/s (AVX-512)",
+          "v": "dot_row q8_0: from 1 957 to 19 837 M elements/s (AVX-512)",
           "d": "2026-09-17"
         },
         {
-          "v": "righe F16 col kernel del tier: 49×",
+          "v": "F16 rows with the tier's kernel: 49x",
           "d": "2026-09-19"
         }
       ],
-      "domande": [
+      "questions": [
         {
           "n": 66,
-          "stato": "chiusa",
-          "testo": "raggiungere llama.cpp a 4 thread sul decode Q4_K restando esatti? raggiunto: 50.4 contro 50.2 token/s"
+          "state": "closed",
+          "text": "reach llama.cpp at 4 threads on Q4_K decode while staying exact? reached: 50.4 against 50.2 tok/s"
         }
       ],
-      "file": [
+      "files": [
         "src/kernels/",
         "tools/mutate_bf16.sh"
       ],
-      "comandi": [
+      "commands": [
         "make bench",
         "make tier-check"
       ],
-      "dipende": [
-        "nucleo"
+      "depends": [
+        "core"
       ]
     },
     {
       "id": "pool",
-      "tappa": "M0",
-      "titolo": "Pool di thread e larghezza per fase",
-      "stato": "fatto",
-      "cosa": "I core del portatile usati senza sprechi: il prompt su tutti, la generazione sulla larghezza che la sessione misura da sola. Il decode non usa tutti i core perché il limite è la memoria, non il calcolo.",
-      "numeri": [
+      "milestone": "M0",
+      "title": "Thread pool and per-phase width",
+      "state": "done",
+      "what": "The laptop's cores used with no waste: the prompt on all of them, generation on the width the session measures for itself. The decode does not use every core because the limit is memory, not compute.",
+      "numbers": [
         {
-          "v": "A/B dentro un solo processo (generate --ab): i passaggi alternati fra due strade nello stesso file, precisione 0.28% in due minuti; i bracci senza periodo, perché A B B A metteva sempre sul braccio A le pagine nuove della KV (ogni 8 posizioni)",
+          "v": "A/B inside a single process (generate --ab): alternating passes between two paths in the same file, 0.28% precision in two minutes; the arms with no period, because A B B A always put the KV's new pages on arm A (every 8 positions)",
           "d": "2026-09-27"
         },
         {
-          "v": "l'argmax del token scelto, prima su un solo thread (116-118 microsecondi a token, trovato dal pensatore), ora diviso fra i thread del pool con gli stessi indici: 5.6-6.9 microsecondi, un token circa lo 0.7% più veloce, una passata di verifica a 3 righe 1.0175x. Fuori dall'A/B dentro un processo non girava: un campo della sessione mai azzerato teneva la scansione seriale (LESSONS #252); corretto il 27 sera, ogni corsa ora 5.5 microsecondi",
+          "v": "the chosen token's argmax, first on a single thread (116-118 microseconds a token, found by the pensatore), now split across the pool's threads with the same indices: 5.6-6.9 microseconds, a token about 0.7% faster, a 3-row verify pass 1.0175x. Outside the in-process A/B it did not run: a session field never cleared kept the serial scan (LESSONS #252); fixed on the evening of the 27th, every run now 5.5 microseconds",
           "d": "2026-09-27"
         },
         {
-          "v": "ogni dimensione di passata di verifica (2-4 righe) misura da sola quanti thread usare, come il decode, saltando la larghezza piu' stretta: su 16 core sceglie 8 thread in 16 corse su 16; Q8_0 3.4-3.9% piu' veloce del pool intero e fino al 5.7% della larghezza del decode. Provare anche la piu' stretta faceva perdere il 2% al Q4_K: ogni prova su 4 thread costava +60%",
+          "v": "every verify pass size (2-4 rows) measures on its own how many threads to use, like the decode, skipping the narrowest width: on 16 cores it picks 8 threads in 16 runs out of 16; Q8_0 3.4-3.9% faster than the full pool and up to 5.7% of the decode's width. Also trying the narrowest cost Q4_K 2%: every 4-thread trial cost +60%",
           "d": "2026-09-27"
         },
         {
-          "v": "il prompt da 8 a 16 thread scala 1.49-1.50x in nativo su Q4_K, come llama.cpp nella gara (1.44-1.49x): il divario di 1.11-1.16x era del container con Q8_0. A 16 thread le code sono il 17-20% del tempo (core più lenti, regioni fisse): proposto il lavoro rubato a blocchi di tessere, non costruito",
+          "v": "the prompt from 8 to 16 threads scales 1.49-1.50x natively on Q4_K, like llama.cpp in the race (1.44-1.49x): the 1.11-1.16x gap was the container with Q8_0. At 16 threads the tails are 17-20% of the time (slower cores, fixed regions): stealing work in tile blocks was proposed, not built",
           "d": "2026-09-26"
         },
         {
-          "v": "gli esperti del decode ora divisi fra i thread in modo bilanciato anche loro (la condizione non li prendeva mai, 8 righe in 64 gruppi). A macchina libera: generazione 1.04-1.08× a 8 thread, il token legge a 51-52 GB/s su 53-55 della RAM, la RAM ferma passa dal 5-11% all'1-4% del token; stessi bit",
+          "v": "the decode's experts now split across threads in a balanced way too (the condition never caught them, 8 rows in 64 groups). On a free machine: generation 1.04-1.08x at 8 threads, the token reads at 51-52 GB/s out of 53-55 of RAM, RAM idle drops from 5-11% to 1-4% of the token; same bits",
           "d": "2026-09-26"
         },
         {
-          "v": "prompt su tutto il pool, decode sulla larghezza misurata: 1.05-1.09×",
+          "v": "prompt on the whole pool, decode on the measured width: 1.05-1.09x",
           "d": "2026-09-18"
         },
         {
-          "v": "SMT peggiora: 32 thread contro 16 → decode 2.2 contro 22.9 tok/s",
+          "v": "SMT makes it worse: 32 threads against 16 -> decode 2.2 against 22.9 tok/s",
           "d": "2026-09-18"
         },
         {
-          "v": "SMT vero (nativo): due thread per core danno al decode +1.6-5.7% a 4 core, niente a 8 (la larghezza che il motore sceglie, 60 tok/s), un crollo a 16 (8.4 contro 58.3 tok/s)",
+          "v": "real SMT (native): two threads per core give the decode +1.6-5.7% at 4 cores, nothing at 8 (the width the engine picks, 60 tok/s), a collapse at 16 (8.4 against 58.3 tok/s)",
           "d": "2026-09-25"
         },
         {
-          "v": "la coda del pool: a 8 thread nel container si aspettava il thread più lento per un quinto di ogni moltiplicazione; a blocchi rubati dagli altri, stessi bit: -8% di tempo nelle chiamate del decode, in nativo pari",
+          "v": "the pool's tail: at 8 threads in the container it waited for the slowest thread for a fifth of every multiplication; with blocks stolen from the others, same bits: -8% of time in decode calls, native even",
           "d": "2026-09-25"
         },
         {
-          "v": "i worker in attesa che portano in cache l'inizio della chiamata dopo: nel banco 1.02-1.14× a chiamata dopo un passo seriale di 1.5-6 us; nel motore pari (12 corse: 0.996 ± 0.004): il passo seriale dopo ogni suggerimento perde quanto la chiamata guadagna. Spenti, pronti da riaccendere",
+          "v": "idle workers that prefetch into cache the start of the call after: in the bench 1.02-1.14x per call after a serial step of 1.5-6 us; in the engine even (12 runs: 0.996 ± 0.004): the serial step after every hint costs as much as the call gains. Turned off, ready to turn back on",
           "d": "2026-09-27"
         },
         {
-          "v": "cosa c'è dopo la fine della regione di un thread: una pagina di guardia fa la chiamata densa 0.8% più veloce, le regioni di un thread una dopo l'altra 1.0-1.75%; gli esperti niente (0.2-0.4% di un token, nel layout denso)",
+          "v": "what lies past the end of a thread's region: a guard page makes the dense call 0.8% faster, a thread's regions one after the other 1.0-1.75%; the experts nothing (0.2-0.4% of a token, in the dense layout)",
           "d": "2026-09-27"
         }
       ],
-      "domande": [
+      "questions": [
         {
           "n": 31,
-          "stato": "aperta",
-          "testo": "lo stimatore della larghezza riscritto: a 512 sul Q4_K nativo sceglie 8 core in 6 corse su 6, pari a 8 forzati; manca il contesto lungo"
+          "state": "open",
+          "text": "the width estimator rewritten: at 512 on native Q4_K it picks 8 cores in 6 runs out of 6, matching 8 forced; long context is missing"
         },
         {
           "n": 67,
-          "stato": "chiusa",
-          "testo": "SMT nel decode: due thread per core battono llama.cpp sugli stessi 4 core? no: +1.6-5.7% a 4 core, niente a 8, dove il motore lavora"
+          "state": "closed",
+          "text": "SMT in the decode: two threads per core beat llama.cpp on the same 4 cores? no: +1.6-5.7% at 4 cores, nothing at 8, where the engine works"
         },
         {
           "n": 68,
-          "stato": "aperta",
-          "testo": "perché 32 thread su 16 core fanno crollare il decode (8.4 contro 58.3 tok/s)?"
+          "state": "open",
+          "text": "why do 32 threads on 16 cores make the decode collapse (8.4 against 58.3 tok/s)?"
         },
         {
           "n": 72,
-          "stato": "chiusa",
-          "testo": "gate e up intrecciati al caricamento? no: a macchina libera 1.006-1.023×, le tre chiamate leggono già al 97-98% della RAM"
+          "state": "closed",
+          "text": "gate and up interleaved at load? no: on a free machine 1.006-1.023x, the three calls already read at 97-98% of RAM"
         },
         {
           "n": 85,
-          "stato": "aperta",
-          "testo": "i passi seriali come messaggi fra core: se smettono di toccare le righe dei worker (add e mix dentro le chiamate, normed e la riga preparata in buffer non letti), i suggerimenti ai worker in attesa pagano?"
+          "state": "open",
+          "text": "the serial steps as messages between cores: if they stop touching the workers' rows (add and mix inside the calls, normed and the prepared row in unread buffers), do the hints to idle workers pay off?"
         }
       ],
-      "file": [
+      "files": [
         "src/base/threads.c",
         "tests/test_phase.c",
         "tools/pool_trace.py",
         "tests/test_base.c",
         "tools/mutate_idle.sh"
       ],
-      "comandi": [
+      "commands": [
         "sh tools/threads_phase.sh sweep",
         "sh tools/race_smt.sh",
         "BENCH_BUILD=build/<dir> sh tools/bench_native.sh bench_q4x --idle 8",
         "TR_POOL_HINT=2 sh tools/ab_inproc.sh build/trochilus.exe idle 12"
       ],
-      "dipende": [
+      "depends": [
         "kernel"
       ]
     },
     {
       "id": "kv",
-      "tappa": "M0",
-      "titolo": "KV con le posizioni in fila",
-      "stato": "fatto",
-      "cosa": "La memoria del contesto messa in modo che la CPU la legga di seguito invece che a salti. Il contesto lungo era il caso peggiore: adesso legge alla velocità della RAM.",
-      "numeri": [
+      "milestone": "M0",
+      "title": "KV with positions in a row",
+      "state": "done",
+      "what": "The context memory laid out so the CPU reads it in sequence instead of jumping around. Long context was the worst case: now it reads at RAM speed.",
+      "numbers": [
         {
-          "v": "le pagine della KV toccate dal pool appena prima che la passata le scriva (ogni flusso parte a inizio pagina): kv_write da 80 a 50 microsecondi a token, generazione +0.17%, primo prompt +0.4%, stessi bit. Toccate in anticipo invece costavano all'attenzione il 2.4%: le pagine presenti oltre la fine dei flussi rallentano le letture dell'1-2.4%",
+          "v": "the KV pages touched by the pool right before the pass writes them (every stream starts at a page's start): kv_write from 80 to 50 microseconds a token, generation +0.17%, first prompt +0.4%, same bits. Touching them ahead of time instead cost the attention 2.4%: pages present past the streams' end slow reads by 1-2.4%",
           "d": "2026-09-27"
         },
         {
-          "v": "pagine da 2 MB per pesi e KV nel container (dove si fa la gara): a macchina libera nessun guadagno; chiuso",
+          "v": "2 MB pages for weights and KV in the container (where the race runs): on a free machine no gain; closed",
           "d": "2026-09-26"
         },
         {
-          "v": "decode a contesto lungo contro llama.cpp, letto come una retta: pari senza contesto, 5.3 contro 3.2 microsecondi per posizione in memoria. Sono i byte della loro KV a 16 bit: esatti a 32 bit servirebbero 81 GB/s, la RAM ne da' 53-57. La nostra attenzione legge gia' alla velocita' di una lettura pura; sulla GPU, stessi bit, li passiamo (1.31x a 2048)",
+          "v": "decode at long context against llama.cpp, read as a line: even with no context, 5.3 against 3.2 microseconds per position in memory. It's the bytes of their 16-bit KV: exact at 32 bit would need 81 GB/s, RAM gives 53-57. Our attention already reads at the speed of a pure read; on the GPU, same bits, we pass them (1.31x at 2048)",
           "d": "2026-09-26"
         },
         {
-          "v": "KV compressa a 28 bit, a macchina ferma: 0.97-1.05× l'attenzione F32; la decodifica si mangia i byte risparmiati (44-45 GB/s contro 49-51): no sulla CPU",
+          "v": "KV compressed to 28 bit, on a still machine: 0.97-1.05x the F32 attention; the decoding eats up the saved bytes (44-45 GB/s against 49-51): no on the CPU",
           "d": "2026-09-24"
         },
         {
-          "v": "nella KV solo i valori del layer 0 dipendono dal solo token (si ripetono nel 62-82% delle posizioni); layer 1-15 e tutte le chiavi: 0 ripetizioni",
+          "v": "in the KV only layer 0's values depend on the token alone (they repeat in 62-82% of positions); layers 1-15 and every key: 0 repeats",
           "d": "2026-09-24"
         },
         {
-          "v": "saltare posizioni in modo esatto: chiuso prima di scrivere un kernel, l'attenzione di OLMoE è piatta e anche un oracolo salta al più lo 0.2% dei byte",
+          "v": "skipping positions exactly: closed before writing a kernel, OLMoE's attention is flat and even an oracle skips at most 0.2% of the bytes",
           "d": "2026-09-24"
         },
         {
-          "v": "decode una posizione alla volta: esatto, tenuto; a macchina ferma sul token non si distingue (0.96-1.05×, la zona -9% a 2048); il banco dava 1.10-1.13× sotto carico",
+          "v": "decode one position at a time: exact, kept; on a still machine on the token it's indistinguishable (0.96-1.05x, the -9% zone at 2048); the bench gave 1.10-1.13x under load",
           "d": "2026-09-24"
         },
         {
-          "v": "contesto 2048: il distacco da llama.cpp (1.16-1.26×) era la KV a 32 bit contro la loro a 16 (518 contro 259 MiB per token); la KV a 16 bit è un no (Marcello, 2026-09-24: solo esatto)",
+          "v": "context 2048: the gap with llama.cpp (1.16-1.26x) was the 32-bit KV against their 16-bit one (518 against 259 MiB per token); 16-bit KV is a no (Marcello, 2026-09-24: exact only)",
           "d": "2026-09-24"
         },
         {
-          "v": "decode a contesto 4000: 1.15-1.18×; la zona passa da 32-35 a 47-48 GB/s",
+          "v": "decode at context 4000: 1.15-1.18x; the zone goes from 32-35 to 47-48 GB/s",
           "d": "2026-09-19"
         }
       ],
-      "domande": [
+      "questions": [
         {
           "n": 84,
-          "stato": "chiusa",
-          "testo": "la stessa corsa oltre la fine di un flusso costa anche ai pesi? sì, ~0.8% di una chiamata densa (una pagina di guardia dopo la regione di ogni thread), niente agli esperti; le regioni di un thread una dopo l'altra 1.0-1.75%: la leva va col pezzo 4 (q, k, v in una chiamata)"
+          "state": "closed",
+          "text": "does the same overrun past a stream's end also cost the weights? yes, ~0.8% of a dense call (a guard page after each thread's region), nothing to the experts; a thread's regions one after the other 1.0-1.75%: the lever goes with piece 4 (q, k, v in one call)"
         },
         {
           "n": 69,
-          "stato": "chiusa",
-          "testo": "passare llama.cpp nel decode a contesto lungo con la KV esatta? sulla CPU no (servono 81 GB/s), sulla GPU si'"
+          "state": "closed",
+          "text": "pass llama.cpp in the long-context decode with the exact KV? on the CPU no (needs 81 GB/s), on the GPU yes"
         }
       ],
-      "file": [
+      "files": [
         "src/kv/kv.c",
         "tests/bench_mem.c (faults, kvend)"
       ],
-      "comandi": [
+      "commands": [
         "sh tools/decode_context.sh measure",
         "make attn-probe && tools/.venv/Scripts/python.exe tools/attn_skip_report.py <dump>",
         "sh tools/ab_env.sh <bin> 12 \"on=TR_KV_TOUCH=1\" \"off=TR_KV_TOUCH=0\" \"on2=TR_KV_TOUCH=1\""
       ],
-      "dipende": [
+      "depends": [
         "kernel"
       ]
     },
     {
       "id": "prefill",
-      "tappa": "M0",
-      "titolo": "Prompt a blocchi + attenzione a gruppi",
-      "stato": "fatto",
-      "cosa": "Il prompt non si elabora un token per volta ma a blocchi di 512, così le matrici sono grandi e i core lavorano pieni. È anche il pezzo che l'ordine per layer (M1) dovrà riorganizzare.",
-      "numeri": [
+      "milestone": "M0",
+      "title": "Prompt in blocks + grouped attention",
+      "state": "done",
+      "what": "The prompt is not processed one token at a time but in blocks of 512, so the matrices are large and the cores work full. It is also the piece the per-layer order (M1) will need to reorganize.",
+      "numbers": [
         {
-          "v": "phase-major (idea del pensatore): la corsia p del contratto è una catena nel tempo, 16 righe dei pesi corrono come corsie SIMD con gli stessi bit; il tile 164.7 GFLOP/s per core (98.6% del picco float); prompt Q4_K a 4 thread 140 -> 218-223 tok/s (llama.cpp 222), a 16 thread 369 -> 575; Q8_0 a 16 thread 390-419 -> 550-569; logit identici al byte",
+          "v": "phase-major (the pensatore's idea): the contract's lane p is a chain in time, 16 weight rows run as SIMD lanes with the same bits; the tile does 164.7 GFLOP/s per core (98.6% of the float peak); Q4_K prompt at 4 threads 140 -> 218-223 tok/s (llama.cpp 222), at 16 threads 369 -> 575; Q8_0 at 16 threads 390-419 -> 550-569; logits identical to the byte",
           "d": "2026-09-26"
         },
         {
-          "v": "l'esponenziale del softmax e dello SwiGLU in vettore (AVX-512 e AVX2, senza FMA): 0 differenze su tutti i 2^32 float in ogni livello; a macchina libera l'attenzione del prompt 1.34-1.37x e il prefill 1.05x a 2048 e a 4000 token",
+          "v": "softmax's and SwiGLU's exponential in vector (AVX-512 and AVX2, no FMA): 0 differences on all 2^32 floats at every level; on a free machine the prompt's attention 1.34-1.37x and the prefill 1.05x at 2048 and at 4000 tokens",
           "d": "2026-09-26"
         },
         {
-          "v": "attenzione del prompt a tessere (4 query per 4 posizioni, le somme delle corsie in vettore): la sua zona 1.31-1.33x nel motore, il prefill 1.03x a 2048 token e 1.06x a 4000; logit del modello vero identici al byte",
+          "v": "the prompt's attention in tiles (4 queries by 4 positions, lane sums in vector): its zone 1.31-1.33x in the engine, the prefill 1.03x at 2048 tokens and 1.06x at 4000; the real model's logits identical to the byte",
           "d": "2026-09-26"
         },
         {
-          "v": "prefill da 30.1 a 196.9 tok/s (blocchi + kernel a 4 token)",
+          "v": "prefill from 30.1 to 196.9 tok/s (blocks + 4-token kernel)",
           "d": "2026-09-17"
         },
         {
-          "v": "attenzione a gruppi su prompt lunghi: 1.09-1.13×",
+          "v": "grouped attention on long prompts: 1.09-1.13x",
           "d": "2026-09-19"
         },
         {
-          "v": "somme esatte alla velocità del float (la sfida di Marcello, col pensatore a turni): W16, il trucco di Winograd (1968) in parole da 16 bit con la scala del sotto-blocco dentro il peso, identico bit per bit a una definizione esatta a interi, fa 167.2 GFLOP/s contro i 164.7 del tile float (e 1.21x a pari larghezza): esatto e almeno veloce quanto il float, nel tile. Sui tensor core int8 della RTX 4070: 59.1 T-MAC/s esatti contro 3.29 del float, E32 lì 4.5x",
+          "v": "exact sums at the float's speed (Marcello's challenge, with the pensatore in shifts): W16, Winograd's trick (1968) in 16-bit words with the sub-block's scale inside the weight, identical bit for bit to an exact integer definition, does 167.2 GFLOP/s against the float tile's 164.7 (and 1.21x at equal width): exact and at least as fast as float, in the tile. On the RTX 4070's int8 tensor cores: 59.1 T-MAC/s exact against 3.29 of float, E32 there 4.5x",
           "d": "2026-09-26"
         },
         {
-          "v": "Q4_K in interi esatti nel motore (W16): prompt 1.001x e decode 1.006x rispetto al float, misurati alternati; logit identici a 4 e 16 thread e fra prompt e decode; gli oracoli sul modello vero tagliato 1-26% più vicini al riferimento. Il +10% previsto sugli esperti non è arrivato: nel motore i tile W16 rendono ~0.83 del microbench",
+          "v": "Q4_K in exact integers in the engine (W16): prompt 1.001x and decode 1.006x against float, measured alternated; logits identical at 4 and 16 threads and between prompt and decode; the oracles on the real cut model 1-26% closer to the reference. The predicted +10% on the experts did not arrive: in the engine the W16 tiles yield ~0.83 of the microbench",
           "d": "2026-09-27"
         }
       ],
-      "domande": [
+      "questions": [
         {
           "n": 77,
-          "stato": "chiusa",
-          "testo": "E32 come definizione? Marcello: sì, a tappe. Tappa 1 misurata (i pezzi W16 sui layout del motore), tappa 2 fatta: Q4_K in interi esatti nel motore, alla velocità del float nel prompt e nella generazione; la tappa 3 è la GPU con i tensor core (domanda 74)"
+          "state": "closed",
+          "text": "E32 as the definition? Marcello: yes, in stages. Stage 1 measured (the W16 pieces on the engine's layouts), stage 2 done: Q4_K in exact integers in the engine, at float speed in prompt and generation; stage 3 is the GPU with tensor cores (question 74)"
         },
         {
           "n": 70,
-          "stato": "chiusa",
-          "testo": "l'esponenziale del softmax in vettore: costruito, gli stessi bit di tr_expf; prefill +5%"
+          "state": "closed",
+          "text": "the softmax's exponential in vector: built, same bits as tr_expf; prefill +5%"
         }
       ],
-      "file": [
+      "files": [
         "src/kernels/kernels.h",
         "src/kernels/kernels.c",
         "src/kernels/kernels_x86.c",
         "src/models/olmoe.c",
         "tests/bench_attn.c"
       ],
-      "comandi": [
+      "commands": [
         "build/trochilus generate -m <Q4_K> -p 512 -n 1 -t 4",
         "sh tools/prefill_context.sh measure",
-        "sh tools/ab_zone.sh <prima> <dopo> attention 8"
+        "sh tools/ab_zone.sh <before> <after> attention 8"
       ],
-      "dipende": [
+      "depends": [
         "kernel",
         "kv"
       ]
     },
     {
       "id": "expf",
-      "tappa": "M0",
-      "titolo": "tr_expf arrotondato correttamente",
-      "stato": "fatto",
-      "cosa": "L'esponenziale della libreria C costava il 30% del prompt lungo. Riscritto: più veloce e arrotondato correttamente su tutti i 4 miliardi di float, verificati uno per uno.",
-      "numeri": [
+      "milestone": "M0",
+      "title": "Correctly-rounded tr_expf",
+      "state": "done",
+      "what": "The C library's exponential cost 30% of the long prompt. Rewritten: faster and correctly rounded across all 4 billion floats, checked one by one.",
+      "numbers": [
         {
-          "v": "contro i riferimenti, su tutti i 2^32 float: l'exp di llama.cpp/ggml sbaglia l'arrotondamento sul 3.36% (fino a 2 ulp), quello di glibc sullo 0.004%, il nostro mai",
+          "v": "against the references, on all 2^32 floats: llama.cpp/ggml's exp misrounds 3.36% of the time (up to 2 ulp), glibc's 0.004%, ours never",
           "d": "2026-09-24"
         },
         {
-          "v": "l'exp esatto con soli float, in AVX-512 e AVX2: 0 diversi su tutti i 4 miliardi di float, 4.8× e 4.4× più veloce di tr_expf per valore; il prompt ne guadagnerebbe solo il 2-3%: resta il riferimento per la GPU",
+          "v": "the exact exp with floats only, in AVX-512 and AVX2: 0 different across all 4 billion floats, 4.8x and 4.4x faster than tr_expf per value; the prompt would only gain 2-3% from it: it stays the reference for the GPU",
           "d": "2026-09-24"
         },
         {
-          "v": "prefill 1.03-1.31× secondo la lunghezza; Windows e Linux ora danno gli stessi byte",
+          "v": "prefill 1.03-1.31x depending on length; Windows and Linux now give the same bytes",
           "d": "2026-09-19"
         }
       ],
-      "domande": [
+      "questions": [
         {
           "n": 39,
-          "stato": "chiusa",
-          "testo": "versione SIMD: no, lo scalare ha già preso quasi tutto"
+          "state": "closed",
+          "text": "SIMD version: no, the scalar one has already taken almost everything"
         },
         {
           "n": 58,
-          "stato": "chiusa",
-          "testo": "l'exp esatto a soli float in SIMD: 4.8x per valore; collegato al motore il 26/09 (domanda 70: softmax e SwiGLU)"
+          "state": "closed",
+          "text": "the exact exp with floats only in SIMD: 4.8x per value; wired into the engine on 09/26 (question 70: softmax and SwiGLU)"
         }
       ],
-      "file": [
+      "files": [
         "src/kernels/expf.c",
         "src/kernels/expf_table.h"
       ],
-      "comandi": [
+      "commands": [
         "make bench-expf"
       ],
-      "dipende": [
+      "depends": [
         "kernel"
       ]
     },
     {
-      "id": "revisione-0922",
-      "tappa": "M0",
-      "titolo": "Revisione e gate",
-      "stato": "in-corso",
-      "cosa": "Revisione del lettore GGUF, dell'archivio degli esperti, del pool, della piattaforma e del cancello (22/09), poi del modello, dei kernel, del tokenizer e della riga di comando (23/09). Il 23: la riga di comando dimensionava i buffer da -n e -p (un trabocco vicino a 2^62) e troncava --tokens a 32 bit; tre opzioni di OLMoE non erano mai state confrontate con transformers (ora c'e' un oracolo apposta); la pressione di memoria nel VM di Docker contava come mutanti uccisi. Poi letti i sopravvissuti di tokenizer.c (75 → 43) e di main.c (334 → 43), tutti nominati: la riga di comando ha un solo parser delle opzioni, coi numeri stretti nel loro intervallo (-n abc esce con 2), e test_cli prova ogni comando. Lo strumento delle mutazioni non nasconde più sopravvissuti dietro timeout da carico e rifiuti di memoria, uccide un controllo scaduto con tutto quello che aveva lanciato (sette processi orfani avevano rallentato e falsato una campagna), ed è abbastanza veloce da girare dopo ogni modifica (CHANGED=HEAD muta solo le righe cambiate). Restano gguf.c, experts.c, threads.c e platform.c fuori da mutate_files.sh, e gli script di misura da portare alla regola nuova della macchina (il file macchina-ferma).",
-      "numeri": [
+      "id": "review-0922",
+      "milestone": "M0",
+      "title": "Review and gate",
+      "state": "in-progress",
+      "what": "Review of the GGUF reader, the expert store, the pool, the platform and the gate (09/22), then of the model, the kernels, the tokenizer and the command line (09/23). On the 23rd: the command line sized -n and -p buffers (an overflow near 2^62) and truncated --tokens to 32 bit; three OLMoE options had never been checked against transformers (now there is an oracle for it); memory pressure in Docker's VM counted as killed mutants. Then read the survivors of tokenizer.c (75 -> 43) and of main.c (334 -> 43), all named: the command line has a single option parser, with numbers kept within their range (-n abc exits with 2), and test_cli tries every command. The mutation tool no longer hides survivors behind load timeouts and memory refusals, kills an expired check along with everything it launched (seven orphan processes had slowed and skewed a campaign), and is fast enough to run after every change (CHANGED=HEAD mutates only the changed lines). Still left out of mutate_files.sh: gguf.c, experts.c, threads.c and platform.c, and the measurement scripts still to move to the new machine rule (the machine-still file).",
+      "numbers": [
         {
-          "v": "gara con llama.cpp dopo gli esperti bilanciati e l'exp in vettore, a macchina libera (container, Q8_0, 8 thread): decode pari a contesto 512 (1.00x), loro 1.04x a 2048 (prima 1.12-1.14x); prefill pari a 512 e a 2048. A 2048 resta la loro KV a 16 bit: sulla GPU li passiamo",
+          "v": "race with llama.cpp after the balanced experts and the vector exp, on a free machine (container, Q8_0, 8 threads): decode even at context 512 (1.00x), theirs 1.04x at 2048 (was 1.12-1.14x); prefill even at 512 and at 2048. At 2048 their 16-bit KV remains: on the GPU we pass them",
           "d": "2026-09-26"
         },
         {
-          "v": "mutazioni più veloci con gli stessi verdetti (prima un giro di copertura, ASan solo sui sopravvissuti): prof.c da 30 a 9 s; gguf.c, experts.c, threads.c, platform.c mutati per la prima volta in 20 minuti; i test C nativi del gate accanto al container",
+          "v": "faster mutations with the same verdicts (before, a coverage pass, ASan only on survivors): prof.c from 30 to 9 s; gguf.c, experts.c, threads.c, platform.c mutated for the first time in 20 minutes; the gate's native C tests alongside the container",
           "d": "2026-09-24"
         },
         {
-          "v": "make check: ~935 s prima, 335 s adesso (gruppi in parallelo, fixture sul volume, test_cleanup)",
+          "v": "make check: ~935 s before, 335 s now (parallel groups, fixtures on the volume, test_cleanup)",
           "d": "2026-09-22"
         },
         {
-          "v": "test nativi su Windows: 18 passati (test_hot compreso, dopo la correzione del TLS)",
+          "v": "native tests on Windows: 18 passed (including test_hot, after the TLS fix)",
           "d": "2026-09-22"
         },
         {
-          "v": "mutanti sopravvissuti: gguf.c 89 → 43, experts.c 27 → 9, threads.c 33 → 23",
+          "v": "surviving mutants: gguf.c 89 -> 43, experts.c 27 -> 9, threads.c 33 -> 23",
           "d": "2026-09-22"
         },
         {
-          "v": "calibrazione del profiler: errore peggiore 9.9995% → 0.00000% con uno stallo di 2 ms",
+          "v": "profiler calibration: worst error 9.9995% -> 0.00000% with a 2 ms stall",
           "d": "2026-09-22"
         },
         {
-          "v": "mutanti sopravvissuti: prof.c 42 → 10, olmoe.c 92 → 70 (tutti nominati), kernels.c 37 → 26 (equivalenti)",
+          "v": "surviving mutants: prof.c 42 -> 10, olmoe.c 92 -> 70 (all named), kernels.c 37 -> 26 (equivalent)",
           "d": "2026-09-23"
         },
         {
-          "v": "oracolo con norm_topk_prob, clip_qkv, rope_theta 500000: 16/16 token, logit entro 2.1e-7",
+          "v": "oracle with norm_topk_prob, clip_qkv, rope_theta 500000: 16/16 tokens, logits within 2.1e-7",
           "d": "2026-09-23"
         },
         {
-          "v": "riga di comando: 4 difetti, 7 casi rossi prima della correzione (exit 0, 1, 134, 139, UBSan)",
+          "v": "command line: 4 defects, 7 red cases before the fix (exit 0, 1, 134, 139, UBSan)",
           "d": "2026-09-23"
         },
         {
-          "v": "mutanti sopravvissuti: tokenizer.c 75 → 43 (tutti letti); 11 timeout, tutti loop veri",
+          "v": "surviving mutants: tokenizer.c 75 -> 43 (all read); 11 timeouts, all real loops",
           "d": "2026-09-23"
         },
         {
-          "v": "mutanti sopravvissuti: main.c 334 → 43 (tutti letti), 646 → 418 mutanti con un solo parser",
+          "v": "surviving mutants: main.c 334 -> 43 (all read), 646 -> 418 mutants with a single parser",
           "d": "2026-09-23"
         },
         {
-          "v": "giro completo di mutate_files.sh: 42 min più 31 per olmoe.c (prima main.c da solo 37 min, olmoe.c 111)",
+          "v": "full run of mutate_files.sh: 42 min plus 31 for olmoe.c (before, main.c alone 37 min, olmoe.c 111)",
           "d": "2026-09-23"
         },
         {
-          "v": "make check verde in 405 s (test_cli nativo su Windows: 19 controlli rossi per i fine riga, corretti)",
+          "v": "make check green in 405 s (native test_cli on Windows: 19 red checks for line endings, fixed)",
           "d": "2026-09-23"
         },
         {
-          "v": "make check: 428 s → 238 s (i file dei test fuori dal bind mount di Windows, tre corsie per i modelli)",
+          "v": "make check: 428 s -> 238 s (test files out of Windows's bind mount, three lanes for models)",
           "d": "2026-09-24"
         },
         {
-          "v": "gara con llama.cpp sullo stesso Q8_0: prefill loro 1.8× (era 13×), decode loro 1.04× a contesto 512 e 1.16× a 2048",
+          "v": "race with llama.cpp on the same Q8_0: prefill theirs 1.8x (was 13x), decode theirs 1.04x at context 512 and 1.16x at 2048",
           "d": "2026-09-24"
         },
         {
-          "v": "gara con llama.cpp dopo le 8 righe per chiamata: prefill pari a 8 thread (loro 1.01-1.03×), loro 1.30-1.35× a 16; decode loro 1.04× a contesto 512, 1.13× a 2048",
+          "v": "race with llama.cpp after the 8 rows per call: prefill even at 8 threads (theirs 1.01-1.03x), theirs 1.30-1.35x at 16; decode theirs 1.04x at context 512, 1.13x at 2048",
           "d": "2026-09-25"
         },
         {
-          "v": "gara con llama.cpp rifatta dopo le due righe per caricamento: prefill loro 1.41× (era 1.8×) a 16 thread e 1.13× a 8; decode 1.00× a contesto 512, 1.12× a 2048",
+          "v": "race with llama.cpp redone after the two rows per load: prefill theirs 1.41x (was 1.8x) at 16 threads and 1.13x at 8; decode 1.00x at context 512, 1.12x at 2048",
           "d": "2026-09-24"
         },
         {
-          "v": "la strada phase-major ora ha un test suo (gruppi da 0 a 513 ingressi, 1-16 thread, due chiamate di fila): ha trovato una scrittura fuori dal buffer (una chiamata senza pool dentro un pool più grande) e una guardia che lasciava passare righe non fatte di blocchi interi, entrambe corrette; 17 mutazioni del codice phase-major, tutte viste rosse; il pannello Q4_K senza VBMI gira ora anche su questa macchina (TR_CPU_MAX=avx512-novbmi)",
+          "v": "the phase-major path now has its own test (groups from 0 to 513 inputs, 1-16 threads, two calls in a row): it found an out-of-buffer write (a poolless call inside a bigger pool) and a guard that let through rows not made of whole blocks, both fixed; 17 mutations of the phase-major code, all seen red; the Q4_K panel with no VBMI now also runs on this machine (TR_CPU_MAX=avx512-novbmi)",
           "d": "2026-09-26"
         },
         {
-          "v": "gare per il README a macchina libera (container, stesso GGUF): Q4_K a 4 thread prompt 0.97x llama.cpp, generazione 1.03x; Q8_0 a 16 thread prompt 1.33x a 512 e 1.42x a 2048, generazione pari a 512, loro 1.04x a 2048",
+          "v": "races for the README on a free machine (container, same GGUF): Q4_K at 4 threads prompt 0.97x llama.cpp, generation 1.03x; Q8_0 at 16 threads prompt 1.33x at 512 and 1.42x at 2048, generation even at 512, theirs 1.04x at 2048",
           "d": "2026-09-26"
         }
       ],
-      "domande": [],
-      "file": [
+      "questions": [],
+      "files": [
         "src/app/main.c (buffer dal contesto, --tokens, JSON)",
         "tests/test_cli.c, tests/test_model_load.c, tests/synth_olmoe.h (tokenizer, file malformati)",
         "tools/make_tiny_olmoe.py --options, fixtures/tiny-olmoe-opts",
         "tools/mutate_auto.py (--cmd, uccisione ripetuta, TIMEOUT e PRESSURE), tools/mutate_files.sh",
         "tests/test_tokenizer.c (rifiuti per messaggio, bordi accettati), src/tokenizer/tokenizer.c (is_added)",
-        "src/app/main.c (parse_opts, parse_num, next_record), tests/test_cli.c (ogni comando), tr_utf8_whole_prefix",
+        "src/app/main.c (parse_opts, parse_num, next_record), tests/test_cli.c (every command), tr_utf8_whole_prefix",
         "tools/mutate_auto.py (sessione per controllo, budget per controllo, --changed), tests/test.h (TR_TEST_FAILFAST)"
       ],
-      "comandi": [
+      "commands": [
         "make check",
         "sh tools/mutate_files.sh <file>  (nel container)"
       ],
-      "dipende": [
-        "nucleo",
-        "m1-diretta"
+      "depends": [
+        "core",
+        "m1-direct"
       ]
     },
     {
-      "id": "genoma",
-      "tappa": "M0",
-      "titolo": "Il modello letto come un genoma",
-      "stato": "fatto",
-      "cosa": "Guardare ogni byte del modello, della memoria del contesto e delle scelte degli esperti, per trovare struttura esatta che nessuno legge: ripetizioni, zeri, parti prevedibili. Dove c'è, si risparmia senza cambiare un bit; dove non c'è, lo sappiamo e non ci si torna.",
-      "numeri": [
+      "id": "genome",
+      "milestone": "M0",
+      "title": "The model read as a genome",
+      "state": "done",
+      "what": "Looking at every byte of the model, the context memory and the experts' choices, to find exact structure nobody reads: repeats, zeros, predictable parts. Where it exists, it is exploited without changing a single bit; where it does not, we know it and do not go back.",
+      "numbers": [
         {
-          "v": "la linea del tempo di un token (tools/token_timeline.py): la RAM resta ferma il 12-15% del token, quasi tutto nell'attesa del thread più lento alla fine delle chiamate, non fra una chiamata e l'altra (0.6%)",
+          "v": "a token's timeline (tools/token_timeline.py): RAM stays idle 12-15% of the token, almost all of it waiting for the slowest thread at the end of calls, not between calls (0.6%)",
           "d": "2026-09-26"
         },
         {
-          "v": "i 16 bit bassi della memoria del contesto non decidono il token: 1 token cambiato su 1792",
+          "v": "the low 16 bits of the context memory do not decide the token: 1 token changed out of 1792",
           "d": "2026-09-26"
         },
         {
-          "v": "i pesi quantizzati sono quasi incomprimibili: i codici Q8_0 portano 7.6-7.7 bit su 8, i Q4_K 3.83-3.87 su 4 (compressione senza perdita ~7% e ~4%): chiuso",
+          "v": "quantized weights are nearly incompressible: Q8_0 codes carry 7.6-7.7 bit out of 8, Q4_K 3.83-3.87 out of 4 (lossless compression ~7% and ~4%): closed",
           "d": "2026-09-24"
         },
         {
-          "v": "blocchi ripetuti 0.008%: le 220 righe identiche della testa d'uscita sono i token che il modello non ha mai imparato",
+          "v": "repeated blocks 0.008%: the output head's 220 identical rows are the tokens the model never learned",
           "d": "2026-09-24"
         },
         {
-          "v": "strumenti pronti per il prossimo modello: tools/weights_genome.py, route_union_report.py, kv_repeats_report.py, draft_agreement.sh",
+          "v": "tools ready for the next model: tools/weights_genome.py, route_union_report.py, kv_repeats_report.py, draft_agreement.sh",
           "d": "2026-09-24"
         }
       ],
-      "domande": [
+      "questions": [
         {
           "n": 56,
-          "stato": "chiusa",
-          "testo": "quanto si comprimono i pesi senza perdita? ~7% Q8_0, ~4% Q4_K: non vale un formato"
+          "state": "closed",
+          "text": "how much do the weights compress losslessly? ~7% Q8_0, ~4% Q4_K: not worth a format"
         },
         {
           "n": 62,
-          "stato": "chiusa",
-          "testo": "c'è struttura esatta nel modello? solo nel vocabolario morto e nei valori del layer 0"
+          "state": "closed",
+          "text": "is there exact structure in the model? only in the dead vocabulary and in layer 0's values"
         },
         {
           "n": 73,
-          "stato": "aperta",
-          "testo": "il token più probabile dalla metà alta della testa d'uscita, esatto solo sulle righe che possono ancora vincere (fino al 4% dei byte)"
+          "state": "open",
+          "text": "the most likely token from the output head's high half, exact only on the rows that can still win (up to 4% of the bytes)"
         }
       ],
-      "file": [
+      "files": [
         "tools/weights_genome.py",
         "tools/kv_repeats_report.py",
         "tools/route_union_report.py",
         "tools/token_timeline.py"
       ],
-      "comandi": [
+      "commands": [
         "tools/.venv/Scripts/python.exe tools/weights_genome.py models/<file>.gguf"
       ],
-      "dipende": [
-        "nucleo"
+      "depends": [
+        "core"
       ]
     },
     {
-      "id": "m1-archivio",
-      "tappa": "M1",
-      "titolo": "Archivio a slot + LRU",
-      "stato": "fatto",
-      "cosa": "La dispensa degli esperti. Tiene in RAM quanti esperti ci stanno nel budget; quando ne serve uno che non c'è, lo legge dal disco e butta via quello che non si usa da più tempo. Funziona perché due token vicini chiedono quasi gli stessi esperti.",
-      "numeri": [
+      "id": "m1-store",
+      "milestone": "M1",
+      "title": "Slot store + LRU",
+      "state": "done",
+      "what": "The experts' pantry. It keeps in RAM as many experts as fit the budget; when one that is missing is needed, it reads it from disk and drops the one unused the longest. It works because two nearby tokens ask for almost the same experts.",
+      "numbers": [
         {
-          "v": "1024 unità (layer, esperto) da 6.375 MiB: 6528 MiB in tutto",
+          "v": "1024 (layer, expert) units of 6.375 MiB: 6528 MiB in all",
           "d": "2026-09-20"
         },
         {
-          "v": "3.6-4.0 esperti su 8 in comune col token prima",
+          "v": "3.6-4.0 experts out of 8 shared with the previous token",
           "d": "2026-09-20"
         }
       ],
-      "domande": [],
-      "file": [
+      "questions": [],
+      "files": [
         "src/memory/experts.c",
         "tests/test_experts.c"
       ],
-      "comandi": [
+      "commands": [
         "make test",
         "sh tools/mutate_experts.sh"
       ],
-      "dipende": [
-        "nucleo"
+      "depends": [
+        "core"
       ]
     },
     {
-      "id": "m1-motore",
-      "tappa": "M1",
-      "titolo": "Budget nel motore",
-      "stato": "fatto",
-      "cosa": "Il motore prende gli esperti dall'archivio invece che dalla RAM, e `--expert-budget` dice quanta RAM dargli. Con qualunque budget i numeri prodotti sono identici al byte: il budget cambia la velocità, mai il risultato.",
-      "numeri": [
+      "id": "m1-engine",
+      "milestone": "M1",
+      "title": "Budget in the engine",
+      "state": "done",
+      "what": "The engine takes experts from the store instead of from RAM, and `--expert-budget` says how much RAM to give it. With any budget the numbers produced are identical to the byte: the budget changes speed, never the result.",
+      "numbers": [
         {
-          "v": "logit identici al byte da budget pieno a budget minimo",
+          "v": "logits identical to the byte from full budget to minimum budget",
           "d": "2026-09-20"
         }
       ],
-      "domande": [],
-      "file": [
+      "questions": [],
+      "files": [
         "src/models/olmoe.c",
         "tests/test_stream.c"
       ],
-      "comandi": [
+      "commands": [
         "build/trochilus run ... --expert-budget 3264"
       ],
-      "dipende": [
-        "m1-archivio"
+      "depends": [
+        "m1-store"
       ]
     },
     {
-      "id": "m1-diretta",
-      "tappa": "M1",
-      "titolo": "Lettura diretta dal disco",
-      "stato": "fatto",
-      "cosa": "Legge saltando la cache del sistema operativo. Senza, il modello starebbe in RAM due volte e ogni misura racconterebbe la velocità della RAM invece di quella del disco.",
-      "numeri": [
+      "id": "m1-direct",
+      "milestone": "M1",
+      "title": "Direct read from disk",
+      "state": "done",
+      "what": "Reads skipping the operating system's cache. Without it, the model would sit in RAM twice and every measurement would tell the speed of RAM instead of disk.",
+      "numbers": [
         {
-          "v": "la cache del sistema gonfierebbe il prompt di 2.42× e la generazione di 1.35×",
+          "v": "the system cache would inflate the prompt by 2.42x and generation by 1.35x",
           "d": "2026-09-21"
         },
         {
-          "v": "disco reale: 1.33-1.37 GB/s, come dice il banco",
+          "v": "real disk: 1.33-1.37 GB/s, as the bench says",
           "d": "2026-09-21"
         }
       ],
-      "domande": [],
-      "file": [
+      "questions": [],
+      "files": [
         "src/base/platform.c"
       ],
-      "comandi": [
+      "commands": [
         "sh tools/experts_budget.sh direct"
       ],
-      "dipende": [
-        "m1-archivio"
+      "depends": [
+        "m1-store"
       ]
     },
     {
-      "id": "m1-piano",
-      "tappa": "M1",
-      "titolo": "Piano automatico",
-      "stato": "fatto",
-      "cosa": "All'avvio guarda quanta RAM c'è libera e sceglie il budget da solo, rifiutandosi di partire se lascerebbe la macchina senza memoria. Nessuna opzione da imparare: è il criterio della tappa.",
-      "numeri": [],
-      "domande": [],
-      "file": [
+      "id": "m1-plan",
+      "milestone": "M1",
+      "title": "Automatic plan",
+      "state": "done",
+      "what": "At startup it looks at how much RAM is free and picks the budget by itself, refusing to start if it would leave the machine without memory. No option to learn: that is the milestone's criterion.",
+      "numbers": [],
+      "questions": [],
+      "files": [
         "src/models/model.c"
       ],
-      "comandi": [
+      "commands": [
         "TR_MEM_AVAILABLE_MIB=4096 build/trochilus run ..."
       ],
-      "dipende": [
-        "m1-motore"
+      "depends": [
+        "m1-engine"
       ]
     },
     {
-      "id": "m1-misure",
-      "tappa": "M1",
-      "titolo": "Misure di M1",
-      "stato": "fatto",
-      "cosa": "Quattro sessioni a macchina ferma per sapere quanto costa davvero leggere gli esperti dal disco. Hanno smentito la simulazione su cui era stato progettato M1, e hanno trovato lo spreco del prompt.",
-      "numeri": [
+      "id": "m1-measurements",
+      "milestone": "M1",
+      "title": "M1's measurements",
+      "state": "done",
+      "what": "Four sessions on a still machine to find out what reading experts from disk really costs. They disproved the simulation M1 had been designed around, and found the prompt's waste.",
+      "numbers": [
         {
-          "v": "generazione: 35.45 / 29.56 / 24.27 / 20.56 tok/s al 100 / 75 / 50 / 25% del modello in RAM",
+          "v": "generation: 35.45 / 29.56 / 24.27 / 20.56 tok/s at 100 / 75 / 50 / 25% of the model in RAM",
           "d": "2026-09-20"
         },
         {
-          "v": "a generazione lunga metà modello in RAM costa solo il 10% (32.0 contro 35.45)",
+          "v": "at long generation, half the model in RAM costs only 10% (32.0 against 35.45)",
           "d": "2026-09-20"
         },
         {
-          "v": "un token generato manca 0.3 esperti subito dopo il prompt, 0.03 più avanti (la simulazione diceva 22.4)",
+          "v": "a generated token misses 0.3 experts right after the prompt, 0.03 further on (the simulation said 22.4)",
           "d": "2026-09-20"
         },
         {
-          "v": "il prompt: 306.9 tok/s col modello in RAM, 80-84 con qualunque budget parziale",
+          "v": "the prompt: 306.9 tok/s with the model in RAM, 80-84 with any partial budget",
           "d": "2026-09-20"
         }
       ],
-      "domande": [
+      "questions": [
         {
           "n": 14,
-          "stato": "chiusa",
-          "testo": "quanti byte per token restano da leggere: misurato, la simulazione rispondeva a un'altra domanda"
+          "state": "closed",
+          "text": "how many bytes per token are left to read: measured, the simulation was answering a different question"
         },
         {
           "n": 16,
-          "stato": "chiusa",
-          "testo": "quanto legge l'NVMe a blocchi grandi: ~1.5 GB/s"
+          "state": "closed",
+          "text": "how fast does the NVMe read in large blocks: ~1.5 GB/s"
         }
       ],
-      "file": [
+      "files": [
         "tools/experts_budget.sh",
         "build/experts_budget/"
       ],
-      "comandi": [
+      "commands": [
         "sh tools/experts_budget.sh measure | misses | long | direct"
       ],
-      "dipende": [
-        "m1-diretta",
-        "m1-piano"
+      "depends": [
+        "m1-direct",
+        "m1-plan"
       ]
     },
     {
-      "id": "m1-ordine-layer",
-      "tappa": "M1",
-      "titolo": "Ordine per layer nel prompt",
-      "stato": "fatto",
-      "cosa": "Il prompt si elabora a blocchi di 512 token. Prima ogni blocco attraversava tutti i layer, quindi sotto budget rileggeva dal disco tutti gli esperti a ogni blocco. Adesso i cicli sono invertiti — per ogni layer, tutti i blocchi — e ogni esperto si legge una volta sola per prompt. Stessi numeri esatti: cambia solo quante volte si aspetta il disco.",
-      "numeri": [
+      "id": "m1-layer-order",
+      "milestone": "M1",
+      "title": "Per-layer order in the prompt",
+      "state": "done",
+      "what": "The prompt is processed in blocks of 512 tokens. Before, every block went through every layer, so under budget it reread every expert from disk at every block. Now the loops are inverted -- for each layer, every block -- and each expert is read only once per prompt. Same exact numbers: only how many times it waits for the disk changes.",
+      "numbers": [
         {
-          "v": "prompt 2048 a budget 50%: 6 273 MiB letti invece di 22 880",
+          "v": "prompt 2048 at 50% budget: 6 273 MiB read instead of 22 880",
           "d": "2026-09-21"
         },
         {
-          "v": "prefill 12.41 s invece di 23.51: 1.89×, calcolo non distinguibile",
+          "v": "prefill 12.41 s instead of 23.51: 1.89x, compute indistinguishable",
           "d": "2026-09-21"
         },
         {
-          "v": "a prompt 512 (una passata sola) niente cambia, come previsto",
+          "v": "at prompt 512 (a single pass) nothing changes, as expected",
           "d": "2026-09-21"
         }
       ],
-      "domande": [
+      "questions": [
         {
           "n": 47,
-          "stato": "chiusa",
-          "testo": "il prompt legge gli esperti una volta per prompt? no, una volta per passata"
+          "state": "closed",
+          "text": "does the prompt read the experts once per prompt? no, once per pass"
         }
       ],
-      "file": [
+      "files": [
         "src/models/olmoe.c (forward_layer, forward_prompt_layer_major)",
         "tests/test_stream.c (once_per_prompt)"
       ],
-      "comandi": [
+      "commands": [
         "make check",
         "sh tools/prefill_overlap.sh 5"
       ],
-      "dipende": [
-        "m1-misure",
+      "depends": [
+        "m1-measurements",
         "prefill"
       ]
     },
     {
-      "id": "m1-cache-sessioni",
-      "tappa": "M1",
-      "titolo": "Il costo del primo prompt",
-      "stato": "in-corso",
-      "cosa": "Sotto budget ogni avvio rilegge il modello dal disco. `trochilus serve` tiene acceso il motore (thread, modello, archivio degli esperti) fra un comando e l'altro, e `run`, `chat`, `generate` ci girano dentro da soli quando c'è, con lo stesso output al byte. Misurato: col modello tutto in RAM il primo prompt passa da 12.8 a 7.8 secondi, il caricamento sparisce. A metà budget quasi niente (13.0 → 12.0 s): ogni prompt riscrive l'archivio da capo, quindi lì la leva è cosa buttare via durante il prompt. Mentre il modello si carica si vede la barra d'acqua arcobaleno (la variante A). Prossimo: leggere mentre scrivi (domanda 48).",
-      "numeri": [
+      "id": "m1-first-prompt-cost",
+      "milestone": "M1",
+      "title": "The first prompt's cost",
+      "state": "in-progress",
+      "what": "Under budget every startup rereads the model from disk. `trochilus serve` keeps the engine on (threads, model, expert store) between commands, and `run`, `chat`, `generate` run inside it on their own when it is up, with the same output to the byte. Measured: with the model fully in RAM the first prompt goes from 12.8 to 7.8 seconds, the load disappears. At half budget almost nothing (13.0 -> 12.0 s): every prompt rewrites the store from scratch, so there the lever is what to drop during the prompt. While the model loads a rainbow water bar shows (variant A). Next: reading while you type (question 48).",
+      "numbers": [
         {
-          "v": "col server, modello tutto in RAM: primo prompt 12.79 → 7.81 s (via i 4.98 s di caricamento)",
+          "v": "with the server, model fully in RAM: first prompt 12.79 -> 7.81 s (removing the 4.98 s of loading)",
           "d": "2026-09-23"
         },
         {
-          "v": "col server, metà budget: 13.00 → 12.04 s (0.926×), 139 mancati in meno su 1157",
+          "v": "with the server, half budget: 13.00 -> 12.04 s (0.926x), 139 fewer misses out of 1157",
           "d": "2026-09-23"
         },
         {
-          "v": "attraverso il server: stesso stdout al byte di ogni comando, modello caricato una volta",
+          "v": "through the server: same stdout to the byte for every command, model loaded once",
           "d": "2026-09-23"
         },
         {
-          "v": "la barra: 63 mutazioni su 63 prese dai test",
+          "v": "the bar: 63 mutations out of 63 caught by the tests",
           "d": "2026-09-23"
         }
       ],
-      "domande": [
+      "questions": [
         {
           "n": 49,
-          "stato": "chiusa",
-          "testo": "sì col modello tutto in RAM (−5 s), poco a metà budget (−1 s)"
+          "state": "closed",
+          "text": "yes with the model fully in RAM (-5 s), little at half budget (-1 s)"
         },
         {
           "n": 48,
-          "stato": "aperta",
-          "testo": "quanto se ne nasconde dietro il tempo che l'utente impiega a scrivere"
+          "state": "open",
+          "text": "how much of it hides behind the time the user takes to type"
         },
         {
           "n": 45,
-          "stato": "aperta",
-          "testo": "il costo del primo prompt si può togliere, o solo nascondere"
+          "state": "open",
+          "text": "can the first prompt's cost be removed, or only hidden"
         }
       ],
-      "file": [
+      "files": [
         "src/app/serve.c",
         "tests/test_serve.c",
         "tools/serve_first_prompt.sh"
       ],
-      "comandi": [
+      "commands": [
         "build/trochilus serve -m <gguf>",
         "build/trochilus serve --status",
         "sh tools/serve_first_prompt.sh"
       ],
-      "dipende": [
-        "m1-misure"
+      "depends": [
+        "m1-measurements"
       ]
     },
     {
-      "id": "m1-sovrapposizione",
-      "tappa": "M1",
-      "titolo": "Disco e calcolo insieme",
-      "stato": "fatto",
-      "cosa": "Prima il motore leggeva, poi calcolava, poi leggeva ancora: disco e core si aspettavano a turno. Adesso, nel prompt lungo, un thread a parte legge dal disco gli esperti del layer dopo mentre i core calcolano quello di adesso. Stessi numeri al byte: cambia solo quando i dati arrivano. Resta metà dell'attesa del disco da capire, e il prompt corto (fino a 512 token) che non legge ancora in anticipo.",
-      "numeri": [
+      "id": "m1-overlap",
+      "milestone": "M1",
+      "title": "Disk and compute together",
+      "state": "done",
+      "what": "Before, the engine read, then computed, then read again: disk and cores waited on each other in turn. Now, in the long prompt, a separate thread reads the next layer's experts from disk while the cores compute the current one. Same numbers to the byte: only when the data arrives changes. Half the disk wait is still to be understood, and the short prompt (up to 512 tokens) still does not read ahead.",
+      "numbers": [
         {
-          "v": "prompt 2048 a metà budget: 11.45 → 9.39 s (1.22×), il tetto calcolato era 1.61×",
+          "v": "prompt 2048 at half budget: 11.45 -> 9.39 s (1.22x), the computed ceiling was 1.61x",
           "d": "2026-09-23"
         },
         {
-          "v": "a 512 token niente: il prompt di un blocco solo non legge in anticipo (tetto 1.40×)",
+          "v": "at 512 tokens nothing: a single-block prompt does not read ahead (ceiling 1.40x)",
           "d": "2026-09-23"
         },
         {
-          "v": "70 MiB letti in più su 6 273 (1.1%)",
+          "v": "70 MiB read extra out of 6 273 (1.1%)",
           "d": "2026-09-23"
         }
       ],
-      "domande": [
+      "questions": [
         {
           "n": 43,
-          "stato": "aperta",
-          "testo": "da che velocità di disco in su conviene precaricare, e con quanti candidati"
+          "state": "open",
+          "text": "from which disk speed up does prefetching pay off, and with how many candidates"
         }
       ],
-      "file": [
+      "files": [
         "src/memory/experts.c (tr_experts_prefetch)",
         "src/base/threads.c (thread e monitor)",
         "tests/test_prefetch.c"
       ],
-      "comandi": [
+      "commands": [
         "SET=prefetch sh tools/prefill_overlap.sh 5",
         "sh tools/mutate_prefetch.sh"
       ],
-      "dipende": [
-        "m1-ordine-layer"
+      "depends": [
+        "m1-layer-order"
       ]
     },
     {
-      "id": "m1-decode-fisso",
-      "tappa": "M1",
-      "titolo": "Il costo fisso della generazione",
-      "stato": "aperto",
-      "cosa": "Sotto budget i primi token dopo il prompt costano di più: circa un secondo una tantum al 25% del modello in RAM. Col modello tutto in RAM non succede, quindi non è il motore che si scalda: è la dispensa degli esperti che si riassesta dopo il prompt. Sappiamo dov'è, non ancora esattamente cosa sia.",
-      "numeri": [
+      "id": "m1-decode-fixed-cost",
+      "milestone": "M1",
+      "title": "Generation's fixed cost",
+      "state": "open",
+      "what": "Under budget the first tokens after the prompt cost more: about one second, once, at 25% of the model in RAM. With the model fully in RAM it does not happen, so it is not the engine warming up: it is the expert store settling after the prompt. We know where it is, not yet exactly what it is.",
+      "numbers": [
         {
-          "v": "residente: 34.64 tok/s a 200 token, 33.48 a 1000 — nessun costo fisso",
+          "v": "resident: 34.64 tok/s at 200 tokens, 33.48 at 1000 -- no fixed cost",
           "d": "2026-09-21"
         },
         {
-          "v": "50%: 29.21 → 30.79 (~0.35 s fissi); 25%: 26.53 → 29.84 (~0.84 s)",
+          "v": "50%: 29.21 -> 30.79 (~0.35 s fixed); 25%: 26.53 -> 29.84 (~0.84 s)",
           "d": "2026-09-21"
         },
         {
-          "v": "i mancati in più dei primi token ne spiegano ~115 ms su 840",
+          "v": "the extra misses of the first tokens explain ~115 ms out of 840",
           "d": "2026-09-21"
         }
       ],
-      "domande": [
+      "questions": [
         {
           "n": 46,
-          "stato": "aperta",
-          "testo": "dove va il resto del costo fisso: profilo per zone dei primi 64 token"
+          "state": "open",
+          "text": "where does the rest of the fixed cost go: a per-zone profile of the first 64 tokens"
         }
       ],
-      "file": [],
-      "comandi": [
+      "files": [],
+      "commands": [
         "make profile SCENARIOS=bench/scenarios-olmoe-1b-7b.json"
       ],
-      "dipende": [
-        "m1-misure"
+      "depends": [
+        "m1-measurements"
       ]
     },
     {
-      "id": "m1-mbolt",
-      "tappa": "M1",
-      "titolo": "Riordino del file per co-attivazione",
-      "stato": "aperto",
-      "cosa": "Riscrivere il GGUF mettendo vicini gli esperti che si accendono insieme (l'idea di mbolt, MIT). Sul nostro disco e con i nostri esperti grossi vale poco: il loro README stesso dice che il guadagno si spegne sopra i 4 MB per pezzo, e i nostri sono 6.4.",
-      "numeri": [
+      "id": "m1-file-reorder",
+      "milestone": "M1",
+      "title": "File reorder by co-activation",
+      "state": "open",
+      "what": "Rewriting the GGUF putting close together the experts that light up together (mbolt's idea, MIT). On our disk and with our large experts it is worth little: their own README says the gain fades above 4 MB per chunk, and ours are 6.4.",
+      "numbers": [
         {
-          "v": "la co-attivazione c'è e cresce con la profondità: ai layer 8-15 il 17-21% delle coppie si accende insieme più del doppio del caso; i 3 compagni più frequenti di un esperto fanno il 18-28% delle sue accensioni in coppia (caso: 4.8%)",
+          "v": "co-activation exists and grows with depth: at layers 8-15, 17-21% of pairs light up together more than double the baseline case; an expert's 3 most frequent companions make up 18-28% of its paired activations (baseline: 4.8%)",
           "d": "2026-09-24"
         },
         {
-          "v": "tetto ≤ 1.15× qui (dal nostro banco del disco), contro il 2.23× che dichiarano sulle loro letture",
+          "v": "ceiling <= 1.15x here (from our own disk bench), against the 2.23x they claim on their own reads",
           "d": "2026-09-21"
         }
       ],
-      "domande": [],
-      "file": [],
-      "comandi": [
+      "questions": [],
+      "files": [],
+      "commands": [
         "make bench-disk",
         "tools/.venv/Scripts/python.exe tools/route_union_report.py build/route/*.bin"
       ],
-      "dipende": [
-        "m1-misure"
+      "depends": [
+        "m1-measurements"
       ]
     },
     {
-      "id": "m1-routing",
-      "tappa": "M1",
-      "titolo": "Traccia del routing",
-      "stato": "fatto",
-      "cosa": "Registrare quali esperti sceglie il modello a ogni token, per capire se si possono prevedere o se si può tenerne in RAM solo una parte. Ha risposto a quattro domande, tutte con un «no» utile.",
-      "numeri": [
+      "id": "m1-routing-trace",
+      "milestone": "M1",
+      "title": "Routing trace",
+      "state": "done",
+      "what": "Recording which experts the model picks at every token, to see if they can be predicted or if only part of them can be kept in RAM. It answered four questions, all with a useful «no».",
+      "numbers": [
         {
-          "v": "il router del layer dopo prevede il 92-95% degli esperti con 12 candidati",
+          "v": "the next layer's router predicts 92-95% of the experts with 12 candidates",
           "d": "2026-09-20"
         },
         {
-          "v": "spegnendo metà degli esperti meno usati il token cambia nel 6-19% delle posizioni: non si può",
+          "v": "turning off half the least-used experts changes the token in 6-19% of positions: it cannot be done",
           "d": "2026-09-20"
         }
       ],
-      "domande": [
+      "questions": [
         {
           "n": 44,
-          "stato": "chiusa",
-          "testo": "il comportamento sul codice è un grafo piccolo e deterministico? no, in tutti e quattro i sensi"
+          "state": "closed",
+          "text": "is behavior on code a small, deterministic graph? no, in all four senses"
         },
         {
           "n": 13,
-          "stato": "chiusa",
-          "testo": "il router del layer dopo indovina gli esperti? sì, ma su questo disco precaricare non rende"
+          "state": "closed",
+          "text": "does the next layer's router guess the experts? yes, but on this disk prefetching does not pay off"
         }
       ],
-      "file": [
+      "files": [
         "tools/route_trace_report.py",
         "tools/mask_quality.sh"
       ],
-      "comandi": [
+      "commands": [
         "build/trochilus run ... --route-trace <file>"
       ],
-      "dipende": [
-        "m1-archivio"
+      "depends": [
+        "m1-store"
       ]
     },
     {
       "id": "m2-kquant",
-      "tappa": "M2",
-      "titolo": "K-quant sulla CPU",
-      "stato": "in-corso",
-      "cosa": "Formati che tengono i pesi in meno byte (Q4_K, Q6_K, Q2_K, IQ2_XXS): meno disco e meno RAM, la leva che si somma a tutto M1. Fatti il 24/09: Q4_K e Q6_K nel motore, esatti rispetto ai loro pesi dequantizzati (identici al bit a gguf-py, i modelli veri tagliati a 2 strati contro transformers nel make check). Q4_K ha un kernel AVX-512 nostro (i 16 valori di un sotto-blocco calcolati una volta); Q6_K spacchetta i 256 quant di un blocco una volta sola e poi va come Q8_0. Con Q6_K gira Q4_K_M, il file che la gente scarica. I modelli veri in Q4_K e Q4_K_M si fanno dal nostro Q8_0, senza download. Misurato di nuovo: nel prefill non conta decodificare i pesi ma caricare le attivazioni, quindi niente riga dequantizzata una volta per blocco (scartata) e invece due righe di pesi per ogni caricamento (tenuta). Il 25/09 il decode Q4_K a 4 thread ha raggiunto llama.cpp (scale in vettore, due righe per chiamata). Prossimo: le due righe anche su AVX2. Due thread per core (SMT) nel decode: misurato il 25/09, non conviene alla larghezza che il motore usa.",
-      "numeri": [
+      "milestone": "M2",
+      "title": "K-quant on the CPU",
+      "state": "in-progress",
+      "what": "Formats that hold the weights in fewer bytes (Q4_K, Q6_K, Q2_K, IQ2_XXS): less disk and less RAM, a lever that adds to all of M1. Done on 09/24: Q4_K and Q6_K in the engine, exact against their dequantized weights (identical to the bit to gguf-py, the real models cut to 2 layers against transformers in make check). Q4_K has our own AVX-512 kernel (a sub-block's 16 values computed once); Q6_K unpacks a block's 256 quants once and then runs like Q8_0. With Q6_K, Q4_K_M runs, the file people download. The real models in Q4_K and Q4_K_M are made from our own Q8_0, with no download. Measured again: in the prefill decoding the weights does not matter, loading the activations does, so no row dequantized once per block (dropped) and instead two weight rows per load (kept). On 09/25 the Q4_K decode at 4 threads reached llama.cpp (scales in vector, two rows per call). Next: the two rows also on AVX2. Two threads per core (SMT) in the decode: measured on 09/25, not worth it at the width the engine uses.",
+      "numbers": [
         {
-          "v": "swiglu e preparazione del down nella stessa chiamata (P4 della domanda 83): prompt 1.0087x, decode pari, stessi bit; la preparazione da sola costa 0.70 microsecondi per riga da 2048",
+          "v": "swiglu and the down projection's prep in the same call (P4 of question 83): prompt 1.0087x, decode even, same bits; the prep alone costs 0.70 microseconds per 2048 row",
           "d": "2026-09-27"
         },
         {
-          "v": "la preparazione una volta per riga (domanda 83): q, k e v da una sola preparazione, gate e up dalle righe dei token attraverso una mappa, niente copia; prompt 1.058x, verifica a 3 righe 1.026x, decode 1.025x con P4 (bracci senza periodo), stessi bit",
+          "v": "the prep once per row (question 83): q, k and v from a single prep, gate and up from the token rows through a map, no copy; prompt 1.058x, 3-row verify pass 1.026x, decode 1.025x with P4 (arms with no period), same bits",
           "d": "2026-09-27"
         },
         {
-          "v": "decode Q4_K a 4 thread pari a llama.cpp (50.4 contro 50.2 token/s, 1.25x rispetto a prima), stessi bit; il prefill a 4 thread resta dietro (loro 1.6x)",
+          "v": "Q4_K decode at 4 threads even with llama.cpp (50.4 against 50.2 tok/s, 1.25x over before), same bits; the prefill at 4 threads stays behind (theirs 1.6x)",
           "d": "2026-09-25"
         },
         {
-          "v": "modello vero in Q4_K_M: decode 0.93× il Q4_K (45 contro 48 tok/s a 16 thread), prefill uguale; llama.cpp sullo stesso file 1.09× in decode",
+          "v": "real model in Q4_K_M: decode 0.93x the Q4_K (45 against 48 tok/s at 16 threads), prefill equal; llama.cpp on the same file 1.09x in decode",
           "d": "2026-09-24"
         },
         {
-          "v": "Q6_K su AVX2 rimisurato: 0.85× il Q8_0 (la prima serie, 0.74-0.80×, era rumore)",
+          "v": "Q6_K on AVX2 remeasured: 0.85x the Q8_0 (the first series, 0.74-0.80x, was noise)",
           "d": "2026-09-24"
         },
         {
-          "v": "kernel Q6_K contro Q8_0 per elemento: AVX-512 0.85× (0.89-1.00× su quattro token), AVX2 0.74-0.80×",
+          "v": "Q6_K kernel against Q8_0 per element: AVX-512 0.85x (0.89-1.00x on four tokens), AVX2 0.74-0.80x",
           "d": "2026-09-24"
         },
         {
-          "v": "oracolo sul taglio a 2 strati in Q4_K_M (Q6_K e Q4_K insieme): 32/32 token, logit entro 2e-4",
+          "v": "oracle on the 2-layer cut in Q4_K_M (Q6_K and Q4_K together): 32/32 tokens, logits within 2e-4",
           "d": "2026-09-24"
         },
         {
-          "v": "Q6_K visto rosso sotto 14 mutazioni su 14",
+          "v": "Q6_K seen red under 14 mutations out of 14",
           "d": "2026-09-24"
         },
         {
-          "v": "modello vero in Q4_K: decode 1.5× il Q8_0 (45.8 contro 30.1 tok/s a 16 thread), prefill uguale",
+          "v": "real model in Q4_K: decode 1.5x the Q8_0 (45.8 against 30.1 tok/s at 16 threads), prefill equal",
           "d": "2026-09-24"
         },
         {
-          "v": "kernel Q4_K contro Q8_0 per elemento: AVX-512 0.84-0.90×, AVX2 0.53-0.63×",
+          "v": "Q4_K kernel against Q8_0 per element: AVX-512 0.84-0.90x, AVX2 0.53-0.63x",
           "d": "2026-09-24"
         },
         {
-          "v": "la stessa tabella su AVX2: pari sulla riga, -3.5% su quattro token alla volta: respinta",
+          "v": "the same table on AVX2: even on the row, -3.5% on four tokens at a time: rejected",
           "d": "2026-09-24"
         },
         {
-          "v": "oracolo sul taglio a 2 strati in Q4_K: 32/32 token, logit entro 1.9e-4",
+          "v": "oracle on the 2-layer cut in Q4_K: 32/32 tokens, logits within 1.9e-4",
           "d": "2026-09-24"
         },
         {
-          "v": "llama.cpp sullo stesso Q4_K: decode 1.07× il nostro a 16 thread, prefill 2.1× (attivazioni a 8 bit)",
+          "v": "llama.cpp on the same Q4_K: decode 1.07x ours at 16 threads, prefill 2.1x (8-bit activations)",
           "d": "2026-09-24"
         },
         {
-          "v": "gli esperti in Q4 dimezzerebbero il disco del prompt (3.3 GiB invece di 6.5)",
+          "v": "experts in Q4 would halve the prompt's disk (3.3 GiB instead of 6.5)",
           "d": "2026-09-21"
         },
         {
-          "v": "Q4_K esatto: l’ingresso a 32 bit in virgola fissa per blocco di 256, somme di interi esatte, un solo arrotondamento; il decode pari al kernel float dopo averne sequenziato il dot a due righe (0.937x il float a caldo)",
+          "v": "exact Q4_K: fixed-point 32-bit input per 256-block, exact integer sums, one rounding; the decode even with the float kernel after sequencing its dot to two rows (0.937x the float when hot)",
           "d": "2026-09-27"
         }
       ],
-      "domande": [
-        "83: mezza preparazione a token, o meno (Marcello): fatti P1, P2 e P4; restano gate e up in una chiamata, le code delle chiamate, e per ultima l'aritmetica dei bit della preparazione"
+      "questions": [
+        {
+          "n": 83,
+          "state": "open",
+          "text": "half a prep per token, or less (Marcello): P1, P2 and P4 done; gate and up in one call remain, the calls' tails, and last the prep's bit arithmetic"
+        }
       ],
-      "file": [
+      "files": [
         "src/kernels/kernels.c",
         "src/kernels/kernels_x86.c",
         "tools/check_dequant.py",
@@ -1042,275 +1046,281 @@
         "tools/bench_kernels.sh",
         "tools/mutate_row2.sh"
       ],
-      "comandi": [
+      "commands": [
         "sh tools/bench_kernels.sh",
         "sh tools/race_q4k.sh 5 m",
         "sh tools/quantize_q4k.sh m",
         "AB_INPROC_PROMPT=8 sh tools/ab_inproc.sh build/trochilus.exe prep 4"
       ],
-      "dipende": [
-        "m1-ordine-layer"
+      "depends": [
+        "m1-layer-order"
       ]
     },
     {
       "id": "m2-assembly",
-      "tappa": "M2",
-      "titolo": "Laboratorio assembly",
-      "stato": "prossimo",
-      "cosa": "Riscrivere in assembly i kernel più caldi, uno alla volta. Resta solo se il test lo trova identico al C e il banco lo trova più veloce; il C resta come riserva per le altre CPU.",
-      "numeri": [
+      "milestone": "M2",
+      "title": "Assembly lab",
+      "state": "next",
+      "what": "Rewriting the hottest kernels in assembly, one at a time. It stays only if the test finds it identical to the C one and the bench finds it faster; the C stays as the fallback for the other CPUs.",
+      "numbers": [
         {
-          "v": "il microkernel a 8 token non ha avuto bisogno dell'assembly: in C con intrinsics gcc tiene tutto nei registri; il matmul ora al 61% del picco senza FMA (102 di 166), il kernel all'87% del suo flusso ideale",
+          "v": "the 8-token microkernel did not need assembly: in C with gcc intrinsics it keeps everything in registers; the matmul now at 61% of the no-FMA peak (102 of 166), the kernel at 87% of its ideal flow",
           "d": "2026-09-24"
         },
         {
-          "v": "il matmul del prefill fa il 49-53% del picco senza FMA su un core (87 di 166.5 GFLOP/s); lo stesso flusso di istruzioni in assembly con 8 token per peso invece di 4 arriva a 119.4: 1.34× (prefill stimato 1.15-1.25×)",
+          "v": "the prefill's matmul does 49-53% of the no-FMA peak on one core (87 of 166.5 GFLOP/s); the same instruction flow in assembly with 8 tokens per weight instead of 4 reaches 119.4: 1.34x (prefill estimated 1.15-1.25x)",
           "d": "2026-09-24"
         },
         {
-          "v": "su Zen 4 l'ordine di istruzioni indipendenti vale il 20%: mul e add alternati uno a uno 139 GFLOP/s, raggruppati 167",
+          "v": "on Zen 4 the order of independent instructions is worth 20%: mul and add alternated one by one 139 GFLOP/s, grouped 167",
           "d": "2026-09-24"
         }
       ],
-      "domande": [
+      "questions": [
         {
           "n": 55,
-          "stato": "chiusa",
-          "testo": "quanto margine c'è sotto il picco? 1.34× col microkernel a 8 token: costruito, 1.17-1.23× sul matmul, prefill 1.19-1.30×"
+          "state": "closed",
+          "text": "how much headroom is there under the peak? 1.34x with the 8-token microkernel: built, 1.17-1.23x on the matmul, prefill 1.19-1.30x"
         },
         {
           "n": 59,
-          "stato": "aperta",
-          "testo": "FMA nella definizione? (decisione di Marcello) Su questo Zen 4 il picco FMA è uguale a mul+add; il flusso a 8 token con FMA va 1.19×"
+          "state": "open",
+          "text": "FMA in the definition? (Marcello's decision) On this Zen 4 the FMA peak equals mul+add; the 8-token flow with FMA goes 1.19x"
         },
         {
           "n": 10,
-          "stato": "aperta",
-          "testo": "più corsie (32 o 64) sbloccano la catena delle somme su un thread?"
+          "state": "open",
+          "text": "do more lanes (32 or 64) unblock the sum chain on one thread?"
         }
       ],
-      "file": [
+      "files": [
         "tests/bench_peak.c"
       ],
-      "comandi": [
+      "commands": [
         "sh tools/bench_native.sh bench_peak",
         "make bench"
       ],
-      "dipende": [
+      "depends": [
         "kernel"
       ]
     },
     {
       "id": "m3-attn",
-      "tappa": "M3",
-      "titolo": "L'attenzione del decode sulla GPU",
-      "stato": "fatto",
-      "cosa": "Il pezzo più lento del decode a contesto lungo, l'attenzione, gira sulla GPU con gli stessi bit della CPU: ogni operazione arrotondata come la definizione, niente fusioni. Il driver si apre mentre il programma gira: chi non ha la GPU non se ne accorge. Un portatile addormenta la GPU fra uno strato e l'altro: un solo gruppo di thread la tiene sveglia.",
-      "numeri": [
+      "milestone": "M3",
+      "title": "The decode's attention on the GPU",
+      "state": "done",
+      "what": "The slowest piece of the long-context decode, the attention, runs on the GPU with the same bits as the CPU: every operation rounded like the definition, no fusions. The driver opens while the program is running: whoever has no GPU does not notice. A laptop puts the GPU to sleep between layers: a single thread group keeps it awake.",
+      "numbers": [
         {
-          "v": "uno strato a contesto 2048: 168 µs contro 704 della CPU; a 4000: 305 contro 1415",
+          "v": "one layer at context 2048: 168 us against the CPU's 704; at 4000: 305 against 1415",
           "d": "2026-09-24"
         },
         {
-          "v": "logit identici al byte attraverso il motore: 2000 posizioni di decode, i token dopo 4000, un giro speculativo",
+          "v": "logits identical to the byte through the engine: 2000 decode positions, tokens past 4000, a speculative round",
           "d": "2026-09-24"
         },
         {
-          "v": "decode nel motore, A/B a macchina ferma: 1.31-1.32× a 2048, 1.54-1.58× a 4000 (previsto 1.29 e 1.57); il token a 4000 da 44.8 a 29.8 ms",
+          "v": "decode in the engine, A/B on a still machine: 1.31-1.32x at 2048, 1.54-1.58x at 4000 (predicted 1.29 and 1.57); the token at 4000 from 44.8 to 29.8 ms",
           "d": "2026-09-24"
         }
       ],
-      "domande": [
-        "tenerla sveglia costa 12-17 W mentre genera: sempre, o solo dal contesto in cui conviene?"
+      "questions": [
+        {
+          "state": "open",
+          "text": "keeping it awake costs 12-17 W while generating: always, or only from the context where it pays off?"
+        }
       ],
-      "file": [
+      "files": [
         "src/backend/gpu_attn.c",
         "tests/test_gpu_attn.c",
         "tools/gpu_exact.sh"
       ],
-      "comandi": [
+      "commands": [
         "sh tools/gpu_exact.sh full",
         "TR_GPU=0 build/trochilus run -m <gguf> -f prompt.txt"
       ],
-      "dipende": [
+      "depends": [
         "kv"
       ]
     },
     {
-      "id": "m3-denso",
-      "tappa": "M3",
-      "titolo": "I pesi densi sulla GPU",
-      "stato": "prossimo",
-      "cosa": "Le matrici che ogni token legge tutte (attenzione e testa di uscita, circa 395 MB a token) in VRAM, accanto alla KV. Il prodotto matrice-vettore Q8_0 sulla GPU dà gli stessi bit della CPU.",
-      "numeri": [
+      "id": "m3-dense",
+      "milestone": "M3",
+      "title": "Dense weights on the GPU",
+      "state": "next",
+      "what": "The matrices every token reads in full (attention and output head, about 395 MB a token) in VRAM, next to the KV. The Q8_0 matrix-vector product on the GPU gives the same bits as the CPU.",
+      "numbers": [
         {
-          "v": "prodotto Q8_0 esatto al 97% della banda della VRAM; i pesi densi di un token 2.4 ms contro ~7.7 sulla CPU",
+          "v": "Q8_0 exact product at 97% of VRAM bandwidth; a token's dense weights 2.4 ms against ~7.7 on the CPU",
           "d": "2026-09-24"
         },
         {
-          "v": "modello: 1.64× a 2048, 1.92× a 4000 insieme all'attenzione",
+          "v": "model: 1.64x at 2048, 1.92x at 4000 together with the attention",
           "d": "2026-09-24"
         },
         {
-          "v": "dopo: il Q4 intero sulla GPU come bozza, verificata esatta dal motore. Il Q4_K sceglie il token del Q8_0 nell'88.7 / 94.7 / 90.6% dei casi (prosa, codice, italiano): sotto il 95% sperato, ma una passata di 9 righe legge solo 3.52× gli esperti di un token, quindi ~2× meno byte a token",
+          "v": "after: exact integer Q4 on the GPU as a draft, checked exact by the engine. Q4_K picks Q8_0's token in 88.7 / 94.7 / 90.6% of cases (prose, code, italian): below the hoped-for 95%, but a 9-row verify pass reads only 3.52x a token's experts, so ~2x fewer bytes a token",
           "d": "2026-09-24"
         }
       ],
-      "domande": [],
-      "file": [
+      "questions": [],
+      "files": [
         "tests/bench_gpu_q8.c"
       ],
-      "comandi": [
+      "commands": [
         "build/tests/bench_gpu_q8.exe check"
       ],
-      "dipende": [
+      "depends": [
         "m3-attn"
       ]
     },
     {
-      "id": "m3-esperti",
-      "tappa": "M3",
-      "titolo": "Gli esperti in VRAM",
-      "stato": "aperto",
-      "cosa": "La GPU come modulo caricabile, non come dipendenza: chi non ce l'ha non se ne accorge. Gli esperti più caldi in VRAM, il resto in RAM e su disco, con un piano unico che decide cosa sta dove.",
-      "numeri": [
+      "id": "m3-experts",
+      "milestone": "M3",
+      "title": "Experts in VRAM",
+      "state": "open",
+      "what": "The GPU as a loadable module, not a dependency: whoever does not have one does not notice. The hottest experts in VRAM, the rest in RAM and on disk, with a single plan deciding what goes where.",
+      "numbers": [
         {
-          "v": "modello: con gli esperti che stanno in VRAM ~4× a 2048 (9.3 ms a token contro 36.8)",
+          "v": "model: with the experts fitting in VRAM ~4x at 2048 (9.3 ms a token against 36.8)",
           "d": "2026-09-24"
         }
       ],
-      "domande": [
-        "un exp esatto con soli float32 per la GPU (il prefill ne vuole miliardi, e i double lì vanno a 1/64)"
+      "questions": [
+        {
+          "state": "open",
+          "text": "an exact exp with float32 only for the GPU (the prefill wants billions of them, and doubles there run at 1/64)"
+        }
       ],
-      "file": [],
-      "comandi": [],
-      "dipende": [
-        "m3-denso",
-        "m1-cache-sessioni",
+      "files": [],
+      "commands": [],
+      "depends": [
+        "m3-dense",
+        "m1-first-prompt-cost",
         "m2-kquant"
       ]
     },
     {
       "id": "m4-v4",
-      "tappa": "M4",
-      "titolo": "DeepSeek V4 Flash",
-      "stato": "aperto",
-      "cosa": "Una seconda famiglia di modelli, per dimostrare che il motore non è cucito addosso a OLMoE. Ha attenzione e routing diversi.",
-      "numeri": [],
-      "domande": [],
-      "file": [
+      "milestone": "M4",
+      "title": "DeepSeek V4 Flash",
+      "state": "open",
+      "what": "A second family of models, to prove the engine is not tailored to OLMoE. It has different attention and routing.",
+      "numbers": [],
+      "questions": [],
+      "files": [
         "docs/DeepSeek_V41_Tech_Report.md"
       ],
-      "comandi": [],
-      "dipende": [
-        "m3-esperti"
+      "commands": [],
+      "depends": [
+        "m3-experts"
       ]
     },
     {
       "id": "m5-spec",
-      "tappa": "M5",
-      "titolo": "Decodifica speculativa",
-      "stato": "fatto",
-      "cosa": "Indovinare più token in una volta riusando pezzi del prompt, e verificarli tutti insieme. Gli stessi token di prima, solo più in fretta quando il testo si ripete — come succede nel codice.",
-      "numeri": [
+      "milestone": "M5",
+      "title": "Speculative decoding",
+      "state": "done",
+      "what": "Guessing several tokens at once by reusing pieces of the prompt, and checking them all together. The same tokens as before, only faster when the text repeats -- as it does in code.",
+      "numbers": [
         {
-          "v": "strada c della domanda 78: una riga di pesi Q4_K decodificata una volta sola per le 2-3 righe di una passata di verifica, stessi bit. Da sola, dalla RAM a 8 thread, legge una matrice densa al 97% (2 token) e all'88% (3 token) della lettura pura, contro il 76% del pannello W16; nel motore a 8 thread in tre sessioni le passate da 2 righe 0.94-0.98 (21.45 ms a macchina libera), da 3 righe 0.96-0.985 (26.45 ms), il prompt fermo; il decode +0.8-1.7% su tutte le zone, anche quelle che il cambiamento non tocca: da capire se e' la posizione del codice. Tre testimoni nuovi nei test (lo zero con segno, i minimi che si annullano, l'ordine dei blocchi) rendono visibile un errore di arrotondamento che nessun test vedeva: 47 mutazioni, tutte viste rosse",
+          "v": "road (c) of question 78: one Q4_K weight row decoded once for a verify pass's 2-3 rows, same bits. Alone, from RAM at 8 threads, it reads a dense matrix at 97% (2 rows) and 88% (3 rows) of a pure read, against the W16 panel's 76%; in the engine at 8 threads, over three sessions, the 2-row passes 0.94-0.98 (21.45 ms on a free machine), the 3-row ones 0.96-0.985 (26.45 ms), the prompt unchanged; the decode +0.8-1.7% on every zone, even the ones the change does not touch: still to find out if it is the code's position. Three new witnesses in the tests (signed zero, minima that cancel out, block order) make visible a rounding error no test used to see: 47 mutations, all seen red",
           "d": "2026-09-27"
         },
         {
-          "v": "la passata corta di Q4_K (domanda 78): il pannello W16 leggeva le sue 16 righe solo quando servivano; portate avanti (il blocco s+2 e le righe dell'elemento dopo) e i gruppi da 2 righe per coppie di dot2: a 8 thread 3 righe da 28.00 a 26.53 ms (0.947), 2 righe da 22.92 a 22.19 (0.968), una riga e il prompt invariati, stessi bit. Ogni passata di verifica misura la sua larghezza (domanda 82): su 16 core Q8_0 0.961-0.966 del pool intero, Q4_K 0.982-1.005, sceglie 8 thread ovunque",
+          "v": "Q4_K's short pass (question 78): the W16 panel read its 16 rows only when needed. Brought forward (block s+2 and the next element's rows) and 2-row groups for dot2 pairs: at 8 threads 3 rows from 28.00 to 26.53 ms (0.947), 2 rows from 22.92 to 22.19 (0.968), one row and the prompt unchanged, same bits. Every verify pass now measures its own width (question 82): on 16 cores Q8_0 0.961-0.966 of the full pool, Q4_K 0.982-1.005, it picks 8 threads everywhere",
           "d": "2026-09-27"
         },
         {
-          "v": "la passata corta ai suoi byte (domanda 78): su Q8_0 la passata di 3 righe da 62.7 a 43.0 ms (una riga 0.72 -> 0.33 di passata: ai suoi byte), 2 righe da 41.3 a 35.9 ms, il decode invariato (1.000), stessi bit; la bozza sul codice nuovo ai prezzi Q8_0 di oggi: il lookup del motore 0.969x -> 1.040x, la soglia 1.013x -> 1.103x (con contesto vero 1.109x e 1.191x). Le passate corte vogliono una larghezza loro: 8 thread su Q8_0, il decode 4",
+          "v": "the short pass at its own bytes (question 78): on Q8_0 the 3-row pass from 62.7 to 43.0 ms (one row 0.72 -> 0.33 of a pass: at its own bytes), 2 rows from 41.3 to 35.9 ms, the decode unchanged (1.000), same bits; the draft on new code at today's Q8_0 prices: the engine's lookup 0.969x -> 1.040x, the threshold 1.013x -> 1.103x (with a real context 1.109x and 1.191x). The short passes want their own width: 8 threads on Q8_0, the decode 4",
           "d": "2026-09-27"
         },
         {
-          "v": "con un contesto vero (domanda 81: 20 prompt tagliati a meta' file da questo repo, 1770-3798 token): il lookup del motore 1.067x, la soglia 1.146x ai prezzi misurati (1.27-1.32x col costo del contesto modellato); una tabella fatta dal repo non aggiunge nulla",
+          "v": "with a real context (question 81: 20 prompts cut in half from this repo's files, 1770-3798 tokens): the engine's lookup 1.067x, the threshold 1.146x at measured prices (1.27-1.32x with the modeled context cost); a table built from the repo adds nothing",
           "d": "2026-09-27"
         },
         {
-          "v": "il post-it smontato: il prezzo di una riga verificata era del 18/09. Oggi costa 0.23-0.30 di passata con bozze da 8 (riscrivere un file va 1.95x su Q8_0, 1.78x su Q4_K), ma 0.50-0.72 con bozze da 1-2, piu' dei suoi byte. Sul codice nuovo una soglia calibrata (la cache di n-grammi del testo, come llama.cpp, piu' la tabella) da' 1.077x ai prezzi di oggi, 1.12-1.21x con la passata corta ai suoi byte",
+          "v": "the sticky note taken apart: the price of a checked row was from 09/18. Today it costs 0.23-0.30 of a pass with drafts of 8 (rewriting a file goes 1.95x on Q8_0, 1.78x on Q4_K), but 0.50-0.72 with drafts of 1-2, more than its own bytes. On new code a calibrated threshold (the text's n-gram cache, like llama.cpp, plus the table) gives 1.077x at today's prices, 1.12-1.21x with the short pass at its own bytes",
           "d": "2026-09-27"
         },
         {
-          "v": "la memoria del contesto della bozza a 8 bit: la bozza sceglie gli stessi token in tutte le 1152 posizioni e legge meno byte; valutata fuori campione, prosa 0.93-1.09x llama.cpp, italiano 0.95-1.12x, codice 1.14-1.26x (modello). La testa ridotta a 16k righe copre solo l'85-93% dei token: scartata. Sulla prosa resta il piano dei pesi della bozza (635 MiB a token)",
+          "v": "the draft's 8-bit context memory: the draft picks the same token at all 1152 positions and reads fewer bytes; evaluated out of sample, prose 0.93-1.09x llama.cpp, italian 0.95-1.12x, code 1.14-1.26x (model). The head cut to 16k rows covers only 85-93% of tokens: dropped. On prose the draft's weight plan remains (635 MiB a token)",
           "d": "2026-09-26"
         },
         {
-          "v": "le due leve della bozza dentro i bit: la sua seconda scelta come foglia in più (+0.07-0.10x) e una memoria del contesto a byte costanti (le posizioni guardate dal token precedente e le successive). Batte llama.cpp di 1.15-1.46x solo sul codice, che si ripete; su prosa e italiano 0.89-1.04x (modello): non si costruisce così",
+          "v": "the draft's two levers inside the bits: its extra second choice as a leaf (+0.07-0.10x) and a constant-bytes context memory (the positions looked at by the previous token and the following ones). It beats llama.cpp by 1.15-1.46x only on code, which repeats; on prose and italian 0.89-1.04x (model): it does not add up like this",
           "d": "2026-09-26"
         },
         {
-          "v": "una bozza dentro i bit del modello esatto (metà alta di ogni peso Q8_0, memoria del contesto a 16 bit), che riparte ogni volta dallo stato esatto: indovina il 97-100% dove il modello è sicuro, 82-98% in tutto; sul testo vero 0.81-1.04× i byte di llama.cpp (modello), peggio col contesto: così com'è non si costruisce",
+          "v": "a draft inside the exact model's bits (every Q8_0 weight's high half, 16-bit context memory), restarting each time from the exact state: it guesses right 97-100% where the model is sure, 82-98% overall; on real text 0.81-1.04x llama.cpp's bytes (model), worse with context: as it is, it does not add up",
           "d": "2026-09-26"
         },
         {
-          "v": "una passata di k righe legge 1.55 / 2.33 / 3.34 / 4.42× gli esperti di un token a k = 2 / 4 / 8 / 16 (a caso sarebbero 1.88 / 3.31 / 5.25 / 7.06): i token vicini riusano gli stessi esperti",
+          "v": "a k-row pass reads 1.55 / 2.33 / 3.34 / 4.42x a token's experts at k = 2 / 4 / 8 / 16 (by chance it would be 1.88 / 3.31 / 5.25 / 7.06): nearby tokens reuse the same experts",
           "d": "2026-09-24"
         },
         {
-          "v": "a contesto lungo: nulla sulla prosa (1.04-1.13 token a passata), 1.57 riscrivendo codice, 1.66× netto sul codice ripetitivo; una passata di ~4 righe legge ~2.8× gli esperti",
+          "v": "at long context: nothing on prose (1.04-1.13 tokens a pass), 1.57 rewriting code, 1.66x net on repetitive code; a ~4-row pass reads ~2.8x the experts",
           "d": "2026-09-24"
         },
         {
-          "v": "--spec 0/1/4/8/15 danno lo stesso testo; il guadagno dipende dal prompt",
+          "v": "--spec 0/1/4/8/15 give the same text; the gain depends on the prompt",
           "d": "2026-09-18"
         }
       ],
-      "domande": [
+      "questions": [
         {
           "n": 32,
-          "stato": "aperta",
-          "testo": "quante righe di bozza conviene tirare, dalla lunghezza del match"
+          "state": "open",
+          "text": "how many draft rows to pull, from the match length"
         },
         {
           "n": 71,
-          "stato": "aperta",
-          "testo": "la bozza dentro i bit: le due leve misurate, supera 1.1x solo sul codice; resta il pezzo di softmax che la bozza salta, passato dalla passata esatta"
+          "state": "open",
+          "text": "the draft inside the bits: the two levers measured, it beats 1.1x only on code; the piece of softmax the draft skips remains, passed by the exact pass"
         },
         {
           "n": 74,
-          "stato": "aperta",
-          "testo": "la bozza sulla GPU mentre la CPU verifica (~1.7-2.2x, modello): serve la decisione di Marcello, se la GPU conta nella gara"
+          "state": "open",
+          "text": "the draft on the GPU while the CPU checks (~1.7-2.2x, model): needs Marcello's decision, whether the GPU counts in the race"
         },
         {
           "n": 75,
-          "stato": "chiusa",
-          "testo": "la memoria della bozza a 8 bit: gratis per la bozza, ma la prosa non passa 1.1x"
+          "state": "closed",
+          "text": "the draft's 8-bit memory: free for the draft, but prose does not pass 1.1x"
         },
         {
           "n": 76,
-          "stato": "aperta",
-          "testo": "perché la bozza con la memoria a 4 bit indovina più spesso di quella a 16 bit (18 contro 3)?"
+          "state": "open",
+          "text": "why does the draft with 4-bit memory guess right more often than the 16-bit one (18 against 3)?"
         },
         {
           "n": 78,
-          "stato": "aperta",
-          "testo": "la passata di verifica da 2-4 righe al prezzo dei suoi byte: fatta su Q8_0; su Q4_K il pannello portato avanti, poi (strada c) due righe di pesi decodificate una volta sola per le 2-3 righe della passata: 2 righe 0.94-0.98x, 3 righe 0.96-0.985x in tre sessioni; resta il resto (+0.30-0.42 ms a riga: q, k, v preparati tre volte) e il denso a 3 righe (+0.39-0.45 ms)"
+          "state": "open",
+          "text": "the 2-4 row verify pass at its own bytes' price: done on Q8_0; on Q4_K the panel brought forward, then (road c) two weight rows decoded once for the pass's 2-3 rows: 2 rows 0.94-0.98x, 3 rows 0.96-0.985x over three sessions. What remains: the rest (+0.30-0.42 ms a row: q, k, v prepared three times) and the dense call at 3 rows (+0.39-0.45 ms)"
         },
         {
           "n": 79,
-          "stato": "aperta",
-          "testo": "una riga che non costa byte: il modello ristretto agli esperti gia' in viaggio, come bozza o filtro"
+          "state": "open",
+          "text": "a row that costs no bytes: the model restricted to the experts already in flight, as a draft or a filter"
         },
         {
           "n": 80,
-          "stato": "aperta",
-          "testo": "lasciare a meta' passata una riga di bozza che lo stato intermedio dice sbagliata"
+          "state": "open",
+          "text": "leaving a draft row half-checked when the intermediate state says it is wrong"
         },
         {
           "n": 81,
-          "stato": "chiusa",
-          "testo": "le bozze sul codice con un contesto vero: la soglia 1.146x, il lookup del motore 1.067x"
+          "state": "closed",
+          "text": "drafts on code with a real context: the threshold 1.146x, the engine's lookup 1.067x"
         },
         {
           "n": 82,
-          "stato": "chiusa",
-          "testo": "la larghezza delle passate di verifica: ora ognuna misura la sua, saltando la piu' stretta; Q8_0 3.4-3.9% piu' veloce del pool intero, Q4_K 1.8% a 3 righe"
+          "state": "closed",
+          "text": "the verify passes' width: each now measures its own, skipping the narrowest; Q8_0 3.4-3.9% faster than the full pool, Q4_K 1.8% at 3 rows"
         }
       ],
-      "file": [
+      "files": [
         "src/gen/lookup.c",
         "tools/draft_probe.c",
         "tools/row_price.sh",
@@ -1318,64 +1328,64 @@
         "src/kernels/kernels.c",
         "bench/prompts/real-context/"
       ],
-      "comandi": [
+      "commands": [
         "sh tools/ab_spec.sh <gguf> <binario> bench/prompts/code.txt 8",
         "make draft-probe",
         "sh tools/row_price.sh <binario>",
         "tools/.venv/Scripts/python.exe tools/draft_gate_sim.py",
-        "ROW_PRICE_OUT=build/rp-x sh tools/row_price.sh <dopo> 4 <prima>"
+        "ROW_PRICE_OUT=build/rp-x sh tools/row_price.sh <after> 4 <before>"
       ],
-      "dipende": [
-        "nucleo"
+      "depends": [
+        "core"
       ]
     },
     {
-      "id": "m5-kv-disco",
-      "tappa": "M5",
-      "titolo": "Checkpoint KV su disco",
-      "stato": "aperto",
-      "cosa": "Salvare la memoria del contesto di un file già letto, così riaprirlo non costa un altro prompt intero. È la leva più grossa per chi lavora sempre sugli stessi file.",
-      "numeri": [],
-      "domande": [
+      "id": "m5-kv-disk",
+      "milestone": "M5",
+      "title": "KV checkpoint on disk",
+      "state": "open",
+      "what": "Saving the context memory of a file already read, so reopening it does not cost a whole new prompt. It is the biggest lever for anyone always working on the same files.",
+      "numbers": [],
+      "questions": [
         {
           "n": 17,
-          "stato": "aperta",
-          "testo": "ricaricare la KV costa meno del prefill? e la KV in q8 cambia i token?"
+          "state": "open",
+          "text": "does reloading the KV cost less than the prefill? and does an 8-bit KV change the tokens?"
         }
       ],
-      "file": [],
-      "comandi": [],
-      "dipende": [
+      "files": [],
+      "commands": [],
+      "depends": [
         "kv",
-        "m1-cache-sessioni"
+        "m1-first-prompt-cost"
       ]
     },
     {
       "id": "m5-server",
-      "tappa": "M5",
-      "titolo": "Server",
-      "stato": "aperto",
-      "cosa": "Un processo che resta acceso e risponde a più richieste. Si incastra con l'archivio che sopravvive alla sessione: è lo stesso problema visto da un'altra parte.",
-      "numeri": [],
-      "domande": [],
-      "file": [],
-      "comandi": [],
-      "dipende": [
-        "m1-cache-sessioni"
+      "milestone": "M5",
+      "title": "Server",
+      "state": "open",
+      "what": "A process that stays up and answers several requests. It fits together with the store surviving the session: it is the same problem seen from another angle.",
+      "numbers": [],
+      "questions": [],
+      "files": [],
+      "commands": [],
+      "depends": [
+        "m1-first-prompt-cost"
       ]
     },
     {
       "id": "m6-vulkan",
-      "tappa": "M6",
-      "titolo": "Vulkan e Metal",
-      "stato": "aperto",
-      "cosa": "Le GPU che non sono NVIDIA: AMD, Intel, integrate, e i Mac. Sempre come moduli, sempre con gli stessi token della CPU.",
-      "numeri": [],
-      "domande": [],
-      "file": [],
-      "comandi": [],
-      "dipende": [
-        "m3-esperti"
+      "milestone": "M6",
+      "title": "Vulkan and Metal",
+      "state": "open",
+      "what": "The GPUs that are not NVIDIA: AMD, Intel, integrated, and Macs. Always as modules, always with the same tokens as the CPU.",
+      "numbers": [],
+      "questions": [],
+      "files": [],
+      "commands": [],
+      "depends": [
+        "m3-experts"
       ]
     }
   ]

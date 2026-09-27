@@ -13,8 +13,7 @@ Two rules over docs/MEASUREMENTS.md, so the same thing cannot close a question a
      tags, so a reader cannot mistake it for something measured:
        "model, not measured"               nobody has measured this yet
        "model superseded by measurement"   history: a measurement has taken its place
-     (the Italian ones, "modello, non misura" and "modello superato dalla misura", count too
-     while the document is half translated). A tag may wrap onto the next or previous line.
+     A tag may wrap onto the next or previous line.
   B. a question row tagged "model, not measured" stays OPEN -- no ~~strikethrough~~ -- until a
      measured number takes its place, wherever in the row's wrapped lines the tag sits. The
      other tag is history, so it may sit in a closed row.
@@ -31,10 +30,10 @@ import sys
 from pathlib import Path
 
 DOC = Path(__file__).resolve().parent.parent / "docs" / "MEASUREMENTS.md"
-TAGS = ("model, not measured", "modello, non misura")
-OLD_TAGS = ("model superseded by measurement", "modello superato dalla misura")
+TAGS = ("model, not measured",)
+OLD_TAGS = ("model superseded by measurement",)
 # the words that announce a number nobody measured
-MODEL_WORDS = re.compile(r"simulat|simulazione|time model|modello a tempo|time estimate|stima a tempo", re.I)
+MODEL_WORDS = re.compile(r"simulat|time model|time estimate", re.I)
 # a row of the questions table: "| 14 | ..."
 QUESTION_ROW = re.compile(r"^\|\s*(\d+)\s*\|")
 # a closed question: the question itself is struck through
@@ -91,8 +90,8 @@ SELF_TEST = [
     ("| 14 | ~~How many bytes per token?~~ the answer\nfrom a trace simulation: 22.4 (model, not measured) |", 1),
     ("| 14 | How many bytes per token? A trace simulation\nsaid 22.4 (model, not measured) |", 0),
     ("| 14 | ~~How many bytes?~~ **Measured**: 1.8 MiB. The simulation said 143\n"
-     "(modello superato dalla misura) |", 0),
-    ("A time model says 1.61x (modello, non misura).\n\nThe simulation said 3.", 1),
+     "(model superseded by measurement) |", 0),
+    ("A time model says 1.61x (model, not measured).\n\nThe simulation said 3.", 1),
 ]
 
 

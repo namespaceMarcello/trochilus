@@ -137,7 +137,7 @@ static void avx2_axpy_f32_4x4(float *y, int64_t y_stride, const float *x, int64_
 /* An F32 weight row is a plain dot_f32 of the row with x, and against 4 input rows it is
  * dot_f32_x4 with the row as `a`: the tier's own kernels instead of the scalar loop (the
  * router's matrix is F32 in every GGUF). */
-_Static_assert(TR_DOT_TOKENS == TR_ATTN_X, "x4"); /* hot-ok: stringa -- a compile-time message, no code */
+_Static_assert(TR_DOT_TOKENS == TR_ATTN_X, "x4"); /* hot-ok: string -- a compile-time message, no code */
 
 TR_TARGET_AVX2
 static float avx2_dot_row_f32(const void *row, const float *x, int64_t n) {

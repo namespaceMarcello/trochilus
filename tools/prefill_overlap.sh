@@ -1,6 +1,6 @@
 #!/bin/sh
 # prefill_overlap.sh — how much of the prefill is the engine WAITING for the disk, and what
-# overlapping that wait with the compute could give (docs/MEASUREMENTS.md §M1 misurato, domanda 47).
+# overlapping that wait with the compute could give (docs/MEASUREMENTS.md §M1 measured, question 47).
 #
 # Under a partial budget the prompt reads the whole expert table once: the bytes are necessary
 # (past ~40 tokens every expert is used). What is not necessary is waiting for them in line with
