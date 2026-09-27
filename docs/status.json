@@ -1,7 +1,7 @@
 {
   "progetto": "Trochilus",
   "sottotitolo": "motore di inferenza per modelli MoE in C, senza dipendenze",
-  "aggiornato": "2026-09-26",
+  "aggiornato": "2026-09-27",
   "stati": {
     "fatto": "finito e provato: test verdi in make check",
     "in-corso": "ci stiamo lavorando adesso",
@@ -149,6 +149,10 @@
       "stato": "fatto",
       "cosa": "I core del portatile usati senza sprechi: il prompt su tutti, la generazione sulla larghezza che la sessione misura da sola. Il decode non usa tutti i core perché il limite è la memoria, non il calcolo.",
       "numeri": [
+        {
+          "v": "ogni dimensione di passata di verifica (2-4 righe) misura da sola quanti thread usare, come il decode, saltando la larghezza piu' stretta: su 16 core sceglie 8 thread in 16 corse su 16; Q8_0 3.4-3.9% piu' veloce del pool intero e fino al 5.7% della larghezza del decode. Provare anche la piu' stretta faceva perdere il 2% al Q4_K: ogni prova su 4 thread costava +60%",
+          "d": "2026-09-27"
+        },
         {
           "v": "il prompt da 8 a 16 thread scala 1.49-1.50x in nativo su Q4_K, come llama.cpp nella gara (1.44-1.49x): il divario di 1.11-1.16x era del container con Q8_0. A 16 thread le code sono il 17-20% del tempo (core più lenti, regioni fisse): proposto il lavoro rubato a blocchi di tessere, non costruito",
           "d": "2026-09-26"
@@ -298,13 +302,17 @@
         {
           "v": "somme esatte alla velocità del float (la sfida di Marcello, col pensatore a turni): W16, il trucco di Winograd (1968) in parole da 16 bit con la scala del sotto-blocco dentro il peso, identico bit per bit a una definizione esatta a interi, fa 167.2 GFLOP/s contro i 164.7 del tile float (e 1.21x a pari larghezza): esatto e almeno veloce quanto il float, nel tile. Sui tensor core int8 della RTX 4070: 59.1 T-MAC/s esatti contro 3.29 del float, E32 lì 4.5x",
           "d": "2026-09-26"
+        },
+        {
+          "v": "Q4_K in interi esatti nel motore (W16): prompt 1.001x e decode 1.006x rispetto al float, misurati alternati; logit identici a 4 e 16 thread e fra prompt e decode; gli oracoli sul modello vero tagliato 1-26% più vicini al riferimento. Il +10% previsto sugli esperti non è arrivato: nel motore i tile W16 rendono ~0.83 del microbench",
+          "d": "2026-09-27"
         }
       ],
       "domande": [
         {
           "n": 77,
-          "stato": "aperta",
-          "testo": "E32 come definizione (attivazioni a 32 bit in interi, somme esatte, arrotondata correttamente nel 96-99% dei casi): nel tile Q4_K W16 è già più veloce del float (167.2 contro 164.7), sulla GPU 4.5x il float, gli stessi bit su CPU e GPU; Q8_0 sulla CPU no (~0.9x). Cambia ogni byte delle uscite, verso la matematica esatta. La vogliamo nel motore, e la GPU conta (domanda 74)?"
+          "stato": "chiusa",
+          "testo": "E32 come definizione? Marcello: sì, a tappe. Tappa 1 misurata (i pezzi W16 sui layout del motore), tappa 2 fatta: Q4_K in interi esatti nel motore, alla velocità del float nel prompt e nella generazione; la tappa 3 è la GPU con i tensor core (domanda 74)"
         },
         {
           "n": 70,
@@ -449,6 +457,10 @@
         },
         {
           "v": "la strada phase-major ora ha un test suo (gruppi da 0 a 513 ingressi, 1-16 thread, due chiamate di fila): ha trovato una scrittura fuori dal buffer (una chiamata senza pool dentro un pool più grande) e una guardia che lasciava passare righe non fatte di blocchi interi, entrambe corrette; 17 mutazioni del codice phase-major, tutte viste rosse; il pannello Q4_K senza VBMI gira ora anche su questa macchina (TR_CPU_MAX=avx512-novbmi)",
+          "d": "2026-09-26"
+        },
+        {
+          "v": "gare per il README a macchina libera (container, stesso GGUF): Q4_K a 4 thread prompt 0.97x llama.cpp, generazione 1.03x; Q8_0 a 16 thread prompt 1.33x a 512 e 1.42x a 2048, generazione pari a 512, loro 1.04x a 2048",
           "d": "2026-09-26"
         }
       ],
@@ -964,6 +976,10 @@
         {
           "v": "gli esperti in Q4 dimezzerebbero il disco del prompt (3.3 GiB invece di 6.5)",
           "d": "2026-09-21"
+        },
+        {
+          "v": "Q4_K esatto: l’ingresso a 32 bit in virgola fissa per blocco di 256, somme di interi esatte, un solo arrotondamento; il decode pari al kernel float dopo averne sequenziato il dot a due righe (0.937x il float a caldo)",
+          "d": "2026-09-27"
         }
       ],
       "domande": [],
@@ -1147,6 +1163,22 @@
       "cosa": "Indovinare più token in una volta riusando pezzi del prompt, e verificarli tutti insieme. Gli stessi token di prima, solo più in fretta quando il testo si ripete — come succede nel codice.",
       "numeri": [
         {
+          "v": "la passata corta di Q4_K (domanda 78): il pannello W16 leggeva le sue 16 righe solo quando servivano; portate avanti (il blocco s+2 e le righe dell'elemento dopo) e i gruppi da 2 righe per coppie di dot2: a 8 thread 3 righe da 28.00 a 26.53 ms (0.947), 2 righe da 22.92 a 22.19 (0.968), una riga e il prompt invariati, stessi bit. Ogni passata di verifica misura la sua larghezza (domanda 82): su 16 core Q8_0 0.961-0.966 del pool intero, Q4_K 0.982-1.005, sceglie 8 thread ovunque",
+          "d": "2026-09-27"
+        },
+        {
+          "v": "la passata corta ai suoi byte (domanda 78): su Q8_0 la passata di 3 righe da 62.7 a 43.0 ms (una riga 0.72 -> 0.33 di passata: ai suoi byte), 2 righe da 41.3 a 35.9 ms, il decode invariato (1.000), stessi bit; la bozza sul codice nuovo ai prezzi Q8_0 di oggi: il lookup del motore 0.969x -> 1.040x, la soglia 1.013x -> 1.103x (con contesto vero 1.109x e 1.191x). Le passate corte vogliono una larghezza loro: 8 thread su Q8_0, il decode 4",
+          "d": "2026-09-27"
+        },
+        {
+          "v": "con un contesto vero (domanda 81: 20 prompt tagliati a meta' file da questo repo, 1770-3798 token): il lookup del motore 1.067x, la soglia 1.146x ai prezzi misurati (1.27-1.32x col costo del contesto modellato); una tabella fatta dal repo non aggiunge nulla",
+          "d": "2026-09-27"
+        },
+        {
+          "v": "il post-it smontato: il prezzo di una riga verificata era del 18/09. Oggi costa 0.23-0.30 di passata con bozze da 8 (riscrivere un file va 1.95x su Q8_0, 1.78x su Q4_K), ma 0.50-0.72 con bozze da 1-2, piu' dei suoi byte. Sul codice nuovo una soglia calibrata (la cache di n-grammi del testo, come llama.cpp, piu' la tabella) da' 1.077x ai prezzi di oggi, 1.12-1.21x con la passata corta ai suoi byte",
+          "d": "2026-09-27"
+        },
+        {
           "v": "la memoria del contesto della bozza a 8 bit: la bozza sceglie gli stessi token in tutte le 1152 posizioni e legge meno byte; valutata fuori campione, prosa 0.93-1.09x llama.cpp, italiano 0.95-1.12x, codice 1.14-1.26x (modello). La testa ridotta a 16k righe copre solo l'85-93% dei token: scartata. Sulla prosa resta il piano dei pesi della bozza (635 MiB a token)",
           "d": "2026-09-26"
         },
@@ -1196,15 +1228,47 @@
           "n": 76,
           "stato": "aperta",
           "testo": "perché la bozza con la memoria a 4 bit indovina più spesso di quella a 16 bit (18 contro 3)?"
+        },
+        {
+          "n": 78,
+          "stato": "aperta",
+          "testo": "la passata di verifica da 2-4 righe al prezzo dei suoi byte: fatta su Q8_0 e su Q4_K (3 righe 0.947x, 2 righe 0.968x); resta il denso di Q4_K, una riga di pesi decodificata una volta sola per 2-3 token (strada c)"
+        },
+        {
+          "n": 79,
+          "stato": "aperta",
+          "testo": "una riga che non costa byte: il modello ristretto agli esperti gia' in viaggio, come bozza o filtro"
+        },
+        {
+          "n": 80,
+          "stato": "aperta",
+          "testo": "lasciare a meta' passata una riga di bozza che lo stato intermedio dice sbagliata"
+        },
+        {
+          "n": 81,
+          "stato": "chiusa",
+          "testo": "le bozze sul codice con un contesto vero: la soglia 1.146x, il lookup del motore 1.067x"
+        },
+        {
+          "n": 82,
+          "stato": "chiusa",
+          "testo": "la larghezza delle passate di verifica: ora ognuna misura la sua, saltando la piu' stretta; Q8_0 3.4-3.9% piu' veloce del pool intero, Q4_K 1.8% a 3 righe"
         }
       ],
       "file": [
         "src/gen/lookup.c",
-        "tools/draft_probe.c"
+        "tools/draft_probe.c",
+        "tools/row_price.sh",
+        "tools/draft_gate_sim.py",
+        "src/kernels/kernels.c",
+        "bench/prompts/real-context/"
       ],
       "comandi": [
         "sh tools/ab_spec.sh <gguf> <binario> bench/prompts/code.txt 8",
-        "make draft-probe"
+        "make draft-probe",
+        "sh tools/row_price.sh <binario>",
+        "tools/.venv/Scripts/python.exe tools/draft_gate_sim.py",
+        "ROW_PRICE_OUT=build/rp-x sh tools/row_price.sh <dopo> 4 <prima>"
       ],
       "dipende": [
         "nucleo"

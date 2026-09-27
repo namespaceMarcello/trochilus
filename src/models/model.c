@@ -30,27 +30,33 @@ struct tr_model {
     int gpu_on;         /* new sessions run the decode's attention on gpu */
 };
 
+/* threads per phase (model.h): the measurement of one size of short pass, the decode's one-token
+ * passes or the passes of n rows; the widths still being measured, then the one kept */
+typedef struct {
+    double sec[TR_DECODE_TUNE_WIDTHS][TR_DECODE_TUNE_ROUNDS_MAX]; /* width[i]'s own passes, this measurement */
+    int n_pass[TR_DECODE_TUNE_WIDTHS]; /* passes recorded so far on width[i], this measurement */
+    int lo;               /* the first width probed: 0 for the decode, 1 for a verify pass (model.h) */
+    int measuring;        /* the next passes of this size are timed, width by width */
+    int extending;        /* 0: round-robin over every width; 1: only pair[0]/pair[1], undecided */
+    int pair[2];           /* the two widths (indices into width[]) still undecided, once extending */
+    int next_in_pair;      /* which of pair[] the next probe in extending mode goes to (0 or 1) */
+    int n_probes;          /* probes run in the round-robin so far, this measurement */
+    int rounds;            /* rounds completed this measurement, round-robin plus extension */
+    int64_t last_milestone; /* context-length class last seen (a power of two >= REMEASURE_POS, or 0) */
+    int n_kept;            /* passes of this size run on the choice since the measurement last armed */
+    int chosen;            /* 0 until the first measurement is over; else the width in effect */
+    int pending;           /* tr_decode_tune_debounce's state: a width waiting for a second vote */
+} tune_state;
+
 struct tr_session {
     const tr_arch_vtable *vt;
     void *impl;
     const tr_model *model;
-    /* threads per phase (model.h): the widths still being measured, then the one kept */
-    int width[TR_DECODE_TUNE_WIDTHS]; /* narrowest first */
+    int width[TR_DECODE_TUNE_WIDTHS]; /* the widths probed, narrowest first */
     int n_widths;
-    double sec[TR_DECODE_TUNE_WIDTHS][TR_DECODE_TUNE_ROUNDS_MAX]; /* width[i]'s own passes, this measurement */
-    int n_pass[TR_DECODE_TUNE_WIDTHS]; /* passes recorded so far on width[i], this measurement */
-    int measuring;        /* the next one-token passes are timed, width by width */
-    int extending;        /* 0: round-robin over every width; 1: only pair[0]/pair[1], undecided */
-    int pair[2];           /* the two widths (indices into width[]) still undecided, once extending */
-    int next_in_pair;      /* which of pair[] the next probe in extending mode goes to (0 or 1) */
-    int n_probes;          /* one-token probes run in the round-robin so far, this measurement */
-    int rounds;            /* rounds completed this measurement, round-robin plus extension */
-    int64_t last_milestone; /* context-length class last seen (a power of two >= REMEASURE_POS, or 0) */
-    int n_kept;            /* one-token passes run on the choice since the measurement last armed */
-    int chosen;            /* 0 until the first measurement is over; else the width in effect */
-    int pending;           /* tr_decode_tune_debounce's state: a width waiting for a second vote */
+    tune_state tune[TR_DECODE_ROWS]; /* [n - 1]: the passes of n rows; [0] is the decode's */
     int last_threads;      /* of the last eval that ran */
-    tr_decode_choice history[TR_DECODE_TUNE_HISTORY]; /* what every measurement decided, oldest first */
+    tr_decode_choice history[TR_DECODE_TUNE_HISTORY]; /* what every decode measurement decided, oldest first */
     int n_history;         /* measurements finished; past the array the newest takes the last slot */
     double (*tune_now)(void *ctx); /* a probe's clock; NULL (the default): tr_time_sec() */
     void *tune_now_ctx;
@@ -64,8 +70,8 @@ void *tr_draft_probe_session(tr_session *s) {
 }
 #endif
 
-/* defined near tr_decode_tune_widths below; tr_session_create arms the first measurement too */
-static void tune_arm(tr_session *s);
+/* defined near tr_decode_tune_widths below; tr_session_create arms the first measurements too */
+static void tune_arm(tune_state *t, int n_widths);
 
 int tr_mem_guard(uint64_t needed_bytes, char *err, size_t err_len) {
     tr_meminfo mi;
@@ -252,15 +258,19 @@ tr_session *tr_session_create(tr_model *m, int64_t n_ctx, int64_t n_batch, char 
     s->impl = impl;
     s->model = m;
     s->n_widths = tr_decode_tune_widths(m->pool != NULL ? tr_pool_size(m->pool) : 1, s->width);
-    s->chosen = s->n_widths == 1 ? s->width[0] : 0;
-    s->pending = 0;
-    s->last_milestone = 0;
+    for (int i = 0; i < TR_DECODE_ROWS; i++) {
+        tune_state *t = &s->tune[i];
+        t->lo = i > 0 && s->n_widths > 1 ? 1 : 0;
+        t->chosen = s->n_widths - t->lo == 1 ? s->width[t->lo] : 0;
+        t->pending = 0;
+        t->last_milestone = 0;
+        tune_arm(t, s->n_widths);
+        t->measuring = s->n_widths - t->lo > 1; /* one width: nothing to measure */
+    }
     s->last_threads = 0;
     s->n_history = 0;
     s->tune_now = NULL;
     s->tune_now_ctx = NULL;
-    tune_arm(s);
-    s->measuring = s->n_widths > 1; /* one width: nothing to measure */
     return s;
 }
 
@@ -325,38 +335,41 @@ int tr_decode_tune_debounce(int current, int *pending, int raw) {
     return current;
 }
 
-static void tune_arm(tr_session *s) {
-    s->measuring = 1;
-    s->extending = 0;
-    s->n_probes = 0;
-    s->rounds = 0;
-    s->n_kept = 0;
-    for (int i = 0; i < s->n_widths; i++) s->n_pass[i] = 0;
+static void tune_arm(tune_state *t, int n_widths) {
+    t->measuring = 1;
+    t->extending = 0;
+    t->n_probes = 0;
+    t->rounds = 0;
+    t->n_kept = 0;
+    for (int i = 0; i < n_widths; i++) t->n_pass[i] = 0;
 }
 
 /* Every width gets stats from its passes so far; on a pairwise tie the session times one more
  * round on just the candidate and the fastest, up to TR_DECODE_TUNE_ROUNDS_MAX; otherwise the
- * measurement is over and the raw choice goes through the debounce. */
-static void tune_decide(tr_session *s) {
+ * measurement is over and the raw choice goes through the debounce (the decode's goes in the
+ * history too). */
+static void tune_decide(tr_session *s, tune_state *t) {
+    const int lo = t->lo, n = s->n_widths - t->lo; /* the widths this size probes: width[lo .. lo + n) */
     double center[TR_DECODE_TUNE_WIDTHS], spread[TR_DECODE_TUNE_WIDTHS];
-    for (int i = 0; i < s->n_widths; i++) tr_decode_tune_stats(s->sec[i], s->n_pass[i], &center[i], &spread[i]);
+    for (int i = 0; i < n; i++) tr_decode_tune_stats(t->sec[lo + i], t->n_pass[lo + i], &center[i], &spread[i]);
     int need_more = 0;
-    int candidate = tr_decode_tune_pick(center, spread, s->n_widths, &need_more);
-    if (need_more && s->rounds < TR_DECODE_TUNE_ROUNDS_MAX) {
+    int candidate = tr_decode_tune_pick(center, spread, n, &need_more);
+    if (need_more && t->rounds < TR_DECODE_TUNE_ROUNDS_MAX) {
         int best = 0;
-        for (int i = 1; i < s->n_widths; i++)
+        for (int i = 1; i < n; i++)
             if (center[i] < center[best]) best = i;
-        s->pair[0] = candidate;
-        s->pair[1] = best;
-        s->next_in_pair = 0;
-        s->extending = 1;
+        t->pair[0] = lo + candidate;
+        t->pair[1] = lo + best;
+        t->next_in_pair = 0;
+        t->extending = 1;
     } else {
-        s->chosen = tr_decode_tune_debounce(s->chosen, &s->pending, s->width[candidate]);
-        s->measuring = 0;
+        t->chosen = tr_decode_tune_debounce(t->chosen, &t->pending, s->width[lo + candidate]);
+        t->measuring = 0;
+        if (t != &s->tune[0]) return;
         int slot = s->n_history < TR_DECODE_TUNE_HISTORY ? s->n_history : TR_DECODE_TUNE_HISTORY - 1;
         s->history[slot].pos = s->vt->pos(s->impl);
-        s->history[slot].width = s->chosen;
-        s->history[slot].picked = s->width[candidate];
+        s->history[slot].width = t->chosen;
+        s->history[slot].picked = s->width[lo + candidate];
         s->n_history++;
     }
 }
@@ -384,13 +397,20 @@ static int session_eval(tr_session *s, const int32_t *tokens, int64_t n, int64_t
     const tr_model *m = s->model;
     int size = m->pool != NULL ? tr_pool_size(m->pool) : 1;
     int threads = size, probe = 0, probe_w = 0, forced = m->decode_threads > 0;
+    /* this size's own measurement: a one-token pass or a verify pass (a logit row a token); none when
+     * forced, for a long pass, for a short prompt (one logit row for several tokens: another cost), or
+     * past the sizes measured (TR_DECODE_ROWS in the environment raised above it): those take the
+     * decode's width */
+    tune_state *t = !forced && n >= 1 && n <= m->decode_rows && n <= TR_DECODE_ROWS && n_logits == n ? &s->tune[n - 1]
+                                                                                                        : NULL;
     if (n <= m->decode_rows) {
         if (forced) threads = m->decode_threads < size ? m->decode_threads : size;
-        else if (n == 1 && s->measuring) {
+        else if (t != NULL && t->measuring) {
             probe = 1;
-            probe_w = s->extending ? s->pair[s->next_in_pair] : s->n_probes % s->n_widths;
+            probe_w = t->extending ? t->pair[t->next_in_pair] : t->lo + t->n_probes % (s->n_widths - t->lo);
             threads = s->width[probe_w];
-        } else if (s->chosen > 0) threads = s->chosen;
+        } else if (t != NULL && t->chosen > 0) threads = t->chosen;
+        else if (s->tune[0].chosen > 0) threads = s->tune[0].chosen;
     }
 
     tr_pool_set_active(m->pool, threads);
@@ -400,27 +420,29 @@ static int session_eval(tr_session *s, const int32_t *tokens, int64_t n, int64_t
     if (rc == 0) {
         if (probe) {
             /* record the pass; tune_decide turns the pile into a center and a spread */
-            s->sec[probe_w][s->n_pass[probe_w]++] = tune_clock(s) - t0;
-            if (!s->extending) {
-                if (++s->n_probes == s->n_widths * TR_DECODE_TUNE_ROUNDS) {
-                    s->rounds = TR_DECODE_TUNE_ROUNDS;
-                    tune_decide(s);
+            t->sec[probe_w][t->n_pass[probe_w]++] = tune_clock(s) - t0;
+            if (!t->extending) {
+                if (++t->n_probes == (s->n_widths - t->lo) * TR_DECODE_TUNE_ROUNDS) {
+                    t->rounds = TR_DECODE_TUNE_ROUNDS;
+                    tune_decide(s, t);
                 }
-            } else if ((s->next_in_pair ^= 1) == 0) {
-                s->rounds++;
-                tune_decide(s);
+            } else if ((t->next_in_pair ^= 1) == 0) {
+                t->rounds++;
+                tune_decide(s, t);
             }
-        } else if (n == 1 && threads == s->chosen && !forced && s->n_widths > 1) {
-            s->n_kept++;
+        } else if (t != NULL && threads == t->chosen && s->n_widths - t->lo > 1) {
+            t->n_kept++;
         }
 
         if (!forced && s->n_widths > 1) {
             int64_t fm = tune_milestone(s->vt->pos(s->impl));
-            if (!s->measuring && (fm > s->last_milestone ||
-                                   (s->pending != 0 && s->n_kept >= TR_DECODE_TUNE_REMEASURE_KEPT))) {
-                tune_arm(s);
+            for (int i = 0; i < TR_DECODE_ROWS; i++) {
+                tune_state *u = &s->tune[i];
+                if (!u->measuring && s->n_widths - u->lo > 1 &&
+                    (fm > u->last_milestone || (u->pending != 0 && u->n_kept >= TR_DECODE_TUNE_REMEASURE_KEPT)))
+                    tune_arm(u, s->n_widths);
+                u->last_milestone = fm;
             }
-            s->last_milestone = fm;
         }
     }
 
@@ -481,7 +503,14 @@ void tr_model_set_decode_threads(tr_model *m, int n_threads) {
 int tr_session_decode_threads(const tr_session *s) {
     int size = s->model->pool != NULL ? tr_pool_size(s->model->pool) : 1;
     if (s->model->decode_threads > 0) return s->model->decode_threads < size ? s->model->decode_threads : size;
-    return s->chosen;
+    return s->tune[0].chosen;
+}
+
+int tr_session_rows_threads(const tr_session *s, int64_t n) {
+    if (n < 1 || n > TR_DECODE_ROWS || n > s->model->decode_rows) return 0;
+    int size = s->model->pool != NULL ? tr_pool_size(s->model->pool) : 1;
+    if (s->model->decode_threads > 0) return s->model->decode_threads < size ? s->model->decode_threads : size;
+    return s->tune[n - 1].chosen;
 }
 
 int tr_session_decode_history(const tr_session *s, const tr_decode_choice **out) {

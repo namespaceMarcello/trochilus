@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""oracle.py — compare Trochilus's forward pass against the transformers
+reference captured in <fixture_dir>/ref.json.
+
+Two fixture shapes are understood:
+  * single-prompt (tools/make_tiny_olmoe.py): ref.json has prompt_ids/full_ids/logits
+    for one prompt, logits as a nested JSON array.
+  * multi-prompt (tools/make_olmoe_2layer_ref.py, `make oracle-real`): ref.json has a
+    "prompts" list, each with name/prompt_ids/full_ids/logits_file; logits are a
+    separate float32 binary per prompt (the same layout `trochilus logits --out`
+    writes), read with numpy instead of nested JSON.
+
+Usage:
+    oracle.py <fixture_dir> <model.gguf> [--binary <path>] [--expect exact|report] [--logit-tol X]
+
+Runs `<binary> generate` on the prompt ids for len(full_ids) - len(prompt_ids)
+greedy tokens, and `<binary> logits` on the full teacher-forced sequence. Prints
+token match, max abs logit diff (overall and per position), and argmax agreement.
+
+--expect exact (default): exit 1 unless every prompt's generated tokens match
+    exactly and the overall max abs logit diff is <= --logit-tol (default 1e-3).
+--expect report: always exit 0 (results are still printed).
+"""
+import argparse
+import json
+import os
+import platform
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+
+import numpy as np
+
+
+def default_binary():
+    return "build/trochilus.exe" if platform.system() == "Windows" else "build/trochilus"
+
+
+def peak_rss_mb():
+    """(this process, largest child so far) peak RSS in MB, or (None, None) on
+    Windows (no resource module) -- the container run reports the real numbers."""
+    try:
+        import resource
+    except ImportError:
+        return None, None
+    div = 1024 * 1024 if sys.platform == "darwin" else 1024
+    self_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / div
+    child_rss = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / div
+    return self_rss, child_rss
+
+
+def parse_tokens_line(stdout):
+    for line in stdout.splitlines():
+        line = line.strip()
+        if line.startswith("tokens:"):
+            rest = line[len("tokens:"):].strip()
+            if not rest:
+                return []
+            return [int(x) for x in rest.split(",")]
+    return None
+
+
+def read_logits(path, n_tokens, vocab):
+    with open(path, "rb") as f:
+        data = f.read()
+    expected = n_tokens * vocab * 4
+    if len(data) != expected:
+        raise RuntimeError("logits file size %d != expected %d" % (len(data), expected))
+    values = struct.unpack("<%df" % (n_tokens * vocab), data)
+    return [values[i * vocab:(i + 1) * vocab] for i in range(n_tokens)]
+
+
+def read_logits_np(path, n_tokens, vocab):
+    """Same binary layout as read_logits, but as one numpy array: the vocab here
+    (tens of thousands) makes the pure-Python per-element loop too slow."""
+    arr = np.fromfile(path, dtype="<f4")
+    expected = n_tokens * vocab
+    if arr.size != expected:
+        raise RuntimeError("logits file size %d floats != expected %d" % (arr.size, expected))
+    return arr.reshape(n_tokens, vocab)
+
+
+def run_generate(binary, model, prompt_ids, n_gen):
+    tokens_arg = ",".join(str(t) for t in prompt_ids)
+    r = subprocess.run([binary, "generate", "-m", model, "--tokens", tokens_arg, "-n", str(n_gen)],
+                        capture_output=True, text=True)
+    if r.returncode != 0:
+        print("generate failed (exit %d):\n%s" % (r.returncode, r.stderr), file=sys.stderr)
+        return None
+    return parse_tokens_line(r.stdout) or []
+
+
+def run_logits(binary, model, full_ids, batch=1):
+    """Returns the path to a temp file with Trochilus's logits for full_ids, or
+    None on failure. Caller removes the file. batch > 1: the tokens run `batch` per
+    forward pass, one row per pass (its last token)."""
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".bin")
+    os.close(tmp_fd)
+    tokens_arg = ",".join(str(t) for t in full_ids)
+    r = subprocess.run([binary, "logits", "-m", model, "--tokens", tokens_arg, "--out", tmp_path, "-b", str(batch)],
+                        capture_output=True, text=True)
+    if r.returncode != 0:
+        print("logits failed (exit %d):\n%s" % (r.returncode, r.stderr), file=sys.stderr)
+        os.remove(tmp_path)
+        return None
+    return tmp_path
+
+
+# Tokens per forward pass checked against one token per pass, plus the whole sequence in one pass.
+BATCH_SIZES = (3, 64)
+
+
+def check_batches(binary, model, full_ids, per_token_path, vocab, label=""):
+    """Prefill in blocks (docs/STATUS.md): `logits -b k` must write, for the last token of
+    each pass, the very bytes that one token per pass gives at that position. Exact by
+    design, so any difference fails whatever --expect says. Returns True if all match."""
+    with open(per_token_path, "rb") as f:
+        per_token = f.read()
+    row, n, ok = 4 * vocab, len(full_ids), True
+    for k in sorted({k for k in BATCH_SIZES if 1 < k < n} | {n}):
+        path = run_logits(binary, model, full_ids, batch=k)
+        if path is None:
+            ok = False
+            continue
+        try:
+            with open(path, "rb") as f:
+                got = f.read()
+        finally:
+            os.remove(path)
+        ends = [min(i + k, n) - 1 for i in range(0, n, k)]
+        same = got == b"".join(per_token[e * row:(e + 1) * row] for e in ends)
+        print("%s%d tokens per pass: %d rows %s" % (label, k, len(ends),
+              "bit-identical to one token per pass" if same else "DIFFERENT from one token per pass"))
+        ok = ok and same
+    return ok
+
+
+def run_single(args, binary, ref):

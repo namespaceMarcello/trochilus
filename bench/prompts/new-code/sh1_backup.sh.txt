@@ -1,0 +1,6 @@
+#!/bin/sh
+# backup.sh — copies a directory into a dated tar.gz and keeps the last N archives.
+# Usage: backup.sh <source dir> <destination dir> [keep]
+set -eu
+
+usage() {

@@ -1,0 +1,29 @@
+/* mat.c — dense matrices of doubles, row-major. */
+#include <stdlib.h>
+#include <math.h>
+
+typedef struct {
+    int rows, cols;
+    double *a;
+} mat;
+
+mat *mat_new(int rows, int cols) {
+    mat *m = malloc(sizeof *m);
+    if (!m) return NULL;
+    m->rows = rows;
+    m->cols = cols;
+    m->a = calloc((size_t)rows * cols, sizeof(double));
+    if (!m->a) {
+        free(m);
+        return NULL;
+    }
+    return m;
+}
+
+void mat_free(mat *m) {
+    if (m) free(m->a);
+    free(m);
+}
+
+/* c = a * b; returns -1 when the shapes do not match. */
+int mat_mul(const mat *a, const mat *b, mat *c) {

@@ -440,6 +440,32 @@ static void test_generate(const char *m) {
     slurp(json_path, json, sizeof json);
     TR_CHECK(strstr(json, "\"lm_head\":{\"calls\":") != NULL);
     remove(json_path);
+    /* the verify passes' own widths (docs/LESSONS.md #228), in --profile-json and on a line of their own
+     * after "threads:". Forced: every size reports the forced width, and no line. Measured (drafts fixed
+     * at 2 on a pool of 8: 8 passes of 3 rows, enough to decide unless two widths tie on the real
+     * clock): the line is there exactly when a size has decided, and says what the JSON says. */
+    expect("--decode-threads 8 --spec 2 --spec-fixed",
+           cli("generate -m %s -p 4 -n 50 -c 64 -t 8 --decode-threads 8 --spec 2 --spec-fixed --profile-json %s", m,
+               json_path),
+           0);
+    ERR_LACKS("verify threads");
+    slurp(json_path, json, sizeof json);
+    TR_CHECK(strstr(json, "\"rows_threads\":[8,8,8]") != NULL);
+    expect("-t 8 --spec 2 --spec-fixed",
+           cli("generate -m %s -p 4 -n 50 -c 64 -t 8 --spec 2 --spec-fixed --profile-json %s", m, json_path), 0);
+    slurp(json_path, json, sizeof json);
+    int r2 = -1, r3 = -1, r4 = -1, w3 = 0;
+    const char *rj = strstr(json, "\"rows_threads\":[");
+    TR_CHECK(rj != NULL && sscanf(rj, "\"rows_threads\":[%d,%d,%d]", &r2, &r3, &r4) == 3);
+    TR_CHECK(r3 == 0 || r3 == 4 || r3 == 8);
+    const char *vt = strstr(err, "\nverify threads: ");
+    TR_CHECK((vt != NULL) == (r2 > 0 || r3 > 0 || r4 > 0));
+    if (vt != NULL && r3 > 0) {
+        const char *v3 = strstr(vt, "3 rows ");
+        TR_CHECK(v3 != NULL && sscanf(v3, "3 rows %d", &w3) == 1);
+        TR_CHECK_EQ_INT(w3, r3);
+    }
+    remove(json_path);
     in_dir(json_path, sizeof json_path, "test_cli_no_such_dir/profile.json");
     expect("--profile-json, no such directory", cli("generate -m %s -p 4 -n 2 -c 16 --profile-json %s", m, json_path),
            1);

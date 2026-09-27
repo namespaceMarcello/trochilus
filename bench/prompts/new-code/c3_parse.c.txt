@@ -1,0 +1,16 @@
+/* csv.c — a small CSV reader: fields separated by commas, quotes allowed. */
+#include <stdio.h>
+#include <string.h>
+#include <ctype.h>
+
+#define MAX_FIELDS 64
+#define MAX_LINE 4096
+
+typedef struct {
+    char *fields[MAX_FIELDS];
+    int n;
+} row;
+
+/* Splits `line` in place into fields, handling "quoted, fields" and "" as an escaped quote.
+ * Returns the number of fields, or -1 when a quote is not closed. */
+int csv_split(char *line, row *r) {

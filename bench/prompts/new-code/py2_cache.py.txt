@@ -1,0 +1,17 @@
+"""A small LRU cache with a time-to-live for each entry."""
+import time
+from collections import OrderedDict
+from typing import Any, Hashable, Optional
+
+
+class TTLCache:
+    """Keeps at most `maxsize` entries; an entry older than `ttl` seconds is gone."""
+
+    def __init__(self, maxsize: int = 128, ttl: float = 60.0):
+        if maxsize <= 0:
+            raise ValueError("maxsize must be positive")
+        self.maxsize = maxsize
+        self.ttl = ttl
+        self._data: "OrderedDict[Hashable, tuple[float, Any]]" = OrderedDict()
+
+    def get(self, key: Hashable, default: Optional[Any] = None) -> Any:

@@ -1,0 +1,16 @@
+"""Shortest paths on a weighted directed graph."""
+import heapq
+from collections import defaultdict
+
+
+class Graph:
+    def __init__(self):
+        self.edges = defaultdict(list)
+
+    def add_edge(self, u, v, w):
+        if w < 0:
+            raise ValueError("negative weight")
+        self.edges[u].append((v, w))
+
+    def dijkstra(self, source):
+        """Returns (dist, prev): the distance of every reachable node and its predecessor."""

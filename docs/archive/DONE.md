@@ -1299,3 +1299,97 @@ against a build of the commit before, `cmp`; `build/trochilus generate -m <Q4_K>
 Check: `make check`; `MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src trochilus-dev:local
 sh tools/mutate_pm.sh` (every line but the first RED); `TR_CPU_MAX=avx512-novbmi
 build/tests/test_kernels` prints "the Q4_K panel from the float transpose".
+
+### 2026-09-27 — Q4_K in exact integers in the engine (W16); the README's races
+- Q4_K's definition is the integer one (question 77, Marcello's ok to the staged plan): per super-block of
+  the input a shift, X in 32 bits as two balanced 16-bit digits, sums of exact integers in any order, the
+  f64 steps at the block's end (kernels.h `q4x_*`: `q4x_prep`, `q4x_dot2`, `q4x_panel`, `q4x_tile`).
+  Scalar (the definition), AVX-512 with VBMI, VNNI and DQ (W16: Winograd's inner product in 16-bit words,
+  the panel with the sub-block scale inside the weight, tiles of 1-4 input rows), AVX2 by rows (also the
+  avx512 tier without VBMI). The driver `matmul_q4x` prepares every input row once; the plan and the
+  panel's reuse are shared with phase-major (`pm_plan_build`, `pm_panel_stale`). The float Q4_K kernels
+  are gone. The same bits at every thread count, width and pass shape; the 2-layer oracles 1-26% nearer
+  their reference; the prompt and the decode at the float's speed (MEASUREMENTS §Exact sums at the float's
+  speed, stage 2).
+- Tests: `test_dot_row_q4_k` against the definition written again from the math (blocks of zeros, of
+  subnormals, just under a power of two, holding a NaN or an infinity), `q4x_diffs` every tier's prepared
+  rows, panels, pairs and tiles against scalar's, the q4x road in `test_matmul_grouped_s` and
+  `test_tier_used`; `tools/mutate_q4x.sh` (25 mutations); `tools/tier_check.sh` runs the road by rows
+  under `TR_CPU_MAX=avx512-novbmi`. `tools/lint.py` checks that every measured number of the README is
+  in MEASUREMENTS (LESSONS #218).
+- The races for the README (container, free machine): Q4_K on one file with `tools/race_llama.sh`
+  (LESSONS #217), Q8_0 at 8 and 16 threads; the README's results table filled.
+Check: `make check`; `MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src trochilus-dev:local
+sh tools/mutate_q4x.sh` (every line but the first RED); `build/trochilus logits -m <Q4_K.gguf> --tokens
+<600 ids> --out a.bin -t 16` and `-t 4` give the same bytes.
+
+### 2026-09-27 — A draft without a model, measured on new code: no
+- `tools/draft_table_gen.sh` (the greedy text of the 18 prompts in `bench/prompts/new-code`),
+  `tools/draft_corpus.py` (the n-gram table's corpus from this machine's public code),
+  `tools/draft_table_sim.py` (the greedy loop replayed with each draft source, and a grammar's ceiling).
+- Result in MEASUREMENTS §A draft without a model: best 1.01x (a 4 MiB table proposing only when 70%
+  sure), a perfect grammar 1.25x at most; not built.
+Check: `sh tools/draft_table_gen.sh`, then the corpus and `tools/draft_table_sim.py` (docs/COMMANDS.md):
+the validation lines say SAME (the replay equals the engine's counters on three prompts).
+
+### 2026-09-27 — The post-it taken apart: the verified row's price today, and a gate that pays
+- `tools/row_price.sh` + `tools/row_price_report.py`: what one more verified row costs by zone (passes of
+  2, 3, 5, 9 rows), native; `build/rowprice/prices.json` for the replay.
+- `tools/draft_gate_sim.py`: the new-code replay priced with the measured passes and at the row's bytes,
+  llama.cpp's lookup decoding replayed, a calibrated gate (out of sample), the grammar's ceiling.
+- Result in MEASUREMENTS §The post-it taken apart: today a row costs 0.50-0.72 of a pass at 2-3 rows,
+  0.23-0.30 at 9; the prompt copy at draft 8 runs 1.95x (Q8_0) / 1.78x (Q4_K) on code-edit; the gate
+  gives 1.077x on new code at today's prices, 1.12-1.21x with the short pass at its bytes; not built.
+Check: `sh tools/row_price.sh <binary>`, `tools/row_price_report.py build/rowprice`, then
+`tools/draft_gate_sim.py` (its first lines print the prices' date and binary).
+
+### 2026-09-27 — The short verify pass at its bytes (question 78, Q8_0)
+- `src/kernels/kernels.c`: a short pass (no expert group of 4 input rows, one of 2 or 3: a verify pass of
+  2-3 rows) takes phase-major's plan on every tier: items of 16 weight rows, balanced, each group's input
+  rows against a weight row while it is in cache; a decode token's call (one row a group) keeps its road.
+- `dot_row_xt` (kernels.h; Q8_0 scalar, AVX2, AVX-512): one weight row against 2 or 3 input rows, decoded
+  once, each sum dot_row's bit for bit.
+- The pool trace names every matmul road and each call's input rows; `tools/token_timeline.py --rows R`
+  reads a verify pass call by call. `tools/row_price.sh <after> <rounds> <before>` alternates two binaries
+  (the first swapped every round, `ROW_PRICE_AA=1` for an A/A); the report prints them side by side.
+  `tools/draft_gate_sim.py --prices --config` replays the drafts at any measured prices.
+- Result (MEASUREMENTS §The short verify pass at its bytes): Q8_0 at 8 threads, 3 rows 62.7 -> 43.0 ms,
+  2 rows 41.3 -> 35.9, the decode 1.000 (order swapped, A/A within 1.1%); the drafts on new code at Q8_0's
+  prices: the engine's lookup 0.969x -> 1.040x, the gate 1.013x -> 1.103x.
+Check: `make check` (test_kernels' `test_short_pass` on every tier, `rowxt_zeros`; test_tier_used's
+3-token eval; test_spec), `tools/mutate_pm.sh` (15 new mutations red); the price with
+`ROW_PRICE_OUT=build/rp-new sh tools/row_price.sh <after> 4 <before>`.
+
+### 2026-09-27 — Drafts with a real context (question 81)
+- `bench/prompts/real-context/`: 20 prompts cut mid-file from this repo (C, Python, shell; 1770-3798
+  tokens; `sources.tsv`, `cut.py` re-cuts them); `tools/draft_ctx_gen.sh` continues them in the container
+  and tokenizes the repo for a leave-one-out table; `tools/draft_gate_sim.py --set --repo --sources --ctx
+  real` replays them, each pass priced at its own context.
+- Result (MEASUREMENTS §Drafts with a real context): the engine's lookup 1.067x, the gate 1.146x at the
+  measured prices (1.27-1.32x with the context modelled); a repo table adds nothing to the gate.
+Check: `sh tools/draft_ctx_gen.sh`, then the replay above: its validation lines say SAME.
+
+### 2026-09-27 — Q4_K's short verify passes: the panel's rows brought ahead (question 78's remainder)
+- `avx512_q4x_panel` brings each row's block s + 2 ahead during block s, and, when `q4x_item_body` hands it
+  the next item's rows (a short group, the worker's following item with other rows: `q4x_panel`'s new `next`
+  argument in kernels.h), those rows too, 9 lines a window; a prefetch changes no bit.
+- `Q4X_MIN_TILE_ROWS` 3: a group of 2 input rows goes by `q4x_dot2` pairs, a token after the other (two such
+  streams cost less than a panel built for two tokens); 3 rows and more build the panel.
+- Q4_K at 8 threads (MEASUREMENTS §The Q4_K short passes): 3 rows 28.00 -> 26.53 ms, 2 rows 22.92 -> 22.19,
+  one row and the prompt unchanged.
+- `tools/row_price.sh`: `ROW_PRICE_EXTRA` (more variants in one rotation), `ROW_PRICE_FORCED=1` (every pass
+  on the config's threads).
+Check: `make check`; the price with `ROW_PRICE_FORCED=1 ROW_PRICE_CFGS="Q4_K 8" ROW_PRICE_MODES="0,1,2"
+ROW_PRICE_AA=1 sh tools/row_price.sh <after> 4 <before>`.
+
+### 2026-09-27 — The verify passes' own width (question 82)
+- `src/models/model.c`: the tuner's state per size of short pass (`tune_state tune[TR_DECODE_ROWS]`); the
+  decode's measurement unchanged; every size of verify pass (a logit row a token) measures its own width with
+  the same rules, the narrowest width skipped; a short prompt and a pass past `TR_DECODE_ROWS` take the
+  decode's width. `tr_session_rows_threads`; the CLI prints `verify threads: <rows> rows <width>` after the
+  `threads:` line and writes `"rows_threads":[...]` in `--profile-json`.
+- On a pool of 16 (MEASUREMENTS §The verify passes' own width): Q8_0's verify passes 0.961-0.966 of the whole
+  pool's time and 0.943-0.981 of the decode's width's; Q4_K 0.982-1.005; 8 threads picked everywhere.
+Check: `make check` (test_phase's `test_session_rows` and `test_rows_env`, test_cli's verify line and JSON);
+`MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src trochilus-dev:local sh tools/mutate_tune.sh`
+(twenty-three mutations, all red, under ASan); `generate ... --spec 2 --spec-fixed` prints the verify widths.

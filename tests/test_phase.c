@@ -20,12 +20,23 @@
  *   history     tr_session_decode_history: every measurement leaves position, width in effect and
  *               pick (a pick the debounce held back is seen once); past TR_DECODE_TUNE_HISTORY
  *               measurements the oldest stay and the last slot holds the newest
+ *   rows        every size of verify pass measures its own width, the narrowest skipped (docs/LESSONS.md
+ *               #228, #236), on a pool of 16: a 3-row size picks 16 where the decode picks 8 and runs
+ *               on it; interleaved with the decode's probes each size keeps its own order (4, 8, 16 /
+ *               8, 16); only the decode's measurements enter the history; sizes 2, 3 and 4 are each
+ *               re-armed at a milestone; a size's own kept passes confirm its pending switch; a short
+ *               prompt is no probe; TR_DECODE_ROWS=9 in the environment: 5 to 9 rows on the decode's
+ *               width (the pool before it), 3 rows its own probe. On a pool of 8 a verify size has
+ *               one width left, the whole pool
  *   keep        forced widths, clamped to the pool, and back to measuring after; rows of a short
- *               pass before the first choice and after it; no pool at all; a failed eval changes
- *               nothing; every logit row identical to one thread, f32 and Q8_0
+ *               pass before the first choice (its own first probe) and after it; no pool at all; a
+ *               failed eval changes nothing; every logit row identical to one thread, f32 and Q8_0
  *
  * Seen red: tools/mutate_tune.sh.
  * Synthetic OLMoE big enough for a pool of 8 to split every matmul (as tests/test_hot.c). */
+#if defined(__linux__) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L /* setenv, unsetenv */
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,7 +48,7 @@
 #include "../src/models/model_internal.h"
 #include "synth_olmoe.h"
 
-enum { VOCAB = 64, POOL = 8, N_PROMPT = 20, N_ONE = 12, N_ROW_PASSES = 4 };
+enum { VOCAB = 64, POOL = 8, POOL16 = 16, N_PROMPT = 20, N_ONE = 12, N_ROW_PASSES = 4 };
 /* short passes of several rows: two, the most that still counts as short, one more, many */
 static const int64_t row_pass[N_ROW_PASSES] = {2, TR_DECODE_ROWS, TR_DECODE_ROWS + 1, 9};
 enum { N_SEQ = N_PROMPT + N_ONE + 2 + TR_DECODE_ROWS + TR_DECODE_ROWS + 1 + 9 };
@@ -290,6 +301,268 @@ static void test_session_extend(tr_model *model, tr_pool *pool) {
         TR_CHECK_EQ_INT(tr_session_decode_threads(s), 4); /* the narrower stands */
         tr_session_free(s);
     }
+}
+
+/* The verify passes' own widths (docs/LESSONS.md #228, #236), on a pool of 16: the decode probes 4, 8
+ * and 16, a verify size 8 and 16 (the narrowest skipped). The fake clock's narrow list is 8's, its wide
+ * list 4's and 16's. A prompt of N_P = 5 is a long pass (no probe).
+ * (a) own width: the decode's probes find 8 the faster, the 3-row size's find 16; the 3-row passes then
+ *     run on 16 and the one-token passes on 8; the 2-row size has decided nothing; crossing pos 32
+ *     re-arms the 3-row measurement too (its next pass probes 8).
+ * (b) interleaved: one-token and 3-row passes alternating, 8 the faster for both: each size probes in its
+ *     own order (the decode 4, 8, 16; a verify size 8, 16), the 3-row size picks 8, and its choice does
+ *     not enter the history (the decode has not finished).
+ * (c) every size re-armed at a milestone: sizes 2, 3 and 4 each pick 16 below pos 32 (a rewind to N_P
+ *     between them), a 4-row pass crosses 32 on its choice, then one pass of each size is probe 1 (8).
+ * (d) a verify size's own kept passes: size 3 picks 16, the re-measure at 32 wants 8 (held back:
+ *     pending), and TR_DECODE_TUNE_REMEASURE_KEPT kept 3-row passes (inside [32, 64) by rewinds) force
+ *     another measurement, whose probe 1 is 8.
+ * (e) a short prompt (3 tokens, one logit row) is no probe of its size: the whole pool, and the next two
+ *     3-row verify passes are probes 1 and 2 (8, then 16). */
+static void test_session_rows(tr_model *model, tr_pool *pool) {
+    enum { N_P = 5 };
+    { /* (a) */
+        fake_clock fc = {0};
+        fc.pool = pool;
+        fc.narrow_w = 8;
+        fc.wide_w = 16;
+        /* the decode's 9 probes take 3 values from narrow (8) and 6 from wide (4, 16); the 3-row size's 6
+         * probes the next 3 of each */
+        static const double narrow[] = {1.00, 1.00, 1.00, 2.00, 2.00, 2.00, 2.00};
+        static const double wide[] = {2.00, 2.00, 2.00, 2.00, 2.00, 2.00, 1.00, 1.00, 1.00, 1.00};
+        fc.narrow = mk_seq(narrow, 7);
+        fc.wide = mk_seq(wide, 10);
+        tr_session *s = tr_session_create(model, 0, 0, NULL, 0);
+        TR_CHECK(s != NULL);
+        if (s == NULL) return;
+        tr_session_set_tune_clock(s, fake_clock_now, &fc);
+        TR_CHECK(tr_session_eval(s, seq, N_P) == 0);
+        TR_CHECK_EQ_INT(tr_session_last_threads(s), POOL16);
+        int64_t pos = N_P;
+        for (int i = 0; i < 9; i++, pos++) TR_CHECK(tr_session_eval(s, seq + pos, 1) == 0); /* pos 14 */
+        TR_CHECK_EQ_INT(tr_session_decode_threads(s), 8);
+        TR_CHECK(tr_session_rewind(s, N_P) == 0); /* room below 32 for the 3-row size */
+        pos = N_P;
+        int rows_probes = 0;
+        for (int i = 0; i < 6; i++, pos += 3) { /* pos 23 */
+            TR_CHECK(tr_session_eval_rows(s, seq + pos, 3, 3) == 0);
+            TR_CHECK_EQ_INT(tr_session_last_threads(s), i % 2 == 0 ? 8 : 16);
+            TR_CHECK_EQ_INT(tr_session_rows_threads(s, 3), i < 5 ? 0 : 16);
+            rows_probes++;
+        }
+        TR_CHECK_EQ_INT(rows_probes, 6);
+        TR_CHECK(tr_session_eval_rows(s, seq + pos, 3, 3) == 0); /* on the 3-row choice */
+        pos += 3;
+        TR_CHECK_EQ_INT(tr_session_last_threads(s), 16);
+        TR_CHECK_EQ_INT(tr_session_decode_threads(s), 8);
+        TR_CHECK_EQ_INT(tr_session_rows_threads(s, 2), 0);
+        TR_CHECK_EQ_INT(tr_session_rows_threads(s, 3), 16);
+        while (pos < 32) { /* still on it, the last one ending at 32 */
+            TR_CHECK(tr_session_eval_rows(s, seq + pos, 3, 3) == 0);
+            pos += 3;
+            TR_CHECK_EQ_INT(tr_session_last_threads(s), 16);
+        }
+        TR_CHECK(tr_session_eval_rows(s, seq + pos, 3, 3) == 0); /* past 32: re-armed, probe 1 is 8 */
+        pos += 3;
+        TR_CHECK_EQ_INT(tr_session_last_threads(s), 8);
+        TR_CHECK_EQ_INT(tr_session_rows_threads(s, 3), 16); /* the choice stands while it measures again */
+        const tr_decode_choice *h = NULL;
+        TR_CHECK_EQ_INT(tr_session_decode_history(s, &h), 1);
+        tr_session_free(s);
+    }
+    { /* (b) */
+        fake_clock fc = {0};
+        fc.pool = pool;
+        fc.narrow_w = 8;
+        fc.wide_w = 16;
+        static const double narrow[] = {1.00};
+        static const double wide[] = {2.00};
+        fc.narrow = mk_seq(narrow, 1);
+        fc.wide = mk_seq(wide, 1);
+        tr_session *s = tr_session_create(model, 0, 0, NULL, 0);
+        TR_CHECK(s != NULL);
+        if (s == NULL) return;
+        tr_session_set_tune_clock(s, fake_clock_now, &fc);
+        TR_CHECK(tr_session_eval(s, seq, N_P) == 0);
+        static const int decode_order[3] = {4, 8, 16};
+        int64_t pos = N_P;
+        int interleaved = 0;
+        for (int i = 0; i < 6; i++) { /* pos 29 */
+            TR_CHECK(tr_session_eval(s, seq + pos, 1) == 0);
+            pos++;
+            TR_CHECK_EQ_INT(tr_session_last_threads(s), decode_order[i % 3]);
+            TR_CHECK(tr_session_eval_rows(s, seq + pos, 3, 3) == 0);
+            pos += 3;
+            TR_CHECK_EQ_INT(tr_session_last_threads(s), i % 2 == 0 ? 8 : 16);
+            interleaved++;
+        }
+        TR_CHECK_EQ_INT(interleaved, 6);
+        TR_CHECK_EQ_INT(tr_session_decode_threads(s), 0); /* 6 of its 9 probes */
+        TR_CHECK_EQ_INT(tr_session_rows_threads(s, 3), 8);
+        const tr_decode_choice *h = NULL;
+        TR_CHECK_EQ_INT(tr_session_decode_history(s, &h), 0);
+        tr_session_free(s);
+    }
+    { /* (c) */
+        fake_clock fc = {0};
+        fc.pool = pool;
+        fc.narrow_w = 8;
+        fc.wide_w = 16;
+        static const double narrow[] = {2.00};
+        static const double wide[] = {1.00};
+        fc.narrow = mk_seq(narrow, 1);
+        fc.wide = mk_seq(wide, 1);
+        tr_session *s = tr_session_create(model, 0, 0, NULL, 0);
+        TR_CHECK(s != NULL);
+        if (s == NULL) return;
+        tr_session_set_tune_clock(s, fake_clock_now, &fc);
+        TR_CHECK(tr_session_eval(s, seq, N_P) == 0);
+        int64_t pos = N_P;
+        for (int64_t n = 2; n <= TR_DECODE_ROWS; n++) {
+            TR_CHECK(tr_session_rewind(s, N_P) == 0);
+            pos = N_P;
+            for (int i = 0; i < 6; i++, pos += n) TR_CHECK(tr_session_eval_rows(s, seq + pos, n, n) == 0);
+            TR_CHECK(pos < 32);
+            TR_CHECK_EQ_INT(tr_session_rows_threads(s, n), 16);
+        }
+        while (pos < 32) { /* 4-row passes on their choice, the last one ending past 32 */
+            TR_CHECK(tr_session_eval_rows(s, seq + pos, 4, 4) == 0);
+            pos += 4;
+            TR_CHECK_EQ_INT(tr_session_last_threads(s), 16);
+        }
+        int rearmed = 0;
+        for (int64_t n = 2; n <= TR_DECODE_ROWS; n++) {
+            TR_CHECK(tr_session_eval_rows(s, seq + pos, n, n) == 0);
+            pos += n;
+            TR_CHECK_EQ_INT(tr_session_last_threads(s), 8);
+            TR_CHECK_EQ_INT(tr_session_rows_threads(s, n), 16); /* the choice stands while it measures again */
+            rearmed++;
+        }
+        TR_CHECK_EQ_INT(rearmed, TR_DECODE_ROWS - 1);
+        TR_CHECK(pos <= 52);
+        tr_session_free(s);
+    }
+    { /* (d) */
+        fake_clock fc = {0};
+        fc.pool = pool;
+        fc.narrow_w = 8;
+        fc.wide_w = 16;
+        static const double narrow[] = {2.00, 2.00, 2.00, 1.00};
+        static const double wide[] = {1.00, 1.00, 1.00, 2.00};
+        fc.narrow = mk_seq(narrow, 4);
+        fc.wide = mk_seq(wide, 4);
+        tr_session *s = tr_session_create(model, 0, 0, NULL, 0);
+        TR_CHECK(s != NULL);
+        if (s == NULL) return;
+        tr_session_set_tune_clock(s, fake_clock_now, &fc);
+        TR_CHECK(tr_session_eval(s, seq, N_P) == 0);
+        int64_t pos = N_P;
+        for (int i = 0; i < 6; i++, pos += 3) TR_CHECK(tr_session_eval_rows(s, seq + pos, 3, 3) == 0); /* pos 23 */
+        TR_CHECK_EQ_INT(tr_session_rows_threads(s, 3), 16);
+        while (pos < 32) {
+            TR_CHECK(tr_session_eval_rows(s, seq + pos, 3, 3) == 0);
+            pos += 3;
+        }
+        for (int i = 0; i < 6; i++, pos += 3) TR_CHECK(tr_session_eval_rows(s, seq + pos % 40, 3, 3) == 0);
+        TR_CHECK_EQ_INT(tr_session_rows_threads(s, 3), 16); /* wants 8: pending, held back */
+        int kept = 0;
+        for (int i = 0; i < TR_DECODE_TUNE_REMEASURE_KEPT; i++) {
+            if (pos + 3 > 63) {
+                TR_CHECK(tr_session_rewind(s, 35) == 0);
+                pos = 35;
+            }
+            TR_CHECK(tr_session_eval_rows(s, seq + pos % 40, 3, 3) == 0); /* any tokens: seq ends at N_SEQ */
+            pos += 3;
+            TR_CHECK_EQ_INT(tr_session_last_threads(s), 16);
+            kept++;
+        }
+        TR_CHECK_EQ_INT(kept, TR_DECODE_TUNE_REMEASURE_KEPT);
+        if (pos + 3 > 63) {
+            TR_CHECK(tr_session_rewind(s, 35) == 0);
+            pos = 35;
+        }
+        TR_CHECK(tr_session_eval_rows(s, seq + pos % 40, 3, 3) == 0); /* re-armed after the last kept pass */
+        TR_CHECK_EQ_INT(tr_session_last_threads(s), 8);
+        tr_session_free(s);
+    }
+    { /* (e) */
+        tr_session *s = tr_session_create(model, 0, 0, NULL, 0);
+        TR_CHECK(s != NULL);
+        if (s == NULL) return;
+        TR_CHECK(tr_session_eval(s, seq, 3) == 0);
+        TR_CHECK_EQ_INT(tr_session_last_threads(s), POOL16);
+        TR_CHECK(tr_session_eval_rows(s, seq + 3, 3, 3) == 0);
+        TR_CHECK_EQ_INT(tr_session_last_threads(s), 8);
+        TR_CHECK(tr_session_eval_rows(s, seq + 6, 3, 3) == 0);
+        TR_CHECK_EQ_INT(tr_session_last_threads(s), 16);
+        tr_session_free(s);
+    }
+}
+
+static void set_env(const char *name, const char *value) {
+#if defined(_WIN32)
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
+static void unset_env(const char *name) {
+#if defined(_WIN32)
+    _putenv_s(name, ""); /* an empty value removes it */
+#else
+    unsetenv(name);
+#endif
+}
+
+/* TR_DECODE_ROWS=9 in the environment at load (tools/threads_phase.sh's rows modes), a pool of 16: a
+ * verify pass of 5 to 9 rows has no measurement of its own and takes the decode's width, the whole pool
+ * until it is in; a 3-row pass is its own size's probe (8); a 10-row pass is long. */
+static void test_rows_env(const char *path, tr_pool *pool) {
+    char err[256];
+    set_env("TR_DECODE_ROWS", "9");
+    tr_model *model = tr_model_load(path, pool, err, sizeof err);
+    unset_env("TR_DECODE_ROWS");
+    TR_CHECK(model != NULL);
+    if (model == NULL) return;
+    tr_session *s = tr_session_create(model, 0, 0, NULL, 0);
+    TR_CHECK(s != NULL);
+    if (s != NULL) {
+        fake_clock fc = {0};
+        fc.pool = pool;
+        fc.narrow_w = 4;
+        fc.wide_w = 16;
+        static const double narrow[] = {1.00};
+        static const double wide[] = {2.00};
+        fc.narrow = mk_seq(narrow, 1);
+        fc.wide = mk_seq(wide, 1);
+        tr_session_set_tune_clock(s, fake_clock_now, &fc);
+        TR_CHECK(tr_session_eval(s, seq, 10) == 0);
+        int64_t pos = 10;
+        TR_CHECK_EQ_INT(tr_session_last_threads(s), POOL16);
+        TR_CHECK(tr_session_eval_rows(s, seq + pos, 5, 5) == 0); /* the decode's width is not in yet */
+        pos += 5;
+        TR_CHECK_EQ_INT(tr_session_last_threads(s), POOL16);
+        TR_CHECK(tr_session_eval_rows(s, seq + pos, 3, 3) == 0);
+        pos += 3;
+        TR_CHECK_EQ_INT(tr_session_last_threads(s), 8);
+        for (int i = 0; i < 9; i++, pos++) TR_CHECK(tr_session_eval(s, seq + pos, 1) == 0); /* pos 27 */
+        TR_CHECK_EQ_INT(tr_session_decode_threads(s), 4);
+        static const int64_t longer[2] = {5, 9};
+        int on_decode_width = 0;
+        for (int i = 0; i < 2; i++) {
+            TR_CHECK(tr_session_eval_rows(s, seq + pos % 40, longer[i], longer[i]) == 0);
+            pos += longer[i];
+            TR_CHECK_EQ_INT(tr_session_last_threads(s), 4);
+            TR_CHECK_EQ_INT(tr_session_rows_threads(s, longer[i]), 0);
+            on_decode_width++;
+        }
+        TR_CHECK_EQ_INT(on_decode_width, 2);
+        TR_CHECK(tr_session_eval_rows(s, seq + pos % 40, 10, 10) == 0);
+        TR_CHECK_EQ_INT(tr_session_last_threads(s), POOL16);
+        tr_session_free(s);
+    }
+    tr_model_free(model);
 }
 
 /* Crossing pos 32 (N_PROMPT=20, synth context 64) re-arms a measurement; a rewind below 32, then
@@ -619,8 +892,13 @@ static void run_case(tr_model *model, tr_pool *pool, int forced, int use_real_cl
         int64_t n = row_pass[p];
         TR_CHECK(tr_session_eval_rows(s, seq + pos, n, n) == 0);
         pos += n;
-        TR_CHECK_EQ_INT(tr_session_last_threads(s), n <= TR_DECODE_ROWS ? chosen : POOL);
+        /* a verify pass skips the narrowest width: on a pool of 8 its size has one width left, the
+         * whole pool, and nothing to measure (test_session_rows measures on a pool of 16) */
+        int want = n > TR_DECODE_ROWS ? POOL : forced > 0 ? chosen : widths[n_widths - 1];
+        TR_CHECK_EQ_INT(tr_session_last_threads(s), want);
         TR_CHECK_EQ_INT(tr_session_decode_threads(s), chosen);
+        /* what a size reports: the forced width, its only width, 0 past the sizes */
+        TR_CHECK_EQ_INT(tr_session_rows_threads(s, n), n > TR_DECODE_ROWS ? 0 : forced > 0 ? want_forced : POOL);
         for (int64_t j = 0; j < n; j++)
             bad += memcmp(tr_session_logits_back(s, j), ref + (pos - 1 - j) * VOCAB, VOCAB * sizeof(float)) != 0;
     }
@@ -632,7 +910,8 @@ static void run_case(tr_model *model, tr_pool *pool, int forced, int use_real_cl
     tr_session_free(s);
 }
 
-/* A short pass of several rows before the session has finished measuring: the whole pool. */
+/* A short pass of several rows before the decode has measured anything, on a pool of 8: its size
+ * has one width left (the narrowest skipped), the whole pool, chosen from the start. */
 static void test_rows_before_measured(tr_model *model, const float *ref) {
     tr_session *s = tr_session_create(model, 0, 0, NULL, 0);
     TR_CHECK(s != NULL);
@@ -641,6 +920,7 @@ static void test_rows_before_measured(tr_model *model, const float *ref) {
     TR_CHECK(tr_session_eval_rows(s, seq + N_PROMPT, 3, 3) == 0);
     TR_CHECK_EQ_INT(tr_session_last_threads(s), POOL);
     TR_CHECK_EQ_INT(tr_session_decode_threads(s), 0);
+    TR_CHECK_EQ_INT(tr_session_rows_threads(s, 3), POOL);
     TR_CHECK(memcmp(tr_session_logits(s), ref + (N_PROMPT + 2) * VOCAB, VOCAB * sizeof(float)) == 0);
     /* a failed eval measures nothing and changes nothing */
     int32_t out_of_range = VOCAB;
@@ -691,6 +971,18 @@ int main(int argc, char **argv) {
         }
         tr_model_free(model);
         tr_pool_destroy(pool);
+        if (pi == 0) {
+            /* the verify sizes' own measurements need three widths: a pool of 16 */
+            tr_pool *pool16 = tr_pool_create(POOL16);
+            tr_model *model16 = pool16 != NULL ? tr_model_load(path, pool16, err, sizeof err) : NULL;
+            TR_CHECK(model16 != NULL);
+            if (model16 != NULL) {
+                test_session_rows(model16, pool16);
+                test_rows_env(path, pool16);
+            }
+            tr_model_free(model16);
+            tr_pool_destroy(pool16);
+        }
 
         /* no pool at all: one thread, nothing to measure, same logits */
         model = tr_model_load(path, NULL, err, sizeof err);

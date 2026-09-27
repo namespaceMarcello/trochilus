@@ -1,0 +1,12 @@
+// queue.ts — a typed priority queue backed by a binary heap.
+
+export class PriorityQueue<T> {
+  private heap: T[] = [];
+
+  constructor(private readonly less: (a: T, b: T) => boolean) {}
+
+  get size(): number {
+    return this.heap.length;
+  }
+
+  push(item: T): void {

@@ -1,0 +1,155 @@
+#!/bin/sh
+# decode_context.sh — the decode as the context grows (docs/MEASUREMENTS.md §Decode a contesto lungo):
+# native Windows, still machine, rotating order, A/A control (tools/ab_modes.sh, docs/LESSONS.md
+# #66). Run from the repo root in Git Bash. Results in build/decode_context/.
+#
+#   sh tools/decode_context.sh measure [rounds]
+#       bench_mem    what the RAM gives: plain reads in a row and scattered, the engine's matmul,
+#                    one token's attention on the two KV layouts (tests/bench_mem.c)
+#       speed        decode at context 32, 512, 2048 and 4000 in ONE ab_modes session: the default
+#                    (the session measures its decode width) and --decode-threads 8, each with its
+#                    A/A copy. About 35 minutes.
+#       profile      ms and bytes read per zone at every context (tools/profile_suite.py on
+#                    bench/scenarios-decode-context.json). About 15 minutes.
+#   sh tools/decode_context.sh widths [rounds]
+#       speed-d16: the decode forced on 16 threads against forced on 8, at the four contexts,
+#       each with its A/A copy: does the decode want half the pool at every context, or was that
+#       a fact of a machine with four cores taken (docs/LESSONS.md #84)? About 40 minutes.
+#       speed-d4: the decode forced on 4 threads against forced on 8, at the four contexts, each
+#       with its A/A copy: the truth the estimator is checked against from 2048 up, where 4 and 8
+#       sit within the noise of three passes (docs/MEASUREMENTS.md domanda 31). About 40 minutes more.
+#   sh tools/decode_context.sh long [runs]
+#       the estimator on a run that crosses two context classes (docs/MEASUREMENTS.md domanda 31): 1500
+#       tokens after a prompt of 1000 go through 1024 and 2048, so the session measures again
+#       twice and the debounce has something to hold. One line per run in long.txt: tok/s and the
+#       history of the choices the `threads:` line prints; then the switches of every run. About
+#       a minute a run, 5 runs.
+#   sh tools/decode_context.sh change <binary-before> [rounds]
+#       exact: the two binaries give the same logits (600 positions, byte for byte) and the same
+#       tokens after a prompt of 4000 on the real model, or the measurement does not start.
+#       speed-auto, speed-d8: before and after at every context, each with its A/A copy, with the
+#       default width and with the decode forced on 8; then bench_mem and the profile of the new
+#       binary. About 90 minutes. PROF_BEFORE=<binary> profiles that binary too (profile-before):
+#       a binary older than the bytes per zone has no such numbers, its twin built with them has.
+#   sh tools/decode_context.sh change-short <binary-before> [rounds, default 6]
+#       THE DEFAULT for measuring a change (Marcello, 2026-09-24): exact as in `change`, then
+#       speed-d8-short, the decode forced on 8 at contexts 512, 2048 and 4000, each with its A/A
+#       copy, then the profile of the new binary on those three scenarios
+#       (bench/scenarios-decode-context-d8.json; PROF_BEFORE=<binary> profiles that one too). About
+#       40 minutes instead of 90. What it leaves out: context 32 (the attention is 2% of the token
+#       there), the measured width (the noisiest, and a matter of its own) and bench_mem (a fact of
+#       the machine, not of the change). Short for what grows with the context (attention on CPU
+#       or GPU, the KV cache and its layout); the full `change` for what every token pays at any
+#       context (weights' kernels and types, expert store, norms, RoPE, router, experts' path, pool,
+#       pinning, threads per phase and the width's estimator), and when the short one surprises at
+#       512 (docs/ARCHITECTURE.md §Profiling).
+#
+# The order of the 16 modes of a session holds every context after every context once (a de
+# Bruijn sequence over the 4 contexts): a run on the machine a 4000-token prompt has just heated
+# is not always the same context, and a mode and its A/A copy never follow the same context, so
+# the A/A difference carries that effect too.
+#
+# The machine's marker (~/.claude/macchina-ferma) is held for the duration and given back at the
+# end, also when the script fails or is interrupted: the other windows pause their work, their
+# containers stay up; if the CPU gets busy in the meantime the measurement stops at the next run
+# instead of going on with a busy machine (AB_GUARD, docs/LESSONS.md #73). A binary Smart App
+# Control still blocks (docs/LESSONS.md #12) is waited for, never rebuilt: a rebuild starts the
+# wait again.
+set -e
+# The body is one function, called on the last line: the shell parses all of it before it runs
+# any, so editing this file while it runs cannot change a run under way (docs/LESSONS.md #69).
+main() {
+WHAT=$1
+B=build/trochilus.exe
+MEMB=build/tests/bench_mem.exe
+M=models/OLMoE-1B-7B-0125-Instruct-Q8_0.gguf
+PY=tools/.venv/Scripts/python.exe
+SCEN=bench/scenarios-decode-context.json
+OUT=build/decode_context
+case "$WHAT" in
+  measure|widths) R=${2:-8} ;;
+  long) R=${2:-5} ;;
+  change) BEFORE=$2; R=${3:-8}; [ -f "$BEFORE" ] || { echo "decode_context: no binary '$BEFORE'"; exit 2; } ;;
+  change-short) BEFORE=$2; R=${3:-6}; [ -f "$BEFORE" ] || { echo "decode_context: no binary '$BEFORE'"; exit 2; } ;;
+  *) echo "usage: decode_context.sh measure [rounds] | widths [rounds] | long [runs] | change <binary-before> [rounds] | change-short <binary-before> [rounds]"; exit 2 ;;
+esac
+mkdir -p $OUT
+[ -f $B ] && [ -f $MEMB ] && [ -f $M ] || { echo "decode_context: $B, $MEMB or $M is missing"; exit 1; }
+[ -z "$PROF_BEFORE" ] || [ -f "$PROF_BEFORE" ] || { echo "decode_context: no binary '$PROF_BEFORE'"; exit 2; }
+
+# up to an hour, one try a minute (a blocked exe exits 126 from Git Bash; bench_mem without
+# arguments prints its usage and exits 2, which is a binary that runs)
+wait_runs() {
+  TRY=0
+  while :; do
+    RC=0
+    "$@" > /dev/null 2>&1 || RC=$?
+    [ "$RC" = 126 ] || break
+    TRY=$((TRY + 1))
+    [ "$TRY" -le 60 ] || { echo "decode_context: $1 still does not run after an hour"; exit 1; }
+    echo "decode_context: $1 does not run yet (Smart App Control?), try $TRY, waiting 60 s"
+    sleep 60
+  done
+}
+# one measurement at a time, and the machine stays awake while it lasts (docs/LESSONS.md #82)
+. tools/measure_guard.lib
+trap measure_end EXIT
+trap 'exit 130' INT TERM
+# after the lock, before the machine's marker: a binary Smart App Control holds (up to an hour)
+# keeps no other window waiting (tools/measure_guard.lib)
+measure_ready() {
+  wait_runs $B cpu
+  wait_runs $MEMB
+  [ -z "$BEFORE" ] || wait_runs $BEFORE cpu
+  [ -z "$PROF_BEFORE" ] || wait_runs $PROF_BEFORE cpu
+}
+measure_begin decode_context
+
+# the other windows' containers stay up, their work paused by the marker; from here on a CPU
+# busy with other work, or the marker lost, stops the measurement at the next run
+# (tools/measure_guard.lib, tools/machine_still.sh, docs/LESSONS.md #73, #84)
+measure_machine decode_context
+still() { cleanup_run sh -c "$AB_GUARD" || { echo "decode_context: the machine is not still $1 (the marker lost, or a busy CPU), stopping"; exit 3; }; }
+
+# The model takes 7 GiB and the memory guard wants 3 more left free; Windows needs minutes to
+# take back what the VM has released (docs/LESSONS.md #72). Up to 15 minutes, a look every 30 s.
+TRY=0
+while :; do
+  AVAIL=$($B cpu 2>&1 | sed -n 's/^ram: .* total, \([0-9]*\)\.[0-9]* GiB available.*/\1/p')
+  [ "${AVAIL:-0}" -lt 12 ] || break
+  TRY=$((TRY + 1))
+  [ "$TRY" -le 30 ] || { echo "decode_context: only ${AVAIL:-?} GiB available after 15 minutes, 12 wanted"; exit 1; }
+  echo "decode_context: ${AVAIL:-?} GiB available, 12 wanted: waiting 30 s"
+  sleep 30
+done
+measure_still decode_context
+measure_declare "before the first run"
+
+# $1: binary, $2: prompt length, $3: context, $4: further arguments
+gen() { echo "$1 generate -m $M -p $2 -n 48 -c $3 -t 16 $4"; }
+
+# $1: name of the output
+bench_mem() {
+  echo "##### bench_mem"
+  still "before bench_mem"
+  for G in ram weights "kv 512" "kv 2048" "kv 4000"; do
+    $MEMB $G --runs 7
+  done > $OUT/bench_mem-$1.txt
+  still "after bench_mem"
+  grep -c "GB/s" $OUT/bench_mem-$1.txt
+}
+
+# $1: name of the output, $2: binary
+profile() {
+  echo "##### profile by zone, $2"
+  still "before the profile"
+  cleanup_run $PY tools/profile_suite.py --binary $2 --scenarios $SCEN > $OUT/profile-$1.txt
+  still "after the profile"
+  grep -c "^==" $OUT/profile-$1.txt
+}
+
+# One session over the four contexts. $1: output name; $2 $3 $4: label, binary and further
+# arguments of the first mode; $5 $6 $7: of the second. Positions of a context in the de Bruijn
+# order 0 0 1 0 2 0 3 1 1 2 1 3 2 2 3 3: the first two take the two modes, the last two their
+# A/A copies.
+session() {

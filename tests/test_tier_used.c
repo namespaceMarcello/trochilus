@@ -61,6 +61,9 @@ static void test_table(void) {
             if (!tr_kernels_support((tr_type)type)) continue;
             /* F16 rows convert with F16C: an AVX2 CPU without it (none is known) keeps scalar's */
             if (type == TR_TYPE_F16 && !tr_cpu()->f16c) continue;
+            /* Q4_K's dot_row is its definition from the floats, off the hot path: the engine's Q4_K products
+             * go through the q4x entries, checked below */
+            if (type == TR_TYPE_Q4_K) continue;
             types++;
             if (K->dot_row[type] == NULL || K->dot_row[type] == S->dot_row[type]) {
                 printf("  tier %s: dot_row of weight type %d is scalar's\n", K->tier, type);
@@ -74,17 +77,12 @@ static void test_table(void) {
         /* AVX-512 takes two rows at a time in every quantized type (kernels_x86.c): an entry left
          * out gives the same numbers slower, and nothing else would notice */
         if (strcmp(K->tier, "avx512") == 0) {
-            static const tr_type row2[] = {TR_TYPE_Q8_0, TR_TYPE_Q4_K, TR_TYPE_Q6_K};
+            static const tr_type row2[] = {TR_TYPE_Q8_0, TR_TYPE_Q6_K};
             for (size_t i = 0; i < sizeof row2 / sizeof row2[0]; i++) {
                 if (K->dot_row2_x4[row2[i]] == NULL) {
                     printf("  tier avx512: dot_row2_x4 of weight type %d is missing\n", (int)row2[i]);
                     missing++;
                 }
-            }
-            /* one token, two Q4_K rows at a time (the decode: kernels_x86.c's avx512_dot_row2_q4_k) */
-            if (K->dot_row2[TR_TYPE_Q4_K] == NULL) {
-                printf("  tier avx512: dot_row2 of weight type %d is missing\n", (int)TR_TYPE_Q4_K);
-                missing++;
             }
             /* and against eight tokens at a time */
             for (size_t i = 0; i < sizeof row2 / sizeof row2[0]; i++) {
@@ -94,13 +92,32 @@ static void test_table(void) {
                 }
             }
         }
+        /* a short verify pass's groups of 2 and 3 input rows (dot_row_xt): Q8_0's is the tier's own */
+        if (K->dot_row_xt[TR_TYPE_Q8_0] == NULL || K->dot_row_xt[TR_TYPE_Q8_0] == S->dot_row_xt[TR_TYPE_Q8_0]) {
+            printf("  tier %s: dot_row_xt of Q8_0 is scalar's or missing\n", K->tier);
+            missing++;
+        }
+        /* Q4_K's integer road: every tier prepares and pairs with its own kernels; AVX-512 with the byte
+         * permutes, VNNI and DQ has its W16 panel and tiles too (elsewhere the road goes by rows) */
+        const tr_cpu_info *ci = tr_cpu();
+        const int w16 = strcmp(K->tier, "avx512") == 0 && ci->avx512bw && ci->avx512vl && ci->avx512dq &&
+                        ci->avx512vnni && ci->avx512vbmi && ci->f16c;
+        if (K->q4x_prep == S->q4x_prep || K->q4x_dot2 == S->q4x_dot2) {
+            printf("  tier %s: q4x_prep or q4x_dot2 is scalar's\n", K->tier);
+            missing++;
+        }
+        if (w16 && (K->q4x_panel == NULL || K->q4x_panel == S->q4x_panel || K->q4x_tile == NULL ||
+                    K->q4x_tile == S->q4x_tile)) {
+            printf("  tier %s: the W16 panel or tile is missing or scalar's\n", K->tier);
+            missing++;
+        }
         TR_CHECK(strcmp(K->tier, tiers[t]) == 0); /* asked for one tier, handed another */
         TR_CHECK(types >= 3); /* F32, F16, Q8_0 today: a loop over nothing proves nothing */
         TR_CHECK_EQ_INT(missing, 0);
         if (missing == 0)
             printf("  tier %-8s every hot entry is its own: dot and axpy with their x4, dot_row and dot_row_x4 of %d "
-                   "weight types\n",
-                   K->tier, types);
+                   "weight types, Q4_K's q4x %s\n",
+                   K->tier, types, w16 ? "with the W16 panel and tiles" : "by rows");
     }
 
     /* a tier exists exactly when the CPU (capped by TR_CPU_MAX) has it, and tr_kernels_init takes
@@ -166,6 +183,7 @@ static void test_ops(void) {
 static const tr_kernels *g_real;                                       /* the tier under the counters */
 static atomic_ullong n_row[TR_TYPE_COUNT], n_x4[TR_TYPE_COUNT], n_r2[TR_TYPE_COUNT], n_r8[TR_TYPE_COUNT]; /* calls, by type */
 static atomic_ullong n_p2[TR_TYPE_COUNT];   /* dot_row2 calls (two rows, one token), by type */
+static atomic_ullong n_xt[TR_TYPE_COUNT];   /* dot_row_xt products (one row, 2 or 3 tokens), by type */
 static atomic_ullong n_dot_x4, n_axpy_x4, n_dot_4x4, n_axpy_4x4;
 
 #define COUNTED(type, name) \
@@ -188,6 +206,10 @@ static atomic_ullong n_dot_x4, n_axpy_x4, n_dot_4x4, n_axpy_4x4;
     static void p2_##name(const void *row0, const void *row1, const float *x, int64_t n, float *out) { \
         atomic_fetch_add(&n_p2[type], 1); \
         g_real->dot_row2[type](row0, row1, x, n, out); \
+    } \
+    static void xt_##name(const void *row, const float *x, int64_t stride, int64_t n, int t, float *out) { \
+        atomic_fetch_add(&n_xt[type], (unsigned long long)t); \
+        g_real->dot_row_xt[type](row, x, stride, n, t, out); \
     }
 COUNTED(TR_TYPE_F32, f32)
 COUNTED(TR_TYPE_F16, f16)
@@ -210,6 +232,23 @@ static void counted_pm_tile(const float *panel, const float *xil, int64_t n, int
                             int64_t y_stride) {
     atomic_fetch_add(&n_pm_products, (unsigned long long)(TR_PM_ROWS * T));
     g_real->pm_tile(panel, xil, n, T, part, y, y_stride);
+}
+
+/* Q4_K's integer road (kernels.h q4x_*): the prepared rows, the pairs (two products a call) and the tiles'
+ * products */
+static atomic_ullong n_q4x_prep, n_q4x_dot2, n_q4x_products;
+static void counted_q4x_prep(const float *x, int64_t n, void *xq) {
+    atomic_fetch_add(&n_q4x_prep, 1);
+    g_real->q4x_prep(x, n, xq);
+}
+static void counted_q4x_dot2(const void *row0, const void *row1, const void *xq, int64_t n, float *out) {
+    atomic_fetch_add(&n_q4x_dot2, 1);
+    g_real->q4x_dot2(row0, row1, xq, n, out);
+}
+static void counted_q4x_tile(const void *panel, const void *xq, size_t xq_stride, int64_t n, int T, float *y,
+                             int64_t y_stride) {
+    atomic_fetch_add(&n_q4x_products, (unsigned long long)(TR_PM_ROWS * T));
+    g_real->q4x_tile(panel, xq, xq_stride, n, T, y, y_stride);
 }
 
 static void counted_dot_f32_x4(const float *a, const float *b, int64_t stride, int64_t n, float *out) {
@@ -235,10 +274,10 @@ static void counted_axpy_f32_4x4(float *y, int64_t y_stride, const float *x, int
 }
 
 /* 2 layers, n_embd 64, 4 heads (2 kv), n_ff 64, 8 experts (3 used), vocab 48, context 32 */
-enum { LAYERS = 2, N_EMBD = 64, N_HEAD = 4, N_HEAD_KV = 2, N_FF = 64, N_EXPERT = 8, N_USED = 3, VOCAB = 48, CTX = 32 };
+enum { LAYERS = 2, N_EMBD = 64, N_HEAD = 4, N_HEAD_KV = 2, N_FF = 64, N_EXPERT = 8, N_USED = 3, VOCAB = 48, CTX = 40 };
 /* a pass of 29 tokens (three threads' chunks of ~9.7 whole tokens: 8 at a time, then fewer), then
  * one token a pass */
-enum { N_PROMPT = 29, N_SINGLE = 2 };
+enum { N_PROMPT = 29, N_SINGLE = 2, N_SHORT = 3 };
 
 static void test_engine(const char *argv0, tr_type type, const char *name, long long n_embd, long long n_ff) {
     static tr_kernels counting;
@@ -269,6 +308,11 @@ static void test_engine(const char *argv0, tr_type type, const char *name, long 
     if (g_real->dot_row2[TR_TYPE_Q8_0] != NULL) counting.dot_row2[TR_TYPE_Q8_0] = p2_q8_0;
     if (g_real->dot_row2[TR_TYPE_Q4_K] != NULL) counting.dot_row2[TR_TYPE_Q4_K] = p2_q4_k;
     if (g_real->dot_row2[TR_TYPE_Q6_K] != NULL) counting.dot_row2[TR_TYPE_Q6_K] = p2_q6_k;
+    if (g_real->dot_row_xt[TR_TYPE_F32] != NULL) counting.dot_row_xt[TR_TYPE_F32] = xt_f32;
+    if (g_real->dot_row_xt[TR_TYPE_F16] != NULL) counting.dot_row_xt[TR_TYPE_F16] = xt_f16;
+    if (g_real->dot_row_xt[TR_TYPE_Q8_0] != NULL) counting.dot_row_xt[TR_TYPE_Q8_0] = xt_q8_0;
+    if (g_real->dot_row_xt[TR_TYPE_Q4_K] != NULL) counting.dot_row_xt[TR_TYPE_Q4_K] = xt_q4_k;
+    if (g_real->dot_row_xt[TR_TYPE_Q6_K] != NULL) counting.dot_row_xt[TR_TYPE_Q6_K] = xt_q6_k;
     counting.dot_f32_x4 = counted_dot_f32_x4;
     counting.axpy_f32_x4 = counted_axpy_f32_x4;
     counting.dot_f32_4x4 = counted_dot_f32_4x4;
@@ -277,6 +321,12 @@ static void test_engine(const char *argv0, tr_type type, const char *name, long 
     if (g_real->pm_panel[TR_TYPE_Q4_K] != NULL) counting.pm_panel[TR_TYPE_Q4_K] = pmp_q4_k;
     if (g_real->pm_panel[TR_TYPE_Q6_K] != NULL) counting.pm_panel[TR_TYPE_Q6_K] = pmp_q6_k;
     if (g_real->pm_tile != NULL) counting.pm_tile = counted_pm_tile;
+    counting.q4x_prep = counted_q4x_prep;
+    counting.q4x_dot2 = counted_q4x_dot2;
+    if (g_real->q4x_tile != NULL) counting.q4x_tile = counted_q4x_tile;
+    atomic_store(&n_q4x_prep, 0);
+    atomic_store(&n_q4x_dot2, 0);
+    atomic_store(&n_q4x_products, 0);
     atomic_store(&n_pm_products, 0);
     for (int i = 0; i < TR_TYPE_COUNT; i++) {
         atomic_store(&n_row[i], 0);
@@ -284,6 +334,7 @@ static void test_engine(const char *argv0, tr_type type, const char *name, long 
         atomic_store(&n_r2[i], 0);
         atomic_store(&n_r8[i], 0);
         atomic_store(&n_p2[i], 0);
+        atomic_store(&n_xt[i], 0);
         atomic_store(&n_pm_panel[i], 0);
     }
     atomic_store(&n_dot_x4, 0);
@@ -300,17 +351,19 @@ static void test_engine(const char *argv0, tr_type type, const char *name, long 
     tr_session *s = model != NULL ? tr_session_create(model, 0, 0, err, sizeof err) : NULL;
     TR_CHECK(s != NULL);
     if (s != NULL) {
-        int32_t tok[N_PROMPT + N_SINGLE];
-        for (int i = 0; i < N_PROMPT + N_SINGLE; i++) tok[i] = (int32_t)((i * 7 + 3) % VOCAB);
+        int32_t tok[N_PROMPT + N_SINGLE + N_SHORT];
+        for (int i = 0; i < N_PROMPT + N_SINGLE + N_SHORT; i++) tok[i] = (int32_t)((i * 7 + 3) % VOCAB);
         tr_kernels_set_active(&counting);
         TR_CHECK(tr_session_eval(s, tok, N_PROMPT) == 0);
         for (int i = 0; i < N_SINGLE; i++) TR_CHECK(tr_session_eval(s, tok + N_PROMPT + i, 1) == 0);
+        /* and a short pass, a verify pass of 3 rows: its groups of 2 and 3 through dot_row_xt */
+        TR_CHECK(tr_session_eval(s, tok + N_PROMPT + N_SINGLE, N_SHORT) == 0);
         tr_kernels_set_active(NULL);
 
         /* products a token asks of the matrices of `type`, layer by layer: q, k, v, the output
          * projection, and gate, up and down of each expert it uses; the router's are F32; the
          * logits are one row of the vocabulary per call */
-        long long tokens = N_PROMPT + N_SINGLE, evals = 1 + N_SINGLE;
+        long long tokens = N_PROMPT + N_SINGLE + N_SHORT, evals = 1 + N_SINGLE + 1;
         long long n_kv = (long long)N_HEAD_KV * (n_embd / N_HEAD);
         long long of_type = tokens * LAYERS * (n_embd + 2 * n_kv + n_embd + N_USED * (2 * n_ff + n_embd)) + evals * VOCAB;
         long long of_router = tokens * LAYERS * N_EXPERT;
@@ -318,8 +371,11 @@ static void test_engine(const char *argv0, tr_type type, const char *name, long 
             long long want = (i == (int)type ? of_type : 0) + (i == TR_TYPE_F32 ? of_router : 0);
             long long got = (long long)atomic_load(&n_row[i]) + 4 * (long long)atomic_load(&n_x4[i]) +
                             8 * (long long)atomic_load(&n_r2[i]) + 16 * (long long)atomic_load(&n_r8[i]) +
-                            2 * (long long)atomic_load(&n_p2[i]) +
-                            (i == (int)type ? (long long)atomic_load(&n_pm_products) : 0);
+                            2 * (long long)atomic_load(&n_p2[i]) + (long long)atomic_load(&n_xt[i]) +
+                            (i == (int)type ? (long long)atomic_load(&n_pm_products) : 0) +
+                            (i == TR_TYPE_Q4_K ? 2 * (long long)atomic_load(&n_q4x_dot2) +
+                                                     (long long)atomic_load(&n_q4x_products)
+                                               : 0);
             TR_CHECK_EQ_INT(got, want);
             if (got != want) printf("  %s model, weight type %d: %lld products through the active table, %lld wanted\n",
                                     name, i, got, want);
@@ -334,13 +390,27 @@ static void test_engine(const char *argv0, tr_type type, const char *name, long 
         } else if (g_real->dot_row2_x8[type] != NULL) {
             TR_CHECK(atomic_load(&n_r8[type]) > 0);
         }
+        /* the short pass's groups of 2 and 3 input rows, where the type has the kernel (Q8_0: every tier) */
+        if (g_real->dot_row_xt[type] != NULL) TR_CHECK(atomic_load(&n_xt[type]) > 0);
         /* and a one-token pass must take the decode's pair where the tier has it */
         if (g_real->dot_row2[type] != NULL) TR_CHECK(atomic_load(&n_p2[type]) > 0);
+        /* Q4_K: every call prepares its rows; the one-token passes pair rows, and the prompt's pass runs tiles
+         * where the tier has the W16 panel */
+        if (type == TR_TYPE_Q4_K) {
+            TR_CHECK(atomic_load(&n_q4x_prep) > 0);
+            TR_CHECK(atomic_load(&n_q4x_dot2) > 0);
+            if (g_real->q4x_panel != NULL && g_real->q4x_tile != NULL) TR_CHECK(atomic_load(&n_q4x_products) > 0);
+            TR_CHECK_EQ_INT(atomic_load(&n_row[type]), 0); /* nothing left to the definition from the floats */
+            printf("  q4_k  model: %llu rows prepared, %llu pairs, %llu tile products\n",
+                   (unsigned long long)atomic_load(&n_q4x_prep), (unsigned long long)atomic_load(&n_q4x_dot2),
+                   (unsigned long long)atomic_load(&n_q4x_products));
+        }
         printf("  %-5s model: %llu phase-major products in %llu panels, %llu calls of 2 rows x 8 tokens, %llu of "
-               "2 x 4, %llu of 1 x 4, %llu dots\n",
+               "2 x 4, %llu of 1 x 4, %llu products of 1 x 2-3, %llu dots\n",
                name, (unsigned long long)atomic_load(&n_pm_products), (unsigned long long)atomic_load(&n_pm_panel[type]),
                (unsigned long long)atomic_load(&n_r8[type]), (unsigned long long)atomic_load(&n_r2[type]),
-               (unsigned long long)atomic_load(&n_x4[type]), (unsigned long long)atomic_load(&n_row[type]));
+               (unsigned long long)atomic_load(&n_x4[type]), (unsigned long long)atomic_load(&n_xt[type]),
+               (unsigned long long)atomic_load(&n_row[type]));
         if (pm) {
             TR_CHECK_EQ_INT(atomic_load(&n_x4[type]), 0); /* no pair of rows left to the one-row road */
         } else if (g_real->dot_row2_x4[type] != NULL) {

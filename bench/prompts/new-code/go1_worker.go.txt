@@ -1,0 +1,13 @@
+// Package pool runs jobs on a fixed number of worker goroutines.
+package pool
+
+import (
+	"context"
+	"sync"
+)
+
+// Job is a unit of work; it returns an error when it fails.
+type Job func(ctx context.Context) error
+
+// Run executes every job with at most n running at once, and returns the first error.
+func Run(ctx context.Context, n int, jobs []Job) error {

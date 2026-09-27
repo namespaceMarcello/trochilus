@@ -1364,7 +1364,7 @@ static int forward_layer(olmoe_model *m, olmoe_session *s, int64_t L, const int3
         ac.score_stride = s->score_stride;
         /* an item costs ~30 ns per cached position: short contexts keep several per chunk; a
          * decode token's heads, one stream of cached positions each, balanced at the tail */
-        TR_TRACE_NOTE(attn_kv_bytes(n_tok, pos0, n_head, head_dim), -1, pos0 + n_tok);
+        TR_TRACE_NOTE(attn_kv_bytes(n_tok, pos0, n_head, head_dim), -1, pos0 + n_tok, n_tok);
         if (n_tok == 1) tr_parallel_for_balanced(pool, n_head, 1 + 256 / (pos0 + 1), attn_body, &ac);
         else tr_parallel_for(pool, n_head * n_tok, 1 + 256 / (pos0 + n_tok), attn_body, &ac);
     } else if (L == m->n_layers - 1) {

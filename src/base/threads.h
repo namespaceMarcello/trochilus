@@ -72,15 +72,15 @@ void tr_parallel_for_balanced(tr_pool *p, int64_t n, int64_t min_chunk, tr_range
 #define TR_POOL_BLOCKS 64
 
 /* The token's timeline (research build only, -DTR_POOL_TRACE; docs/MEASUREMENTS.md §The engine
- * read as entangled pairs): the bytes the calling thread's next parallel_for reads, and the shape
- * that names it (rows, cols of a weight; rows -1 for the decode's attention, cols its positions).
- * The trace writes them after the call's chunks; tools/token_timeline.py reads them. Elsewhere it
- * compiles to nothing. */
+ * read as entangled pairs): the bytes the calling thread's next parallel_for reads, the shape
+ * that names it (rows, cols of a weight; rows -1 for the attention, cols its positions), and its
+ * input rows (a pass's tokens, a grouped matmul's gathered rows). The trace writes them after the
+ * call's chunks; tools/token_timeline.py reads them. Elsewhere it compiles to nothing. */
 #if defined(TR_POOL_TRACE)
-void tr_pool_trace_note(uint64_t bytes, int64_t rows, int64_t cols);
-#define TR_TRACE_NOTE(bytes, rows, cols) tr_pool_trace_note((bytes), (rows), (cols))
+void tr_pool_trace_note(uint64_t bytes, int64_t rows, int64_t cols, int64_t in);
+#define TR_TRACE_NOTE(bytes, rows, cols, in) tr_pool_trace_note((bytes), (rows), (cols), (in))
 #else
-#define TR_TRACE_NOTE(bytes, rows, cols) ((void)0)
+#define TR_TRACE_NOTE(bytes, rows, cols, in) ((void)0)
 #endif
 
 /* ---- one thread of one's own, and a monitor to talk to it ----

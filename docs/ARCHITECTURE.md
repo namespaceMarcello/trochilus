@@ -21,8 +21,11 @@ Where each ported file comes from: `docs/ORIGINS.md`.
 2. **One binary for all CPUs.** Kernels chosen at runtime (cpuid / hwcap), not with `-march`:
    the same executable uses AVX-512 VNNI where it exists and AVX2 or scalar elsewhere. Neither
    colibri nor ds4 does this.
-3. **Scalar defines the numbers.** Every SIMD or assembly variant sums in the same order
-   and is **bit-identical** to scalar, verified by tests. A non-identical variant does not enter.
+3. **Scalar defines the numbers.** F32, F16, Q8_0 and Q6_K follow the lane contract: every SIMD
+   or assembly variant sums in the same order. Q4_K is exact (since 2026-09-26): the input in 32-bit
+   block fixed point, sums of exact integers in any order, then fixed f64 steps (kernels.h
+   `q4x_*`), correctly rounded in 96-99% of outputs. Either way every variant is **bit-identical**
+   to scalar, verified by tests. A non-identical variant does not enter.
 4. **Zero dependencies in the core**: libc, system threads. No OpenMP (on macOS and MinGW it
    is an extra library), no third-party libraries. GPU backends are modules loaded at runtime:
    the core starts even where CUDA or Metal are absent.
@@ -201,11 +204,15 @@ remain.
   cores, Windows places two on the same physical core and prefill loses 30% (`docs/MEASUREMENTS.md`
   §Where do threads go). **Threads per phase**: a long pass (the prompt) is bound by compute
   and uses the whole pool; a short pass (decode, short draft: up to 4 rows) is bound by weight
-  reads and uses the first n slots of the pool. n is not a constant: every session **measures**
-  it on its first one-token passes (whole pool, half, quarter, never below 4 threads), keeps
-  the tightest within measured noise on those same passes, remeasures every doubling of context,
-  and changes only after two concordant measurements; `--decode-threads` forces it. Width
-  changes speed, never a logit (`docs/MEASUREMENTS.md` §Threads per phase).
+  reads and uses the first n slots of the pool, its matmuls cut by weight rows and balanced (a
+  verify pass of 2-3 rows too, each weight row read once for all its rows: §The short verify pass
+  at its bytes; for Q4_K the W16 panel's rows brought ahead and a 2-row group by pairs: §The Q4_K short
+  passes). n is not a constant: every session **measures** it for each kind of short pass, the
+  one-token passes (whole pool, half, quarter, never below 4 threads) and each size of verify pass
+  on its own (the narrowest of those widths skipped: more rows, more work a byte read), keeps the
+  tightest within measured noise on those same passes, remeasures every doubling of context, and
+  changes only after two concordant measurements; `--decode-threads` forces them all (§The verify
+  passes' own width). Width changes speed, never a logit (`docs/MEASUREMENTS.md` §Threads per phase).
 - **GPU**: all of one token in a single command batch, tensors stay on device (ds4). Today only a
   decode token's attention runs there, a call per layer, same bits (`src/backend/gpu_attn.h`); a
   laptop GPU sleeps in the CPU's gaps between layers unless kept awake (`docs/LESSONS.md` #153).
@@ -217,13 +224,14 @@ remain.
 | Level | What it compares | Where |
 |---|---|---|
 | kernel | every SIMD/asm variant against scalar, bit by bit, on random input | `tests/test_kernels.c` |
+| Q4_K's integer definition | the scalar definition against one written again from the math in the test (the shift found by trying, nearest-even by `nearbyint`, T and M in int64, the f64 steps; blocks of zeros, of subnormals, holding a NaN or an infinity); every tier's prepared rows and W16 panels byte for byte, its pairs and tiles of every width against scalar's dot_row; 26 mutations seen red | `tests/test_kernels.c` (`test_dot_row_q4_k`, `q4x_diffs`), `tools/mutate_q4x.sh` |
 | tier | the whole engine under every tier (`TR_CPU_MAX`): model test, and logits byte-identical across tiers, threads, `-b` | `make tier-check` (`tools/tier_check.sh`) |
 | tier is used | same numbers do not say which code ran: every hot entry of every tier is its own function, per weight type; and in the engine products counted on the active table, type by type, are exactly rows × tokens | `tests/test_tier_used.c`, also under every tier in `make tier-check` |
 | tiny model | greedy tokens **identical** to transformers (f32, f16); logits within tolerance per position; q8_0 report only, because reference is not quantized | `tools/make_tiny_olmoe.py` → `tools/oracle.py` (`make oracle`) |
 | real model | true OLMoE cut to 2 layers against transformers on same Q8_0 weights dequantized: identical tokens, logits within 1e-3 | `make oracle-real` (skipped without the model) |
 | exact optimization | logits of true model before and after, byte-identical, with multiple thread counts | `trochilus logits` + `cmp`, by hand |
 | prefill in blocks | logits and cache with many tokens per pass identical bit-for-bit to one token per pass: `n_batch`, split calls, threads, f32/Q8_0, rewind | `tests/test_prefill.c`; `tools/oracle.py` (`logits -b 3/64/whole` to byte) on tiny and OLMoE 2-layer |
-| threads per phase | every logit byte-identical to one thread only with measured width and every forced width; the narrowed pool uses only the first n workers; choice among widths on fake times | `tests/test_phase.c`, `tests/test_base.c` (`test_pool_active`), `make tier-check` (`--decode-threads`) |
+| threads per phase | every logit byte-identical to one thread only with measured width and every forced width; the narrowed pool uses only the first n workers; choice among widths on fake times, each size of verify pass on its own | `tests/test_phase.c`, `tests/test_base.c` (`test_pool_active`), `make tier-check` (`--decode-threads`) |
 
 ## Model scale
 

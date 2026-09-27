@@ -1,0 +1,18 @@
+#!/usr/bin/env python3
+"""todo.py — a command-line to-do list stored in a JSON file."""
+import argparse
+import json
+import sys
+from pathlib import Path
+
+STORE = Path.home() / ".todo.json"
+
+
+def load() -> list:
+    if not STORE.exists():
+        return []
+    with STORE.open(encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save(items: list) -> None:

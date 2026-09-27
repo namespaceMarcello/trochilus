@@ -1,0 +1,11 @@
+// server.js — an Express API for a list of books.
+const express = require('express');
+
+const app = express();
+app.use(express.json());
+
+let books = [];
+let nextId = 1;
+
+// GET /books — every book, optionally filtered by ?author=
+app.get('/books', (req, res) => {

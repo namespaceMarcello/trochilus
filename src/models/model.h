@@ -191,9 +191,16 @@ const tr_route_trace *tr_session_route_trace(const tr_session *s);
  * 8 at 512 tokens and lose 4% at 2048) and with the heat, so the session measures again once
  * tr_session_pos crosses the next power of two from TR_DECODE_TUNE_REMEASURE_POS up (recomputed
  * from the current position every time, so a rewind lowers it back down too), or after
- * TR_DECODE_TUNE_REMEASURE_KEPT one-token passes if a switch is still waiting on its second vote.
- * Until the first choice is in, other short passes use the whole pool. The width changes the
- * speed, never a logit.
+ * TR_DECODE_TUNE_REMEASURE_KEPT passes of its size if a switch is still waiting on its second vote.
+ * Every size of verify pass has a measurement of its own, the same in every step: the passes of n
+ * rows with a logit row each (a draft of n - 1 tokens verified) are timed from the first one, on
+ * every width but the narrowest (a pool of 16: 8 and 16; a pool of 8: nothing to measure, the
+ * whole pool), because a verify pass does more work per byte read than the decode and fills the
+ * bus with more threads: on the reference machine one Q8_0 row wants 4 threads and three rows 8,
+ * and the narrowest width never won a verify pass while a probe on it cost a Q4_K pass +60%
+ * (docs/LESSONS.md #228, #236). A short prompt (one logit row), or a pass longer than TR_DECODE_ROWS but
+ * still short (the environment's TR_DECODE_ROWS), takes the decode's width, and the whole pool until
+ * it is in. The width changes the speed, never a logit.
  * TR_DECODE_ROWS in the environment, read at load, moves where a short pass ends, for
  * measurements (0: no pass is short, which is the engine before threads per phase). */
 #define TR_DECODE_ROWS 4                  /* what the dense kernel covers with one read of a weight row */
@@ -206,9 +213,13 @@ const tr_route_trace *tr_session_route_trace(const tr_session *s);
 /* Forces the threads of every short pass of every session of this model (clamped to the
  * pool), measuring nothing; n_threads <= 0 goes back to measuring. */
 void tr_model_set_decode_threads(tr_model *m, int n_threads);
-/* Threads the short passes of this session run on: the forced number, or the measured one, or
+/* Threads the one-token passes of this session run on: the forced number, or the measured one, or
  * 0 until the session has measured for the first time. */
 int tr_session_decode_threads(const tr_session *s);
+/* The same for the verify passes of n rows, n from 1 to TR_DECODE_ROWS: the forced number, or the
+ * width their own measurement chose (0 until it is over); 0 for any other n (a long pass, or past
+ * the short passes). */
+int tr_session_rows_threads(const tr_session *s, int64_t n);
 /* Threads the last eval of this session ran on (0 before the first). */
 int tr_session_last_threads(const tr_session *s);
 /* What every measurement of this session decided, oldest first: the position it ended at, the

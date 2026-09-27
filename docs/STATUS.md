@@ -135,17 +135,11 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
   stands, for prefill. 32 threads (SMT) sink: prefill −33%, decode −90%. Pin holds under loaded
   machine (+19% on prefill, 3 rounds). On macOS no pin (cannot), and a mask already set on the
   process is respected. `TR_POOL_PIN=0/1/2` for comparisons.
-- 2026-09-18 — **On a MoE one extra draft row is not almost free**: measured by zone, native
-  (`docs/MEASUREMENTS.md` §Revision), costs **17.6 ms** if alone and **13.7 ms** each if eight,
-  against 31.3 of a pass. Cost is in experts (91% and 61%): draft row reads 2.3–4.7 new experts
-  per layer out of 8 and time follows those MiB; dense multiplications free for first extra row.
-  Speculation break-even at **44–56%** drafts accepted, not 15% measured in container (LESSONS #59).
-  So adaptive draft not just shortens: after an all-wrong draft **stops** for 1, 3, 7, 15, then
-  16 steps (LESSONS #60). Remeasured with A/A control, 8 rounds: worst case **0.953×** (previous
-  3 rounds said 1.01×: wrong, LESSONS #66), best case **1.175×** (1.34× with `--spec-fixed`,
-  3 rounds, for those rewriting a file). «Worst case as without» **not reached**, and pause
-  constants do not reach it (replay with measured costs: at most 0.97–0.98×): `--spec`
-  remains **off by default**.
+- 2026-09-18, repriced 2026-09-27 — **On a MoE a draft row is not free**: its new experts (2.3–4.7
+  of 8 a layer) are its price. 09-18: 17.6 ms alone, 13.7 each at eight, of a 31.3 ms pass; today
+  (`tools/row_price.sh`, MEASUREMENTS §The post-it taken apart) 0.50–0.72 of a pass at 2–3 rows
+  (above their bytes: LESSONS #224), 0.23–0.30 at 9. The adaptive draft stops after an all-wrong
+  draft for 1, 3, 7, 15, then 16 steps (LESSONS #60). `--spec` stays **off by default** (point 1).
 - 2026-09-18 — **When a difference is a conclusion**: comparisons with `tools/ab_modes.sh` (8
   rounds, rotating order, one mode given twice as A/A control). A single A/A pair is noisy (same
   decode: 0.5% in one block, 2.2% in another): threshold is the worst A/A of the session for that
@@ -172,7 +166,9 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
   noise **of the pair** (it and fastest), with more passes on the two, up to 6, if margin decides;
   remeasures at every context doubling (from 32) and changes only with two agreed measurements
   (second arrives at most after 128 passes). The `threads:` line prints choice history. Remains
-  validation on real model (first of next steps).
+  validation on real model (first of next steps). **2026-09-27**: each size of verify pass measures its
+  own width the same way, the narrowest skipped (question 82: a 3-row pass wants 8 where the decode
+  wants 4).
 - 2026-09-19 — **KV holds positions of one head in a row** (`src/kv/`, first piece of KV layer;
   `docs/MEASUREMENTS.md` §Decode at long context). This machine's RAM gives **~57 GB/s** read
   with 4–6 threads and beyond drops (question 4, remeasured on clean machine: the «~54» of this
@@ -300,37 +296,30 @@ the x8 and two-row kernels; the Q4_K decode level with llama.cpp at 4 threads, e
 (decode 1.04-1.08× at 8 threads); the softmax's and SwiGLU's exp in a vector (prefill 1.05×); the
 race of 14:28, a free machine: decode level at 512, theirs 1.04× at 2048. Closed as no: SMT, gate/up
 interleaved, 2 MB pages, drafts in the high bits, question 75's 8-bit draft KV out of sample;
-- **2026-09-26 evening: phase-major, the prompt's matmul at the float's peak with the same bits**
-  (MEASUREMENTS §Phase-major; LESSONS #207-#213; the thinker's idea, two agents bouncing rounds). The
-  lane contract's lane p is a chain in time, so sixteen weight rows run as SIMD lanes: a panel per 16
-  rows (Q4_K from a byte transpose on VBMI, Q8_0), the inputs interleaved once a call, tiles of 4..24
-  rows cut evenly, items (group, 16 rows, chunk) with stealing (kernels.h `pm_*`,
-  `tr_matmul_grouped_s`). The tile 164.7 GFLOP/s a core, 98.6% of the no-FMA peak. Native, free
-  machine, alternated: **Q4_K prompt at 4 threads 140 → 218-223 tok/s** (llama.cpp 222 in the
-  container), 8 threads 241 → 353, 16 threads 369 → 575; **Q8_0** 8 threads 267-287 → 374-377, 16
-  threads 390-419 → 550-569; the decode unchanged; the real model's logits byte-identical at 1, 4, 8
-  and 16 threads. E24 (exact integers, 3 digits of 8 bits) was built and measured first: as fast, not
-  more exact than F32 on the real inputs (per 32: 41% of outputs worse), set aside;
-- **2026-09-26 night: the orchestration under test, exact sums at the float's speed** (LESSONS
-  #213-#216; MEASUREMENTS §Exact sums at the float's speed). `test_matmul_grouped_s` found a heap
-  overrun (a no-pool call inside a larger pool's body) and a guard hole, both fixed; `tools/mutate_pm.sh`
-  17 of 17 red; `TR_CPU_MAX=avx512-novbmi` runs the float-transpose panel. The challenge, with the
-  thinker in rounds: **W16** (Winograd's inner product in 16-bit words, the sub-block scale inside the
-  weight word sc·q, int32 lanes that wrap and are exact over a 64-column window, windows into int64 by a
-  biased even/odd split) is bit-identical to an order-free integer definition (E32-class) and runs
-  **167.2 GFLOP/s-eq at 4 tokens a tile against the float tile's 164.7 at 24** (the float at 4: ~138).
-  The RTX 4070's int8 tensor cores: 59.1 exact T-MAC/s against the float contract's 3.29 (E32 4.5x
-  there). The experts' cold panel costs 2.0-2.2x a hot one alone, but prefetching the next item's rows
-  gave 0.990 (noise): reverted. **Question 77 for Marcello: E32 as the definition (every byte changes,
-  toward the exact math), with question 74.** `make quick` green; `make check` waits for 12 GB free;
-- **next, one piece at a time**: `make check` when Windows has 12 GB free; if Marcello says yes to 77,
-  W16 into the engine for Q4_K (its panel and the activations' digits timed first, then the experts
-  zone A/B; the 32-row tile for the broadcast loads, +12% on the loop); the race in the container (Q4_K
-  at 4 threads, Q8_0 at 8 and 16: `tools/race_q4k.sh`, `tools/race_llama.sh`); the interleave shared
-  by gate/up and by q/k/v; Q6_K's panel; questions 74 (**does the GPU count?**) and 76; the Q4_K race
-  at long context.
-  Queued: tile-block stealing in the prompt's matmul, prefill at 4 threads, vector scales on AVX2,
-  question 68, M3's dense weights on the GPU. **For Marcello, 59 and 60**. 61 after M4.
+- **2026-09-26: phase-major and exact Q4_K** (MEASUREMENTS §Phase-major, §Exact sums at the float's speed;
+  LESSONS #207-#222): sixteen weight rows run as SIMD lanes in the lane contract's order, the tile 164.7
+  GFLOP/s a core (98.6% of the no-FMA peak); Q4_K in exact integers (W16 panels and tiles, kernels.h
+  `q4x_*`) at the float's speed; the races for the README (container, free machine): Q4_K 4 threads prompt
+  level with llama.cpp (220.0 against 220.6), decode 1.03x; Q8_0 16 threads prompt 1.33-1.42x. The
+  GPU-against-CPU decode A/B is still owed at a free machine with no writes (LESSONS #222).
+- **2026-09-27: the post-it, the short verify passes at their bytes** (MEASUREMENTS §The post-it taken
+  apart to §The verify passes' own width; LESSONS #223-#236): at 09-27's prices a calibrated gate gives
+  1.077x on new code, and with a real context (question 81) the lookup 1.067x, the gate 1.146x. **Question
+  78**: Q8_0's short pass on phase-major's balanced items and `dot_row_xt` (8 threads: 3 rows 62.7 -> 43.0
+  ms, 2 rows 41.3 -> 35.9); Q4_K's W16 panel read its 16 rows on demand (#233): each row's block s + 2 and
+  the next item's rows brought ahead, a 2-row group by `q4x_dot2` pairs: 3 rows 28.00 -> 26.53 ms, 2 rows
+  22.92 -> 22.19, one row and the prompt unchanged. **Question 82**: every size of verify pass measures its
+  own width, the narrowest skipped: on a pool of 16 Q8_0's verify passes 0.961-0.966 of the whole pool's time (0.943-0.981 of the decode's width's), Q4_K 0.982-1.005, 8 threads picked everywhere (measuring every width lost on Q4_K: #236). The decode's change-short (before the Q4_K change): logits
+  identical, decode 0.987-1.005 (A/A 0.993-1.014). `make check` green; `tools/mutate_tune.sh` 23 of 23 red under ASan.
+- **next, one piece at a time**: road (c), a Q4_K weight row decoded once for 2-3 prepared tokens (the
+  dense's +0.5-0.9 ms a row; the design in `build/prompt-next-postit.md`); the rest's +0.35-0.41 a row
+  (q, k, v prepared three times); the row price at 2048 and 4000 positions; #229; questions 79, 80; the gate
+  in C; `--spec` by default (Marcello). Then: the GPU A/B at a free machine with no writes; the engine's
+  deletion series of a W16 item (0.83 of the microbench); the prep once a token for gate and up; AVX2's W16
+  tile; `dot_row2` is dead code (remove it with `tools/mutate_row2.sh`'s lines); `tests/bench_q4k_genome.c`
+  sequences a kernel that is gone. Queued: questions 74 (**does the GPU count?**) and 76; the interleave
+  shared by gate/up and by q/k/v; Q6_K's panel; tile-block stealing; question 68; M3's dense weights on the
+  GPU. **For Marcello, 59 and 60**. 61 after M4.
 
 **Night of 2026-09-24**: the gate 428 → 238 s; **M2: Q4_K and Q6_K** exact (Q4_K decode 1.5× the
 Q8_0; Q4_K_M runs).
@@ -411,14 +400,11 @@ forces width** (`--decode-threads`), never `auto`: no conclusion rests on unvali
    runs, at most one 4 → 8 change in long run. Logits do not change (result does not depend on
    threads). If criterion falls, before touching a constant look at pass times of each measurement
    (added to history).
-1. **Turn on `--spec` by default?** Condition «worst case as without» **not met**: 0.953× where
-   model invents, 1.175× where copies (A/A, 8 rounds). Changing pause constants not enough (replay
-   with measured costs: at most 0.97–0.98×); lever is draft row cost, which for short drafts at
-   91% in experts (question 12). Marcello decides: on accepting −5% / +17.5%, or off as today.
-   With threads per phase both ratios remeasured: `--spec 0` takes 9% from tight decode, worst of
-   `--spec 8` is 6.4%, best 2%. **Before deciding** (Marcello, 2026-09-19: «branch that avoids
-   −5 and keeps +17»): pause already that branch, and −5% is cost of finding it wrong; path is
-   decide before trying, from match length (question 32: count without timer, then replay).
+1. **Turn on `--spec` by default?** Condition «worst case as without»: 0.953× on new code in 09-18's
+   A/A; **2026-09-27** at today's Q4_K prices the replay gives the adaptive lookup 1.014× on new code
+   and a calibrated gate 1.077× (1.067× and 1.146× with a real context, question 81; on Q8_0 after
+   question 78 1.040× and 1.103× on new code), the copy at a fixed draft of 8 1.78–1.95× (native,
+   code-edit): a native A/B on new code first (after Q4_K's short groups), then Marcello decides.
 2. **Measured width, on other machines** (question 31, after point 0): `sh
    tools/threads_phase.sh widths` and `sh tools/decode_context.sh widths` on different machine, as
    soon as one available (4–8 cores, more memory channels, Apple Silicon no pin, P/E cores).

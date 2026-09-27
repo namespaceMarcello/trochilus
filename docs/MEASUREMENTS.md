@@ -195,6 +195,11 @@ decides | — | — |
 | 74 | The draft on the GPU: the Q8_0 high-nibble planes and the draft's KV in VRAM, the CPU verifying from RAM, overlapped (the idea bounce of 2026-09-26, `build/entangled/bounce.md`): ~2.2x overlapped, ~1.7x serial in time (model). For Marcello: does the GPU count in the race (the GPU attention did) | a ~50-line CUDA probe timing one batch-1 draft step (plane 635 MiB + KV halves 256): pass <= 6 ms a draft token, fail > 15 ms | the draft's 891 MiB a draft token off the RAM bus |
 | 75 | ~~A draft KV in int4 (or int8) written once per position, and a draft head of the top ~16k rows~~ **Measured 2026-09-26** (§The draft's KV in 8 and 4 bits): the 8-bit copy changes no draft token and lifts every cell 0.02-0.14x; out of sample prose 0.93-1.09x, Italian 0.95-1.12x, code 1.14-1.26x; the 16k head covers 85-93% of the exact tokens: out. Prose does not pass 1.1x: the draft's weight plane is what is left | — | — |
 | 76 | Why does a 4-bit draft KV agree with the exact model more often than a 16-bit one (18 flips won, 3 lost, mostly where the exact margin is under 1 nat)? A guess: noise on the old keys inflates their softmax weight (Jensen) against the last 64 kept at 16 bits | kv4 with no positions kept at 16 bits; Gaussian noise on the 16-bit draft's old keys | a draft that is cheaper and closer at once |
+| 78 | The verify pass of 2-4 rows at its bytes (§The post-it taken apart): while no group reaches 4 rows the grouped matmul cut by weight rows and balanced (every input row of a group against a weight row while it is in cache), a kernel decoding a weight row once for 2-3 tokens. **Q8_0 done 2026-09-27** (§The short verify pass at its bytes: 3 rows at its bytes, a row 0.31 of a pass; 2 rows 0.43). **Q4_K 2026-09-27** (§The Q4_K short passes: the W16 panel's rows brought ahead, a 2-row group by `q4x_dot2` pairs: 3 rows 28.0 -> 26.5 ms, 2 rows 22.9 -> 22.2 at 8 threads); left: the dense's +0.5-0.9 ms a row (road (c): a Q4_K weight row decoded once for 2-3 prepared tokens) and the rest's +0.35-0.41 | `sh tools/row_price.sh` before and after (2, 3, 5, 9 rows), also with a 2048 and 4000-position prefix (the context is modelled today); then `tools/draft_gate_sim.py` | new code's drafts are short: a row costs 0.50-0.72 of a pass today, 0.31-0.36 at its bytes; every draft source gains |
+| 79 | A row that costs no bytes: the model restricted to the experts the pass already reads (the union of its exact rows'), as a draft, or as a filter of the gate's draft before its exact rows (two-stage verification) | a `draft_probe` variant: agreement with the exact argmax by margin, restricted to the union of 1 and of 2 exact rows | the model's knowledge of names at ~0.03-0.05 of a pass a row, where the table knows 22% of them |
+| 80 | Drop a draft row mid-pass when the main row's intermediate state says its draft is wrong (logit lens on the draft's and the gate's candidates' rows of the head, a few KB) | per layer, the draft's logit-lens rank among the candidates on the replay's positions | a wrong row then costs its new experts only up to the layer where it is dropped |
+| 81 | The drafts on code written with a real context: a function of a real file continued mid-file with the rest of the file and its neighbours in the prompt, and a table built from the user's own repository. **Answered 2026-09-27** (§Drafts with a real context): the engine's lookup 1.067x, the gate 1.146x at the measured prices (1.27-1.32x with the context modelled), the repo table adds nothing to the gate; left: the row's price measured at ~3000 positions | the 18-prompt pipeline (`tools/draft_table_gen.sh`, `tools/draft_gate_sim.py`) on prompts cut from this repo's `src/` and `tools/`, the table from the repo minus the file under test | the 18 prompts are file beginnings (~100-200 positions): real use has thousands, and the context sources are the best drafters measured |
+| 82 | The short passes' width when every pass drafts (LESSONS #228): the tuner probes one-row passes only, so a session with a draft on every pass runs its 2-4-row passes on the whole pool. **Answered 2026-09-27** (§The verify passes' own width): every size of verify pass measures its own width, the narrowest skipped; on a pool of 16 Q8_0 0.961-0.966 of the pool, Q4_K 0.982-1.005, 8 threads picked everywhere; left: the probes' cost on long sessions (a re-measure every doubling) | the passes of 1, 2 and 3 rows at 4, 8 and 16 threads forced (`--decode-threads`) on a pool of 16, alternated; then the tuner fed the short passes too | after question 78 the short passes are still 1.04-1.09x slower at 16 threads than at 8 |
 
 Reference machine: Ryzen 9 7940HX (Zen 4, 16 core / 32 thread, AVX-512 VNNI/BF16), 31 GB
 RAM (2×16 GB DDR5-5200), NVMe Micron 1 TB, GPU RTX 4070 Laptop 8 GB and Radeon 610M (not used
@@ -4324,6 +4329,457 @@ F16 scale cannot ride in a 16-bit word, ~0.9×). Where int8 matrix units exist (
 here; AMX, SME, NPUs elsewhere) the exact integer definition is also the fast one, and the float contract
 cannot use them. Order-free sums also make any split, width or device give the same bits.
 
+**W16 on the engine's own layouts: stage 1 of question 77's plan (Marcello's ok, 2026-09-26 night).**
+Each piece timed alone before building anything in `src/` (`build/e24/wino/w16.h`, `w16_panel.c`,
+`w16_digits.c`, `w16_tile.c`, `zone_model.py`; predictions in `build/e24/predictions.txt`). One change to
+the prototype's layout: the Winograd pairs are the low and high nibble of one quant byte, columns
+(64c + i, 64c + 32 + i), so the panel needs no nibble shuffle and the input's digits stay in natural
+column order (the tile broadcasts the dwords at 64c + 32 + 2u and 64c + 2u). The panel per super-block:
+d, dmin and the eight m_j as f64 (even rows, then odd: the order the windows' int64 split gives), then
+four windows of a row term (int32, the even rows biased by 2^31) and 16 pairs of 16-bit weight vectors
+sc·q: 9 728 bytes, 76 KB for 16 rows × 2048 against the float panel's 128 KB. Native, one core, best of 7,
+background 1.7-2.0:
+- **the panel** (a 16 × 32-byte transpose in 24 `vpermt2b` a window, the nibbles widened by `vpmovzxbw`,
+  times the rows' scales by `vpmullw`, each window's row term by `vpdpwssd`): byte for byte its scalar
+  definition over 64 panels; hot **1.10 µs** against the float VBMI panel's 1.83 (0.61×; predicted
+  0.45-0.65 µs: wrong), **cold 1.95 against 3.76-3.81 (0.52×)**. Its deletion series: the row term 18%
+  (0.90 without it), its 16-deep `vpdpwssd` chain split in four 0%;
+- **the input's digits** (a shift per super-block by `vscalefps`, X by `vcvtps2dq`, V1 = round(X/64591)
+  in f64, V0 by `vpmulld`, the windows' token terms by one `vpdpwssd` each, the sub-blocks' exact sums in
+  f64): its scalar definition on every token (a zero block, a block of subnormals, a large negative
+  maximum); **0.65 µs a token of 2048** against the float interleave's 0.23 (2.8×). Computed once a
+  token for gate and up (shared by the token's 8 experts) and once a (token, expert) for down: 0.5% of
+  the experts' work;
+- **the tile**, 16 rows × T tokens on those two, the windows into int64 by the biased even/odd split:
+  **0 of 1 536 outputs differ** from the definition computed straight from the Q4_K bytes and the floats
+  (T = 1..4, the same special blocks). GFLOP/s-eq, the panel in L2:
+
+| | T = 1 | 2 | 3 | 4 | 8 | 12 | 24 |
+|---|---|---|---|---|---|---|---|
+| W16 tile | 122.2 | 156.0 | 165.6 | **168.2** | | | |
+| float tile | | | | 127.2 | 140.6 | 155.9 | 161.5 |
+
+- **the experts zone** (d): OLMoE's real routing (32 (layer, pass of 512) pairs), items (expert, 16 rows)
+  as the engine cuts them, cold panels, the tiles' measured rates: float 141.1 GFLOP/s-eq a core (the
+  engine measures 124-127, 0.89 of the model), W16 155.8: **1.10× on the experts zone**, and at least as
+  fast on the dense projections (168.2 at T = 4 against the float's 161.5 at T = 24). The estimate wins:
+  stage 2 (the definition in the kernels, prompt and generation together) is next.
+
+**Stage 2: Q4_K's definition is the integer one, in the engine (2026-09-26 night).** kernels.h `q4x_*`: an
+input row prepared once (`q4x_prep`), the decode's pairs (`q4x_dot2`), the W16 panel and tiles of 1-4
+rows (`q4x_panel`, `q4x_tile`); the scalar definition, AVX-512 (VBMI, VNNI, DQ: W16) and AVX2 (by rows,
+also the avx512 tier without VBMI); the driver `matmul_q4x` prepares every input row once, groups of 2
+input rows or more take panels and tiles, one-row groups the pairs. The float Q4_K kernels are gone
+(419 lines). Exactness: the real model's logits identical at 4 and 16 threads over 600 positions, and
+position 599 the same by one-token passes and by passes of 64; the 2-layer cut against its reference,
+max |logit diff|, float → integer: Q4_K 1.50e-05 → 1.11e-05 (dante), 1.850e-04 → 1.835e-04 (long);
+Q4_K_M 1.29e-05 → 1.05e-05, 1.96e-04 → 1.94e-04 (every greedy token the same). Speed, native, Q4_K,
+`tools/ab_zone.sh` HEAD against W16, 6 alternated pairs, 4 threads:
+
+| | predicted | measured |
+|---|---|---|
+| the prompt of 512, experts zone after/before | 0.88-0.93 | 0.992 [0.987-0.997] |
+| the prompt of 512 | 0.90-0.95 | 1.001 [0.995-1.008] |
+| the decode's matmul zones, first `q4x_dot2` | 0.95-1.02 | 1.080 [1.064-1.102] |
+| the decode's matmul zones, final `q4x_dot2` | 0.95-0.99 | **1.006 [0.989-1.016]** (decode 1.004) |
+
+- **The decode's pair, sequenced** (`build/e24/wino/dot2_ram.c`, `dot2_genome.c`: two rows of 2048 in
+  L1, and 256 MB of rows from RAM): the first kernel 188 ns a pair against the float's 172 (1.09×; RAM
+  1.09× on one thread, 1.12× on four); the block end's four reductions joined in f64 (exact: integers
+  under 2^53) 177 (1.03×); its chains split in two 183 (worse: not latency, reverted). The deletion
+  series: no header pre-pass −16%, no quant loads and widening −11%, no nibble split −6%, no `vpmullw`
+  −4%, no digit loads −3%, the scales' broadcasts 0. The headers of both rows in one ymm (a row a
+  128-bit lane) and d, dmin of both by one `vcvtph2ps`: **161.6 ns = 0.937× the float's** hot, RAM
+  0.954× on one thread and 0.971× on four (51.0 against 49.5 GB/s); in the engine level (above).
+- **The prompt did not gain**: per item (expert, 16 rows; 68 tokens on average, not the median's 28)
+  the model gives W16 28.5 µs and the float 31.5; the engine takes about 34.5 for both. The float's
+  tile keeps 0.90 of its microbench rate in the engine, W16's about 0.83: the microbench fed the tile
+  the same four tokens every call, the engine feeds it four others each time (their digits from L2 or
+  L3), and at T = 4 the 76 KB panel is read again every four tokens (the float's 128 KB every 24).
+  Not yet measured piece by piece in the engine (the next step: a deletion series of the item there).
+
+## The race for the README (2026-09-26 night)
+
+Both engines in the container on the same GGUF, a free machine (the guard's load 2.03-2.12 before the
+first series, 2.09-2.49 after the last), each engine two series of 5 runs alternated with the other's
+(`tools/race_llama.sh`; the Q4_K rows with `RACE_MODEL=<Q4_K> RACE_PROMPTS=512 RACE_THREADS=4`), the
+median of the 10 runs. `tools/race_q4k.sh`, which loads the Q4_K and the Q8_0 file in turn, ended twice
+as NOT FREE (2.51, 3.02) with Windows' Memory Compression at 0.49 right after its last series: its two
+models (11.6 GB) press the memory; one model at a time left 0.25 (LESSONS #217).
+
+| tok/s | llama.cpp | Trochilus | Trochilus / llama.cpp |
+|---|---|---|---|
+| Q4_K, prompt 512, 4 threads | 221.2 (221.0 / 221.4) | 215.0 (216.6 / 214.7) | 0.97 |
+| Q4_K, generation after it, 4 threads | 51.2 (51.1 / 51.6) | 52.6 (52.8 / 52.6) | 1.03 |
+| Q8_0, prompt 512, 16 / 8 threads | 370.7 / 260.2 | 492.9 / 363.6 | **1.33 / 1.40** |
+| Q8_0, prompt 2048, 16 / 8 threads | 341.3 / 239.1 | 485.2 / 347.8 | **1.42 / 1.45** |
+| Q8_0, generation at 512, 16 / 8 threads | 33.7 / 33.1 | 32.7 / 33.1 | 0.97 / 1.00 |
+| Q8_0, generation at 2048, 16 / 8 threads | 27.7 / 27.2 | 26.4 / 26.3 | 0.95 / 0.96 |
+
+**The Q4_K rows again on the exact engine** (Q4_K in integers, §Exact sums at the float's speed, stage 2;
+the same command, 2026-09-27, background 2.44 before (a transient python at 1.00), 2.00 after): prefill
+llama.cpp 220.6 (219.9 / 221.2), Trochilus 220.0 (219.5 / 220.1), **1.00**; decode 50.9 (51.0 / 50.1)
+against 52.4 (52.1 / 52.8), 1.03. These are the README's Q4_K rows.
+
+Predictions (written first): the Q4_K prompt 0.97-1.01 (0.97, the bottom), its decode level (1.03);
+the Q8_0 prompt at 16 threads 0.95-1.10 (**1.33-1.42: wrong, phase-major scales to 16 threads in the
+container too**), at 8 threads 1.2-1.35 (1.40-1.45); the decode level at 512 and theirs 1.04× at 2048
+(1.00 and 1.04: right). What is left to llama.cpp: the Q4_K prompt at 4 threads (their activations in
+8 bits; W16 is the exact lever, above) and the decode at 2048 (the KV's bytes, §The attention against
+llama.cpp's).
+
+## A draft without a model: an n-gram table and a grammar on new code (2026-09-27)
+
+**The idea** (Marcello's thread on the quantum spirit, 2026-09-26/27). Moving data costs, computing
+does not: every token moves ~1 GB of weights from RAM, the same bytes every time, known in advance,
+while the new information of a token is a few KB. So something small that lives in the cache guesses
+the next tokens, and the exact model verifies them all in one pass: several tokens for one trip of the
+weights, and the same bits (`make spec-check`). It need not be a network: a table of the token
+sequences most frequent in public code plus the language's grammar, built like q/kdb+ (its ~800 KB
+interpreter lives in L2). The question: how often does it guess on **new** code, where the prompt
+lookup gets 13% and loses (0.60x fixed, 0.953x adaptive, §Adaptive draft)? Decision rule written
+first: near 50% accepted build it, 25-50% try a confidence gate, below 25% stop.
+
+**How.**
+- Text: the greedy continuation of 18 new-code prompts in 9 languages (`bench/prompts/new-code`: C,
+  Python, JavaScript, TypeScript, Go, Rust, shell, SQL), 256 tokens each, 4 608 tokens, Q4_K, native,
+  8 threads (`sh tools/draft_table_gen.sh`, ~20 min).
+- Table: 78 MiB of public code already on this machine (llama.cpp, ds4, colibri, the venv's
+  site-packages, node_modules, Go, shell, SQL; no Rust), 26.7 M tokens by the engine's tokenizer
+  (`tools/draft_corpus.py`, then `tokenize --batch`). Contexts of 4 down to 1 token, each with its most
+  frequent next token and that token's share (the confidence); pruned to the most frequent contexts
+  within a budget, 16 bytes an entry. The draft chains the table and stops when the product of the
+  confidences falls below a threshold.
+- Replay: `tools/draft_table_sim.py` replays `tr_greedy_step` (fixed and adaptive policies,
+  `src/gen/greedy.c`) with each draft source, the lookup copied line by line from `src/gen/lookup.c`.
+  **Validated**: on three prompts stopped at 200 tokens the replay gives the engine's own counters
+  exactly (129 passes 74/402, 138 passes 62/271, 129 passes 71/376).
+- Speed: a model, from the native Q8_0 costs of §Adaptive draft (a one-row pass 31.3 ms, an extra row
+  17.6 ms alone, 13.7 ms each at eight, linear between). On the prompt lookup it gives 0.68x fixed and
+  0.97x adaptive where 0.60x and 0.953x were measured: slightly optimistic.
+- Grammar: not built, its ceiling measured. A perfect grammar proposes the true next tokens while they
+  are structural (no letter, digit or underscore: whitespace, brackets, operators, punctuation).
+
+| Draft source, new code | Accepted | Tokens a pass | Estimated speed |
+|---|---|---|---|
+| prompt lookup (today), fixed 8 | 16.3% | 1.37 | 0.68x |
+| prompt lookup (today), adaptive | 44.7% | 1.18 | 0.97x |
+| table 4 MiB, proposes only at >= 70% confidence | **64.2%** | 1.10 | **1.01x** |
+| table 16 MiB, >= 70% | 59.8% | 1.13 | 1.01x |
+| table 16 MiB, >= 50% | 40.7% | 1.19 | 0.95x |
+| table 85 MiB, >= 70% | 41.8% | 1.17 | 0.96x |
+| full table (212 MiB), >= 70% | 26.2% | 1.20 | 0.86x |
+| lookup, else the 16 MiB table (>= 50%), adaptive | 45.7% | 1.24 | 0.97x |
+| perfect grammar (ceiling) | 100% | 1.79 | **1.25x** |
+
+Readings:
+- **No cheap draft passes break-even on new code**: the best is the small table proposing only when
+  sure, 60-64% accepted but 1.10-1.13 tokens a pass, 1.01x. The rule's "near 50%" was reached and is not
+  enough: a guess that is right but alone saves less than the extra row costs.
+- **A bigger table is worse**: it knows more long contexts, seen a few times each, whose confidence is
+  noise (the full table at 70% accepts 26%).
+- **Structure is 44.2% of the tokens but scattered between names**: even a grammar that is never wrong
+  gives 1.79 tokens a pass and at most 1.25x. Names are the program's own and no table holds them.
+- Under the adaptive policy every mix lands at 0.96-0.97x, as the lookup alone: where the lookup fails,
+  the table adds nothing.
+- **The lever is the cost of a verified row, not the guess**: a drafted token routes to other experts
+  (§Experts read by a pass of k rows), so a row costs about half a pass. The table at 30% confidence
+  gives 1.21-1.35 tokens a pass: with a row at a fifth of a pass it would pay. The draft inside the
+  exact bits (question 71, 82-98% agreement) remains the strong source; this closes the cheap one.
+- **Reopened 2026-09-27** (§The post-it taken apart): the replay's row price was nine days older than the
+  engine; at today's prices a calibrated gate gives 1.077x on the same texts.
+
+## The post-it taken apart: the verified row's price today, and a gate that pays (2026-09-27)
+
+**The doubt** (Marcello: the section above closed too early). Taken apart with the method: the replay priced
+every pass with the constants of 2026-09-18 (an extra row 17.6 ms alone, 13.7 each at eight, of 31.3), older
+than x8, the balanced experts, phase-major and the exact Q4_K; and already then the extra row's new experts
+ran at 29.8 MiB/ms against the one-row pass's 49.8, "the why is not measured" (§Revisione). Predictions in
+`build/rp/predictions.txt`, written before the run.
+
+**The price today** (`sh tools/row_price.sh`, native, attention on the CPU for every mode, code-edit with the
+draft fixed at 1, 2, 4, 8: every pass then has 2, 3, 5, 9 rows; three rounds alternated after a warm-up;
+background 1.59 logical processors before, 1.57 after: free). Pass ms, then one more row's ms and share of a
+pass; the new experts' MiB/ms (the one-row pass reads its experts at 53.1 on Q8_0, 49.5 on Q4_K):
+
+| rows a pass | Q8_0, 8 threads | new experts | Q4_K, 8 threads | new experts | Q8_0, 16 threads |
+|---|---|---|---|---|---|
+| 1 | 25.71 | | 15.90 | | 26.52 |
+| 2 | 40.41: 14.70 (0.57) | 36.3 MiB/ms | 23.89: 7.98 (0.50) | 41.5 | 45.51: 18.99 (0.72) |
+| 3 | 62.53: 18.41 (**0.72**), dense +6.71 a row | 36.3 | 28.72: 6.41 (0.40) | 42.1 | 69.06: 21.27 (0.80) |
+| 5 | 59.13: 8.36 (0.32) | 47.4 | 38.64: 5.68 (0.36) | 39.0 | 59.81: 8.32 (0.31) |
+| 9 | 79.62: 6.74 (0.26) | 45.4 | 54.03: 4.77 (0.30) | 36.3 | 75.97: 6.18 (0.23) |
+
+- **Long drafts got cheap without anyone measuring it**: at 9 rows a row costs 0.23-0.30 of a pass (0.44 on
+  09-18), and the prompt copy at a fixed draft of 8 on code-edit runs **1.95x** on Q8_0 (38.7 -> 75.5 tok/s)
+  and **1.78x** on Q4_K (62.4 -> 111.2), against 1.34x on 09-18.
+- **Short passes are where the price is wrong, and they are new code's**: 2 rows cost 0.50-0.57 of a pass
+  (0.72 at 16 threads), and on Q8_0 3 rows cost more than 5. Read in the code: while no group reaches 4 rows
+  (a pass of 2-3 rows) the grouped matmul leaves phase-major and the balanced pool
+  (`tr_matmul_one_row_per_group` fails): static chunks cut by index, i.e. by compute, a shared expert's rows
+  split between threads, the new experts at 28-36 MiB/ms; and 3 tokens have no kernel that decodes a weight
+  row once for all of them (x4 and x8 need 4 and 8): +6.7 ms of dense a row on Q8_0. P1 said 12-15 ms
+  (0.45-0.52): 14.7 (0.57), above; P2 7-10 ms at 9 rows: 6.7; P3 0.50-0.60 on Q4_K: 0.50; P4 wrong: 16
+  threads make the short passes worse.
+- The row at its bytes (its new experts at the one-row pass's MiB/ms, 1.2 ms of the rest): 0.36 of a pass at
+  2 rows, 0.31 at 3 (Q4_K): question 78.
+
+**The drafts priced right** (`tools/draft_gate_sim.py`: the texts and the replay of the section above; the
+measured Q4_K passes; the row at its bytes at 300, 2048 and 4000 positions, the KV read once a pass and the
+attention's compute a row: the context is a model, not measured). Each cell: speed against no draft:
+
+| new code, 18 texts | 09-18 price | measured today, Q4_K | bytes, 300 | bytes, 2048 | bytes, 4000 |
+|---|---|---|---|---|---|
+| prompt lookup, adaptive (the engine) | 0.972x | 1.014x | 1.048x | 1.082x | 1.100x |
+| table 4 MiB >= 0.7 (the best above) | 1.013x | 1.027x | 1.046x | 1.059x | 1.066x |
+| llama.cpp's lookup decoding, draft 15 | 0.681x | 0.803x | 0.877x | 0.969x | 1.023x |
+| llama.cpp's lookup decoding, draft 3 | 0.921x | 1.021x | 1.092x | 1.170x | 1.214x |
+| **gate: context cache + table, calibrated, out of sample** | 1.038x | **1.077x** | **1.116x** | **1.170x** | **1.210x** |
+| perfect grammar (ceiling) | 1.252x | 1.334x | 1.427x | 1.510x | 1.556x |
+
+- **The loss is in knowing when, not in guessing**: on the true context at least one cheap source is right
+  on 68.3% of the tokens (structural, 44.3%: the table's top-1 34.3%, the lookup 26.8%; names, 55.7%: table
+  21.6%, word completion from the text 11.5%, lookup 28.7%), while the drafts above add 0.1-0.5 tokens a pass.
+- **The gate**: each source's P(right) by bin (llama.cpp's context cache of the text itself by n, occurrences
+  and share; the table by order and confidence), learned on 9 prompts and scored on the other 9, both ways;
+  token j is proposed while P(tokens 1..j right) > the price of row j. Predictions: 0.99-1.03x at the 09-18
+  price (1.038x), 1.06-1.10x at bytes 300 (1.116x), 1.10-1.15x at 4000 (1.210x): each at or above.
+- **Structure is cheaper to verify**: in the code route traces the second of a pair brings 4.25-4.43 new
+  experts of 8, **2.99 when both tokens are structural** (U(2) 1.37 against 1.52-1.55).
+- **llama.cpp's lookup drafts better than the table** (1.46 tokens a pass at draft 3 against 1.10-1.27): its
+  cache of the text itself, n from 1 to 4, validated by corpus counts. At its default length (16) it loses
+  here as the fixed draft does on ours: a MoE row is not free (ORIGINS row 8).
+- The verdict above came from the price, not from the guess: at today's prices the cheap draft gains 7.7%
+  on new code; with the short pass at its bytes 11.6%, 17-21% at 2048-4000 positions (modelled).
+- Two claims of an outside review (DeepSeek, via Marcello), measured on the same replay: **a grammar that
+  also knows keywords** (9.6% of the tokens) lifts the ceiling from 1.79 to **2.15 tokens a pass**, 1.334x ->
+  1.460x at today's price (1.583x at bytes, 1.774x at 4000; predicted 2.0-2.2 and ~1.45x): a ceiling, since
+  a grammar knows that a keyword may come, not which. **A suffix automaton** on prompt + generated text (the
+  longest earlier match, up to 32 tokens, as one more calibrated source) adds nothing: 1.062x against the
+  context cache's 1.077x (predicted +0.00-0.02x): long repeats are rare in new code, and the engine's lookup
+  already reads the generated text. What the review rightly finds missing: prompts with a real context (the
+  18 are file beginnings), question 81.
+
+## The short verify pass at its bytes (question 78, 2026-09-27)
+
+**The deletion series, by call** (a `TR_POOL_TRACE` build whose notes now name every road and carry each
+call's input rows, LESSONS #226; code-edit with the draft fixed at 1 and 2, 120 tokens, 8 threads, native;
+`tools/token_timeline.py --rows R`; background 2.16 before, 2.64 after: structure). One more row, call by
+call, against the one-row pass, Q8_0:
+
+| call | 1 row | 2 rows | 3 rows |
+|---|---|---|---|
+| experts, gate/up and down | 15.6 ms: 816 MiB at 55 GB/s | +15.7 ms: 1313 MiB at 44 GB/s | +26.6 ms: 1616 MiB at 40 GB/s |
+| q, k, v, o | 5.4 ms at 52.5 GB/s | +1.3 ms (42 GB/s) | **+10.3 ms (18 GB/s)** |
+| head | 2.0 ms | +0.3 ms (48 GB/s) | **+4.3 ms (17 GB/s)** |
+| attention | 2.3 ms | +0.6 | +0.8 |
+| the calls with no weight (norms, RoPE, routing, mixes) | 0.5 ms | +0.5 | +0.9 |
+
+- **The largest piece at 3 rows: the dense weights read three times** (LESSONS #227). No group reaches 4 rows,
+  so `tr_matmul_grouped` cuts static chunks of p*rows+r: each weight row of q, k, v, o and the head sits under
+  2-3 threads at different times. At 2 rows the halves run in lockstep and the L3 serves the second read.
+- **Then the experts**: the same static chunks, by compute (a shared expert's rows split between threads), and
+  each Q8_0 weight row decoded once a token (x4 needs 4).
+- Q4_K's integer road was balanced already: its experts at their bytes at 2 rows (52 GB/s), 47.6 GB/s at 3;
+  its dense at 39 / 35 GB/s (the W16 panel and a tile of 2-3 rows): +0.9 / +1.3 ms; no weight +0.5 / +1.0.
+- The references (read 09-27): llama.cpp's tinyBLAS takes a dense Q8_0 matmul from 2 columns (n < 2 returns),
+  tiles of up to 4 weight rows by 1-4 columns, each block decoded once for all of them (int8 activations);
+  `mul_mat_id` (the experts) goes by `vec_dot`, one token at a time.
+
+**The change** (each output one `dot_row` of its own, the same bits by construction; `make check`, test_spec's
+verify rows at every thread count, eight mutations of `tools/mutate_pm.sh` red):
+- a short pass (no group of 4 input rows, one of 2 or 3) takes phase-major's plan on any tier: items of 16
+  weight rows, balanced, every input row of the group against each weight row while it is in cache
+  (`matmul_phase_major`); a one-row-per-group call (a decode token) stays on its own road;
+- `dot_row_xt` (Q8_0: scalar, AVX2, AVX-512): one weight row against 2 or 3 input rows, decoded once, each sum
+  in its own named accumulator, as x4 does with 4.
+
+**The price after** (`sh tools/row_price.sh <after> 3 <before>`: the two binaries alternated run by run, 3
+rounds after a warm-up, native, TR_GPU=0, code-edit; background 2.53 before, at the rule's edge, 1.58 after;
+the new binary ran first in every pair, LESSONS #232: the large effects stand, the small ones are the second
+session's below). Pass ms before -> after, and one more row's share of a pass:
+
+| rows | Q8_0, 8 threads | Q8_0, 16 threads | Q4_K, 8 threads (its road untouched) |
+|---|---|---|---|
+| 1 | 25.73 -> 26.04 | 25.98 -> 25.96 | 15.99 -> 16.38 |
+| 2 | 41.45 -> **37.15** (0.896): a row 0.61 -> **0.43** | 47.27 -> **38.47** (0.814): 0.82 -> 0.48 | 24.06 -> 23.15: 0.50 -> 0.41 |
+| 3 | 64.59 -> **42.36** (0.656): a row 0.76 -> **0.31** | 71.58 -> **46.24** (0.646): 0.88 -> 0.39 | 28.68 -> 29.10: 0.40 -> 0.39 |
+| 5 | 60.55 -> 58.60 (0.968) | 59.57 -> 59.09 (0.992) | 39.03 -> 39.25 |
+| 9 | 80.24 -> 78.17 (0.974) | 78.09 -> 77.14 (0.988) | 54.59 -> 54.81 |
+
+**Again, the first binary swapped every round, and an A/A** (`ROW_PRICE_CFGS="Q8_0 8" ROW_PRICE_AA=1 sh
+tools/row_price.sh <after> 4 <before>`, 4 rounds, background 1.64 before and 1.61 after: free):
+
+| rows | Q8_0, 8 threads: before -> after | the A/A (before against itself) |
+|---|---|---|
+| 1 | 25.79 -> 25.78 (**1.000**: the decode did not move) | 0.996 |
+| 2 | 41.33 -> **35.93** (0.869): a row 0.60 -> **0.39** of a pass | 0.989 |
+| 3 | 62.69 -> **42.97** (0.685): a row 0.72 -> **0.33** | 1.004 |
+| 5 | 59.57 -> 58.27 (0.978) | 0.996 |
+| 9 | 79.87 -> 78.34 (0.981) | 1.007 |
+
+- **Q8_0's 3-row pass is at its bytes**: its new experts at 52.0 MiB/ms (the one-row pass's 52.9), the dense
+  -0.1 ms a row (the target was <= ~42 ms: 42.4-43.0). The 2-row pass nearly: 35.9 against <= ~35, its new
+  experts at 47.1 MiB/ms, attention +0.34 and the rest +0.52 a row (first session's split).
+- The first session's one-row 1.012 was the order (#232): with the order swapped the one-row pass is 1.000,
+  the A/A within 1.1% everywhere; the 5- and 9-row gains (2.2%, 1.9%) sit above the A/A.
+- **The drafts at these prices** (`tools/draft_gate_sim.py --prices build/rowprice-q78b/<side>/prices.json
+  --config Q8_0-t8`, the measured column): new code, the engine's lookup 0.969x -> **1.040x**, the gate 1.013x
+  -> **1.103x**; with a real context (question 81's 20 texts) 0.998x -> **1.109x** and 1.061x -> **1.191x**
+  (1.169x and 1.274x with the context's cost modelled). On Q8_0 the engine's own lookup stops losing on new
+  code; Q4_K's prices, and so the Q4_K rows of §Drafts with a real context, are unchanged.
+
+**The width, forced** (question 82: `--decode-threads` 4, 8, 16 on a pool of 16, alternated run by run, 3
+rounds after a warm-up, native; background 1.46 after). Pass ms:
+
+| rows | Q8_0: 4 / 8 / 16 threads | Q4_K: 4 / 8 / 16 threads |
+|---|---|---|
+| 1 | **25.69** / 27.04 / 28.48 | 17.84 / **15.84** / 16.64 |
+| 2 | 37.40 / **36.13** / 37.81 | 34.44 / 23.26 / **23.12** |
+| 3 | 46.47 / **43.15** / 45.72 | 44.57 / 28.83 / **27.66** |
+
+- **The one-row pass's width is not the short passes'**: on Q8_0 the decode wants 4 threads, a 3-row pass 8
+  (the tuner's 4 would cost it 1.08x, the whole pool 1.06x); on Q4_K 4 threads double the short passes (the
+  W16 panel and tiles are compute). A short pass needs its own measured width (question 82).
+- Q4_K's column is the session's noise on an unchanged road: a pass moves ±3%, a row price 0.09 of a pass
+  (LESSONS #230): a price is compared inside one alternated session only.
+- 16 threads are still 1.04x (2 rows) and 1.09x (3 rows) slower than 8: the short passes never get a tuned
+  width when every pass drafts (LESSONS #228).
+- Predictions (`build/rowprice-q78/predictions.txt`): 3 rows 40-44 ms: 42.36, in; 2 rows 33-36: 37.15, above;
+  16 threads 34-38 and 42-47: 38.47 and 46.24, in; 5 and 9 rows 1-3% faster: 2.2% and 1.9% (the second
+  session), in; Q4_K and the one-row pass within 2%: 1.025 and 1.012 in the first session (the order and the
+  noise above), 1.000 for the one-row pass in the second, in.
+- Left, by size: Q4_K's short groups (the dense +1.2 ms at 2 rows, +0.9 a row at 3; its experts 42.8 MiB/ms
+  at 3), the short passes' width (#228), the 2-row pass's rest.
+
+## Drafts with a real context (question 81, 2026-09-27)
+
+The 18 new-code prompts are file beginnings (100-200 positions); real use continues a function mid-file.
+20 prompts cut from this repo (`bench/prompts/real-context`: 11 C, 6 Python, 3 shell; a real file up to the
+start of a function's body, 1770-3798 tokens, mean 2852; `sources.tsv`, `cut.py`), each continued greedily
+for 256 tokens (Q4_K, in the container, `tools/draft_ctx_gen.sh`), replayed by `tools/draft_gate_sim.py --set
+build/draft_ctx --ctx real` (validated: the replay's counters equal the engine's `--spec 8` on c05_olmoe and
+py03_route_trace, SAME, and its pass counts on all 20). A repo table: the n-gram table of this repo's code
+without the file under test (leave one out). Speed against no draft (tokens a pass, accepted), Q4_K's prices
+of 09-27 (about 300 positions; "real ctx" adds the byte model's context terms at each pass's position):
+
+| 20 texts with a real context | measured | measured, real ctx | bytes, real ctx | new code (18), measured |
+|---|---|---|---|---|
+| prompt lookup, adaptive (the engine) | 1.067x (1.37t, 52%) | 1.164x | 1.200x | 1.014x |
+| public table 4 MiB >= 0.7 | 1.017x | 1.044x | 1.054x | 1.027x |
+| repo table, leave one out | 1.056x (1.30t) | 1.134x | 1.164x | 0.991x |
+| llama.cpp's lookup, draft 3 | 1.096x (1.75t) | 1.273x | 1.338x | 1.021x |
+| **gate: context cache + public table, out of sample** | **1.146x** (1.71t, 55%) | **1.271x** | **1.324x** | 1.077x |
+| gate + the repo table | 1.146x | 1.256x | 1.311x | 1.079x |
+| perfect grammar (ceiling); counting whitespace runs | 1.299x; 1.375x | 1.427x; 1.532x | 1.478x; 1.594x | 1.334x; 1.423x |
+
+- **With a real context the cheap drafts pay**: the engine's own lookup 1.014x -> 1.067x, the gate 1.077x ->
+  1.146x at the measured prices, 1.27-1.32x with the context's cost modelled (a native row price at ~3000
+  positions is owed). Per text the gate runs from 0.967x (py03) to 1.616x (py04).
+- The repo table beats the public one alone (1.056x against 1.017x) and adds nothing as the gate's third
+  source: it is right where both others are wrong on 4.3% of the positions.
+- Predictions (`build/draft_ctx/predictions.txt`, before any run): the engine's lookup and the gates in range;
+  the repo table as a source predicted +0.01-0.04x, measured 0 to -0.015x.
+- Found on the way: the replay's token classes count 23 whitespace-run tokens as names (LESSONS #229): the
+  grammar ceilings of §The post-it taken apart are low (new code 1.423x, not 1.334x).
+
+## The Q4_K short passes: the panel's rows brought ahead (question 78's remainder, 2026-09-27)
+
+Q4_K's verify passes of 2-3 rows read the dense weights at 35-39 GB/s through the W16 panel and the new
+experts at 42.8 MiB/ms at 3 rows (§The short verify pass at its bytes). The targets at 8 threads (the
+bytes): 2 rows <= ~21.6 ms, 3 rows <= ~26. The predictions, mine and the Opus design agent's, are in
+`build/rowprice-q79/predictions.txt`, each written before its run. All native, a free machine,
+`tools/row_price.sh`, 4 rounds, the first binary swapped every round, pass ms at 8 threads.
+
+**(a) A group of 2-3 rows by pairs** (`Q4X_MIN_TILE_ROWS` 4: `q4x_dot2` a token at a time, the weight row
+read again from L1/L2 for the next token), against today, with an A/A:
+
+| rows | today | by pairs | A/A | one more row: dense, new experts |
+|---|---|---|---|---|
+| 1 | 15.59 | 15.78 (1.012) | 1.011 | |
+| 2 | 22.99 | **22.20 (0.966)** | 0.999 | +1.32 -> +0.80 ms; 44.0 -> 48.0 MiB/ms |
+| 3 | 28.44 | 28.99 (1.019) | 1.000 | +0.91 -> +1.28 ms; 42.2 -> 44.0 MiB/ms |
+
+Two `q4x_dot2` streams beat a panel built for two tokens; three do not (a panel's cost per token is under
+half a dot2's). The panel was also losing more than its arithmetic: `avx512_q4x_panel` read its 16 rows on
+demand, 16 short interleaved streams (a 144-byte block of each row a step) that no hardware prefetcher
+follows, and at 2-3 rows a panel serves a single tile (LESSONS #233; the design agent's road (e)).
+
+**The panel's rows brought ahead**: seven binaries in one alternated session (background 1.41 / 1.33).
+pf1 hands the panel the next item's rows (the worker's following item, when its group is short: 9 lines per
+64-column window of the current build); pf2 brings each row's block s + 2 during block s (12 prefetches a
+window); pf3 does both; m3 is `Q4X_MIN_TILE_ROWS` 3 (a 2-row group by pairs).
+
+| variant | 1 row | 2 rows | 3 rows | prompt, 411 tokens (tok/s) |
+|---|---|---|---|---|
+| today (pf0) | 15.81 | 23.07 | 28.32 | 405.2 |
+| today again (A/A) | 0.990 | 0.996 | 0.988 | 408.9 |
+| pf1: the next item's rows | 0.989 | 22.07 (0.957) | 27.08 (0.956) | 407.4 |
+| pf2: block s + 2 | 0.981 | 22.58 (0.979) | 27.54 (0.972) | 408.0 |
+| pf3: both | 0.994 | 22.14 (0.960) | **26.65 (0.941)** | 409.2 |
+| m3: 2-row groups by pairs | 0.990 | 22.00 (0.954) | 28.10 (0.992) | 405.6 |
+| pf1 + m3 | 0.992 | **21.89 (0.949)** | 26.81 (0.947) | 405.3 |
+| (a): every 2-3-row group by pairs | 1.004 | 22.18 (0.961) | 28.56 (1.009) | 406.0 |
+
+- **The panel's extra time was mostly latency**: pf1 took 1.24 ms off the 3-row pass (the premise's disproof
+  was <= 0.3). With pf3, one more row at 3 rows costs 5.46 ms (6.25 today): new experts at 46.9 MiB/ms
+  (42.6), dense +0.47 ms (+0.84), attention 0.08, the rest 0.40.
+- pf3 beat pf1 by 0.43 ms at 3 rows (predicted a tie): block s + 2 covers each worker's first item and the
+  items another worker takes over. pf1 is 0.3-0.7 ms short of the agent's prediction at both sizes.
+- The prompt (411 tokens, 8 threads, 12 runs a binary) did not move: 405-409 tok/s everywhere, the A/A 0.9%.
+- Predictions: (a) 2 rows 22.4-22.9 (mine) and 22.2-22.7 (the agent's): 22.20; 3 rows 28.6-29.4 and
+  28.2-29.2: 28.99. In the series, m3 and pf1 + m3 in the agent's ranges; pf1 and pf2 above them (less gain).
+
+**Kept: pf3 and m3 together**, measured as the final binary (question 82's tuner in it, so every pass is
+forced onto 8 threads: `ROW_PRICE_FORCED=1`), against today, with an A/A (background 1.49 / 1.24):
+
+| rows | today | final | A/A | one more row: dense, new experts |
+|---|---|---|---|---|
+| 1 | 15.50 | 15.44 (0.996) | 0.999 | |
+| 2 | 22.92 | **22.19 (0.968)** | 1.000 | +1.32 -> +0.92 ms; 44.1 -> 47.1 MiB/ms |
+| 3 | 28.00 | **26.53 (0.947)** | 1.006 | +0.88 -> +0.51 ms; 42.9 -> 46.5 MiB/ms |
+
+- A row's share of a pass: 0.48 -> 0.44 at 2 rows, 0.40 -> 0.36 at 3 (Q8_0: 0.39 and 0.33).
+- Predictions: 1 row 1.000 +-1%, in; 2 rows 21.8-22.1, 22.19 (0.09 above: the session gave 2 rows less than
+  pf1 + m3's, LESSONS #230's spread between sessions); 3 rows 26.4-26.8, in.
+- Left, by size: the dense, +0.5 ms a row at 3 rows and +0.9 at 2 (each weight row decoded once a token:
+  a kernel decoding it once for 2-3 prepared tokens, road (c), whose design is in the next session's
+  post-it); the rest, +0.35-0.41 a row; the new experts, 3-4 MiB/ms under the one-row pass's 50.8.
+
+## The verify passes' own width (question 82, 2026-09-27)
+
+The tuner measured the width of one-token passes only (LESSONS #228): a verify pass took the decode's width,
+or the whole pool while the decode had measured nothing (a session drafting on every pass). Forced on a pool
+of 16 (§The short verify pass at its bytes), a 3-row Q8_0 pass wants 8 threads where the decode wants 4. Now
+every size of verify pass (2 to `TR_DECODE_ROWS` rows, a logit row each) has a measurement of its own, with
+the decode's rules (the fastest within its own noise, again at every doubling of the context, a switch on
+two votes; model.c `tune_state`); a short prompt (one logit row) and a pass past `TR_DECODE_ROWS` take the
+decode's width. The same final binary three ways on a pool of 16, drafts fixed, 200 tokens, 4 rounds
+(`tools/row_price.sh` with wrapper scripts, `build/q79/fin*/`): tuned; the pool (`TR_DECODE_ROWS=1`: the
+verify passes on 16, the engine before when every pass drafts); the decode's width forced (4 threads for
+Q8_0, 8 for Q4_K: the engine before once the decode has measured). Pass ms:
+
+| | pool | decode's width | tuned, every width probed | tuned, the narrowest skipped |
+|---|---|---|---|---|
+| Q8_0, 2 rows | 36.97 / 37.08 | 36.61 / 36.30 | 35.95 (0.972): 8 in 4 runs of 4 | **35.62 (0.961)**: 8, 4 of 4 |
+| Q8_0, 3 rows | 44.37 / 44.31 | 45.30 / 45.43 | 43.39 (0.978): 8 or 16 | **42.82 (0.966)**: 8, 4 of 4 |
+| Q4_K, 2 rows | 22.01 / 22.11 | 22.08 / 22.07 | 22.38 (1.017): 16 | 22.21 (1.005): 8, 4 of 4 |
+| Q4_K, 3 rows | 27.06 / 27.00 | 26.35 / 26.77 | 27.72 (1.024): 8 or 16 | **26.51 (0.982)**: 8, 4 of 4 |
+
+(two sessions, each with its own pool and decode's-width columns; background 1.23 / 1.17, then 1.48 / 1.13)
+
+- **Every width probed lost on Q4_K** (LESSONS #236): three probes on 4 threads cost a Q4_K 3-row pass +60%
+  each, more than the right width wins back in a 200-token run; and the pick wavered between 8 and 16.
+- **The narrowest skipped** (a verify pass does more work per byte read than the decode: in every
+  measurement the narrowest width lost it, by 3-61%): 8 picked in 16 runs of 16; Q8_0 3.4-3.9% faster than
+  the pool and 1.9-5.7% faster than the decode's width; Q4_K 1.8% faster at 3 rows, 0.5% slower at 2 (its
+  three probes on 16). On a pool of 8 a verify size has one width left, the whole pool.
+- Since the prefetched panel (§The Q4_K short passes) a Q4_K 3-row pass wants 8 threads, no longer 16 (26.35
+  against 27.06).
+- Predictions (`build/rowprice-q79/predictions.txt`): every width probed, Q8_0 in and better, Q4_K 1-3%
+  slower (in); the narrowest skipped, Q8_0 better than predicted, Q4_K in, no size more than 1% slower than
+  the pool (in).
+
 ## Attempts
 
 | Data | Cosa | Prima | Dopo | Spread | Esito |
@@ -4381,3 +4837,13 @@ cannot use them. Order-free sums also make any split, width or device give the s
 | 2026-09-26 | exact E32 Q4_K tile by Winograd's inner product (the digit in the weight's free nibble; bit-identical to its definition) | plain E32 127.0 GFLOP/s-eq, the float tile 164.7 (one core) | 149.0 after the f64 super-block end (136.6 before); W16 (scale inside a 16-bit weight) 158.7, with its windows into int64 167.2 | one core, background ~2.0-2.4 | W16 at T = 4 167.2 against the float tile's 164.7 at T = 24: exact and at least as fast on the tile; not yet in the engine (question 77, §Exact sums at the float's speed) |
 | 2026-09-26 | the float contract's arithmetic against int8 tensor cores on the laptop's RTX 4070 (premise) | mul.rn + add.rn 3.29 T-MAC/s | mma.sync s8 59.10 T-MAC/s (exact); E32 = 14.8 eq, 4.5x | one run each, 7 launches, best | premise measured: question 74 (does the GPU count?) for Marcello |
 | 2026-09-26 | the next item's 16 rows prefetched into L2 before the current item's tiles (the panel from cold weights 3.7-4.0 us against 1.83 hot, measured alone; same bits) | experts zone, Q4_K, 512 tokens, 4 threads | 0.990 [0.970-1.022], prefill 0.995 | 6 alternated pairs, load rising to 3.5 mid-run | reverted: inside the noise (predicted +4-6%); to retry spread over the tile's phases, at a free machine |
+| 2026-09-26 | Q4_K's definition in exact integers in the engine (W16 panel and tiles for the prompt, `q4x_dot2` for the decode; question 77's stage 2) | float Q4_K: prompt 512 at 4 threads, decode at 4 threads | prompt 1.001 [0.995-1.008], experts zone 0.992; decode matmul zones 1.080 → 1.006 [0.989-1.016] after the pair's headers of both rows in one ymm (the pair 0.937x the float's, hot) | ab_zone, 6 alternated pairs, background 1.74-2.63 | kept: exact (logits identical at 4/16 threads and between prompt and decode; the 2-layer oracles 1-26% nearer their reference) at the float's speed in both phases; the modelled +10% on the experts zone did not come (§Exact sums at the float's speed, stage 2) |
+| 2026-09-27 | a draft without a model on new code: an n-gram table from 78 MiB of public code (4-212 MiB), a grammar's ceiling (§A draft without a model) | prompt lookup 0.68x fixed, 0.97x adaptive (model; measured 0.60x, 0.953x) | best 1.01x (4 MiB table, >= 70% sure, 64% accepted); a perfect grammar 1.25x at most | replay = the engine's counters on 3 prompts; speed from measured row costs | not built: right guesses come one at a time, a row costs half a pass |
+| 2026-09-27 | the same drafts priced with today's verified row (`tools/row_price.sh`) and at its bytes, a calibrated gate, llama.cpp's lookup replayed (§The post-it taken apart) | best 1.01x at the 09-18 price | gate (context cache + table) 1.077x at today's Q4_K prices, 1.116x at bytes (1.170x / 1.210x at 2048 / 4000, modelled); the prompt copy at draft 8 on code-edit 1.95x Q8_0, 1.78x Q4_K | row prices native, free machine, 3 alternated rounds; the gate out of sample | the 09-18 verdict reversed; not built: question 78 (the short pass at its bytes) first |
+| 2026-09-27 | the short verify pass on phase-major's balanced items on every tier, and Q8_0's `dot_row_xt` (a weight row decoded once for 2-3 tokens), same bits (§The short verify pass at its bytes) | Q8_0 8 threads: 2 rows 41.33, 3 rows 62.69 ms; 16 threads 47.27 / 71.58 | 35.93 (0.869) / 42.97 (0.685): a row 0.60 -> 0.39 and 0.72 -> 0.33 of a pass; 16 threads 0.814 / 0.646; one row 1.000; drafts at Q8_0's prices on new code 0.969x -> 1.040x (the engine's lookup), the gate 1.013x -> 1.103x | native, free machine, 4 rounds, the order swapped every round, A/A within 1.1% | **kept**: Q8_0's 3-row pass at its bytes; left Q4_K's short groups and the width (question 82) |
+| 2026-09-27 | the short passes' width forced to 4 / 8 / 16 threads on a pool of 16 (question 82) | the one-row pass's best: Q8_0 4 threads, Q4_K 8 | a 3-row pass: Q8_0 best at 8 (46.47 / 43.15 / 45.72 ms), Q4_K at 8-16 (44.57 / 28.83 / 27.66) | native, free, 3 rounds alternated | measured, not built: a short pass needs its own width |
+| 2026-09-27 | Q4_K's groups of 2-3 rows by `q4x_dot2` pairs, a token at a time (`Q4X_MIN_TILE_ROWS` 4) | Q4_K 8 threads: 2 rows 22.99, 3 rows 28.44 ms | 22.20 (0.966) / 28.99 (1.019) | native, free, 4 rounds, order swapped, A/A within 1.1% | 2 rows kept (as `Q4X_MIN_TILE_ROWS` 3), 3 rows no (§The Q4_K short passes) |
+| 2026-09-27 | the W16 panel's rows brought ahead: the next item's (pf1), block s + 2 (pf2), both (pf3); with 2-row groups by pairs (m3) | 23.07 / 28.32 ms | pf3 22.14 / 26.65 (0.941); pf1 + m3 21.89 / 26.81; the prompt 405 -> 405-409 tok/s | native, free, 7 binaries alternated, A/A 0.988-0.996 | **kept**: pf3 and m3 (§The Q4_K short passes) |
+| 2026-09-27 | the final (pf3 + m3), every pass forced on 8 threads | 15.50 / 22.92 / 28.00 ms | 15.44 / 22.19 (0.968) / 26.53 (0.947) | native, free, 4 rounds, A/A within 0.6% | **kept** |
+| 2026-09-27 | every size of verify pass measuring its own width, on every width (question 82) | pool of 16, the pool: Q8_0 2 / 3 rows 36.97 / 44.37, Q4_K 22.01 / 27.06 ms | 0.972 / 0.978, Q4_K 1.017 / 1.024 | native, free, 4 rounds, three ways alternated | no: the probes on 4 threads cost Q4_K more than they win (§The verify passes' own width) |
+| 2026-09-27 | the same, the narrowest width skipped | 37.08 / 44.31, Q4_K 22.11 / 27.00 | 0.961 / 0.966, Q4_K 1.005 / 0.982; 8 picked in 16 of 16 | native, free, 4 rounds | **kept** |

@@ -1,0 +1,236 @@
+/* experts.c — the expert store: RAM-resident units backed by on-demand reads from disk, one
+ * doubly linked LRU list holding every slot (free slots at the cold end) and an O(1) unit -> slot
+ * index (see experts.h for the contract; docs/ARCHITECTURE.md "Esecuzione" Esperti (M1)). */
+#include "experts.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "../base/platform.h"
+#include "../base/threads.h"
+
+/* One slot's occupant and its place in the single LRU list that threads every slot together:
+ * used slots in recency order toward lru_head (hot), free slots toward lru_tail (cold). */
+typedef struct {
+    int32_t unit;        /* -1 when the slot is free */
+    int32_t prev, next;  /* -1 at the ends of the list */
+} experts_slot;
+
+/* A slot's read ahead (tr_experts_prefetch). Every field is read and written under the store's
+ * monitor: the calling thread fills the first group and queues the slot, the I/O thread copies
+ * them, reads without the lock, and writes the second group with done = 1. */
+typedef struct {
+    int64_t layer, id;
+    tr_experts_read_fn read;
+    void *read_ctx;
+    int done, rc;
+    uint64_t bytes;
+    double sec;
+    uint64_t shift[TR_EXPERT_PARTS];
+} experts_job;
+
+struct tr_experts {
+    int64_t n_layers, n_expert, n_used;
+    size_t *part_bytes;           /* own copy: [n_layers][TR_EXPERT_PARTS] */
+    uint64_t *part_slot_offset;   /* own: [n_layers][TR_EXPERT_PARTS], each layer's own aligned
+                                   * layout inside a slot (layers can need different part sizes) --
+                                   * fixed at create time, same for every slot */
+    uint64_t *part_offset;        /* own copy: [n_layers][TR_EXPERT_PARTS] */
+    uint64_t read_align;          /* 1 (buffered) or TR_FILE_DIRECT_ALIGN (direct); every read this
+                                   * store issues has offset, length and buffer address multiples of
+                                   * it (src/base/platform.h tr_file_alignment) */
+    tr_experts_read_fn read;
+    void *read_ctx;
+
+    unsigned char *slab;  /* n_slots * slot_bytes, aligned to read_align (at least 64) */
+    int32_t *slot_of;     /* [n_units]: the slot holding this unit, or -1 */
+    experts_slot *slots;  /* [n_slots] */
+    uint64_t *slot_part_shift; /* [n_slots][TR_EXPERT_PARTS]: recorded at the fill that last loaded
+                               * this slot -- how far past its area's own aligned start (in
+                               * part_slot_offset) that fill's part bytes actually begin
+                               * (file_off - lo). Changes every time the slot is refilled, since a
+                               * different (layer, expert) generally has a different file offset
+                               * modulo read_align. */
+    int32_t lru_head;     /* hot end: most recently touched or filled */
+    int32_t lru_tail;     /* cold end: next victim */
+
+    uint64_t *seen_call;  /* [n_units]: stamp of the acquire call that last named this unit */
+    uint64_t call_seq;    /* bumped at the start of every tr_experts_acquire. 64 bits: 0, the stamp
+                           * of a unit never named, never comes back (32 would wrap in months of
+                           * decoding and call a first id a duplicate) */
+
+    tr_experts_stats stats; /* n_units, n_slots, slot_bytes and the running counters */
+
+    /* reading ahead (tr_experts_prefetch_start); io == NULL: never started, every field NULL/0 */
+    tr_thread *io;
+    tr_monitor *mon;
+    experts_job *jobs;       /* [n_slots], under mon */
+    int32_t *queue;          /* [n_slots] ring of slots for the I/O thread, under mon */
+    int64_t q_head, q_len;   /* under mon */
+    int io_stop;             /* under mon: the I/O thread ends once the queue is empty */
+    unsigned char *pending;  /* [n_slots]: reserved and not taken in yet -- calling thread only */
+    int64_t n_pending;       /* calling thread only */
+    int prefetch_failed;     /* calling thread only: a read ahead failed since the last wait */
+};
+
+static uint64_t round_up_to(uint64_t n, uint64_t align) {
+    return (n + align - 1) / align * align;
+}
+
+/* Bytes one part occupies inside a slot (experts.h tr_experts_slot_bytes). read_align == 1: the
+ * part's own bytes, rounded up to 64 (today's layout, unchanged). read_align > 1: the part's file
+ * offset is not itself aligned, so the read landing it can start up to read_align - 1 bytes early
+ * and end up to read_align - 1 bytes late; round_up_to(part_bytes, read_align) + read_align is
+ * always room enough for that (the two slacks together are at most 2 * (read_align - 1), and this
+ * gives at least read_align, plus whatever round_up_to already added). */
+static uint64_t part_area_bytes(uint64_t part_bytes, uint64_t read_align) {
+    uint64_t align = read_align > 64 ? read_align : 64;
+    uint64_t area = round_up_to(part_bytes, align);
+    if (read_align > 1) area += read_align;
+    return area;
+}
+
+uint64_t tr_experts_slot_bytes(const size_t *part_bytes, int64_t n_layers, uint64_t read_align) {
+    uint64_t max_total = 0;
+    for (int64_t layer = 0; layer < n_layers; layer++) {
+        uint64_t total = 0;
+        for (int p = 0; p < TR_EXPERT_PARTS; p++)
+            total += part_area_bytes((uint64_t)part_bytes[(size_t)layer * TR_EXPERT_PARTS + (size_t)p], read_align);
+        if (total > max_total) max_total = total;
+    }
+    return max_total;
+}
+
+int64_t tr_experts_min_slots(int64_t n_expert, int64_t n_used) {
+    return n_expert + n_used;
+}
+
+/* ---- the LRU list: unlink a slot from wherever it is, or push it to the hot end ---- */
+
+static void lru_unlink(tr_experts *x, int32_t s) {
+    experts_slot *sl = &x->slots[s];
+    if (sl->prev != -1) x->slots[sl->prev].next = sl->next; else x->lru_head = sl->next;
+    if (sl->next != -1) x->slots[sl->next].prev = sl->prev; else x->lru_tail = sl->prev;
+    sl->prev = sl->next = -1;
+}
+
+static void lru_push_front(tr_experts *x, int32_t s) {
+    experts_slot *sl = &x->slots[s];
+    sl->prev = -1;
+    sl->next = x->lru_head;
+    if (x->lru_head != -1) x->slots[x->lru_head].prev = s;
+    x->lru_head = s;
+    if (x->lru_tail == -1) x->lru_tail = s;
+}
+
+static void lru_push_back(tr_experts *x, int32_t s) {
+    experts_slot *sl = &x->slots[s];
+    sl->next = -1;
+    sl->prev = x->lru_tail;
+    if (x->lru_tail != -1) x->slots[x->lru_tail].next = s;
+    x->lru_tail = s;
+    if (x->lru_head == -1) x->lru_head = s;
+}
+
+/* The coldest slot the store may take: never one in flight, and never one holding a unit of
+ * layer skip_a or skip_b (-1: no such layer). -1 if there is none. Without reading ahead this is
+ * lru_tail, the plain LRU victim. */
+static int32_t coldest_victim(const tr_experts *x, int64_t skip_a, int64_t skip_b) {
+    for (int32_t s = x->lru_tail; s != -1; s = x->slots[s].prev) {
+        if (x->pending != NULL && x->pending[s]) continue;
+        int32_t u = x->slots[s].unit;
+        if (u != -1) {
+            int64_t layer = u / x->n_expert;
+            if (layer == skip_a || layer == skip_b) continue;
+        }
+        return s;
+    }
+    return -1;
+}
+
+/* (layer, id)'s parts into the slot area at base, one read each, through read/ctx: 0, or -1 at
+ * the first part that fails. *bytes and *sec grow by what the reads before a failure moved too.
+ * Touches only fields fixed at create time (the I/O thread calls it). */
+static int read_parts(const tr_experts *x, tr_experts_read_fn read, void *ctx, int64_t layer, int64_t id,
+                      unsigned char *base, uint64_t shift[TR_EXPERT_PARTS], uint64_t *bytes, double *sec) {
+    uint64_t align = x->read_align;
+    for (int p = 0; p < TR_EXPERT_PARTS; p++) {
+        size_t idx = (size_t)layer * TR_EXPERT_PARTS + (size_t)p;
+        uint64_t file_off = x->part_offset[idx] + (uint64_t)x->part_bytes[idx] * (uint64_t)id;
+        /* align == 1: lo == file_off, hi == file_off + part_bytes -- the exact bytes. align > 1:
+         * the aligned range the read must actually cover. */
+        uint64_t lo = file_off / align * align;
+        uint64_t hi = (file_off + (uint64_t)x->part_bytes[idx] + align - 1) / align * align;
+        size_t n = (size_t)(hi - lo);
+        double t0 = tr_time_sec();
+        int rc = read(ctx, base + x->part_slot_offset[idx], n, lo);
+        *sec += tr_time_sec() - t0;
+        if (rc != 0) return -1;
+        *bytes += n;
+        shift[p] = file_off - lo;
+    }
+    return 0;
+}
+
+/* The I/O thread: takes queued slots in order, reads each one's unit, publishes it done. Ends
+ * when told to and the queue is empty. */
+static void io_main(void *arg) {
+    tr_experts *x = (tr_experts *)arg;
+    tr_monitor_lock(x->mon);
+    for (;;) {
+        while (x->q_len == 0 && !x->io_stop) tr_monitor_wait(x->mon);
+        if (x->q_len == 0) break;
+        int32_t s = x->queue[x->q_head];
+        x->q_head = (x->q_head + 1) % x->stats.n_slots;
+        x->q_len--;
+        experts_job job = x->jobs[s];
+        tr_monitor_unlock(x->mon);
+
+        job.bytes = 0;
+        job.sec = 0.0;
+        unsigned char *base = x->slab + (uint64_t)s * x->stats.slot_bytes;
+        job.rc = read_parts(x, job.read, job.read_ctx, job.layer, job.id, base, job.shift, &job.bytes, &job.sec);
+
+        tr_monitor_lock(x->mon);
+        job.done = 1;
+        x->jobs[s] = job;
+        tr_monitor_broadcast(x->mon);
+    }
+    tr_monitor_unlock(x->mon);
+}
+
+static void prefetch_stop(tr_experts *x) {
+    if (x->io != NULL) {
+        tr_monitor_lock(x->mon);
+        x->io_stop = 1;
+        tr_monitor_broadcast(x->mon);
+        tr_monitor_unlock(x->mon);
+        tr_thread_join(x->io);
+        x->io = NULL;
+    }
+    tr_monitor_free(x->mon);
+    free(x->jobs);
+    free(x->queue);
+    free(x->pending);
+    x->mon = NULL;
+    x->jobs = NULL;
+    x->queue = NULL;
+    x->pending = NULL;
+}
+
+void tr_experts_free(tr_experts *x) {
+    if (x == NULL) return;
+    prefetch_stop(x); /* first: the I/O thread may still be writing into the slab */
+    free(x->part_bytes);
+    free(x->part_slot_offset);
+    free(x->part_offset);
+    tr_free_aligned(x->slab);
+    free(x->slot_of);
+    free(x->slots);
+    free(x->slot_part_shift);
+    free(x->seen_call);
+    free(x);
+}
+
+tr_experts *tr_experts_create(const tr_experts_config *cfg, char *err, size_t err_len) {

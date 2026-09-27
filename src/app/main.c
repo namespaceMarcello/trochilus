@@ -391,27 +391,38 @@ static void print_threads(const tr_pool *pool, const tr_session *sess, int force
     int decode = tr_session_decode_threads(sess);
     if (decode <= 0) {
         fprintf(stderr, "threads: %d prompt, decode not measured yet\n", tr_pool_size(pool));
-        return;
+    } else {
+        fprintf(stderr, "threads: %d prompt, %d decode (%s)", tr_pool_size(pool), decode,
+                forced > 0 ? "forced" : "measured");
+        const tr_decode_choice *h = NULL;
+        int n = forced > 0 ? 0 : tr_session_decode_history(sess, &h);
+        int shown = n < TR_DECODE_TUNE_HISTORY ? n : TR_DECODE_TUNE_HISTORY;
+        if (shown > 0) fprintf(stderr, ", choices");
+        for (int i = 0; i < shown; i++) {
+            if (i == shown - 1 && n > shown) fprintf(stderr, " ..."); /* the last slot is the newest */
+            fprintf(stderr, " %lld:%d", (long long)h[i].pos, h[i].width);
+            if (h[i].picked != h[i].width) fprintf(stderr, "(%d)", h[i].picked);
+        }
+        fputc('\n', stderr);
     }
-    fprintf(stderr, "threads: %d prompt, %d decode (%s)", tr_pool_size(pool), decode,
-            forced > 0 ? "forced" : "measured");
-    const tr_decode_choice *h = NULL;
-    int n = forced > 0 ? 0 : tr_session_decode_history(sess, &h);
-    int shown = n < TR_DECODE_TUNE_HISTORY ? n : TR_DECODE_TUNE_HISTORY;
-    if (shown > 0) fprintf(stderr, ", choices");
-    for (int i = 0; i < shown; i++) {
-        if (i == shown - 1 && n > shown) fprintf(stderr, " ..."); /* the last slot is the newest */
-        fprintf(stderr, " %lld:%d", (long long)h[i].pos, h[i].width);
-        if (h[i].picked != h[i].width) fprintf(stderr, "(%d)", h[i].picked);
+    /* the verify passes' own widths where measured, on a line of their own (tools/ab_modes.sh and
+     * tools/decode_context.sh read the one above to its end) */
+    int shown_rows = 0;
+    for (int r = 2; forced <= 0 && r <= TR_DECODE_ROWS; r++) {
+        int w = tr_session_rows_threads(sess, r);
+        if (w <= 0) continue;
+        fprintf(stderr, "%s%d rows %d", shown_rows++ > 0 ? ", " : "verify threads: ", r, w);
     }
-    fputc('\n', stderr);
+    if (shown_rows > 0) fputc('\n', stderr);
 }
 
 /* {"engine": <tr_prof_write_json output>, "model", "n_prompt", "n_gen", "threads"
- * (actual pool size), "decode_threads" (0: the session had not finished measuring), "cpu",
+ * (actual pool size), "decode_threads" (0: the session had not finished measuring), "rows_threads"
+ * (the same for the verify passes of 2 .. TR_DECODE_ROWS rows, tr_session_rows_threads), "cpu",
  * "kernel_tier"} — the raw material for tools/profile_suite.py. */
 static int write_profile_json(const char *path, tr_prof *prof, const char *model_path, int64_t n_prompt,
-                               int64_t n_gen, int actual_threads, int decode_threads) {
+                               int64_t n_gen, int actual_threads, const tr_session *sess) {
+    int decode_threads = tr_session_decode_threads(sess);
     FILE *out = fopen(path, "w");
     if (out == NULL) return -1;
 
@@ -423,8 +434,10 @@ static int write_profile_json(const char *path, tr_prof *prof, const char *model
 
     fprintf(out, ",\"model\":");
     write_json_string(out, model_path);
-    fprintf(out, ",\"n_prompt\":%" PRId64 ",\"n_gen\":%" PRId64 ",\"threads\":%d,\"decode_threads\":%d,\"cpu\":",
+    fprintf(out, ",\"n_prompt\":%" PRId64 ",\"n_gen\":%" PRId64 ",\"threads\":%d,\"decode_threads\":%d,\"rows_threads\":[",
             n_prompt, n_gen, actual_threads, decode_threads);
+    for (int n = 2; n <= TR_DECODE_ROWS; n++) fprintf(out, "%s%d", n > 2 ? "," : "", tr_session_rows_threads(sess, n));
+    fprintf(out, "],\"cpu\":");
     write_json_string(out, cpu_line);
     fprintf(out, ",\"kernel_tier\":");
     write_json_string(out, tr_kernels_get()->tier);
@@ -632,8 +645,7 @@ static int cmd_generate(int argc, char **argv) {
     /* fewer tokens than asked is a failure, not a success with short output (LESSONS #17) */
     int rc = context_full ? 3 : 0;
     if (profile_json_path != NULL &&
-        write_profile_json(profile_json_path, prof, model_path, n_prompt, produced, tr_pool_size(pool),
-                           tr_session_decode_threads(sess)) != 0) {
+        write_profile_json(profile_json_path, prof, model_path, n_prompt, produced, tr_pool_size(pool), sess) != 0) {
         fprintf(stderr, "generate: could not write --profile-json '%s'\n", profile_json_path);
         rc = 1;
     }

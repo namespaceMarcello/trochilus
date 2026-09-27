@@ -141,6 +141,24 @@ static void k_dot_row_x4_q8_0(const void *row, const float *x, int64_t stride, i
     for (int t = 0; t < TR_DOT_TOKENS; t++) out[t] = lane_combine(lane[t]);
 }
 
+/* The same against t input rows, t 2 or 3 (kernels.h dot_row_xt) */
+static void k_dot_row_xt_q8_0(const void *row, const float *x, int64_t stride, int64_t n, int t, float *out) {
+    const unsigned char *p = (const unsigned char *)row;
+    int64_t nb = n / TR_Q8_0_BLOCK_ELEMS;
+    float lane[TR_DOT_TOKENS][TR_LANES] = {{0}};
+    int64_t k = 0;
+    for (int64_t b = 0; b < nb; b++) {
+        const unsigned char *blk = p + (size_t)b * TR_Q8_0_BLOCK_BYTES;
+        float scale = q8_0_block_scale(blk);
+        const int8_t *qs = (const int8_t *)(blk + TR_Q8_0_SCALE_BYTES);
+        for (int j = 0; j < TR_Q8_0_BLOCK_ELEMS; j++, k++) {
+            float w = scale * (float)qs[j];
+            for (int u = 0; u < t; u++) lane[u][k % TR_LANES] += w * x[u * stride + k];
+        }
+    }
+    for (int u = 0; u < t; u++) out[u] = lane_combine(lane[u]);
+}
+
 /* ---- Q4_K: 256 elements/block in 8 sub-blocks of 32 (kernels_internal.h) ---- */
 
 static void k_dequant_q4_k(const void *row, float *out, int64_t n) {
@@ -157,42 +175,174 @@ static void k_dequant_q4_k(const void *row, float *out, int64_t n) {
     }
 }
 
-/* The weight is the dequantized one, element by element (never d * sum(q*x) - m * sum(x),
- * which rounds otherwise): dot_row(row, x) is dot_f32(dequant_row(row), x) bit for bit. */
-static float k_dot_row_q4_k(const void *row, const float *x, int64_t n) {
-    const unsigned char *p = (const unsigned char *)row;
-    int64_t nb = n / TR_Q4_K_BLOCK_ELEMS;
-    float lane[TR_LANES] = {0};
-    int64_t k = 0;
-    for (int64_t b = 0; b < nb; b++) {
-        const unsigned char *blk = p + (size_t)b * TR_Q4_K_BLOCK_BYTES;
-        const unsigned char *qs = blk + TR_Q4_K_QS_OFFSET;
-        float scale[8], min[8];
-        tr_q4_k_scales(blk, scale, min);
-        for (int i = 0; i < TR_Q4_K_BLOCK_ELEMS; i++, k++) {
-            float w = scale[i >> 5] * (float)tr_q4_k_quant(qs, i) - min[i >> 5];
-            lane[k % TR_LANES] += w * x[k];
+/* ---- Q4_K's integer definition (kernels.h q4x_*, kernels_internal.h for the layouts) ---- */
+
+/* the input row x prepared: per super-block its shift, X, the digits and the sub-blocks' sums; then each
+ * window's token term per digit, sum over its 32 pairs (a, a+32) of C (V_a + V_a+32) + V_a V_a+32 */
+static void k_q4x_prep(const float *x, int64_t n, void *xq) {
+    const tr_q4x_view v = tr_q4x_view_of(xq, n);
+    for (int64_t s = 0; s < n / TR_Q4_K_BLOCK_ELEMS; s++) {
+        const float *xs = x + s * TR_Q4_K_BLOCK_ELEMS;
+        float m = 0.0f;
+        int bad = 0;
+        for (int k = 0; k < TR_Q4_K_BLOCK_ELEMS; k++) {
+            const float a = fabsf(xs[k]);
+            if (!(a <= 3.40282347e38f)) bad = 1; /* a NaN or an infinity */
+            else if (a > m) m = a;
+        }
+        const int sh = bad ? 0 : tr_q4x_shift(m);
+        v.scale[s] = bad ? (double)NAN : ldexp(1.0, -sh);
+        /* x 2^sh is exact in double, and adding and taking away 1.5 2^52 rounds it to the nearest integer,
+         * ties to even (|x 2^sh| <= TR_Q4X_XMAX < 2^51) */
+        const double f = bad ? 0.0 : ldexp(1.0, sh), magic = 6755399441055744.0;
+        for (int j = 0; j < 8; j++) {
+            int64_t b = 0;
+            for (int i = 0; i < 32; i++) {
+                const int64_t k = s * TR_Q4_K_BLOCK_ELEMS + 32 * j + i;
+                const int32_t X = bad ? 0 : (int32_t)(((double)x[k] * f + magic) - magic);
+                tr_q4x_digits(X, &v.v0[k], &v.v1[k]);
+                b += X;
+            }
+            v.bf[8 * s + j] = (double)b;
         }
     }
-    return lane_combine(lane);
+    for (int64_t w = 0; w < n / 64; w++)
+        for (int d = 0; d < 2; d++) {
+            const int16_t *vd = d ? v.v1 : v.v0;
+            int64_t e = 0;
+            for (int i = 0; i < 32; i++) {
+                const int64_t a = vd[64 * w + i], c = vd[64 * w + 32 + i];
+                e += TR_Q4X_C * (a + c) + a * c;
+            }
+            v.tok[2 * w + d] = (int32_t)(uint32_t)(uint64_t)e;
+        }
 }
 
-static void k_dot_row_x4_q4_k(const void *row, const float *x, int64_t stride, int64_t n, float *out) {
+/* v_s 2^-sh_s of the block at blk against super-block s of a prepared row: T and M exact, then the f64
+ * steps (the scale is a power of two, or NaN) */
+static double q4x_block(const unsigned char *blk, const tr_q4x_view *v, int64_t s) {
+    int sc[8], m[8];
+    tr_q4_k_sc_m(blk, sc, m);
+    uint16_t hd, hm;
+    memcpy(&hd, blk, 2);
+    memcpy(&hm, blk + 2, 2);
+    const double d = (double)half_to_float(hd), dmin = (double)half_to_float(hm);
+    const unsigned char *qs = blk + TR_Q4_K_QS_OFFSET;
+    int64_t T = 0, M = 0;
+    for (int j = 0; j < 8; j++) {
+        int64_t S0 = 0, S1 = 0;
+        for (int i = 0; i < 32; i++) {
+            const int64_t k = s * TR_Q4_K_BLOCK_ELEMS + 32 * j + i, q = tr_q4_k_quant(qs, 32 * j + i);
+            S0 += q * v->v0[k];
+            S1 += q * v->v1[k];
+        }
+        T += (int64_t)sc[j] * (S0 + (int64_t)TR_Q4X_BASE * S1);
+        M += (int64_t)m[j] * (int64_t)v->bf[8 * s + j];
+    }
+    const double val = d * (double)T - dmin * (double)M;
+    return val * v->scale[s];
+}
+
+/* The definition from the floats: each super-block of x prepared on the stack and summed in order. */
+static float k_dot_row_q4_k(const void *row, const float *x, int64_t n) {
     const unsigned char *p = (const unsigned char *)row;
-    int64_t nb = n / TR_Q4_K_BLOCK_ELEMS;
-    float lane[TR_DOT_TOKENS][TR_LANES] = {{0}};
-    int64_t k = 0;
-    for (int64_t b = 0; b < nb; b++) {
-        const unsigned char *blk = p + (size_t)b * TR_Q4_K_BLOCK_BYTES;
-        const unsigned char *qs = blk + TR_Q4_K_QS_OFFSET;
-        float scale[8], min[8];
-        tr_q4_k_scales(blk, scale, min);
-        for (int i = 0; i < TR_Q4_K_BLOCK_ELEMS; i++, k++) {
-            float w = scale[i >> 5] * (float)tr_q4_k_quant(qs, i) - min[i >> 5];
-            for (int t = 0; t < TR_DOT_TOKENS; t++) lane[t][k % TR_LANES] += w * x[t * stride + k];
+    double buf[1152 / sizeof(double)]; /* tr_q4x_bytes(256) */
+    const tr_q4x_view v = tr_q4x_view_of(buf, TR_Q4_K_BLOCK_ELEMS);
+    double y = 0.0;
+    for (int64_t s = 0; s < n / TR_Q4_K_BLOCK_ELEMS; s++) {
+        k_q4x_prep(x + s * TR_Q4_K_BLOCK_ELEMS, TR_Q4_K_BLOCK_ELEMS, buf);
+        y = y + q4x_block(p + (size_t)s * TR_Q4_K_BLOCK_BYTES, &v, 0);
+    }
+    return (float)y;
+}
+
+static void k_q4x_dot2(const void *row0, const void *row1, const void *xq, int64_t n, float *out) {
+    const unsigned char *p0 = (const unsigned char *)row0, *p1 = (const unsigned char *)row1;
+    const tr_q4x_view v = tr_q4x_view_of(xq, n);
+    double y0 = 0.0, y1 = 0.0;
+    for (int64_t s = 0; s < n / TR_Q4_K_BLOCK_ELEMS; s++) {
+        y0 = y0 + q4x_block(p0 + (size_t)s * TR_Q4_K_BLOCK_BYTES, &v, s);
+        y1 = y1 + q4x_block(p1 + (size_t)s * TR_Q4_K_BLOCK_BYTES, &v, s);
+    }
+    out[0] = (float)y0;
+    out[1] = (float)y1;
+}
+
+/* the lane of row r in the panel's doubles: the even rows first */
+static int q4x_eo(int r) { return (r & 1) ? 8 + r / 2 : r / 2; }
+
+static void k_q4x_panel(const void *rows, size_t row_bytes, int64_t n, void *panel, const void *next) {
+    (void)next;
+    const unsigned char *base = (const unsigned char *)rows;
+    for (int64_t s = 0; s < n / TR_Q4_K_BLOCK_ELEMS; s++) {
+        unsigned char *sb = (unsigned char *)panel + (size_t)s * TR_Q4X_SB_BYTES;
+        double cst[TR_Q4X_CONST_BYTES / sizeof(double)];
+        int sc[TR_PM_ROWS][8], m[TR_PM_ROWS][8];
+        for (int r = 0; r < TR_PM_ROWS; r++) {
+            const unsigned char *blk = base + (size_t)r * row_bytes + (size_t)s * TR_Q4_K_BLOCK_BYTES;
+            tr_q4_k_sc_m(blk, sc[r], m[r]);
+            uint16_t hd, hm;
+            memcpy(&hd, blk, 2);
+            memcpy(&hm, blk + 2, 2);
+            cst[q4x_eo(r)] = (double)half_to_float(hd);
+            cst[16 + q4x_eo(r)] = (double)half_to_float(hm);
+            for (int j = 0; j < 8; j++) cst[32 + 16 * j + q4x_eo(r)] = (double)m[r][j];
+        }
+        memcpy(sb, cst, sizeof cst);
+        for (int c = 0; c < 4; c++) {
+            unsigned char *win = sb + TR_Q4X_CONST_BYTES + (size_t)c * TR_Q4X_WIN_BYTES;
+            for (int r = 0; r < TR_PM_ROWS; r++) {
+                const unsigned char *q = base + (size_t)r * row_bytes + (size_t)s * TR_Q4_K_BLOCK_BYTES +
+                                         TR_Q4_K_QS_OFFSET + 32 * c;
+                int64_t e = 0;
+                for (int u = 0; u < 16; u++)
+                    for (int h = 0; h < 2; h++) {
+                        const int16_t wl = (int16_t)(sc[r][2 * c] * (q[2 * u + h] & 15) + TR_Q4X_C);
+                        const int16_t wh = (int16_t)(sc[r][2 * c + 1] * (q[2 * u + h] >> 4) + TR_Q4X_C);
+                        memcpy(win + 64 + 128 * u + 4 * r + 2 * h, &wl, 2);
+                        memcpy(win + 128 + 128 * u + 4 * r + 2 * h, &wh, 2);
+                        e += (int64_t)wl * wh;
+                    }
+                const uint32_t neg = (uint32_t)(uint64_t)(-e) + ((r & 1) ? 0u : 0x80000000u);
+                memcpy(win + 4 * r, &neg, 4);
+            }
         }
     }
-    for (int t = 0; t < TR_DOT_TOKENS; t++) out[t] = lane_combine(lane[t]);
+}
+
+/* The definition from the panel's own bytes, a row and an input row at a time: w = word - TR_Q4X_C, T and
+ * M exact, the f64 steps (the panel's row terms are the SIMD tiles' business, checked with the panel). */
+static void k_q4x_tile(const void *panel, const void *xq, size_t xq_stride, int64_t n, int T, float *y,
+                       int64_t y_stride) {
+    for (int t = 0; t < T; t++) {
+        const tr_q4x_view v = tr_q4x_view_of((const unsigned char *)xq + (size_t)t * xq_stride, n);
+        for (int r = 0; r < TR_PM_ROWS; r++) {
+            double acc = 0.0;
+            for (int64_t s = 0; s < n / TR_Q4_K_BLOCK_ELEMS; s++) {
+                const unsigned char *sb = (const unsigned char *)panel + (size_t)s * TR_Q4X_SB_BYTES;
+                double cst[TR_Q4X_CONST_BYTES / sizeof(double)];
+                memcpy(cst, sb, sizeof cst);
+                int64_t Ts = 0, Ms = 0;
+                for (int c = 0; c < 4; c++) {
+                    const unsigned char *win = sb + TR_Q4X_CONST_BYTES + (size_t)c * TR_Q4X_WIN_BYTES;
+                    for (int u = 0; u < 16; u++)
+                        for (int h = 0; h < 2; h++) {
+                            int16_t wl, wh;
+                            memcpy(&wl, win + 64 + 128 * u + 4 * r + 2 * h, 2);
+                            memcpy(&wh, win + 128 + 128 * u + 4 * r + 2 * h, 2);
+                            const int64_t a = s * TR_Q4_K_BLOCK_ELEMS + 64 * c + 2 * u + h, b = a + 32;
+                            const int64_t Xa = v.v0[a] + (int64_t)TR_Q4X_BASE * v.v1[a];
+                            const int64_t Xb = v.v0[b] + (int64_t)TR_Q4X_BASE * v.v1[b];
+                            Ts += (int64_t)(wl - TR_Q4X_C) * Xa + (int64_t)(wh - TR_Q4X_C) * Xb;
+                        }
+                }
+                for (int j = 0; j < 8; j++) Ms += (int64_t)cst[32 + 16 * j + q4x_eo(r)] * (int64_t)v.bf[8 * s + j];
+                const double val = cst[q4x_eo(r)] * (double)Ts - cst[16 + q4x_eo(r)] * (double)Ms;
+                acc = acc + val * v.scale[s];
+            }
+            y[(int64_t)t * y_stride + r] = (float)acc;
+        }
+    }
 }
 
 /* ---- Q6_K: 256 elements/block in 16 sub-blocks of 16 (kernels_internal.h) ---- */
@@ -278,6 +428,11 @@ int tr_kernels_support(tr_type type) {
            type == TR_TYPE_Q6_K;
 }
 
+size_t tr_q4x_bytes(int64_t n) {
+    const size_t b = 4 * (size_t)n + (size_t)n / 8 + (size_t)n / 4 + (size_t)n / 32;
+    return (b + 63) / 64 * 64;
+}
+
 static tr_kernels g_scalar_kernels;          /* global-ok: kernel tables depend only on the CPU */
 static int g_scalar_built = 0;               /* global-ok: same */
 static const tr_kernels *g_active = NULL;    /* global-ok: tier chosen for the CPU (or forced by tests) */
@@ -299,8 +454,12 @@ static void build_scalar_table(tr_kernels *k) {
     k->dot_row_x4[TR_TYPE_F32] = k_dot_row_x4_f32;
     k->dot_row_x4[TR_TYPE_F16] = k_dot_row_x4_f16;
     k->dot_row_x4[TR_TYPE_Q8_0] = k_dot_row_x4_q8_0;
-    k->dot_row_x4[TR_TYPE_Q4_K] = k_dot_row_x4_q4_k;
+    k->dot_row_xt[TR_TYPE_Q8_0] = k_dot_row_xt_q8_0;
     k->dot_row_x4[TR_TYPE_Q6_K] = k_dot_row_x4_q6_k;
+    k->q4x_prep = k_q4x_prep;
+    k->q4x_dot2 = k_q4x_dot2;
+    k->q4x_panel = k_q4x_panel;
+    k->q4x_tile = k_q4x_tile;
     k->dequant_row[TR_TYPE_F32] = k_dequant_f32;
     k->dequant_row[TR_TYPE_F16] = k_dequant_f16;
     k->dequant_row[TR_TYPE_Q8_0] = k_dequant_q8_0;
@@ -357,6 +516,15 @@ void tr_rope_table(float *cos_t, float *sin_t, int64_t n_pos, int64_t head_dim, 
 }
 
 /* hot: begin */
+
+#if defined(TR_POOL_TRACE)
+/* the weights a grouped call reads, the groups with input rows: the pool trace's note (threads.h) */
+static uint64_t matmul_used_bytes(const int64_t *offsets, int64_t n_groups, int64_t rows, size_t row_bytes) {
+    int64_t used = 0;
+    for (int64_t g = 0; g < n_groups; g++) used += offsets[g + 1] > offsets[g];
+    return (uint64_t)used * (uint64_t)rows * row_bytes;
+}
+#endif
 
 /* Index space of a matmul job: p * rows + r (input row p, weight row r). */
 typedef struct {
@@ -507,11 +675,7 @@ void tr_matmul_grouped(tr_pool *pool, const tr_mat *w, const int64_t *offsets, i
     /* Keep chunks worth threading: roughly a few thousand scalar multiplies
      * worth of rows per chunk, never less than one row. */
     int64_t min_chunk = ctx.cols > 0 ? (4096 / ctx.cols) + 1 : 1;
-#if defined(TR_POOL_TRACE)
-    int64_t used = 0; /* the weights this call reads: the groups with rows */
-    for (int64_t g = 0; g < n_groups; g++) used += offsets[g + 1] > offsets[g];
-    TR_TRACE_NOTE((uint64_t)used * (uint64_t)ctx.rows * ctx.row_bytes, ctx.rows, ctx.cols);
-#endif
+    TR_TRACE_NOTE(matmul_used_bytes(offsets, n_groups, ctx.rows, ctx.row_bytes), ctx.rows, ctx.cols, offsets[n_groups]);
     /* One input row per group (a decode token, its experts' gathered rows): only weight rows to
      * stream, balanced at the tail. More rows share tiles, which want long chunks. */
     if (tr_matmul_one_row_per_group(offsets, n_groups)) tr_parallel_for_balanced(pool, n, min_chunk, matmul_body, &ctx);
@@ -587,10 +751,22 @@ static void pm_interleave_body(void *ctx_, int64_t begin, int64_t end, int worke
     }
 }
 
-/* input rows [p_begin, p_end) of group g against its 16 weight rows from r0, one dot_row2 (or two dot_row)
- * per pair of rows: the same bits as a tile */
+/* input rows [p_begin, p_end) of group g against its 16 weight rows from r0: two or three of them with each
+ * weight row decoded once for all (dot_row_xt), else one dot_row2 (or two dot_row) per pair of rows and input
+ * row: the same bits as a tile */
 static void pm_rows_by_dot(const pm_ctx *c, int64_t g, int64_t r0, int64_t p_begin, int64_t p_end) {
     const unsigned char *rows = (const unsigned char *)c->w[g].data + (size_t)r0 * c->row_bytes;
+    const int64_t t = p_end - p_begin;
+    if ((t == 2 || t == 3) && c->k->dot_row_xt[c->w[g].type] != NULL) {
+        const float *xp = c->x + p_begin * c->cols;
+        float *yp = c->y + p_begin * c->rows + r0;
+        float out[3];
+        for (int r = 0; r < TR_PM_ROWS; r++) {
+            c->k->dot_row_xt[c->w[g].type](rows + (size_t)r * c->row_bytes, xp, c->cols, c->cols, (int)t, out);
+            for (int64_t j = 0; j < t; j++) yp[j * c->rows + r] = out[j];
+        }
+        return;
+    }
     for (int64_t p = p_begin; p < p_end; p++) {
         const float *xp = c->x + p * c->cols;
         float *yp = c->y + p * c->rows + r0;
@@ -604,6 +780,53 @@ static void pm_rows_by_dot(const pm_ctx *c, int64_t g, int64_t r0, int64_t p_beg
             }
         }
     }
+}
+
+/* The plan of both roads, cut evenly (piece i of L in n: [i*L/n, (i+1)*L/n)): a group of min_rows input rows
+ * or more in chunks of at most PM_CHUNK, each in tiles of at most tile_max; a smaller group in one chunk with no
+ * tiles. Items are (group, TR_PM_ROWS weight rows, chunk); every worker's panel is forgotten. The tiles fit the
+ * plan's room (pm_max_tiles: max_tokens / PM_MIN_ROWS + the chunks) while tile_max >= PM_MIN_ROWS: a chunk of
+ * len holds ceil(len / tile_max) <= len / PM_MIN_ROWS + 1 tiles. Returns the items; *n_tiles the tiles. */
+static int64_t pm_plan_build(pm_plan *pl, const int64_t *offsets, int64_t n_groups, int64_t rows, int64_t min_rows,
+                             int64_t tile_max, int n_workers, int64_t *n_tiles) {
+    int64_t n_items = 0, n_chunks = 0, nt_all = 0;
+    for (int64_t g = 0; g < n_groups; g++) {
+        int64_t cg = offsets[g + 1] - offsets[g];
+        int64_t nch = cg >= min_rows ? (cg + PM_CHUNK - 1) / PM_CHUNK : 1;
+        pl->item0[g] = n_items;
+        pl->nchunk[g] = nch;
+        pl->chunk0[g] = n_chunks;
+        if (cg > 0) n_items += (rows / TR_PM_ROWS) * nch;
+        if (cg >= min_rows) {
+            for (int64_t ch = 0; ch < nch; ch++) {
+                int64_t c0 = offsets[g] + ch * cg / nch, c1 = offsets[g] + (ch + 1) * cg / nch, len = c1 - c0;
+                int64_t nt = (len + tile_max - 1) / tile_max;
+                pl->tile0[n_chunks++] = nt_all;
+                for (int64_t t = 0; t < nt; t++) {
+                    pl->tile_p[nt_all] = c0 + t * len / nt;
+                    pl->tile_t[nt_all] = c0 + (t + 1) * len / nt - pl->tile_p[nt_all];
+                    nt_all++;
+                }
+            }
+        } else {
+            pl->tile0[n_chunks++] = nt_all; /* its one chunk has no tiles */
+        }
+    }
+    pl->item0[n_groups] = n_items;
+    pl->chunk0[n_groups] = n_chunks;
+    pl->tile0[n_chunks] = nt_all;
+    for (int i = 0; i < 2 * n_workers; i++) pl->last[i] = -1;
+    *n_tiles = nt_all;
+    return n_items;
+}
+
+/* 1 when the worker's panel (last: its group and rows) is not group g's rows rg; then it is marked as theirs,
+ * and the caller builds it */
+static int pm_panel_stale(int64_t *last, int64_t g, int64_t rg) {
+    if (last[0] == g && last[1] == rg) return 0;
+    last[0] = g;
+    last[1] = rg;
+    return 1;
 }
 
 static void pm_item_body(void *ctx_, int64_t begin, int64_t end, int worker) {
@@ -633,11 +856,7 @@ static void pm_item_body(void *ctx_, int64_t begin, int64_t end, int worker) {
             pm_rows_by_dot(c, g, r0, p_begin + ch * n_in / nch, p_begin + (ch + 1) * n_in / nch);
             continue;
         }
-        if (last[0] != g || last[1] != rg) {
-            c->k->pm_panel[c->w[g].type](rows, c->row_bytes, c->cols, panel);
-            last[0] = g;
-            last[1] = rg;
-        }
+        if (pm_panel_stale(last, g, rg)) c->k->pm_panel[c->w[g].type](rows, c->row_bytes, c->cols, panel);
         int64_t ci = pl->chunk0[g] + ch;
         for (int64_t i = pl->tile0[ci]; i < pl->tile0[ci + 1]; i++) {
             int64_t p0 = pl->tile_p[i];
@@ -647,21 +866,26 @@ static void pm_item_body(void *ctx_, int64_t begin, int64_t end, int worker) {
     }
 }
 
-/* 1 when the call took the phase-major road */
+/* 1 when the call took the phase-major road. A group of PM_MIN_ROWS input rows or more runs tiles. A short
+ * pass (no such group, one of 2 or 3: a verify pass of 2-3 rows) is taken too, on a tier with no tiles as
+ * well: every group by rows (pm_rows_by_dot) in items cut by weight rows and balanced, a group's input rows
+ * against each weight row while it is in cache (docs/MEASUREMENTS.md §The short verify pass at its bytes).
+ * One input row a group (a decode token) stays on tr_matmul_grouped's balanced road. */
 static int matmul_phase_major(tr_pool *pool, const tr_mat *w, const int64_t *offsets, int64_t n_groups,
                               const float *x, float *y, const tr_pm_scratch *s) {
     const tr_kernels *k = tr_kernels_get();
     const tr_type type = w[0].type;
     const int64_t rows = w[0].rows, cols = w[0].cols, n_in = offsets[n_groups];
-    if (s == NULL || s->plan == NULL || k->pm_tile == NULL || k->pm_interleave == NULL || k->pm_panel[type] == NULL)
-        return 0;
+    if (s == NULL || s->plan == NULL) return 0;
     /* a row must be whole blocks of its type too (a Q4_K row of 272 columns has 0 bytes) */
     if (rows % TR_PM_ROWS != 0 || cols % 16 != 0 || tr_row_bytes(type, cols) == 0 || cols > s->max_cols ||
         n_groups > s->max_groups || n_in > s->max_tokens || n_in * cols > s->max_x)
         return 0;
-    int any = 0;
-    for (int64_t g = 0; g < n_groups; g++) any |= offsets[g + 1] - offsets[g] >= PM_MIN_ROWS;
-    if (!any) return 0;
+    int64_t most = 0;
+    for (int64_t g = 0; g < n_groups; g++)
+        if (offsets[g + 1] - offsets[g] > most) most = offsets[g + 1] - offsets[g];
+    if (most < 2) return 0;
+    if (most >= PM_MIN_ROWS && (k->pm_tile == NULL || k->pm_interleave == NULL || k->pm_panel[type] == NULL)) return 0;
 
     pm_ctx c;
     c.w = w;
@@ -675,38 +899,136 @@ static int matmul_phase_major(tr_pool *pool, const tr_mat *w, const int64_t *off
     c.s = s;
     c.plan = pm_plan_of(s);
     c.row_bytes = tr_row_bytes(type, cols);
-    pm_plan *pl = &c.plan;
-    /* the plan: chunks and tiles cut evenly (piece i of L in n: [i*L/n, (i+1)*L/n)) */
-    int64_t n_items = 0, n_chunks = 0, n_tiles = 0;
-    for (int64_t g = 0; g < n_groups; g++) {
-        int64_t cg = offsets[g + 1] - offsets[g];
-        int64_t nch = cg >= PM_MIN_ROWS ? (cg + PM_CHUNK - 1) / PM_CHUNK : 1;
-        pl->item0[g] = n_items;
-        pl->nchunk[g] = nch;
-        pl->chunk0[g] = n_chunks;
-        if (cg > 0) n_items += (rows / TR_PM_ROWS) * nch;
-        if (cg >= PM_MIN_ROWS) {
-            for (int64_t ch = 0; ch < nch; ch++) {
-                int64_t c0 = offsets[g] + ch * cg / nch, c1 = offsets[g] + (ch + 1) * cg / nch, len = c1 - c0;
-                int64_t nt = (len + TR_PM_TILE_MAX - 1) / TR_PM_TILE_MAX;
-                pl->tile0[n_chunks++] = n_tiles;
-                for (int64_t t = 0; t < nt; t++) {
-                    pl->tile_p[n_tiles] = c0 + t * len / nt;
-                    pl->tile_t[n_tiles] = c0 + (t + 1) * len / nt - pl->tile_p[n_tiles];
-                    n_tiles++;
-                }
+    int64_t n_tiles;
+    const int64_t n_items = pm_plan_build(&c.plan, offsets, n_groups, rows, PM_MIN_ROWS, TR_PM_TILE_MAX, s->n_workers, &n_tiles);
+
+    if (n_tiles > 0) tr_parallel_for(pool, n_tiles, 1, pm_interleave_body, &c);
+    TR_TRACE_NOTE(matmul_used_bytes(offsets, n_groups, rows, c.row_bytes), rows, cols, n_in);
+    tr_parallel_for_balanced(pool, n_items, 1, pm_item_body, &c);
+    return 1;
+}
+
+/* ---- Q4_K's integer road (kernels.h q4x_*) --------------------------------------------------------------
+ * Every input row prepared once (its digits, sums and shifts); then items as the phase-major road cuts them,
+ * (group, 16 weight rows, a chunk of the group's input rows): a group of Q4X_MIN_TILE_ROWS input rows or more
+ * builds the rows' W16 panel (kept while the worker's next item has the same rows) and runs tiles of at most
+ * TR_Q4X_TILE_MAX rows cut evenly; a smaller group (a decode token, or the two of a verify pass) goes two
+ * weight rows at a time through q4x_dot2, a token after the other: two such streams cost less than a panel
+ * built for two tokens (docs/MEASUREMENTS.md §The Q4_K short passes). A short group's panel is built from the
+ * rows the previous item brought ahead (q4x_panel's next). Every output is the definition's, whatever the
+ * thread or the tile. */
+#define Q4X_MIN_TILE_ROWS 3
+
+typedef struct {
+    const tr_mat *w;
+    const int64_t *offsets;
+    int64_t n_groups, rows, cols;
+    const float *x;
+    float *y;
+    const tr_kernels *k;
+    const tr_pm_scratch *s;
+    pm_plan plan;
+    size_t row_bytes, xq_row;   /* a weight row's bytes, a prepared input row's */
+} q4x_ctx;
+
+static void q4x_prep_body(void *ctx_, int64_t begin, int64_t end, int worker) {
+    (void)worker;
+    const q4x_ctx *c = (const q4x_ctx *)ctx_;
+    for (int64_t p = begin; p < end; p++) c->k->q4x_prep(c->x + p * c->cols, c->cols, c->s->xq + (size_t)p * c->xq_row);
+}
+
+/* input rows [p_begin, p_end) of group g against its TR_PM_ROWS weight rows from r0, two a call */
+static void q4x_rows(const q4x_ctx *c, int64_t g, int64_t r0, int64_t p_begin, int64_t p_end) {
+    const unsigned char *rows = (const unsigned char *)c->w[g].data + (size_t)r0 * c->row_bytes;
+    for (int64_t p = p_begin; p < p_end; p++) {
+        const unsigned char *xq = c->s->xq + (size_t)p * c->xq_row;
+        float *yp = c->y + p * c->rows + r0;
+        for (int r = 0; r < TR_PM_ROWS; r += 2)
+            c->k->q4x_dot2(rows + (size_t)r * c->row_bytes, rows + (size_t)(r + 1) * c->row_bytes, xq, c->cols, yp + r);
+    }
+}
+
+static void q4x_item_body(void *ctx_, int64_t begin, int64_t end, int worker) {
+    const q4x_ctx *c = (const q4x_ctx *)ctx_;
+    const pm_plan *pl = &c->plan;
+    /* a worker the scratch has no panel for (a call with no pool from inside a larger pool's body): by rows */
+    const int own = worker < c->s->n_workers && c->k->q4x_panel != NULL && c->k->q4x_tile != NULL;
+    unsigned char *panel = own ? (unsigned char *)(c->s->work + (size_t)worker * (size_t)(TR_PM_PANEL_FLOATS(c->s->max_cols) +
+                                                                                           TR_PM_PART))
+                               : NULL;
+    int64_t *last = own ? pl->last + 2 * worker : NULL;
+    int64_t g = 0, lo = 0, hi = c->n_groups - 1;
+    while (lo < hi) { /* the last group whose first item is <= begin */
+        int64_t mid = lo + (hi - lo + 1) / 2;
+        if (pl->item0[mid] <= begin) lo = mid;
+        else hi = mid - 1;
+    }
+    g = lo;
+    for (int64_t it = begin; it < end; it++) {
+        while (pl->item0[g + 1] <= it) g++;
+        int64_t local = it - pl->item0[g], nch = pl->nchunk[g];
+        int64_t rg = local / nch, ch = local % nch;
+        int64_t r0 = rg * TR_PM_ROWS, p_begin = c->offsets[g], n_in = c->offsets[g + 1] - p_begin;
+        if (n_in < Q4X_MIN_TILE_ROWS || !own) {
+            q4x_rows(c, g, r0, p_begin + ch * n_in / nch, p_begin + (ch + 1) * n_in / nch);
+            continue;
+        }
+        if (pm_panel_stale(last, g, rg)) {
+            /* a short group (one tile an item, over soon): the item after this one, when it has other rows,
+             * brought ahead while this panel is built */
+            const void *next = NULL;
+            if (n_in <= TR_Q4X_TILE_MAX && it + 1 < pl->item0[c->n_groups]) {
+                int64_t g2 = g;
+                while (pl->item0[g2 + 1] <= it + 1) g2++;
+                const int64_t rg2 = (it + 1 - pl->item0[g2]) / pl->nchunk[g2];
+                if (g2 != g || rg2 != rg)
+                    next = (const unsigned char *)c->w[g2].data + (size_t)(rg2 * TR_PM_ROWS) * c->row_bytes;
             }
-        } else {
-            pl->tile0[n_chunks++] = n_tiles; /* its one chunk has no tiles */
+            c->k->q4x_panel((const unsigned char *)c->w[g].data + (size_t)r0 * c->row_bytes, c->row_bytes, c->cols, panel,
+                            next);
+        }
+        int64_t ci = pl->chunk0[g] + ch;
+        for (int64_t i = pl->tile0[ci]; i < pl->tile0[ci + 1]; i++) {
+            int64_t p0 = pl->tile_p[i];
+            c->k->q4x_tile(panel, c->s->xq + (size_t)p0 * c->xq_row, c->xq_row, c->cols, (int)pl->tile_t[i],
+                           c->y + p0 * c->rows + r0, c->rows);
         }
     }
-    pl->item0[n_groups] = n_items;
-    pl->chunk0[n_groups] = n_chunks;
-    pl->tile0[n_chunks] = n_tiles;
-    for (int i = 0; i < 2 * s->n_workers; i++) pl->last[i] = -1;
+}
 
-    tr_parallel_for(pool, n_tiles, 1, pm_interleave_body, &c);
-    tr_parallel_for_balanced(pool, n_items, 1, pm_item_body, &c);
+/* 1 when the call took the integer road */
+static int matmul_q4x(tr_pool *pool, const tr_mat *w, const int64_t *offsets, int64_t n_groups, const float *x,
+                      float *y, const tr_pm_scratch *s) {
+    const tr_kernels *k = tr_kernels_get();
+    const int64_t rows = w[0].rows, cols = w[0].cols, n_in = offsets[n_groups];
+    if (w[0].type != TR_TYPE_Q4_K || s == NULL || s->plan == NULL || s->xq == NULL || k->q4x_prep == NULL ||
+        k->q4x_dot2 == NULL)
+        return 0;
+    if (rows % TR_PM_ROWS != 0 || tr_row_bytes(TR_TYPE_Q4_K, cols) == 0 || cols > s->max_cols ||
+        n_groups > s->max_groups || n_in > s->max_tokens || (uint64_t)n_in * tr_q4x_bytes(cols) > (uint64_t)s->xq_bytes)
+        return 0;
+    q4x_ctx c;
+    c.w = w;
+    c.offsets = offsets;
+    c.n_groups = n_groups;
+    c.rows = rows;
+    c.cols = cols;
+    c.x = x;
+    c.y = y;
+    c.k = k;
+    c.s = s;
+    c.plan = pm_plan_of(s);
+    c.row_bytes = tr_row_bytes(TR_TYPE_Q4_K, cols);
+    c.xq_row = tr_q4x_bytes(cols);
+    /* tiles of at most TR_Q4X_TILE_MAX (4: within the plan's room, ceil(len / 4) tiles a chunk) */
+    int64_t n_tiles;
+    const int64_t n_items = pm_plan_build(&c.plan, offsets, n_groups, rows, Q4X_MIN_TILE_ROWS, TR_Q4X_TILE_MAX,
+                                          s->n_workers, &n_tiles);
+    (void)n_tiles;
+
+    tr_parallel_for(pool, n_in, 1, q4x_prep_body, &c);
+    TR_TRACE_NOTE(matmul_used_bytes(offsets, n_groups, rows, c.row_bytes), rows, cols, n_in);
+    tr_parallel_for_balanced(pool, n_items, 1, q4x_item_body, &c);
     return 1;
 }
 
@@ -714,6 +1036,7 @@ void tr_matmul_grouped_s(tr_pool *pool, const tr_mat *w, const int64_t *offsets,
                          float *y, const tr_pm_scratch *s) {
     if (n_groups <= 0 || offsets[n_groups] <= 0 || w[0].rows <= 0) return;
     if (pool != NULL && s != NULL && tr_pool_size(pool) > s->n_workers) s = NULL;
+    if (matmul_q4x(pool, w, offsets, n_groups, x, y, s)) return;
     if (matmul_phase_major(pool, w, offsets, n_groups, x, y, s)) return;
     tr_matmul_grouped(pool, w, offsets, n_groups, x, y);
 }
@@ -725,12 +1048,19 @@ void tr_matmul_s(tr_pool *pool, const tr_mat *w, const float *x, int64_t n_token
 
 /* hot: end */
 
+/* the input buffer: the interleaved floats, or as many bytes as the prepared Q4_K rows of the largest call */
+static uint64_t pm_input_bytes(const tr_pm_scratch *t, int64_t max_cols, int64_t max_x) {
+    const uint64_t xil = (uint64_t)(max_x + pm_max_tiles(t) * 16 * TR_PM_PAD) * sizeof(float);
+    const uint64_t xq = (uint64_t)t->max_tokens * (uint64_t)tr_q4x_bytes(max_cols);
+    return xil > xq ? xil : xq;
+}
+
 uint64_t tr_pm_scratch_bytes(int n_workers, int64_t max_groups, int64_t max_tokens, int64_t max_cols, int64_t max_x) {
     tr_pm_scratch t;
     t.max_groups = max_groups;
     t.max_tokens = max_tokens;
     uint64_t plan = (uint64_t)((max_groups + 1) * 3 + pm_max_chunks(&t) + 1 + 2 * pm_max_tiles(&t) + 2 * n_workers);
-    return (uint64_t)(max_x + pm_max_tiles(&t) * 16 * TR_PM_PAD) * sizeof(float) +
+    return pm_input_bytes(&t, max_cols, max_x) +
            (uint64_t)n_workers * (uint64_t)(TR_PM_PANEL_FLOATS(max_cols) + TR_PM_PART) * sizeof(float) +
            plan * sizeof(int64_t);
 }
@@ -745,7 +1075,9 @@ int tr_pm_scratch_init(tr_pm_scratch *s, int n_workers, int64_t max_groups, int6
     s->max_cols = max_cols;
     s->max_x = max_x;
     uint64_t plan = (uint64_t)((max_groups + 1) * 3 + pm_max_chunks(s) + 1 + 2 * pm_max_tiles(s) + 2 * n_workers);
-    s->xil = (float *)tr_alloc_aligned((size_t)(max_x + pm_max_tiles(s) * 16 * TR_PM_PAD) * sizeof(float), 64);
+    s->xil = (float *)tr_alloc_aligned((size_t)pm_input_bytes(s, max_cols, max_x), 64);
+    s->xq = (unsigned char *)s->xil;
+    s->xq_bytes = max_tokens * (int64_t)tr_q4x_bytes(max_cols);
     s->work = (float *)tr_alloc_aligned(
         (size_t)n_workers * (size_t)(TR_PM_PANEL_FLOATS(max_cols) + TR_PM_PART) * sizeof(float), 64);
     s->plan = (int64_t *)tr_alloc_aligned((size_t)plan * sizeof(int64_t), 64);

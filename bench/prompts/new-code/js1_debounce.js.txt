@@ -1,0 +1,7 @@
+// utils.js — small helpers for the browser.
+
+/**
+ * Returns a function that calls `fn` only after `wait` ms have passed
+ * without another call. The last arguments win.
+ */
+export function debounce(fn, wait) {

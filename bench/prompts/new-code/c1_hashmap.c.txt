@@ -1,0 +1,26 @@
+/* strmap.c — an open-addressing hash map from strings to ints. */
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+
+typedef struct {
+    char *key;
+    int value;
+    int used;
+} slot;
+
+typedef struct {
+    slot *slots;
+    size_t cap, len;
+} strmap;
+
+static uint64_t hash_str(const char *s) {
+    uint64_t h = 1469598103934665603ULL;
+    while (*s) {
+        h ^= (unsigned char)*s++;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+int strmap_init(strmap *m, size_t cap) {

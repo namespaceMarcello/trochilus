@@ -5,6 +5,8 @@
 
 #include "kernels.h"
 
+#include <math.h>
+#include <stdint.h>
 #include <string.h>
 
 #define TR_Q8_0_BLOCK_ELEMS 32
@@ -81,6 +83,72 @@ static inline void tr_q4_k_scales(const unsigned char *blk, float scale[8], floa
 static inline unsigned tr_q4_k_quant(const unsigned char *qs, int i) {
     unsigned byte = qs[32 * (i >> 6) + (i & 31)];
     return (i & 32) ? byte >> 4 : byte & 0x0F;
+}
+
+/* the six-bit sc_j and m_j of the block at blk, as integers (tr_q4_k_scales without d and dmin) */
+static inline void tr_q4_k_sc_m(const unsigned char *blk, int sc[8], int m[8]) {
+    const unsigned char *s = blk + 4;
+    for (int j = 0; j < 4; j++) {
+        sc[j] = s[j] & 63;
+        m[j] = s[j + 4] & 63;
+        sc[j + 4] = (s[j + 8] & 0x0F) | ((s[j] >> 6) << 4);
+        m[j + 4] = (s[j + 8] >> 4) | ((s[j + 4] >> 6) << 4);
+    }
+}
+
+/* ---- Q4_K's integer definition (kernels.h q4x_*) ----
+ * An input row of n columns prepared once (tr_q4x_bytes(n) bytes): int16 v0[n], v1[n], the balanced digits
+ * of X = v0 + TR_Q4X_BASE v1 in natural column order; int32 tok[n/64][2], each 64-column window's token term
+ * per digit, mod 2^32; double bf[n/256][8], each 32-column sub-block's exact sum of X; double scale[n/256],
+ * 2^-sh of each super-block, NaN for one that holds a NaN or an infinity (its digits and sums are then 0).
+ * The panel of 16 rows (TR_Q4X_PANEL_BYTES(n)): per super-block 1280 bytes of doubles, d[16], dmin[16] and
+ * m[8][16], each with the even rows first, then the odd ones (the order the tile's int64 split gives), then
+ * 4 windows of 64 columns, window c the block's quant chunk c (bytes 32c..32c+31: low nibbles columns
+ * 64c..64c+31, high nibbles 64c+32..64c+63): 16 int32, minus the window's row term mod 2^32, plus 2^31 on
+ * the even rows; then for u = 0..15 two vectors of 32 int16, lane r (words 2r, 2r+1) of the byte pair
+ * i = 2u, 2u+1 of row r: wl = sc_2c lo(b_i) + TR_Q4X_C, wh = sc_2c+1 hi(b_i) + TR_Q4X_C. The tile pairs the
+ * low and the high nibble of a byte (columns a = 64c+i and a+32): (wl_a + V_a+32)(wh_a + V_a) = w_a V_a +
+ * w_a+32 V_a+32 + a row term (wl_a wh_a) + a token term (C (V_a + V_a+32) + V_a V_a+32), the words and the
+ * digits each fit 16 bits and so does their sum. */
+#define TR_Q4X_C (-473)
+#define TR_Q4X_CONST_BYTES 1280
+#define TR_Q4X_WIN_BYTES (64 + 16 * 128)
+#define TR_Q4X_SB_BYTES (TR_Q4X_CONST_BYTES + 4 * TR_Q4X_WIN_BYTES)
+
+typedef struct {
+    int16_t *v0, *v1;
+    int32_t *tok;
+    double *bf, *scale;
+} tr_q4x_view;
+
+static inline tr_q4x_view tr_q4x_view_of(const void *xq, int64_t n) {
+    tr_q4x_view v;
+    unsigned char *p = (unsigned char *)(uintptr_t)xq;
+    v.v0 = (int16_t *)(void *)p;
+    v.v1 = v.v0 + n;
+    v.tok = (int32_t *)(void *)(p + 4 * (size_t)n);
+    v.bf = (double *)(void *)(p + 4 * (size_t)n + (size_t)n / 8);
+    v.scale = v.bf + n / 32;
+    return v;
+}
+
+/* the shift of a block whose largest |x| is m (finite): the largest sh with m 2^sh <= TR_Q4X_XMAX, 0 for 0.
+ * m 2^(31 - e) lies in [2^30, 2^31) and TR_Q4X_XMAX in between: one step down at most. */
+static inline int tr_q4x_shift(float m) {
+    if (m == 0.0f) return 0;
+    int e;
+    (void)frexpf(m, &e);
+    int sh = 31 - e;
+    if (ldexp((double)m, sh) > TR_Q4X_XMAX) sh--;
+    return sh;
+}
+
+/* X = v0 + TR_Q4X_BASE v1, v1 the nearest integer to X / TR_Q4X_BASE (never a tie: the base is odd) */
+static inline void tr_q4x_digits(int32_t X, int16_t *v0, int16_t *v1) {
+    const int64_t b = TR_Q4X_BASE, x = X;
+    const int64_t q = x >= 0 ? (x + b / 2) / b : -((-x + b / 2) / b);
+    *v1 = (int16_t)q;
+    *v0 = (int16_t)(x - b * q);
 }
 
 /* Q6_K (ggml's block_q6_K): 256 elements in 210 bytes. 128 bytes of low 4 bits (ql), 64 of high 2

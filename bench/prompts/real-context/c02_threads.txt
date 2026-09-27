@@ -1,0 +1,219 @@
+/* threads.c — persistent worker pool: one slot per worker, spin then sleep.
+ *
+ * Protocol (every shared field is either atomic or written only while its reader
+ * cannot be reading it):
+ *   - Worker i owns slot i. The dispatcher writes fn/ctx/chunk only while the slot is IDLE,
+ *     and every region of the call (regions[], one per chunk) before the first READY store,
+ *     then publishes the slots by storing READY. The worker reads the fields only after
+ *     seeing READY, runs its chunk (run_chunk: its region a block at a time, then the other
+ *     regions' leftover blocks), stores IDLE, decrements `remaining`. No region is written
+ *     again before `remaining` is 0, so a late helper never claims from the next call.
+ *   - Waiting: a worker spins (CPU pause) for up to spin_sec, then sleeps on cond_work
+ *     after setting slot.sleeping under the lock; the dispatcher checks `sleeping`
+ *     after publishing and broadcasts under the lock. The dispatcher waits for
+ *     `remaining` the same way (spin, then cond_done with caller_sleeping).
+ *     Atomics are sequentially consistent, so a store followed by the other side's
+ *     load cannot miss a wake-up.
+ *   - The calling thread runs chunk 0. A call from inside a body, or with p == NULL,
+ *     runs serially (t_depth).
+ *   - A narrowed pool (tr_pool_set_active) publishes to the first `active` slots only: a
+ *     worker past the width never sees READY, spins out its budget and sleeps until a wider
+ *     call finds it sleeping and broadcasts. */
+
+#if defined(__linux__) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+#if defined(__linux__) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE
+#endif
+
+#include "threads.h"
+#include "cpu.h"
+#include "platform.h"
+
+#include <stdatomic.h>
+#include <stdlib.h>
+
+#if defined(_WIN32)
+#  include <windows.h>
+#else
+#  include <pthread.h>
+#endif
+
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+#  include <immintrin.h>
+#  define CPU_RELAX() _mm_pause()
+#elif defined(__aarch64__) || defined(__arm__)
+#  define CPU_RELAX() __asm__("yield")
+#else
+#  define CPU_RELAX() ((void)0)
+#endif
+
+enum { SLOT_IDLE = 0, SLOT_READY = 1 };
+
+typedef struct {
+    atomic_int state;
+    atomic_int sleeping;
+    tr_range_fn fn;
+    void *ctx;
+    int chunk; /* the region of the call this worker owns (regions[chunk]) */
+    tr_pool *pool;
+    int id;
+    int pin;                /* number of processors the worker pins itself to, 0: none */
+    unsigned pin_group;
+    unsigned short pin_cpu[TR_CPU_MAX_SMT];
+#if defined(TR_POOL_TRACE)
+    int trace_call, trace_chunk; /* where this chunk's start and end go, -1: not traced */
+#endif
+} slot;
+
+/* Slots on lines of their own: a worker polling its state never shares a line with another
+ * slot. The slot is 72 bytes, so a union with char[64] packed them at 72-byte strides and put
+ * worker k's state on the line of worker k-1's begin/end, which the dispatcher writes on every
+ * call (docs/LESSONS.md #104). */
+typedef struct {
+    _Alignas(64) slot s;
+} slot_line;
+_Static_assert(sizeof(slot_line) % 64 == 0, "a slot_line must fill whole cache lines");
+
+/* One contiguous region of a call, owned by one chunk's thread: it runs [begin, first_end) first,
+ * then claims the rest a block at a time by an atomic add on `next`, and so does any thread whose
+ * own region is done (from the front: one more stream start, at the tail of the call only). Each
+ * region on a line of its own: the owner's claims do not bounce against its neighbours'. */
+typedef struct {
+    _Alignas(64) atomic_int_fast64_t next;
+    int64_t begin, first_end, end;
+} region_line;
+_Static_assert(sizeof(region_line) % 64 == 0, "a region_line must fill whole cache lines");
+
+struct tr_pool {
+    int size; /* includes the calling thread */
+    int active; /* threads a parallel_for may use, 1..size: the dispatcher's own, no worker reads it */
+    double spin_sec;
+    int blocks;         /* blocks a region is claimed in (TR_POOL_BLOCKS); 1: one block, no help */
+    int call_chunks;    /* the current call's regions: written before its READY stores */
+    int64_t call_block; /* the current call's block after each region's first */
+    slot_line *slots; /* size entries, slot 0 unused */
+    region_line *regions; /* size entries, one per chunk of the current call */
+    atomic_int remaining;
+    atomic_int caller_sleeping;
+    atomic_int shutdown;
+    int caller_pinned;           /* this pool counts in t_pin_depth of the thread that made it */
+    tr_affinity caller_affinity; /* where the calling thread ran before any live pool pinned it */
+
+#if defined(_WIN32)
+    HANDLE *workers;
+    SRWLOCK lock;
+    CONDITION_VARIABLE cond_work;
+    CONDITION_VARIABLE cond_done;
+#else
+    pthread_t *workers;
+    pthread_mutex_t lock;
+    pthread_cond_t cond_work;
+    pthread_cond_t cond_done;
+#endif
+};
+
+#if defined(TR_POOL_TRACE)
+/* Research build only (make BUILD=build/<x>-trace EXTRA_CFLAGS=-DTR_POOL_TRACE): every
+ * parallel_for's dispatch and end, and each chunk's start and end, for the first TRACE_CALLS calls
+ * of the process, written at exit to $TR_POOL_TRACE_FILE (tools/pool_trace.py reads it). The
+ * engine proper never has it. */
+#include <stdio.h>
+enum { TRACE_CALLS = 60000, TRACE_CHUNKS = 64 };
+typedef struct { int64_t n; int chunks; double t0, t1; uint64_t bytes; int64_t rows, cols; } trace_call_rec;
+static trace_call_rec g_trace_call[TRACE_CALLS];               /* global-ok: research build only */
+static double g_trace_chunk[TRACE_CALLS][TRACE_CHUNKS][2];     /* global-ok: research build only */
+static atomic_int g_trace_n;                                    /* global-ok: research build only */
+static int g_trace_armed;                                       /* global-ok: research build only */
+/* The next call's note (tr_pool_trace_note), per calling thread; taken by that call. */
+static _Thread_local uint64_t t_note_bytes;                     /* global-ok: research build only */
+static _Thread_local int64_t t_note_rows, t_note_cols;          /* global-ok: research build only */
+
+void tr_pool_trace_note(uint64_t bytes, int64_t rows, int64_t cols) {
+    t_note_bytes = bytes;
+    t_note_rows = rows;
+    t_note_cols = cols;
+}
+
+static void trace_dump(void);
+
+/* A new call's record, or -1 past TRACE_CALLS; takes the thread's pending note. */
+static int trace_begin(int64_t n, int chunks) {
+    if (!g_trace_armed) { g_trace_armed = 1; atexit(trace_dump); }
+    int tc = atomic_fetch_add(&g_trace_n, 1);
+    if (tc >= TRACE_CALLS || chunks > TRACE_CHUNKS) tc = -1;
+    if (tc >= 0) {
+        g_trace_call[tc].n = n;
+        g_trace_call[tc].chunks = chunks;
+        g_trace_call[tc].bytes = t_note_bytes;
+        g_trace_call[tc].rows = t_note_rows;
+        g_trace_call[tc].cols = t_note_cols;
+        g_trace_call[tc].t0 = tr_time_sec();
+    }
+    t_note_bytes = 0;
+    t_note_rows = t_note_cols = 0;
+    return tc;
+}
+
+static void trace_dump(void) {
+    const char *path = getenv("TR_POOL_TRACE_FILE");
+    if (path == NULL) return;
+    FILE *f = fopen(path, "w");
+    if (f == NULL) return;
+    int n = atomic_load(&g_trace_n);
+    if (n > TRACE_CALLS) n = TRACE_CALLS;
+    double base = n > 0 ? g_trace_call[0].t0 : 0.0;
+    for (int i = 0; i < n; i++) {
+        const trace_call_rec *c = &g_trace_call[i];
+        fprintf(f, "%lld %d %.3f %.3f", (long long)c->n, c->chunks, (c->t0 - base) * 1e6, (c->t1 - base) * 1e6);
+        for (int k = 0; k < c->chunks && k < TRACE_CHUNKS; k++)
+            fprintf(f, " %.3f %.3f", (g_trace_chunk[i][k][0] - base) * 1e6, (g_trace_chunk[i][k][1] - base) * 1e6);
+        fprintf(f, " %llu %lld %lld\n", (unsigned long long)c->bytes, (long long)c->rows, (long long)c->cols);
+    }
+    fclose(f);
+}
+#endif
+
+static _Thread_local int t_worker_id = -1;  /* global-ok: per thread, not per model */
+static _Thread_local int t_depth = 0;       /* global-ok: per thread, not per model */
+/* Live pools that pinned this thread as their worker 0, and where it ran before the first of
+ * them. Per thread and counted, not per pool: with two pools alive the second would save the
+ * first one's pin as "before" and, destroyed last, leave the thread on one core for good. */
+static _Thread_local int t_pin_depth = 0;       /* global-ok: per thread, not per model */
+static _Thread_local tr_affinity t_pin_prev;    /* global-ok: per thread, not per model */
+
+#if defined(_WIN32)
+#  define POOL_LOCK(p)      AcquireSRWLockExclusive(&(p)->lock)
+#  define POOL_UNLOCK(p)    ReleaseSRWLockExclusive(&(p)->lock)
+#  define POOL_WAKE_ALL(cv) WakeAllConditionVariable(&(cv))
+#  define POOL_WAIT(cv, p)  SleepConditionVariableSRW(&(cv), &(p)->lock, INFINITE, 0)
+#else
+#  define POOL_LOCK(p)      pthread_mutex_lock(&(p)->lock)
+#  define POOL_UNLOCK(p)    pthread_mutex_unlock(&(p)->lock)
+#  define POOL_WAKE_ALL(cv) pthread_cond_broadcast(&(cv))
+#  define POOL_WAIT(cv, p)  pthread_cond_wait(&(cv), &(p)->lock)
+#endif
+
+/* hot: begin */
+/* Chunk `own` of the current call: its region's first block, the rest of its region a block at a
+ * time, then the other regions' leftovers, nearest first. A block is claimed by one atomic add, so
+ * every index runs exactly once, on whichever thread claims it; by the determinism contract
+ * (threads.h) that changes when a result is ready, never the result. */
+static void run_chunk(tr_pool *p, int own, tr_range_fn fn, void *ctx, int worker) {
+    int chunks = p->call_chunks;
+    int64_t block = p->call_block;
+    region_line *mine = &p->regions[own];
+    fn(ctx, mine->begin, mine->first_end, worker);
+    for (int k = 0; k < chunks; k++) {
+        region_line *g = &p->regions[own + k < chunks ? own + k : own + k - chunks];
+        if (atomic_load_explicit(&g->next, memory_order_relaxed) >= g->end) continue;
+        for (;;) {
+            int64_t s = atomic_fetch_add_explicit(&g->next, block, memory_order_relaxed);
+            if (s >= g->end) break;
+            fn(ctx, s, s + block < g->end ? s + block : g->end, worker);
+        }
+    }
+}
+
+static void worker_loop(slot *w) {

@@ -1,6 +1,7 @@
 /* test_kernels.c — tests for src/kernels/kernels.c: half->float, Q8_0, Q4_K and Q6_K dequant,
  * the 16-lane reduction contract (kernels.h) against an independent in-test
- * implementation, dot_row == dot_f32(dequantized), every SIMD tier == scalar,
+ * implementation, dot_row == dot_f32(dequantized) for the float-contract types, Q4_K's integer
+ * definition against its own in-test reference (and its prepared and panel roads), every SIMD tier == scalar,
  * rope/swiglu/attention == their first per-element definitions, tr_matmul
  * thread-count determinism, tr_matmul_grouped == one dot_row per element, the decode's one-token
  * matmul == one dot_row per row at every thread count. */
@@ -49,6 +50,10 @@ static unsigned next_rand(unsigned *seed) {
 static float rand_float(unsigned *seed) {
     return ((float)(next_rand(seed) % 20001u) - 10000.0f) / 1000.0f; /* [-10, 10] */
 }
+
+static int same_float(float a, float b);
+static float rand_special(unsigned *seed, int special);
+static void fill_q4_k(unsigned char *row, int64_t nb, unsigned *seed, int special);
 
 /* ---- half -> float, via dequant_row[F16] (no other public entry point) --- */
 
@@ -259,31 +264,136 @@ static void test_dot_row_q8_0(void) {
     TR_CHECK(bit_eq(got, want));
 }
 
-/* Q4_K: the weight in the dot is the dequantized weight, element by element, and dot_row_x4 is
- * four dot_rows */
-static void test_dot_row_q4_k(void) {
-    const tr_kernels *K = tr_kernels_tier("scalar");
-    TR_CHECK(K != NULL);
-    if (K == NULL) return;
-
-    enum { N = 512 };                  /* two blocks */
-    static unsigned char row[2 * 144];
-    static float x[4 * N], dequant[N];
-    unsigned seed = 4242u;
-    for (int i = 0; i < 2 * 144; i++) row[i] = (unsigned char)(next_rand(&seed) >> 16);
-    for (int b = 0; b < 2; b++) {
-        uint16_t d = (uint16_t)(0x2C00u + (next_rand(&seed) & 0x3FFu));    /* ~0.06..0.12 */
-        uint16_t dmin = (uint16_t)(0x2800u + (next_rand(&seed) & 0x3FFu)); /* ~0.03..0.06 */
-        memcpy(row + 144 * b, &d, 2);
-        memcpy(row + 144 * b + 2, &dmin, 2);
+/* ---- Q4_K's integer definition (kernels.h q4x_*) ---------------------------------------------------------
+ * The definition written again here from the math alone, not from kernels.c: the shift found by trying
+ * every one from 400 down, X by ldexp and nearbyint, the six-bit scales by ggml's formula, T and M in
+ * int64, the f64 steps; NaN for a block of x that holds a NaN or an infinity. */
+static float ref_q4x(const unsigned char *row, const float *x, int64_t n) {
+    double y = 0.0;
+    for (int64_t s = 0; s < n / 256; s++) {
+        const unsigned char *blk = row + (size_t)s * 144, *q = blk + 16, *sb = blk + 4;
+        const float *xs = x + s * 256;
+        double m = 0.0;
+        int bad = 0;
+        for (int k = 0; k < 256; k++) {
+            if (isnan(xs[k]) || isinf(xs[k])) bad = 1;
+            else if (fabs((double)xs[k]) > m) m = fabs((double)xs[k]);
+        }
+        if (bad) {
+            y = y + (double)NAN;
+            continue;
+        }
+        int sh = 0;
+        if (m > 0.0)
+            for (sh = 400; ldexp(m, sh) > 2085998640.0; sh--) {}
+        int64_t T = 0, M = 0;
+        for (int j = 0; j < 8; j++) {
+            const int sc = j < 4 ? sb[j] & 63 : (sb[j + 4] & 0x0F) | ((sb[j - 4] >> 6) << 4);
+            const int mn = j < 4 ? sb[j + 4] & 63 : (sb[j + 4] >> 4) | ((sb[j] >> 6) << 4);
+            for (int i = 0; i < 32; i++) {
+                const int k = 32 * j + i;
+                const int64_t X = (int64_t)nearbyint(ldexp((double)xs[k], sh));
+                const int64_t qk = (k & 32) ? q[32 * (k >> 6) + (k & 31)] >> 4 : q[32 * (k >> 6) + (k & 31)] & 15;
+                T += sc * qk * X;
+                M += mn * X;
+            }
+        }
+        uint16_t hd, hm;
+        memcpy(&hd, blk, 2);
+        memcpy(&hm, blk + 2, 2);
+        const double v = (double)tr_half_to_float(hd) * (double)T - (double)tr_half_to_float(hm) * (double)M;
+        y = y + v * ldexp(1.0, -sh);
     }
-    for (int i = 0; i < 4 * N; i++) x[i] = rand_float(&seed);
+    return (float)y;
+}
 
-    K->dequant_row[TR_TYPE_Q4_K](row, dequant, N);
-    TR_CHECK(bit_eq(K->dot_row[TR_TYPE_Q4_K](row, x, N), ref_dot_f32(dequant, x, N)));
-    float out[TR_DOT_TOKENS];
-    K->dot_row_x4[TR_TYPE_Q4_K](row, x, N, N, out);
-    for (int t = 0; t < TR_DOT_TOKENS; t++) TR_CHECK(bit_eq(out[t], ref_dot_f32(dequant, x + t * N, N)));
+/* an input of the Q4_K tests: ordinary (a zero now and then), or special (+-0, subnormals, underflowing and
+ * huge values, kept rare), or with `nonfinite` now and then an infinity or a NaN too */
+static float q4x_input(unsigned *seed, int special, int nonfinite) {
+    if (nonfinite && next_rand(seed) % 700u == 0) return next_rand(seed) % 3u == 0 ? NAN : (next_rand(seed) & 1) ? INFINITY : -INFINITY;
+    if (!special) return (next_rand(seed) % 13u == 0) ? 0.0f : rand_float(seed);
+    switch (next_rand(seed) % 300u) {
+    case 0: return 3.0e38f;
+    case 1: return -2.5e38f;
+    default: return rand_special(seed, 1);
+    }
+}
+
+/* Branch: the scalar tier's Q4_K dot (the definition from the floats), its prepared road (q4x_prep and
+ * q4x_dot2) and its panel road (q4x_panel and q4x_tile of every width T = 1..TR_Q4X_TILE_MAX), each against
+ * ref_q4x bit for bit (NaN: any NaN); 16 rows ordinary and special, 4 input rows of every kind, a block of
+ * zeros, a block of subnormals and a block of one huge value among small ones; n of one, two and eight
+ * blocks. Counted; and one block's d one ulp off moves the result (the comparison is not blind). */
+static void test_dot_row_q4_k(void) {
+    const tr_kernels *S = tr_kernels_tier("scalar");
+    TR_CHECK(S != NULL);
+    if (S == NULL) return;
+    enum { R = TR_PM_ROWS, NT = TR_Q4X_TILE_MAX, NMAX = 2048 };
+    static const int64_t ns[3] = {256, 512, 2048};
+    static unsigned char rows[R * (NMAX / 256) * 144];
+    static float x[NT * NMAX], want[NT][R], y[NT * 40];
+    static unsigned char xq[NT][NMAX / 256 * 1152] __attribute__((aligned(64)));
+    static unsigned char panel[NMAX / 256 * 9728] __attribute__((aligned(64)));
+    unsigned seed = 4242u;
+    long compared = 0, nans = 0;
+    for (int ni = 0; ni < 3; ni++) {
+        const int64_t n = ns[ni];
+        const size_t rb = tr_row_bytes(TR_TYPE_Q4_K, n), xb = tr_q4x_bytes(n);
+        TR_CHECK(xb <= sizeof xq[0] && TR_Q4X_PANEL_BYTES(n) <= sizeof panel);
+        for (int mode = 0; mode < 4; mode++) {
+            const int wspecial = mode & 1, xspecial = (mode >> 1) & 1;
+            for (int r = 0; r < R; r++) fill_q4_k(rows + (size_t)r * rb, n / 256, &seed, wspecial);
+            for (int64_t i = 0; i < NT * n; i++) x[i] = q4x_input(&seed, xspecial, mode == 3);
+            if (mode == 2) {
+                for (int k = 0; k < 256; k++) x[k] = 0.0f;                                   /* input 0: a zero block */
+                for (int k = 0; k < 256; k++) x[n + k] = ldexpf(rand_float(&seed), -140);     /* input 1: subnormals */
+                x[2 * n + 5] = 1.0e30f;                                                     /* input 2: one huge value */
+                /* input 3: a block whose largest |x| is just under a power of two (7.99 = 0.999 2^3): the shift
+                 * one step down, or X past what two digits write */
+                for (int k = 0; k < 256; k++) x[3 * n + k] = 0.79f * rand_float(&seed);
+                x[3 * n + 17] = -7.99f;
+            }
+            for (int t = 0; t < NT; t++) {
+                S->q4x_prep(x + (size_t)t * n, n, xq[t]);
+                for (int r = 0; r < R; r++) {
+                    want[t][r] = ref_q4x(rows + (size_t)r * rb, x + (size_t)t * n, n);
+                    nans += isnan(want[t][r]);
+                    TR_CHECK(same_float(S->dot_row[TR_TYPE_Q4_K](rows + (size_t)r * rb, x + (size_t)t * n, n), want[t][r]));
+                }
+                for (int r = 0; r < R; r += 2) {
+                    float o[2];
+                    S->q4x_dot2(rows + (size_t)r * rb, rows + (size_t)(r + 1) * rb, xq[t], n, o);
+                    TR_CHECK(same_float(o[0], want[t][r]) && same_float(o[1], want[t][r + 1]));
+                }
+                compared += R;
+            }
+            S->q4x_panel(rows, rb, n, panel, NULL);
+            for (int T = 1; T <= NT; T++) {
+                for (int i = 0; i < NT * 40; i++) y[i] = -777.0f;
+                S->q4x_tile(panel, xq[0], sizeof xq[0], n, T, y, 40);
+                for (int t = 0; t < T; t++) {
+                    for (int r = 0; r < R; r++) TR_CHECK(same_float(y[t * 40 + r], want[t][r]));
+                    for (int r = R; r < 40; r++) TR_CHECK(y[t * 40 + r] == -777.0f);
+                }
+                compared += (long)T * R;
+            }
+        }
+    }
+    /* the comparison is not blind: the same row with its second block's d one ulp up gives another result */
+    {
+        const int64_t n = 512;
+        fill_q4_k(rows, 2, &seed, 0);
+        for (int64_t i = 0; i < n; i++) x[i] = rand_float(&seed);
+        const float good = ref_q4x(rows, x, n);
+        uint16_t hd;
+        memcpy(&hd, rows + 144, 2);
+        hd = (uint16_t)(hd + 1);
+        memcpy(rows + 144, &hd, 2);
+        TR_CHECK(!bit_eq(S->dot_row[TR_TYPE_Q4_K](rows, x, n), good));
+    }
+    TR_CHECK(compared > 0 && nans > 0);
+    printf("  q4_k integer definition on the scalar tier: %ld outputs of dot_row, q4x_dot2 and q4x_tile (T 1..%d) "
+           "equal to the reference, %ld of them NaN\n", compared, NT, nans);
 }
 
 /* Q6_K: the same two checks */
@@ -424,6 +534,60 @@ static void row2x8_diffs(const tr_kernels *K, const tr_kernels *S, tr_type type,
     g_x8_compared++;
 }
 
+/* One row against 2 and 3 input rows (dot_row_xt, a short verify pass's group; a stride of n + 5 floats):
+ * each sum scalar's dot_row of its own input row, and the scalar table's xt, bit for bit. Counted. The rows
+ * are copied to the end of a buffer of exactly their size: a kernel reading a row it was not given is ASan's. */
+static long g_xt_compared;
+static void rowxt_diffs(const tr_kernels *K, const tr_kernels *S, tr_type type, const unsigned char *r0,
+                        const float *x, int64_t n, int *bad) {
+    for (int t = 2; t <= 3; t++) {
+        const size_t len = (size_t)((t - 1) * (n + 5) + n);
+        float *xe = (float *)malloc(len * sizeof(float));
+        TR_CHECK(xe != NULL);
+        if (xe == NULL) return;
+        memcpy(xe, x, len * sizeof(float));
+        float ok[3] = {-777.0f, -777.0f, -777.0f}, os[3];
+        K->dot_row_xt[type](r0, xe, n + 5, n, t, ok);
+        S->dot_row_xt[type](r0, x, n + 5, n, t, os);
+        for (int j = 0; j < t; j++) {
+            if (!same_float(ok[j], os[j])) (*bad)++;
+            if (!same_float(ok[j], S->dot_row[type](r0, x + j * (n + 5), n))) (*bad)++;
+        }
+        if (t == 2 && ok[2] != -777.0f) (*bad)++; /* two input rows: the kernel of two, no third output */
+        free(xe);
+        g_xt_compared++;
+    }
+}
+
+/* Signed zeros through dot_row_xt: a Q8_0 row of positive weights against input rows of -0.0, and one of
+ * negative weights against +0.0: every product is -0.0, and the sum is +0.0 only from accumulators that start
+ * at +0.0, as dot_row's do (a start at -0.0 gives -0.0: seen red, docs/LESSONS.md #231). */
+static void rowxt_zeros(const tr_kernels *K, int64_t n, int *bad) {
+    static unsigned char zrow[(4096 / 32) * 34];
+    static float zx[3 * (4096 + 5)];
+    unsigned seed = 5u;
+    for (int neg = 0; neg < 2; neg++) {
+        for (int64_t b = 0; b < n / 32; b++) {
+            unsigned char *blk = zrow + (size_t)b * TR_Q8_0_BLOCK_BYTES;
+            const uint16_t d = 0x3C00u; /* 1.0 */
+            memcpy(blk, &d, 2);
+            for (int i = 0; i < 32; i++) {
+                const int q = 1 + (int)(next_rand(&seed) % 127u);
+                blk[2 + i] = (unsigned char)(int8_t)(neg ? -q : q);
+            }
+        }
+        for (int64_t i = 0; i < 3 * (n + 5); i++) zx[i] = neg ? 0.0f : -0.0f;
+        for (int t = 2; t <= 3; t++) {
+            float o[3];
+            K->dot_row_xt[TR_TYPE_Q8_0](zrow, zx, n + 5, n, t, o);
+            for (int j = 0; j < t; j++)
+                if (!same_float(o[j], 0.0f) || !same_float(o[j], K->dot_row[TR_TYPE_Q8_0](zrow, zx + j * (n + 5), n)))
+                    (*bad)++;
+            g_xt_compared++;
+        }
+    }
+}
+
 /* A tile of a prompt's attention: 4 query rows of a (len + 5 apart: not b's stride) against the 4
  * rows of b `stride` apart. Every score must be scalar's dot_f32 of its pair times the scale, and
  * the tier's 4x4 must equal scalar's 4x4; every one of the 4 outputs (rows of y, len + 2 apart,
@@ -457,6 +621,59 @@ static void tile_diffs(const tr_kernels *K, const tr_kernels *S, const float *a,
             break;
         }
     g_tile_compared++;
+}
+
+/* Q4_K's integer road, the tier against scalar: 16 rows of 1, 2 and 8 blocks and 4 input rows (special: the
+ * rows' halves over their whole range, the inputs with +-0, subnormals, huge values and now and then a NaN or
+ * an infinity); the prepared rows byte for byte, q4x_dot2 and every tile width against scalar's dot_row, the
+ * panels byte for byte. Counted per entry: an entry never compared proves nothing (docs/LESSONS.md #43). */
+static long g_q4x_prep_cmp, g_q4x_dot2_cmp, g_q4x_panel_cmp, g_q4x_tile_cmp;
+static void q4x_diffs(const tr_kernels *K, const tr_kernels *S, unsigned *seed, int special, int *bad) {
+    enum { R = TR_PM_ROWS, NT = TR_Q4X_TILE_MAX, NMAX = 2048 };
+    static const int64_t nbs[3] = {1, 2, NMAX / 256};
+    static unsigned char rows[R * (NMAX / 256) * 144];
+    static float x[NT * NMAX], want[NT][R], y[NT * R];
+    static unsigned char xk[NT][NMAX / 256 * 1152] __attribute__((aligned(64)));
+    static unsigned char xs[NT][NMAX / 256 * 1152] __attribute__((aligned(64)));
+    static unsigned char pk[NMAX / 256 * 9728] __attribute__((aligned(64))), ps[NMAX / 256 * 9728] __attribute__((aligned(64)));
+    for (int bi = 0; bi < 3; bi++) {
+        const int64_t nb = nbs[bi], n = nb * 256;
+        const size_t rb = tr_row_bytes(TR_TYPE_Q4_K, n), xb = tr_q4x_bytes(n);
+        for (int r = 0; r < R; r++) fill_q4_k(rows + (size_t)r * rb, nb, seed, special);
+        for (int64_t i = 0; i < NT * n; i++) x[i] = q4x_input(seed, special, special);
+        if (special) { /* input 1: a block of subnormals (a shift past 127: AVX2 scales it in two steps) */
+            for (int k = 0; k < 256; k++) x[n + k] = ldexpf(rand_float(seed), -140);
+            x[2 * n + 3] = 2.0e38f; /* input 2: one huge value among ordinary ones (a negative shift) */
+        }
+        /* input 3: a largest |x| just under a power of two (the shift one step down) */
+        for (int k = 0; k < 256; k++) x[3 * n + k] = 0.79f * rand_float(seed);
+        x[3 * n + 40] = 15.97f;
+        for (int t = 0; t < NT; t++) {
+            K->q4x_prep(x + (size_t)t * n, n, xk[t]);
+            S->q4x_prep(x + (size_t)t * n, n, xs[t]);
+            if (memcmp(xk[t], xs[t], xb) != 0) (*bad)++;
+            g_q4x_prep_cmp++;
+            for (int r = 0; r < R; r++) want[t][r] = S->dot_row[TR_TYPE_Q4_K](rows + (size_t)r * rb, x + (size_t)t * n, n);
+            for (int r = 0; r < R; r += 2) {
+                float o[2];
+                K->q4x_dot2(rows + (size_t)r * rb, rows + (size_t)(r + 1) * rb, xk[t], n, o);
+                if (!same_float(o[0], want[t][r]) || !same_float(o[1], want[t][r + 1])) (*bad)++;
+                g_q4x_dot2_cmp++;
+            }
+        }
+        if (K->q4x_panel == NULL || K->q4x_tile == NULL) continue;
+        K->q4x_panel(rows, rb, n, pk, NULL);
+        S->q4x_panel(rows, rb, n, ps, NULL);
+        if (memcmp(pk, ps, TR_Q4X_PANEL_BYTES(n)) != 0) (*bad)++;
+        g_q4x_panel_cmp++;
+        for (int T = 1; T <= NT; T++) {
+            K->q4x_tile(pk, xk[0], sizeof xk[0], n, T, y, R);
+            for (int t = 0; t < T; t++)
+                for (int r = 0; r < R; r++)
+                    if (!same_float(y[t * R + r], want[t][r])) (*bad)++;
+            g_q4x_tile_cmp++;
+        }
+    }
 }
 
 /* Runs K and S on the same inputs; counts the calls whose results differ. */
@@ -563,34 +780,20 @@ static void count_diffs(const tr_kernels *K, const tr_kernels *S, unsigned seed,
                     if (!same_float(xk[t], K->dot_row[TR_TYPE_Q8_0](row, b + t * n, n))) (*bad_row)++;
                 }
             }
+            if (K->dot_row_xt[TR_TYPE_Q8_0] != NULL && 3 * (n + 5) <= CMP_MAX_N) {
+                rowxt_diffs(K, S, TR_TYPE_Q8_0, row, b, n, bad_row);
+                rowxt_zeros(K, n, bad_row);
+                rowxt_zeros(S, n, bad_row);
+            }
         }
-        /* Q4_K rows of 1 to 16 blocks (256 to 4096 elements), the same two checks */
+        /* Q4_K rows of 1 to 16 blocks (256 to 4096 elements): the definition from the floats */
         for (int64_t nb = 1; nb <= 16; nb++) {
             fill_q4_k(row, nb, &seed, round % 2);
             int64_t n = nb * 256;
             if (!same_float(K->dot_row[TR_TYPE_Q4_K](row, b, n), S->dot_row[TR_TYPE_Q4_K](row, b, n))) (*bad_row)++;
-            if (K->dot_row2[TR_TYPE_Q4_K] != NULL) {
-                fill_q4_k(row2, nb, &seed, round % 2);
-                pair_diffs(K, S, TR_TYPE_Q4_K, row, row2, b, n, bad_row);
-            }
-            if (K->dot_row2_x4[TR_TYPE_Q4_K] != NULL && 4 * (n + 3) <= CMP_MAX_N) {
-                fill_q4_k(row2, nb, &seed, round % 2);
-                row2_diffs(K, S, TR_TYPE_Q4_K, row, row2, b, n, bad_row);
-            }
-            if (K->dot_row2_x8[TR_TYPE_Q4_K] != NULL) {
-                fill_q4_k(row2, nb, &seed, round % 2);
-                row2x8_diffs(K, S, TR_TYPE_Q4_K, row, row2, n, bad_row);
-            }
-            if (K->dot_row_x4[TR_TYPE_Q4_K] != NULL && 4 * n <= CMP_MAX_N) {
-                float xk[TR_DOT_TOKENS], xs[TR_DOT_TOKENS];
-                K->dot_row_x4[TR_TYPE_Q4_K](row, b, n, n, xk);
-                S->dot_row_x4[TR_TYPE_Q4_K](row, b, n, n, xs);
-                for (int t = 0; t < TR_DOT_TOKENS; t++) {
-                    if (!same_float(xk[t], xs[t])) (*bad_row)++;
-                    if (!same_float(xk[t], K->dot_row[TR_TYPE_Q4_K](row, b + t * n, n))) (*bad_row)++;
-                }
-            }
         }
+        /* and its prepared road every eighth round: 16 rows of 1, 2 and 8 blocks against 4 input rows */
+        if (round % 8 == 0) q4x_diffs(K, S, &seed, round % 16 == 8, bad_row);
         /* Q6_K rows of 1 to 16 blocks, the same two checks */
         for (int64_t nb = 1; nb <= 16; nb++) {
             fill_q6_k(row, nb, &seed, round % 2);
@@ -665,7 +868,6 @@ static float wrong_dot_row_q6_k(const void *row, const float *x, int64_t n) {
         } \
     }
 WRONG_ROW2(q8_0)
-WRONG_ROW2(q4_k)
 WRONG_ROW2(q6_k)
 
 /* the same against eight input rows: count_diffs must see a wrong dot_row2_x8 */
@@ -678,7 +880,6 @@ WRONG_ROW2(q6_k)
         } \
     }
 WRONG_ROW2X8(q8_0)
-WRONG_ROW2X8(q4_k)
 WRONG_ROW2X8(q6_k)
 
 /* two rows against one input row: count_diffs must see a wrong dot_row2 */
@@ -688,8 +889,26 @@ WRONG_ROW2X8(q6_k)
         out[1] = wrong_dot_row_##name(r1, x, n); \
     }
 WRONG_PAIR(q8_0)
-WRONG_PAIR(q4_k)
 WRONG_PAIR(q6_k)
+
+/* Q4_K's prepared road, each entry wrong in one place: count_diffs must see every one */
+static void wrong_q4x_prep(const float *x, int64_t n, void *xq) {
+    tr_kernels_tier("scalar")->q4x_prep(x, n, xq);
+    ((int16_t *)xq)[1] ^= 1; /* one digit */
+}
+static void wrong_q4x_dot2(const void *row0, const void *row1, const void *xq, int64_t n, float *out) {
+    tr_kernels_tier("scalar")->q4x_dot2(row0, row1, xq, n, out);
+    out[1] = nextafterf(out[1], INFINITY);
+}
+static void wrong_q4x_panel(const void *rows, size_t row_bytes, int64_t n, void *panel, const void *next) {
+    tr_kernels_tier("scalar")->q4x_panel(rows, row_bytes, n, panel, next);
+    ((unsigned char *)panel)[TR_Q4X_CONST_BYTES + 3] ^= 0x80; /* row 0's bias in the first window */
+}
+static void wrong_q4x_tile(const void *panel, const void *xq, size_t xq_stride, int64_t n, int T, float *y,
+                           int64_t y_stride) {
+    tr_kernels_tier("scalar")->q4x_tile(panel, xq, xq_stride, n, T, y, y_stride);
+    y[0] = nextafterf(y[0], INFINITY);
+}
 
 static float wrong_dot_row_f16(const void *row, const float *x, int64_t n) {
     static float w[CMP_MAX_N];
@@ -733,9 +952,10 @@ static void wrong_axpy_f32_4x4(float *y, int64_t y_stride, const float *x, int64
  * may then decode a panel of rows once and run F32 over every token without moving a bit
  * (docs/MEASUREMENTS.md question 63). test_dot_row_* hold it for the scalar tier on two blocks.
  * Branch covered: each tier's own dot_row and dot_f32 (never scalar's through a NULL); a panel
- * one ulp off in every weight must fail it for each type, and the comparisons are counted. */
-enum { DQ_TYPES = 4 };
-static const tr_type g_dq_types[DQ_TYPES] = {TR_TYPE_F16, TR_TYPE_Q8_0, TR_TYPE_Q4_K, TR_TYPE_Q6_K};
+ * one ulp off in every weight must fail it for each type, and the comparisons are counted. Q4_K is not
+ * among them: its dot is the integer definition (kernels.h q4x_*), exact sums instead of float products. */
+enum { DQ_TYPES = 3 };
+static const tr_type g_dq_types[DQ_TYPES] = {TR_TYPE_F16, TR_TYPE_Q8_0, TR_TYPE_Q6_K};
 
 static void fill_row_of(tr_type type, unsigned char *row, int64_t n, unsigned *seed, int special) {
     if (type == TR_TYPE_F16) fill_f16(row, n, seed, special);
@@ -837,34 +1057,45 @@ static void test_tiers_match_scalar(void) {
     count_diffs(&wrong, S, 7u, &bad_dot, &bad_row, &bad_axpy, &bad_x4);
     TR_CHECK_EQ_INT(bad_dot + bad_axpy + bad_x4, 0);
     TR_CHECK(bad_row > 0);
-    /* and a wrong two-row kernel of each quantized type alone: the scalar table has none, so
-     * these are the only calls of dot_row2_x4 the wrong table makes */
-    void (*const wrong_row2[3])(const void *, const void *, const float *, int64_t, int64_t, float *) = {
-        wrong_row2_q8_0, wrong_row2_q4_k, wrong_row2_q6_k};
-    static const tr_type row2_types[3] = {TR_TYPE_Q8_0, TR_TYPE_Q4_K, TR_TYPE_Q6_K};
-    for (int i = 0; i < 3; i++) {
+    /* and a wrong two-row kernel of each float-contract quantized type alone: the scalar table has
+     * none, so these are the only calls of dot_row2_x4 the wrong table makes (Q4_K has its q4x road) */
+    void (*const wrong_row2[2])(const void *, const void *, const float *, int64_t, int64_t, float *) = {
+        wrong_row2_q8_0, wrong_row2_q6_k};
+    static const tr_type row2_types[2] = {TR_TYPE_Q8_0, TR_TYPE_Q6_K};
+    for (int i = 0; i < 2; i++) {
         wrong = *S;
         wrong.dot_row2_x4[row2_types[i]] = wrong_row2[i];
         count_diffs(&wrong, S, 7u, &bad_dot, &bad_row, &bad_axpy, &bad_x4);
         TR_CHECK_EQ_INT(bad_dot + bad_axpy + bad_x4, 0);
         TR_CHECK(bad_row > 0);
     }
-    /* and a wrong eight-token kernel of each quantized type alone (the scalar table has none either) */
-    void (*const wrong_row2x8[3])(const void *, const void *, const float *, int64_t, int64_t, float *) = {
-        wrong_row2x8_q8_0, wrong_row2x8_q4_k, wrong_row2x8_q6_k};
-    for (int i = 0; i < 3; i++) {
+    /* and a wrong eight-token kernel of each alone (the scalar table has none either) */
+    void (*const wrong_row2x8[2])(const void *, const void *, const float *, int64_t, int64_t, float *) = {
+        wrong_row2x8_q8_0, wrong_row2x8_q6_k};
+    for (int i = 0; i < 2; i++) {
         wrong = *S;
         wrong.dot_row2_x8[row2_types[i]] = wrong_row2x8[i];
         count_diffs(&wrong, S, 7u, &bad_dot, &bad_row, &bad_axpy, &bad_x4);
         TR_CHECK_EQ_INT(bad_dot + bad_axpy + bad_x4, 0);
         TR_CHECK(bad_row > 0);
     }
-    /* and a wrong one-token pair of each quantized type alone (the scalar table has none either) */
-    void (*const wrong_pair[3])(const void *, const void *, const float *, int64_t, float *) = {
-        wrong_pair_q8_0, wrong_pair_q4_k, wrong_pair_q6_k};
-    for (int i = 0; i < 3; i++) {
+    /* and a wrong one-token pair of each alone (the scalar table has none either) */
+    void (*const wrong_pair[2])(const void *, const void *, const float *, int64_t, float *) = {wrong_pair_q8_0,
+                                                                                                wrong_pair_q6_k};
+    for (int i = 0; i < 2; i++) {
         wrong = *S;
         wrong.dot_row2[row2_types[i]] = wrong_pair[i];
+        count_diffs(&wrong, S, 7u, &bad_dot, &bad_row, &bad_axpy, &bad_x4);
+        TR_CHECK_EQ_INT(bad_dot + bad_axpy + bad_x4, 0);
+        TR_CHECK(bad_row > 0);
+    }
+    /* and each q4x entry wrong alone: its comparison is live */
+    for (int i = 0; i < 4; i++) {
+        wrong = *S;
+        if (i == 0) wrong.q4x_prep = wrong_q4x_prep;
+        if (i == 1) wrong.q4x_dot2 = wrong_q4x_dot2;
+        if (i == 2) wrong.q4x_panel = wrong_q4x_panel;
+        if (i == 3) wrong.q4x_tile = wrong_q4x_tile;
         count_diffs(&wrong, S, 7u, &bad_dot, &bad_row, &bad_axpy, &bad_x4);
         TR_CHECK_EQ_INT(bad_dot + bad_axpy + bad_x4, 0);
         TR_CHECK(bad_row > 0);
@@ -879,26 +1110,37 @@ static void test_tiers_match_scalar(void) {
         /* same numbers says nothing on WHICH function ran: that the tier's entries are its own,
          * and that the engine goes through them, is tests/test_tier_used.c */
         g_x8_compared = 0;
+        g_xt_compared = 0;
         g_pair_compared = 0;
         g_tile_compared = 0;
+        g_q4x_prep_cmp = g_q4x_dot2_cmp = g_q4x_panel_cmp = g_q4x_tile_cmp = 0;
         count_diffs(K, S, 2026u + (unsigned)t, &bad_dot, &bad_row, &bad_axpy, &bad_x4);
         TR_CHECK_EQ_INT(bad_dot, 0);
         TR_CHECK_EQ_INT(bad_row, 0);
         TR_CHECK_EQ_INT(bad_axpy, 0);
         TR_CHECK_EQ_INT(bad_x4, 0);
+        /* Q4_K's prepared road was compared, and its panel road where the tier has one */
+        TR_CHECK(g_q4x_prep_cmp > 0 && g_q4x_dot2_cmp > 0);
+        if (K->q4x_panel != NULL) TR_CHECK(g_q4x_panel_cmp > 0 && g_q4x_tile_cmp > 0);
+        printf("  tier %-8s q4x: %ld prepared rows, %ld dot2, %ld panels, %ld tiles identical to scalar (%s)\n", K->tier,
+               g_q4x_prep_cmp, g_q4x_dot2_cmp, g_q4x_panel_cmp, g_q4x_tile_cmp,
+               K->q4x_prep == S->q4x_prep ? "the scalar kernels by rows"
+                                          : K->q4x_panel != NULL ? "W16 panel and tiles" : "its own kernels by rows");
         /* the tier's x8 kernels were compared, if it has any */
         int has_x8 = 0;
         for (int type = 0; type < TR_TYPE_COUNT; type++) has_x8 |= K->dot_row2_x8[type] != NULL;
         if (has_x8) TR_CHECK(g_x8_compared > 0);
+        /* the short pass's kernel of 2 and 3 input rows (every tier has Q8_0's, the scalar one at least) */
+        TR_CHECK(K->dot_row_xt[TR_TYPE_Q8_0] != NULL && g_xt_compared > 0);
         /* and its two-rows-one-token kernels, if it has any */
         int has_pair = 0;
         for (int type = 0; type < TR_TYPE_COUNT; type++) has_pair |= K->dot_row2[type] != NULL;
         if (has_pair) TR_CHECK(g_pair_compared > 0);
         TR_CHECK(g_tile_compared > 0); /* the prompt's tiles */
         printf("  tier %-8s dot_f32, axpy_f32, their x4 and 4x4 (%ld tiles), dot_row, dot_row2 (%ld calls), dot_row_x4, "
-               "dot_row2_x4 and "
+               "dot_row_xt (%ld calls), dot_row2_x4 and "
                "dot_row2_x8 (%ld calls) of f32, f16, q8_0, q4_k and q6_k %s\n",
-               K->tier, g_tile_compared, g_pair_compared, g_x8_compared,
+               K->tier, g_tile_compared, g_pair_compared, g_xt_compared, g_x8_compared,
                bad_dot == 0 && bad_row == 0 && bad_axpy == 0 && bad_x4 == 0 ? "identical to scalar"
                                                                             : "DIFFER from scalar");
     }
@@ -1413,11 +1655,11 @@ static float pm_input(unsigned *seed, int special) {
  * OLMoE's 2048; the interleaved rows in a buffer of exactly TR_PM_XIL_FLOATS(n, T) floats (ASan sees a
  * run past the pad). And the sign of an all-zero dot: Q8_0 rows of negative weights against +0.0 inputs
  * and positive ones against -0.0, whose every product is -0.0: the sum starts from +0.0 (docs/LESSONS.md
- * #214). A tier without the entries is skipped; the counter fails the test if nothing was compared. The
- * line printed says which Q4_K panel the avx512 tier has (tools/tier_check.sh checks the cap). */
+ * #214). A tier without the entries is skipped; the counter fails the test if nothing was compared. Q4_K
+ * has no float panel: its prompt takes the integer road (test_matmul_grouped_s, test_dot_row_q4_k). */
 static void test_phase_major(void) {
     static const char *tiers[2] = {"avx2", "avx512"};
-    static const tr_type types[2] = {TR_TYPE_Q4_K, TR_TYPE_Q8_0};
+    static const tr_type types[2] = {TR_TYPE_Q6_K, TR_TYPE_Q8_0};
     static const int64_t ns[3] = {256, 512, 2048};
     const tr_kernels *S = tr_kernels_tier("scalar");
     TR_CHECK(S != NULL);
@@ -1491,27 +1733,50 @@ static void test_phase_major(void) {
     /* on a CPU without AVX-512 no tier has the entries yet: nothing to compare, and nothing to fail */
     const tr_kernels *A = tr_kernels_tier("avx512");
     if (A != NULL) TR_CHECK(compared > 0);
-    if (A != NULL && A->pm_panel[TR_TYPE_Q4_K] != NULL)
-        printf("  phase-major on tier avx512: %lld outputs equal to dot_row, the Q4_K panel from %s\n", (long long)compared,
-               tr_cpu()->avx512vbmi ? "byte permutes (vbmi)" : "the float transpose");
+    if (A != NULL) printf("  phase-major on tier avx512: %lld outputs equal to dot_row\n", (long long)compared);
 }
 
 /* ---- tr_matmul_grouped_s: the phase-major road's orchestration (kernels.c pm_*) --------------------
- * Branch: the plan (chunks, tiles, groups under PM_MIN_ROWS on dot_row2), the panel a worker keeps
+ * Branch: the plan (chunks, tiles, groups under PM_MIN_ROWS on dot_row2, those of 2 and 3 on dot_row_xt,
+ * counted), a short pass (no group of PM_MIN_ROWS: taken on every tier), the panel a worker keeps
  * between its items, and the guards that send a call back to tr_matmul_grouped. Against
  * tr_matmul_grouped with no pool (every output one dot_row) byte for byte: 13 groups of 0, 1..5 input
  * rows (both sides of PM_MIN_ROWS), 23..25 (one tile and two), 255..257 and 513 (PM_CHUNK's edges);
  * 16 and 48 weight rows; Q4_K and Q8_0; no pool and pools of 1, 3, 7 and 16; each case twice in a row,
  * on other weights of the same shape. With 16 rows and no pool, consecutive groups share their rows'
  * index: a panel kept by its rows alone would serve the wrong group; one group of 5 inputs called
- * twice: a panel kept from the call before would serve. Counted (pm_tile): the road was taken, and
- * never where it must not be: a pool larger than the scratch, a worker index past the scratch's (no
- * pool, inside a larger pool's body), a Q4_K row that is not whole blocks (docs/LESSONS.md #214). */
-static atomic_long g_pms_tiles;
+ * twice: a panel kept from the call before would serve. Counted (pm_tile, q4x_tile): the road was
+ * taken, and never where it must not be: a pool larger than the scratch, a worker index past the
+ * scratch's (no pool, inside a larger pool's body), a Q4_K row that is not whole blocks (docs/LESSONS.md
+ * #214). Q4_K takes its integer road (kernels.c matmul_q4x): every input row prepared exactly once
+ * (counted), groups of one input row by q4x_dot2, the others by W16 panels and tiles where the tier has
+ * them; the reference is tr_matmul_grouped's dot_row, the definition from the floats. */
+static atomic_long g_pms_tiles, g_pms_preps, g_pms_dot2;
 static const tr_kernels *g_pms_real;
 static void pms_tile(const float *panel, const float *xil, int64_t n, int T, float *part, float *y, int64_t y_stride) {
     atomic_fetch_add(&g_pms_tiles, 1);
     g_pms_real->pm_tile(panel, xil, n, T, part, y, y_stride);
+}
+/* Q4_K's integer road: the preparation, its tiles (counted with the phase-major ones) and its pairs */
+static void pms_q4x_prep(const float *x, int64_t n, void *xq) {
+    atomic_fetch_add(&g_pms_preps, 1);
+    g_pms_real->q4x_prep(x, n, xq);
+}
+static void pms_q4x_tile(const void *panel, const void *xq, size_t xq_stride, int64_t n, int T, float *y,
+                         int64_t y_stride) {
+    atomic_fetch_add(&g_pms_tiles, 1);
+    g_pms_real->q4x_tile(panel, xq, xq_stride, n, T, y, y_stride);
+}
+static void pms_q4x_dot2(const void *row0, const void *row1, const void *xq, int64_t n, float *out) {
+    atomic_fetch_add(&g_pms_dot2, 1);
+    g_pms_real->q4x_dot2(row0, row1, xq, n, out);
+}
+/* Q8_0's groups of 2 and 3 input rows (a short verify pass's), counted by t */
+static atomic_long g_pms_xt, g_pms_xt2, g_pms_xt3;
+static void pms_xt_q8_0(const void *row, const float *x, int64_t stride, int64_t n, int t, float *out) {
+    atomic_fetch_add(&g_pms_xt, 1);
+    atomic_fetch_add(t == 2 ? &g_pms_xt2 : &g_pms_xt3, 1);
+    g_pms_real->dot_row_xt[TR_TYPE_Q8_0](row, x, stride, n, t, out);
 }
 
 typedef struct {
@@ -1541,10 +1806,6 @@ static void test_matmul_grouped_s(void) {
     static const int64_t rows_of[2] = {16, 48};
     static const int threads[4] = {1, 3, 7, 16};
     const tr_kernels *K = tr_kernels_get();
-    if (K->pm_tile == NULL || K->pm_interleave == NULL) {
-        printf("  matmul_grouped_s: tier %s has no phase-major entries, nothing to compare\n", K->tier);
-        return;
-    }
     int64_t offsets[G + 1];
     offsets[0] = 0;
     for (int g = 0; g < G; g++) offsets[g + 1] = offsets[g] + sizes[g];
@@ -1552,12 +1813,18 @@ static void test_matmul_grouped_s(void) {
     static tr_kernels counting;
     g_pms_real = K;
     counting = *K;
-    counting.pm_tile = pms_tile;
+    if (K->pm_tile != NULL) counting.pm_tile = pms_tile;
+    counting.q4x_prep = pms_q4x_prep;
+    counting.q4x_dot2 = pms_q4x_dot2;
+    if (K->q4x_tile != NULL) counting.q4x_tile = pms_q4x_tile;
+    TR_CHECK(K->dot_row_xt[TR_TYPE_Q8_0] != NULL);
+    counting.dot_row_xt[TR_TYPE_Q8_0] = pms_xt_q8_0;
     tr_kernels_set_active(&counting);
     long taken = 0, refused = 0;
     for (int ti = 0; ti < 2; ti++) {
         const tr_type type = types[ti];
-        if (K->pm_panel[type] == NULL) continue;
+        const int q4x = type == TR_TYPE_Q4_K, tiles = q4x ? K->q4x_panel != NULL && K->q4x_tile != NULL : 1;
+        if (!q4x && (K->pm_panel[type] == NULL || K->pm_tile == NULL || K->pm_interleave == NULL)) continue;
         const size_t rb = tr_row_bytes(type, COLS);
         for (int ri = 0; ri < 2; ri++) {
             const int64_t R = rows_of[ri];
@@ -1593,9 +1860,17 @@ static void test_matmul_grouped_s(void) {
                     for (int v = 0; v < 2; v++) {
                         memset(y, 0x7F, ybytes);
                         atomic_store(&g_pms_tiles, 0);
+                        atomic_store(&g_pms_preps, 0);
+                        atomic_store(&g_pms_dot2, 0);
+                        atomic_store(&g_pms_xt, 0);
                         tr_matmul_grouped_s(pool, w[v], offsets, G, x, y, &s);
                         TR_CHECK(memcmp(y, ref[v], ybytes) == 0);
-                        TR_CHECK(atomic_load(&g_pms_tiles) > 0);
+                        if (tiles) TR_CHECK(atomic_load(&g_pms_tiles) > 0);
+                        if (!q4x) TR_CHECK(atomic_load(&g_pms_xt) > 0); /* the groups of 2 and 3 */
+                        if (q4x) { /* every input row prepared once; the one-row group by pairs */
+                            TR_CHECK_EQ_INT(atomic_load(&g_pms_preps), N);
+                            TR_CHECK(atomic_load(&g_pms_dot2) > 0);
+                        }
                         taken++;
                     }
                     if (pool != NULL) tr_pool_destroy(pool);
@@ -1615,9 +1890,11 @@ static void test_matmul_grouped_s(void) {
                 if (p8 != NULL) {
                     memset(y, 0x7F, ybytes);
                     atomic_store(&g_pms_tiles, 0);
+                    atomic_store(&g_pms_preps, 0);
                     tr_matmul_grouped_s(p8, w[0], offsets, G, x, y, &s4); /* 8 workers, room for 4 */
                     TR_CHECK(memcmp(y, ref[0], ybytes) == 0);
                     TR_CHECK_EQ_INT(atomic_load(&g_pms_tiles), 0);
+                    TR_CHECK_EQ_INT(atomic_load(&g_pms_preps), 0); /* Q4_K: the definition from the floats */
                     pms_nested nc;
                     nc.w = w[1];
                     nc.offsets = offsets;
@@ -1646,7 +1923,7 @@ static void test_matmul_grouped_s(void) {
             free(y);
         }
     }
-    /* a Q4_K row of 272 columns is not whole blocks (row bytes 0): no tile may run on it */
+    /* a Q4_K row of 272 columns is not whole blocks (row bytes 0): the integer road may not take it */
     {
         tr_pm_scratch s;
         unsigned char *wq = (unsigned char *)calloc(16, 2 * 144);
@@ -1654,12 +1931,22 @@ static void test_matmul_grouped_s(void) {
         const int64_t off[2] = {0, 8};
         int ok = wq != NULL && x != NULL && y != NULL && tr_pm_scratch_init(&s, 1, 1, 8, 272, 8 * 272) == 0;
         TR_CHECK(ok);
-        if (ok && K->pm_panel[TR_TYPE_Q4_K] != NULL) {
+        if (ok) {
             tr_mat wm = {TR_TYPE_Q4_K, 16, 272, wq};
             atomic_store(&g_pms_tiles, 0);
+            atomic_store(&g_pms_preps, 0);
             tr_matmul_grouped_s(NULL, &wm, off, 1, x, y, &s);
             TR_CHECK_EQ_INT(atomic_load(&g_pms_tiles), 0);
+            TR_CHECK_EQ_INT(atomic_load(&g_pms_preps), 0);
             refused++;
+            /* and phase-major's own guard: a Q8_0 row of 272 columns is 8.5 blocks */
+            if (K->pm_panel[TR_TYPE_Q8_0] != NULL && K->pm_tile != NULL) {
+                tr_mat w8 = {TR_TYPE_Q8_0, 16, 272, wq};
+                atomic_store(&g_pms_tiles, 0);
+                tr_matmul_grouped_s(NULL, &w8, off, 1, x, y, &s);
+                TR_CHECK_EQ_INT(atomic_load(&g_pms_tiles), 0);
+                refused++;
+            }
         }
         if (ok) tr_pm_scratch_free(&s);
         free(wq);
@@ -1668,8 +1955,98 @@ static void test_matmul_grouped_s(void) {
     }
     tr_kernels_set_active(NULL);
     TR_CHECK(taken > 0 && refused > 0);
-    printf("  matmul_grouped_s on tier %s: %ld calls through phase-major equal to dot_row, %ld refusals on "
-           "the old road\n", K->tier, taken, refused);
+    printf("  matmul_grouped_s on tier %s: %ld calls through phase-major (Q8_0) and the integer road (Q4_K) equal to "
+           "dot_row, %ld refusals on the old road\n", K->tier, taken, refused);
+}
+
+/* ---- the short verify pass (kernels.c matmul_phase_major, question 78) ------------------------------------
+ * Branch: a call whose largest group has 2 or 3 input rows takes phase-major's plan on EVERY tier, the ones
+ * without pm kernels too; its groups of 2 and of 3 go through dot_row_xt (counted by t: both must run), the
+ * others by dot_row. A call of one input row a group (a decode token) never builds the plan: the plan's first
+ * word (item0[0], which pm_plan_build writes) is left as it was. Against tr_matmul_grouped with no pool, byte
+ * for byte: groups of 1, 2, 3, 0, 2 and 3; Q8_0 rows of 256 and 96 columns (3 blocks), 16 and 48 weight rows;
+ * no pool and pools of 1, 3, 7 and 16; on the scalar tier, and AVX2 and AVX-512 where the CPU has them (before
+ * 2026-09-27 such a call went back to tr_matmul_grouped's static chunks, and a tier without pm kernels still
+ * would if the road asked for them: seen red). */
+static void test_short_pass(void) {
+    static const char *const tiers[] = {"scalar", "avx2", "avx512"};
+    enum { G = 6 };
+    static const int64_t sizes[G] = {1, 2, 3, 0, 2, 3};
+    static const int64_t cols_of[2] = {256, 96}, rows_of[2] = {16, 48};
+    static const int threads[4] = {1, 3, 7, 16};
+    static const int64_t one[G + 1] = {0, 1, 2, 3, 3, 4, 5}; /* a decode's experts: one row a group */
+    int64_t offsets[G + 1];
+    offsets[0] = 0;
+    for (int g = 0; g < G; g++) offsets[g + 1] = offsets[g] + sizes[g];
+    const int64_t N = offsets[G];
+    static tr_kernels counting;
+    long calls = 0, decodes = 0;
+    for (size_t ti = 0; ti < sizeof tiers / sizeof tiers[0]; ti++) {
+        const tr_kernels *K = tr_kernels_tier(tiers[ti]);
+        if (K == NULL) continue;
+        g_pms_real = K;
+        counting = *K;
+        TR_CHECK(K->dot_row_xt[TR_TYPE_Q8_0] != NULL);
+        counting.dot_row_xt[TR_TYPE_Q8_0] = pms_xt_q8_0;
+        tr_kernels_set_active(&counting);
+        for (int ci = 0; ci < 2; ci++) {
+            for (int ri = 0; ri < 2; ri++) {
+                const int64_t C = cols_of[ci], R = rows_of[ri];
+                const size_t rb = tr_row_bytes(TR_TYPE_Q8_0, C), ybytes = (size_t)N * (size_t)R * sizeof(float);
+                unsigned char *wd = (unsigned char *)malloc((size_t)G * (size_t)R * rb);
+                float *x = (float *)malloc((size_t)(N * C) * sizeof(float));
+                float *ref = (float *)malloc(ybytes), *ref1 = (float *)malloc(ybytes), *y = (float *)malloc(ybytes);
+                tr_pm_scratch s;
+                int ok = wd != NULL && x != NULL && ref != NULL && ref1 != NULL && y != NULL &&
+                         tr_pm_scratch_init(&s, 16, G, N, C, N * C) == 0;
+                TR_CHECK(ok);
+                if (ok) {
+                    unsigned seed = 7u + (unsigned)(ti * 4 + (size_t)ci * 2 + (size_t)ri);
+                    for (int64_t r = 0; r < G * R; r++) fill_row_of(TR_TYPE_Q8_0, wd + (size_t)r * rb, C, &seed, 0);
+                    for (int64_t i = 0; i < N * C; i++) x[i] = (next_rand(&seed) % 13u == 0) ? 0.0f : rand_float(&seed);
+                    tr_mat w[G];
+                    for (int g = 0; g < G; g++) {
+                        w[g].type = TR_TYPE_Q8_0;
+                        w[g].rows = R;
+                        w[g].cols = C;
+                        w[g].data = wd + (size_t)g * (size_t)R * rb;
+                    }
+                    tr_matmul_grouped(NULL, w, offsets, G, x, ref);
+                    tr_matmul_grouped(NULL, w, one, G, x, ref1);
+                    for (int pi = -1; pi < 4; pi++) {
+                        tr_pool *pool = pi < 0 ? NULL : tr_pool_create(threads[pi]);
+                        TR_CHECK(pi < 0 || pool != NULL);
+                        if (pi >= 0 && pool == NULL) continue;
+                        memset(y, 0x7F, ybytes);
+                        atomic_store(&g_pms_xt2, 0);
+                        atomic_store(&g_pms_xt3, 0);
+                        tr_matmul_grouped_s(pool, w, offsets, G, x, y, &s);
+                        TR_CHECK(memcmp(y, ref, ybytes) == 0);
+                        TR_CHECK(atomic_load(&g_pms_xt2) > 0 && atomic_load(&g_pms_xt3) > 0);
+                        calls++;
+                        /* the decode's call keeps its road: the same bytes, and no plan built */
+                        memset(y, 0x7F, ybytes);
+                        s.plan[0] = -7;
+                        tr_matmul_grouped_s(pool, w, one, G, x, y, &s);
+                        TR_CHECK(memcmp(y, ref1, (size_t)one[G] * (size_t)R * sizeof(float)) == 0);
+                        TR_CHECK_EQ_INT(s.plan[0], -7);
+                        decodes++;
+                        if (pool != NULL) tr_pool_destroy(pool);
+                    }
+                }
+                if (ok) tr_pm_scratch_free(&s);
+                free(wd);
+                free(x);
+                free(ref);
+                free(ref1);
+                free(y);
+            }
+        }
+        tr_kernels_set_active(NULL);
+        printf("  short pass on tier %-8s groups of 1-3 input rows equal to dot_row at 1-16 threads, both widths of "
+               "dot_row_xt run; the decode's call builds no plan\n", K->tier);
+    }
+    TR_CHECK(calls > 0 && decodes > 0);
 }
 
 int main(void) {
@@ -1697,6 +2074,7 @@ int main(void) {
     test_one_row_per_group();
     test_phase_major();
     test_matmul_grouped_s();
+    test_short_pass();
 
     TR_TEST_EXIT();
 }

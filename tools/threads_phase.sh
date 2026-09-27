@@ -18,8 +18,9 @@
 #         decode-512               prompt on 16 threads, decode forced on 16, 8, 4, 12, 6, the
 #                                  measured default, and 16 again
 #         spec-code-edit, spec-code   --spec 8 where the draft is accepted and where it is not:
-#                                  before, after, after with every verify pass narrow
-#                                  (TR_DECODE_ROWS=16), before again
+#                                  before, after, after with the verify passes of 5 to 16
+#                                  rows on the decode's width too (TR_DECODE_ROWS=16; those
+#                                  of 2 to 4 rows measure widths of their own), before again
 #
 # The machine's marker (~/.claude/macchina-ferma) is held for the duration and given back at the
 # end, also when the script fails or is interrupted: the other windows pause their work, their

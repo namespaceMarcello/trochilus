@@ -368,11 +368,31 @@ def check_expf_table():
         fail(83, (r.stdout + r.stderr).strip() or "tools/gen_expf_table.py --check failed")
 
 
+def check_readme_numbers():
+    """#218: the README's draft gave a GPU time no document held ("168 us a layer"). The README carries no
+    number of its own: every decimal in it, and every integer followed by a unit of measure, appears as it
+    is in docs/MEASUREMENTS.md (thin and no-break spaces read as spaces; code blocks and links skipped)."""
+    def norm(s):
+        return s.replace(" ", " ").replace(" ", " ").replace("\xa0", " ")
+    readme = norm((ROOT / "README.md").read_text(encoding="utf-8"))
+    readme = re.sub(r"```.*?```", "", readme, flags=re.S)
+    readme = re.sub(r"\]\([^)]*\)|https?://\S+", "", readme)
+    meas = norm((ROOT / "docs" / "MEASUREMENTS.md").read_text(encoding="utf-8"))
+    units = r"(µs|ms|tok/s|GFLOP/s|GB/s|MB/s|MiB|GiB)"
+    for m in re.finditer(r"(?<![\w.])(\d+\.\d+)(?![\w.]*\d)", readme):
+        if m.group(1) not in meas:
+            fail(218, f"README.md: {m.group(1)} is in no line of docs/MEASUREMENTS.md")
+    for m in re.finditer(r"(?<![\w.])(\d{1,3}(?: \d{3})+|\d+) ?" + units + r"(?!\w)", readme):
+        num, unit = m.group(1), m.group(2)
+        if not re.search(r"(?<![\w.])" + re.escape(num) + r" ?" + re.escape(unit), meas):
+            fail(218, f"README.md: '{num} {unit}' is in no line of docs/MEASUREMENTS.md")
+
+
 def main():
     for check in (check_docs_control_chars, check_line_endings, check_doc_limits, check_no_future_dates, check_lessons_table,
                   check_type_table, check_tests_no_tmpfile, check_hot_zones, check_global_state,
                   check_makefile_recipes_ascii, check_shell_scripts_whole, check_scripts_clean_up,
-                  check_no_failure_into_tee, check_expf_table):
+                  check_no_failure_into_tee, check_expf_table, check_readme_numbers):
         check()
     for f in failures:
         print(f)

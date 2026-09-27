@@ -1,0 +1,14 @@
+//! A tokenizer for simple arithmetic expressions.
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Token {
+    Num(f64),
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    LParen,
+    RParen,
+}
+
+pub fn tokenize(src: &str) -> Result<Vec<Token>, String> {

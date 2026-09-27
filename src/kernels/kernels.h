@@ -51,6 +51,13 @@
 /* floats of a panel of n columns, and of an interleaved tile of T input rows */
 #define TR_PM_PANEL_FLOATS(n) (16 * ((int64_t)(n) + TR_PM_PAD))
 #define TR_PM_XIL_FLOATS(n, T) (16 * ((int64_t)(n) / 16 * (T) + TR_PM_PAD))
+/* Q4_K's integer definition (docs/ARCHITECTURE.md §Q4_K in integers; the table's q4x_* entries): the widest
+ * tile of prepared input rows, the bytes of a 16-row panel of n columns, the largest |X| of an input element
+ * (the two balanced 16-bit digits' reach, 32295 + 64591 * 32295) and the digits' base. */
+#define TR_Q4X_TILE_MAX 4
+#define TR_Q4X_PANEL_BYTES(n) ((size_t)(n) / 256 * 9728)
+#define TR_Q4X_XMAX 2085998640.0
+#define TR_Q4X_BASE 64591
 /* Cache positions a dot_f32_x4 or axpy_f32_x4 kernel handles per load of the query or the output. */
 #define TR_ATTN_X 4
 /* Cache positions per block in tr_attention_group: a block of keys (then of values) stays in the
@@ -70,6 +77,9 @@ typedef struct {
 size_t tr_row_bytes(tr_type type, int64_t n);
 /* 1 if the matmul and dequant kernels support this type. */
 int tr_kernels_support(tr_type type);
+/* Bytes of one input row of n columns prepared for Q4_K's integer definition (the table's q4x_prep; a
+ * multiple of 64). */
+size_t tr_q4x_bytes(int64_t n);
 
 /* Kernel table. Filled once by tr_kernels_init from tr_cpu(); read-only afterwards. */
 typedef struct {
@@ -102,6 +112,10 @@ typedef struct {
      * read and decoded once for all of them (fewer bytes and conversions per element, same
      * numbers). NULL for a type without a variant: the caller loops over dot_row. */
     void (*dot_row_x4[TR_TYPE_COUNT])(const void *row, const float *x, int64_t stride, int64_t n, float *out);
+    /* The same for t input rows, t 2 or 3 (a short verify pass's group, too few for dot_row_x4):
+     * out[j] = dot_row(row, x + j*stride, n) for j < t, bit for bit, the row decoded once for all
+     * of them. NULL: the caller calls dot_row for each input row. */
+    void (*dot_row_xt[TR_TYPE_COUNT])(const void *row, const float *x, int64_t stride, int64_t n, int t, float *out);
     /* Two weight rows against the same input row (a decode token): out[0] = dot_row(row0, x, n)
      * and out[1] = dot_row(row1, x, n), bit for bit, each row with its own chain of adds. NULL:
      * the caller calls dot_row twice. */
@@ -132,6 +146,25 @@ typedef struct {
     void (*pm_panel[TR_TYPE_COUNT])(const void *rows, size_t row_bytes, int64_t n, float *panel);
     void (*pm_interleave)(const float *x, int64_t stride, int64_t n, int T, float *xil);
     void (*pm_tile)(const float *panel, const float *xil, int64_t n, int T, float *part, float *y, int64_t y_stride);
+    /* Q4_K's integer definition (docs/ARCHITECTURE.md §Q4_K in integers), a Q4_K row against an input row x
+     * of n columns (a multiple of 256): per super-block s of x, sh_s the largest shift with max|x_k| 2^sh_s
+     * <= TR_Q4X_XMAX (0 for an all-zero block), X_k = nearest-even(x_k 2^sh_s), T_s = sum_k sc_j q_k X_k and
+     * M_s = sum_j m_j sum_{k in j} X_k (exact integers), v_s = fl64(fl64(d_s T_s) - fl64(dmin_s M_s)); the
+     * result fl32(sum_s v_s 2^-sh_s), the sum in f64 in increasing s from +0, and NaN when a block of x
+     * holds a NaN or an infinity. Every sum inside a block is exact: any order, width, split or device
+     * gives these bits. dot_row[TR_TYPE_Q4_K] computes it from the floats; these from an input row
+     * prepared once (its digits, the windows' token terms, the sub-blocks' sums and the shifts):
+     * q4x_prep: x (n floats) -> xq (tr_q4x_bytes(n) bytes, 64-byte aligned);
+     * q4x_dot2: out[0], out[1] = rows row0 and row1 against the prepared row xq (the decode's road);
+     * q4x_panel: TR_PM_ROWS consecutive rows (row_bytes apart) -> panel (TR_Q4X_PANEL_BYTES(n) bytes,
+     *   64-byte aligned); next, when not NULL, is the TR_PM_ROWS rows the caller builds after these (the
+     *   same row_bytes and n), which a tier may bring toward its caches while it builds (never read);
+     * q4x_tile: the panel against T prepared rows xq, xq + xq_stride, ..., T from 1 to TR_Q4X_TILE_MAX:
+     *   y[t * y_stride + r] = the panel's row r against input row t. */
+    void (*q4x_prep)(const float *x, int64_t n, void *xq);
+    void (*q4x_dot2)(const void *row0, const void *row1, const void *xq, int64_t n, float *out);
+    void (*q4x_panel)(const void *rows, size_t row_bytes, int64_t n, void *panel, const void *next);
+    void (*q4x_tile)(const void *panel, const void *xq, size_t xq_stride, int64_t n, int T, float *y, int64_t y_stride);
     /* decode one row of n elements to f32 */
     void (*dequant_row[TR_TYPE_COUNT])(const void *row, float *out, int64_t n);
     /* y[i] = tr_expf(x[i]) for i < n, element-wise; y may be x (in place). The exponential of the
@@ -167,6 +200,9 @@ void tr_matmul_grouped(tr_pool *pool, const tr_mat *w, const int64_t *offsets, i
 typedef struct {
     float *xil;
     int64_t max_x;              /* floats of xil */
+    unsigned char *xq;          /* Q4_K's prepared input rows (the table's q4x_prep), the same memory as xil: a call
+                                 * takes one road or the other */
+    int64_t xq_bytes;           /* max_tokens * tr_q4x_bytes(max_cols) */
     float *work;                /* n_workers * (TR_PM_PANEL_FLOATS(max_cols) + TR_PM_PART) floats: panels with pads */
     int64_t max_cols;
     int n_workers;
@@ -181,7 +217,12 @@ void tr_pm_scratch_free(tr_pm_scratch *s);
 uint64_t tr_pm_scratch_bytes(int n_workers, int64_t max_groups, int64_t max_tokens, int64_t max_cols, int64_t max_x);
 /* tr_matmul_grouped and tr_matmul, the same y bit for bit, taking the phase-major road where it applies:
  * the tier has pm_panel for w's type and pm_tile, rows and cols are multiples of TR_PM_ROWS and 16, the
- * call fits s; a group of fewer than 4 input rows keeps the x4 and x8 kernels. s == NULL: the old road. */
+ * call fits s; a group of fewer than 4 input rows goes by rows, 2 or 3 of them through dot_row_xt. A short
+ * pass (no group of 4 input rows, one of 2 or 3: a verify pass of 2-3 rows) takes the road on any tier,
+ * items cut by weight rows and balanced; one input row a group stays on tr_matmul_grouped's. A Q4_K weight takes its
+ * integer road where the call fits s: every input row prepared once (q4x_prep), then the W16 panel and
+ * tiles for a group of 2 input rows or more where the tier has them, q4x_dot2 otherwise; each output is
+ * dot_row[TR_TYPE_Q4_K]'s. s == NULL: the old road (for Q4_K, dot_row from the floats). */
 void tr_matmul_grouped_s(tr_pool *pool, const tr_mat *w, const int64_t *offsets, int64_t n_groups, const float *x,
                          float *y, const tr_pm_scratch *s);
 void tr_matmul_s(tr_pool *pool, const tr_mat *w, const float *x, int64_t n_tokens, float *y, const tr_pm_scratch *s);

@@ -1,11 +1,13 @@
 """token_timeline.py -- where a decode token's time goes against the bytes it reads, from a
 TR_POOL_TRACE build's file (threads.c; docs/MEASUREMENTS.md §The engine read as entangled pairs).
 
-    tools/.venv/Scripts/python.exe tools/token_timeline.py <trace> [--bw GBs] [--skip K]
+    tools/.venv/Scripts/python.exe tools/token_timeline.py <trace> [--bw GBs] [--skip K] [--rows R]
 
-Each trace line is one parallel_for: "n chunks t0 t1 (start end) x chunks bytes rows cols", times in
-microseconds; bytes/rows/cols come from TR_TRACE_NOTE (a weight's shape, rows -1 for the decode's
-attention with cols its positions; 0 0 0 for calls that read no weight). A decode token is the calls
+Each trace line is one parallel_for: "n chunks t0 t1 (start end) x chunks bytes rows cols in", times in
+microseconds; bytes/rows/cols/in come from TR_TRACE_NOTE (a weight's shape, rows -1 for the
+attention with cols its positions; in the call's input rows; 0 0 0 0 for calls that read no weight;
+traces before 2026-09-27 have no in). --rows R takes the passes of R input rows instead of the decode's
+tokens (a verify pass of a fixed draft, --spec R-1 --spec-fixed). A decode token is the calls
 from one q projection with one input row to the next; its wall runs from its first call's dispatch
 to the next token's, so the code between calls (and between tokens) is the gap. Against --bw, the
 GB/s a plain read of the same bytes gets on the same threads, every call's loss is its wall minus
@@ -24,13 +26,15 @@ def load(path):
         t0, t1 = float(v[2]), float(v[3])
         tail = v[4 + 2 * chunks:]
         b, r, c = (int(tail[0]), int(tail[1]), int(tail[2])) if len(tail) >= 3 else (0, 0, 0)
-        calls.append({"n": n, "chunks": chunks, "t0": t0, "t1": t1, "bytes": b, "rows": r, "cols": c})
+        i = int(tail[3]) if len(tail) >= 4 else 0  # the note's input rows (traces since 2026-09-27)
+        calls.append({"n": n, "chunks": chunks, "t0": t0, "t1": t1, "bytes": b, "rows": r, "cols": c, "in": i})
     return calls
 
 
-def tokens(calls):
-    """Decode tokens: a q projection (the first weight of a layer-0 attention) with n == rows opens
-    one. The first weight call after a head call is layer 0's q."""
+def tokens(calls, k=1):
+    """Passes of k input rows (a decode token: k = 1): a q projection (the first weight of a layer-0
+    attention) whose note says k input rows opens one; a trace without the input rows, n == rows
+    (k = 1 only). The first weight call after a head call is layer 0's q."""
     head_rows = max((c["rows"] for c in calls), default=0)
     out, cur, after_head = [], None, True
     for c in calls:
@@ -38,7 +42,8 @@ def tokens(calls):
             after_head = False
             if cur is not None:
                 out.append(cur)
-            cur = [c] if c["n"] == c["rows"] else None
+            opens = c["in"] == k if c["in"] > 0 else (k == 1 and c["n"] == c["rows"])
+            cur = [c] if opens else None
             continue
         if cur is not None:
             cur.append(c)
@@ -62,15 +67,17 @@ def name_of(c, seen):
 
 def main():
     args = [a for a in sys.argv[1:]]
-    bw, skip = 53.0, 4
+    bw, skip, k = 53.0, 4, 1
     if "--bw" in args:
         i = args.index("--bw"); bw = float(args[i + 1]); del args[i:i + 2]
     if "--skip" in args:
         i = args.index("--skip"); skip = int(args[i + 1]); del args[i:i + 2]
+    if "--rows" in args:
+        i = args.index("--rows"); k = int(args[i + 1]); del args[i:i + 2]
     calls = load(args[0])
-    toks = tokens(calls)
+    toks = tokens(calls, k)
     if len(toks) <= skip + 1:
-        sys.exit("token_timeline: %d decode tokens, need more than --skip + 1" % len(toks))
+        sys.exit("token_timeline: %d passes of %d rows, need more than --skip + 1" % (len(toks), k))
     # a token's wall ends where the next one begins: the last token has no end, dropped
     toks = toks[skip:]
     rows = []
@@ -94,8 +101,8 @@ def main():
     nbytes = statistics.median(r[2] for r in rows)
     ncalls = statistics.median(r[3] for r in rows)
     ideal = nbytes / (bw * 1e3)  # bytes / (GB/s) in microseconds
-    print("%d decode tokens (context %d-%d), medians a token; plain read %.1f GB/s" %
-          (n_tok, rows[0][4], rows[-1][4], bw))
+    print("%d passes of %d rows (context %d-%d), medians a pass; plain read %.1f GB/s" %
+          (n_tok, k, rows[0][4], rows[-1][4], bw))
     print("  wall %.0f us, in calls %.0f us (%.1f%%), between calls %.0f us (%.1f%%)" %
           (wall, in_calls, 100 * in_calls / wall, wall - in_calls, 100 * (wall - in_calls) / wall))
     print("  %d calls, %.1f MiB read, %.1f GB/s over the token; at the plain read %.0f us: the RAM idle %.0f us (%.1f%%)" %

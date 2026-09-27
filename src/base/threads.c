@@ -121,19 +121,20 @@ struct tr_pool {
  * engine proper never has it. */
 #include <stdio.h>
 enum { TRACE_CALLS = 60000, TRACE_CHUNKS = 64 };
-typedef struct { int64_t n; int chunks; double t0, t1; uint64_t bytes; int64_t rows, cols; } trace_call_rec;
+typedef struct { int64_t n; int chunks; double t0, t1; uint64_t bytes; int64_t rows, cols, in; } trace_call_rec;
 static trace_call_rec g_trace_call[TRACE_CALLS];               /* global-ok: research build only */
 static double g_trace_chunk[TRACE_CALLS][TRACE_CHUNKS][2];     /* global-ok: research build only */
 static atomic_int g_trace_n;                                    /* global-ok: research build only */
 static int g_trace_armed;                                       /* global-ok: research build only */
 /* The next call's note (tr_pool_trace_note), per calling thread; taken by that call. */
 static _Thread_local uint64_t t_note_bytes;                     /* global-ok: research build only */
-static _Thread_local int64_t t_note_rows, t_note_cols;          /* global-ok: research build only */
+static _Thread_local int64_t t_note_rows, t_note_cols, t_note_in; /* global-ok: research build only */
 
-void tr_pool_trace_note(uint64_t bytes, int64_t rows, int64_t cols) {
+void tr_pool_trace_note(uint64_t bytes, int64_t rows, int64_t cols, int64_t in) {
     t_note_bytes = bytes;
     t_note_rows = rows;
     t_note_cols = cols;
+    t_note_in = in;
 }
 
 static void trace_dump(void);
@@ -149,10 +150,11 @@ static int trace_begin(int64_t n, int chunks) {
         g_trace_call[tc].bytes = t_note_bytes;
         g_trace_call[tc].rows = t_note_rows;
         g_trace_call[tc].cols = t_note_cols;
+        g_trace_call[tc].in = t_note_in;
         g_trace_call[tc].t0 = tr_time_sec();
     }
     t_note_bytes = 0;
-    t_note_rows = t_note_cols = 0;
+    t_note_rows = t_note_cols = t_note_in = 0;
     return tc;
 }
 
@@ -169,7 +171,8 @@ static void trace_dump(void) {
         fprintf(f, "%lld %d %.3f %.3f", (long long)c->n, c->chunks, (c->t0 - base) * 1e6, (c->t1 - base) * 1e6);
         for (int k = 0; k < c->chunks && k < TRACE_CHUNKS; k++)
             fprintf(f, " %.3f %.3f", (g_trace_chunk[i][k][0] - base) * 1e6, (g_trace_chunk[i][k][1] - base) * 1e6);
-        fprintf(f, " %llu %lld %lld\n", (unsigned long long)c->bytes, (long long)c->rows, (long long)c->cols);
+        fprintf(f, " %llu %lld %lld %lld\n", (unsigned long long)c->bytes, (long long)c->rows, (long long)c->cols,
+                (long long)c->in);
     }
     fclose(f);
 }

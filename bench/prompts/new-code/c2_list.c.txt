@@ -1,0 +1,21 @@
+/* list.c — a doubly linked list of points, with sorting and search. */
+#include <stdio.h>
+#include <stdlib.h>
+
+typedef struct node {
+    double x, y;
+    struct node *prev, *next;
+} node;
+
+typedef struct {
+    node *head, *tail;
+    size_t len;
+} list;
+
+void list_init(list *l) {
+    l->head = l->tail = NULL;
+    l->len = 0;
+}
+
+/* Appends a point at the end; returns 0, or -1 when out of memory. */
+int list_push_back(list *l, double x, double y) {

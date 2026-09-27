@@ -1,0 +1,191 @@
+/* tokenizer.c — byte-level BPE from GGUF metadata (see tokenizer.h).
+ *
+ * Load turns the file's strings into ids once: merges become a hash from a pair of
+ * token ids to (rank, merged id), every token keeps the bytes it decodes to, and the
+ * string-to-id table is dropped. Encoding then never looks at a string again. */
+#include "tokenizer.h"
+
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "unicode.h"
+
+/* ---- pre-tokenizer families ------------------------------------------------ */
+
+typedef enum {
+    /* GPT-2 ByteLevel regex:
+     * 's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+ */
+    PRE_GPT2
+} pre_rules;
+
+typedef struct {
+    const char *pre;    /* tokenizer.ggml.pre */
+    pre_rules rules;
+    int nfc;            /* the family's tokenizer.json normalizes to NFC */
+} family;
+
+/* A family enters this table only with an oracle run against its tokenizer.json
+ * (tools/tokenizer_oracle.py): the name alone does not say what HF does. */
+static const family FAMILIES[] = {
+    /* OLMo / OLMoE: GPT-NeoX tokenizer, NFC normalizer, ByteLevel without prefix space */
+    {"olmo", PRE_GPT2, 1},
+};
+
+/* ---- the tokenizer --------------------------------------------------------- */
+
+#define MAX_TOKENS ((size_t)1 << 24)
+#define MAX_MERGES ((size_t)1 << 24)
+#define EMPTY_KEY UINT64_MAX
+
+struct tr_tokenizer {
+    int32_t n_tokens;
+    uint8_t *type;              /* [n_tokens] tr_token_type */
+    char *bytes;                /* decoded bytes of every token, concatenated */
+    uint32_t *off;              /* [n_tokens + 1] token i is bytes[off[i]..off[i+1]) */
+    int32_t byte_token[256];    /* the token of each single byte */
+
+    uint64_t *merge_key;        /* open addressing: left << 32 | right, EMPTY_KEY when free */
+    int32_t *merge_rank;
+    int32_t *merge_result;
+    size_t merge_mask;
+
+    int32_t *added;             /* control and user-defined tokens with text, by first byte */
+    uint32_t added_start[257];  /* added[added_start[b]..added_start[b+1]) start with byte b,
+                                   longest first */
+    const family *fam;
+    int32_t bos, eos;
+    int add_bos, add_eos;
+};
+
+static int fail(char *err, size_t err_len, const char *msg, const char *detail) {
+    if (err != NULL && err_len > 0) {
+        if (detail != NULL) snprintf(err, err_len, "tokenizer: %s '%s'", msg, detail);
+        else snprintf(err, err_len, "tokenizer: %s", msg);
+    }
+    return -1;
+}
+
+static uint64_t hash_bytes(const char *s, size_t n) {
+    uint64_t h = 1469598103934665603ull;    /* FNV-1a */
+    for (size_t i = 0; i < n; i++) {
+        h ^= (uint8_t)s[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static uint64_t hash_u64(uint64_t x) {
+    x ^= x >> 33;    /* splitmix64 finalizer */
+    x *= 0xff51afd7ed558ccdull;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ull;
+    x ^= x >> 33;
+    return x;
+}
+
+static size_t pow2_at_least(size_t n) {
+    size_t c = 16;
+    while (c < n) c <<= 1;
+    return c;
+}
+
+/* GPT-2 byte-level alphabet: printable bytes stand for themselves, the other 68 map
+ * in order to U+0100.. so that every byte is a visible character. */
+static void byte_alphabet(uint32_t *b2cp, int16_t *cp2b /* [324] */) {
+    uint32_t next = 256;
+    for (int i = 0; i < 324; i++) cp2b[i] = -1;
+    for (int b = 0; b < 256; b++) {
+        int printable = (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255);
+        b2cp[b] = printable ? (uint32_t)b : next++;
+        cp2b[b2cp[b]] = (int16_t)b;
+    }
+}
+
+/* string -> id, used only while loading */
+typedef struct {
+    int32_t *slot;      /* id + 1; 0 when free */
+    size_t mask;
+    char **str;
+} str_index;
+
+static int32_t str_index_find(const str_index *x, const char *s, size_t n) {
+    size_t h = (size_t)hash_bytes(s, n) & x->mask;
+    while (x->slot[h] != 0) {
+        const char *c = x->str[x->slot[h] - 1];
+        if (strlen(c) == n && memcmp(c, s, n) == 0) return x->slot[h] - 1;
+        h = (h + 1) & x->mask;
+    }
+    return -1;
+}
+
+static void str_index_add(str_index *x, int32_t id) {
+    const char *s = x->str[id];
+    size_t n = strlen(s);
+    size_t h = (size_t)hash_bytes(s, n) & x->mask;
+    while (x->slot[h] != 0) {
+        const char *c = x->str[x->slot[h] - 1];
+        if (strcmp(c, s) == 0) return;      /* the first id with a string keeps it */
+        h = (h + 1) & x->mask;
+    }
+    x->slot[h] = id + 1;
+}
+
+static int merge_find(const tr_tokenizer *t, int32_t left, int32_t right, int32_t *rank, int32_t *result) {
+    uint64_t key = (uint64_t)(uint32_t)left << 32 | (uint32_t)right;
+    size_t h = (size_t)hash_u64(key) & t->merge_mask;
+    while (t->merge_key[h] != EMPTY_KEY) {
+        if (t->merge_key[h] == key) {
+            *rank = t->merge_rank[h];
+            *result = t->merge_result[h];
+            return 1;
+        }
+        h = (h + 1) & t->merge_mask;
+    }
+    return 0;
+}
+
+typedef struct {
+    uint8_t first;
+    uint32_t len;
+    int32_t id;
+} added_key;
+
+/* by first byte, then longest first, then id */
+static int cmp_added(const void *pa, const void *pb) {
+    const added_key *a = (const added_key *)pa, *b = (const added_key *)pb;
+    if (a->first != b->first) return a->first < b->first ? -1 : 1;
+    if (a->len != b->len) return a->len > b->len ? -1 : 1;
+    return a->id < b->id ? -1 : (a->id > b->id);
+}
+
+/* a control or user-defined token with text: matched in the text before splitting; one
+ * predicate for the count and the fill, so the two cannot disagree */
+static int is_added(const tr_tokenizer *t, size_t i) {
+    return (t->type[i] == TR_TOKEN_CONTROL || t->type[i] == TR_TOKEN_USER_DEFINED) && t->off[i + 1] > t->off[i];
+}
+
+void tr_tokenizer_free(tr_tokenizer *t) {
+    if (t == NULL) return;
+    free(t->type);
+    free(t->bytes);
+    free(t->off);
+    free(t->merge_key);
+    free(t->merge_rank);
+    free(t->merge_result);
+    free(t->added);
+    free(t);
+}
+
+static int get_token_id(const tr_gguf *g, const char *key, int32_t n_tokens, int32_t *out,
+                        char *err, size_t err_len) {
+    uint32_t v;
+    *out = -1;
+    if (tr_gguf_find_kv(g, key) == NULL) return 0;
+    if (tr_gguf_get_u32(g, key, &v) != 0 || v >= (uint32_t)n_tokens) return fail(err, err_len, "token id out of range in", key);
+    *out = (int32_t)v;
+    return 0;
+}
+
+tr_tokenizer *tr_tokenizer_load(const tr_gguf *g, char *err, size_t err_len) {

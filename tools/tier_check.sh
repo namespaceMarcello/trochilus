@@ -34,13 +34,16 @@ for tier in scalar avx2; do
             { echo "tier-check: $t fails under TR_CPU_MAX=$tier"; tail -5 "$OUT/$t-$tier.log"; exit 1; }
     done
 done
-# the avx512 tier without byte permutes (docs/LESSONS.md #213): a VBMI machine runs the float-transpose
-# Q4_K panel only under this cap; the kernel tests must pass on it and say that panel ran
-if "$B/tests/test_kernels" | grep -q "Q4_K panel from byte permutes"; then
+# the avx512 tier without byte permutes (docs/LESSONS.md #213): a VBMI machine runs Q4_K's integer road
+# by rows (no W16 panel) only under this cap; the kernel tests and the engine's must pass on it, and the
+# kernel tests must say that road ran
+if "$B/tests/test_kernels" | grep -q "tier avx512 *q4x: .*(W16 panel and tiles)"; then
     kernels=$(TR_CPU_MAX=avx512-novbmi "$B/tests/test_kernels") ||
         { echo "tier-check: test_kernels fails under TR_CPU_MAX=avx512-novbmi"; exit 1; }
-    echo "$kernels" | grep -q "Q4_K panel from the float transpose" ||
-        { echo "tier-check: TR_CPU_MAX=avx512-novbmi did not take VBMI away"; exit 1; }
+    echo "$kernels" | grep -q "tier avx512 *q4x: .*(its own kernels by rows)" ||
+        { echo "tier-check: TR_CPU_MAX=avx512-novbmi did not take VBMI away from Q4_K's road"; exit 1; }
+    TR_CPU_MAX=avx512-novbmi "$B/tests/test_tier_used" > "$OUT/test_tier_used-avx512-novbmi.log" 2>&1 ||
+        { echo "tier-check: test_tier_used fails under TR_CPU_MAX=avx512-novbmi"; exit 1; }
 fi
 
 # 40 tokens below the fixture's vocabulary (128) and context (128)

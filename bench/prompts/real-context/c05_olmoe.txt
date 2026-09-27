@@ -1,0 +1,213 @@
+/* olmoe.c — tr_arch_vtable for "olmoe" (src/models/model.h).
+ *
+ * Reads hyperparameters and every weight tensor from GGUF metadata (M0: no
+ * streaming, the whole model is loaded), then runs forward passes over blocks of
+ * tokens: embedding -> N x [attention with GQA and NeoX RoPE, softmax-then-topk MoE
+ * FFN, tokens grouped by expert] -> output norm -> logits of the last token.
+ * Matches transformers' OlmoeForCausalLM (tools/.venv/.../modeling_olmoe.py):
+ * q_norm/k_norm over the whole projection (not per head), router softmax over
+ * all experts before top-k, ties broken to the lower expert id, optional
+ * norm_topk_prob rescaling. */
+#include "model.h"
+#include "model_internal.h"
+
+#include <inttypes.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "../base/platform.h"
+#include "../kernels/kernels.h"
+#include "../kv/kv.h"
+#include "../memory/experts.h"
+
+#ifdef TR_ATTN_PROBE
+/* A diagnostic build only (make attn-probe, tools/attn_probe.c): sees every decode token's
+ * attention, head by head. The engine is never built with it. */
+void tr_attn_probe(int64_t layer, int64_t head, const float *q, const float *keys, const float *values,
+                   int64_t n_pos, int64_t head_dim, float scale);
+void tr_attn_probe_out(int64_t layer, int64_t head, const float *out, int64_t n_pos, int64_t head_dim);
+#endif
+
+#ifdef TR_DRAFT_PROBE
+/* A diagnostic build only (make draft-probe, tools/draft_probe.c): a draft's routing (the top k of
+ * the used experts, rescaled) and a decode token's attention over a subset of positions (a window,
+ * or those the exact session's previous token attended to most). The probe returns 1 when it
+ * computed the head itself. The engine is never built with it. */
+void tr_draft_probe_route(float *sel_w, int64_t n_used);
+int tr_draft_probe_attention(int64_t layer, int64_t head, const float *q, const float *keys, const float *values,
+                             int64_t n_pos, int64_t head_dim, float scale, float *scores, int64_t score_stride,
+                             float *out);
+#endif
+
+/* ---- weights ---------------------------------------------------------- */
+
+typedef struct {
+    float *attn_norm;   /* [n_embd] */
+    float *ffn_norm;     /* [n_embd] */
+    float *q_norm;        /* [n_qkv] */
+    float *k_norm;          /* [n_kv] */
+    tr_mat wq, wk, wv, wo;  /* wq/wk/wv: cols=n_embd; wo: cols=n_qkv, rows=n_embd */
+    tr_mat gate_inp;         /* router: rows=n_expert, cols=n_embd */
+
+    /* stacked expert tensors, raw ggml layout [in, out, n_expert], seen as one tr_mat per
+     * expert (byte offset e * out * row_bytes(in)): [n_expert] each, one allocation */
+    tr_mat *exps;
+    const tr_mat *gate_exps; /* rows=n_ff, cols=n_embd */
+    const tr_mat *up_exps;    /* rows=n_ff, cols=n_embd */
+    const tr_mat *down_exps;   /* rows=n_embd, cols=n_ff */
+} olmoe_layer;
+
+/* Owns the buffers behind a session's tr_route_trace, defined near tr_session_route_trace_begin
+ * below (docs/MEASUREMENTS.md domande 13-15). Opaque here: forward_pass only ever sees s->trace != NULL. */
+typedef struct olmoe_route_trace olmoe_route_trace;
+
+typedef struct {
+    tr_pool *pool; /* not owned */
+    tr_model_info info;
+
+    int64_t n_layers, n_embd, n_ff, n_head, n_head_kv, head_dim, n_qkv, n_kv;
+    int64_t n_expert, n_expert_used, vocab, n_ctx_train;
+    float rms_eps, rope_freq_base, clamp;
+    int have_clamp, norm_topk;
+
+    float *output_norm; /* [n_embd] */
+    tr_mat token_embd;    /* rows=vocab, cols=n_embd */
+    tr_mat output;          /* rows=vocab, cols=n_embd */
+    olmoe_layer *layers;      /* [n_layers] */
+
+    tr_gguf *gguf;       /* kept open for the model's life: tr_experts reads straight from it
+                          * (buffered), unless experts_file is not NULL */
+    tr_file *experts_file; /* NULL: experts read through gguf's own buffered handle; else a second,
+                            * unbuffered handle on the same path this model owns and closes (Step C,
+                            * docs/ARCHITECTURE.md): tr_experts then reads with tr_file_alignment */
+    tr_experts *experts; /* shared store for every layer's gate/up/down experts (Esperti M1) */
+    unsigned char *expert_off; /* [n_layers][n_expert], 1: never chosen (tr_model_set_expert_mask,
+                                * measurement only); NULL: every expert can be chosen */
+    tr_gpu *gpu; /* not owned (tr_model_set_gpu): new sessions run the decode's attention there */
+
+    /* every tr_alloc_aligned buffer owned by this model, freed on destroy */
+    void **owned;
+    size_t n_owned, cap_owned;
+} olmoe_model;
+
+/* Tokens in one forward pass when the caller does not choose (llama.cpp's n_ubatch). */
+#define OLMOE_DEFAULT_BATCH 512
+/* Consecutive tokens of a head whose attention runs as one group (tr_attention_group): the keys
+ * and the values come from memory once per group. Measured at 4, 16 and 64 on a prompt of 4000:
+ * the same speed (docs/MEASUREMENTS.md "Prefill su prompt lunghi"); 16 rows of scores stay in L2. */
+#define OLMOE_ATTN_QUERIES 16
+/* The work of a pass that belongs to one token alone (norms, RoPE, the write into the cache, the
+ * router's choice, the rows copied for the experts) is split over the pool by token, at least
+ * this many to a chunk: a decode token or a short pass stays on the calling thread. */
+#define OLMOE_TOKENS_PER_CHUNK 8
+
+typedef struct {
+    olmoe_model *m; /* not owned */
+    int64_t n_ctx;
+    int64_t n_batch; /* most tokens in one forward pass (B below) */
+    int64_t pos;
+    tr_prof prof; /* disabled by default (zero-initialized in olmoe_session_create) */
+
+    tr_kv kv; /* [n_layers][n_head_kv][n_ctx][head_dim]: one head's positions in a row (src/kv/kv.h) */
+    /* The same keys and values in VRAM, and a decode token's attention run there with the same
+     * bits (src/backend/gpu_attn.h); NULL: the CPU. Every pass writes both caches, so the CPU's is
+     * always whole: a driver error sets gpu_failed and the session goes on without the GPU. */
+    tr_gpu_attn *gpu;
+    int gpu_failed;
+    int gpu_warm;       /* this pass is the last of a multi-token eval: keep the GPU awake (gpu_attn.h) */
+    int64_t gpu_tokens; /* decode tokens whose attention ran on the GPU */
+
+    /* RoPE cos/sin per position: [n_ctx][head_dim / 2] each (tr_rope_table) */
+    float *rope_cos, *rope_sin;
+
+    /* scratch of one forward pass, reused every call; U = n_expert_used */
+    float *x, *normed, *attn_out, *ffn_out; /* [B][n_embd] */
+    float *q, *attn_concat;                 /* [B][n_qkv] */
+    float *k, *v;                           /* [B][n_kv] */
+    float *router;                          /* [B][n_expert] */
+    int64_t *sel_id;  /* [B][U] experts of each token, increasing id */
+    float *sel_w;     /* [B][U] their weights */
+    int64_t *place;   /* [B][U] row of each (token, slot) in the grouped buffers below */
+    int64_t *offsets; /* [n_expert + 1] grouped rows of each expert */
+    int64_t *acquire_ids; /* [n_expert] scratch: this pass's non-empty experts of the current layer,
+                           * for tr_experts_acquire (olmoe_refresh_experts, outside the hot zone) */
+    unsigned char *taken; /* [n_workers][n_expert] scratch of the router's choice, a row per pool worker */
+    float *xg;        /* [B*U][n_embd] expert inputs, grouped by expert */
+    float *h1, *h2;   /* [B*U][n_ff] gate and up outputs */
+    float *h3;        /* [B*U][n_embd] down outputs */
+    float *logits;    /* [n_logits_max][vocab], oldest kept position first */
+    int64_t n_logits_max; /* rows the buffer holds (TR_LOGIT_ROWS_MAX, never more than B) */
+    int64_t n_logits;     /* rows the last pass filled */
+    float *scores;    /* attention scores, a group of rows per pool worker: [n_workers][OLMOE_ATTN_QUERIES][score_stride] */
+    int64_t score_stride; /* floats from a row of scores to the next: n_ctx and some (score_row_stride) */
+    int64_t n_workers;
+    tr_pm_scratch pm; /* the prompt's phase-major matmul (kernels.h tr_matmul_grouped_s) */
+
+    olmoe_route_trace *trace; /* NULL: tracing off (docs/MEASUREMENTS.md domande 13-15) */
+
+    /* [n_ctx][n_embd]: the whole prompt's hidden state, layer by layer (docs/MEASUREMENTS.md "Il
+     * prefill legge il modello una volta per passata"). NULL when the expert store is fully
+     * resident (nothing to save a re-read for); non-NULL only makes forward_prompt_layer_major
+     * reachable, it does not force it (olmoe_eval still needs n > n_batch). */
+    float *x_all;
+    /* The layer whose units the next olmoe_refresh_experts may read ahead once it has acquired
+     * its own (tr_experts_prefetch), -1: none. Set by forward_prompt_layer_major for the first
+     * block of each layer but the last; used and cleared by olmoe_refresh_experts. */
+    int64_t prefetch_layer;
+} olmoe_session;
+
+/* Reading ahead during a layer-major prompt (olmoe_refresh_experts): the next layer's missing
+ * units are read while this one computes, when this layer's first block alone asked for at least
+ * n_expert - n_expert / OLMOE_PREFETCH_SPARE_DIV of its experts. Measured on OLMoE-1B-7B (docs/
+ * MEASUREMENTS.md): a 512-token block asks for nearly every expert of every layer, so the next
+ * layer will too, and a unit read ahead is almost never one the prompt does not use. A short or
+ * narrow block leaves the next layer's reads on demand, as without reading ahead. */
+#define OLMOE_PREFETCH_SPARE_DIV 16
+
+/* ---- loading helpers ---------------------------------------------------- */
+
+static int track(olmoe_model *m, void *p) {
+    if (p == NULL) return 0;
+    if (m->n_owned == m->cap_owned) {
+        size_t newcap = m->cap_owned ? m->cap_owned * 2 : 16;
+        void **grown = (void **)realloc(m->owned, newcap * sizeof(void *));
+        if (grown == NULL) {
+            tr_free_aligned(p);
+            return -1;
+        }
+        m->owned = grown;
+        m->cap_owned = newcap;
+    }
+    m->owned[m->n_owned++] = p;
+    return 0;
+}
+
+/* The load's progress (model.h tr_progress): bytes read so far against the load's total, handed
+ * to the caller after every tensor read at load and every expert unit tr_experts_load_all reads. */
+typedef struct {
+    const tr_progress *to; /* NULL: nobody asked */
+    uint64_t done, total;
+} load_progress;
+
+static void progress_add(load_progress *lp, uint64_t bytes) {
+    if (lp->to == NULL || lp->to->fn == NULL) return;
+    lp->done += bytes;
+    lp->to->fn(lp->to->ctx, lp->done, lp->total);
+}
+
+static void progress_unit(void *ctx, uint64_t unit_bytes) {
+    progress_add((load_progress *)ctx, unit_bytes);
+}
+
+static int req_u32(tr_gguf *g, const char *key, uint32_t *out, char *err, size_t err_len) {
+    if (tr_gguf_get_u32(g, key, out) != 0) {
+        snprintf(err, err_len, "missing metadata key '%s'", key);
+        return -1;
+    }
+    return 0;
+}
+
+static int check_shape(const tr_gguf_tensor *t, uint32_t n_dims, uint64_t ne0, uint64_t ne1, uint64_t ne2,
+                        char *err, size_t err_len) {

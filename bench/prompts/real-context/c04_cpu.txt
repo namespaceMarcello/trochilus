@@ -1,0 +1,237 @@
+/* cpu.c — runtime CPU feature and topology detection.
+ *
+ * x86-64 uses CPUID (via <cpuid.h>, available on gcc and clang alike, so the
+ * same code compiles on MinGW-w64, Linux gcc and Linux clang) plus XGETBV to
+ * confirm the OS actually saves AVX / AVX-512 register state before trusting
+ * those CPUID bits. arm64 has no single instruction for this and instead asks
+ * the OS (getauxval on Linux, sysctlbyname on macOS, IsProcessorFeaturePresent
+ * on Windows). Detection runs once and is cached in a file-scope struct behind
+ * a plain "already done" flag, not a mutex: this is race-free only because the
+ * whole engine calls tr_cpu() for the first time from the main thread, before
+ * the worker pool (and therefore any other thread) exists — tr_pool_create()
+ * itself calls tr_cpu() to resolve n_threads <= 0, which establishes this. */
+
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE /* sched_getaffinity and the CPU_* macros */
+#endif
+#if defined(__linux__) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+#if defined(__linux__) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE
+#endif
+
+#include "cpu.h"
+#include "platform.h"
+
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#if defined(__x86_64__) || defined(_M_X64)
+#  define TR_CPU_X86_64 1
+#  include <cpuid.h>
+#  include <immintrin.h>
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#  define TR_CPU_ARM64 1
+#endif
+
+#if defined(_WIN32)
+#  include <windows.h>
+#elif defined(__APPLE__)
+#  include <sys/sysctl.h>
+#  include <sys/types.h>
+#else
+#  include <dirent.h>
+#  include <sched.h>
+#  include <unistd.h>
+#  if defined(TR_CPU_ARM64)
+#    include <sys/auxv.h>
+#  endif
+#endif
+
+/* Kernel-stable arm64 hwcap bit positions (uapi/asm/hwcap.h). Defined here as
+ * a fallback so detection still compiles against an older libc/kernel header
+ * that has not caught up; the numeric values are part of the Linux ABI. */
+#if defined(TR_CPU_ARM64) && !defined(_WIN32) && !defined(__APPLE__)
+#ifndef HWCAP_ASIMDDP
+#define HWCAP_ASIMDDP (1 << 20)
+#endif
+#ifndef HWCAP_SVE
+#define HWCAP_SVE (1 << 22)
+#endif
+#ifndef HWCAP2_I8MM
+#define HWCAP2_I8MM (1 << 13)
+#endif
+#endif
+
+#if defined(_WIN32) && defined(TR_CPU_ARM64)
+#ifndef PF_ARM_V8_INSTRUCTIONS_AVAILABLE
+#define PF_ARM_V8_INSTRUCTIONS_AVAILABLE 29
+#endif
+#endif
+
+/* ---- x86-64 --------------------------------------------------------- */
+
+#if defined(TR_CPU_X86_64)
+
+/* Isolated in its own target-attributed function per cpu.h's requirement:
+ * XGETBV must not execute unless CPUID already confirmed OSXSAVE, so this is
+ * never called on a CPU/OS combination where the instruction would fault. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("xsave")))
+#endif
+static uint64_t read_xcr0(void) {
+    return _xgetbv(0);
+}
+
+static void detect_x86(tr_cpu_info *c) {
+    unsigned eax, ebx, ecx, edx;
+
+    if (__get_cpuid(0, &eax, &ebx, &ecx, &edx)) {
+        unsigned max_leaf = eax;
+        memcpy(c->vendor + 0, &ebx, 4);
+        memcpy(c->vendor + 4, &edx, 4);
+        memcpy(c->vendor + 8, &ecx, 4);
+        c->vendor[12] = '\0';
+
+        int have_osxsave = 0, have_avx_os = 0, have_avx512_os = 0;
+
+        if (max_leaf >= 1 && __get_cpuid(1, &eax, &ebx, &ecx, &edx)) {
+            c->sse42 = (ecx >> 20) & 1u;
+            c->fma = (ecx >> 12) & 1u;
+            c->f16c = (ecx >> 29) & 1u;
+            have_osxsave = (ecx >> 27) & 1u;
+            int avx_bit = (ecx >> 28) & 1u;
+
+            if (have_osxsave && avx_bit) {
+                uint64_t xcr0 = read_xcr0();
+                have_avx_os = (xcr0 & 0x6) == 0x6;                 /* SSE + AVX state (bits 1,2) */
+                have_avx512_os = have_avx_os && (xcr0 & 0xE0) == 0xE0; /* + opmask/ZMM state (bits 5,6,7) */
+            }
+            c->avx = have_avx_os ? 1u : 0u;
+        }
+
+        if (max_leaf >= 7) {
+            if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
+                c->avx2 = have_avx_os && ((ebx >> 5) & 1u);
+                c->avx512f = have_avx512_os && ((ebx >> 16) & 1u);
+                c->avx512dq = have_avx512_os && ((ebx >> 17) & 1u);
+                c->avx512bw = have_avx512_os && ((ebx >> 30) & 1u);
+                c->avx512vl = have_avx512_os && ((ebx >> 31) & 1u);
+                c->avx512vnni = have_avx512_os && ((ecx >> 11) & 1u);
+                c->avx512vbmi = have_avx512_os && ((ecx >> 1) & 1u);
+            }
+            if (__get_cpuid_count(7, 1, &eax, &ebx, &ecx, &edx)) {
+                c->avxvnni = have_avx_os && ((eax >> 4) & 1u);
+                c->avx512bf16 = have_avx512_os && ((eax >> 5) & 1u);
+            }
+        }
+
+        if (__get_cpuid(0x80000000u, &eax, &ebx, &ecx, &edx) && eax >= 0x80000004u) {
+            unsigned brand[12];
+            __get_cpuid(0x80000002u, &brand[0], &brand[1], &brand[2], &brand[3]);
+            __get_cpuid(0x80000003u, &brand[4], &brand[5], &brand[6], &brand[7]);
+            __get_cpuid(0x80000004u, &brand[8], &brand[9], &brand[10], &brand[11]);
+            char raw[49];
+            memcpy(raw, brand, 48);
+            raw[48] = '\0';
+
+            const char *start = raw;
+            while (*start == ' ') start++;
+            size_t len = strlen(start);
+            while (len > 0 && start[len - 1] == ' ') len--;
+            if (len >= sizeof c->brand) len = sizeof c->brand - 1;
+            memcpy(c->brand, start, len);
+            c->brand[len] = '\0';
+        }
+    }
+}
+
+#endif /* TR_CPU_X86_64 */
+
+/* ---- arm64 ------------------------------------------------------------ */
+
+#if defined(TR_CPU_ARM64)
+
+static void detect_arm64(tr_cpu_info *c) {
+    c->neon = 1; /* mandatory baseline on arm64 */
+
+#if defined(_WIN32)
+    /* Windows exposes no documented PF_* flag for dot-product / I8MM / SVE
+     * detection; left at 0 (conservative: falls back to plain NEON kernels).
+     * Not exercised by this project's build/test matrix (x86-64 only). */
+    (void)IsProcessorFeaturePresent(PF_ARM_V8_INSTRUCTIONS_AVAILABLE);
+    c->dotprod = 0;
+    c->i8mm = 0;
+    c->sve = 0;
+#elif defined(__APPLE__)
+    int val = 0;
+    size_t len = sizeof val;
+    if (sysctlbyname("hw.optional.arm.FEAT_DotProd", &val, &len, NULL, 0) == 0)
+        c->dotprod = val ? 1u : 0u;
+    val = 0;
+    len = sizeof val;
+    if (sysctlbyname("hw.optional.arm.FEAT_I8MM", &val, &len, NULL, 0) == 0)
+        c->i8mm = val ? 1u : 0u;
+    c->sve = 0; /* no SVE on Apple silicon */
+#else
+    unsigned long hwcap = getauxval(AT_HWCAP);
+    unsigned long hwcap2 = getauxval(AT_HWCAP2);
+    c->dotprod = (hwcap & HWCAP_ASIMDDP) ? 1u : 0u;
+    c->sve = (hwcap & HWCAP_SVE) ? 1u : 0u;
+    c->i8mm = (hwcap2 & HWCAP2_I8MM) ? 1u : 0u;
+#endif
+}
+
+#endif /* TR_CPU_ARM64 */
+
+/* ---- vendor/brand fallback for non-x86 ------------------------------- */
+
+#if defined(TR_CPU_ARM64)
+static void fill_vendor_brand(tr_cpu_info *c) {
+#if defined(__APPLE__)
+    strncpy(c->vendor, "Apple", sizeof c->vendor - 1);
+    size_t len = sizeof c->brand;
+    if (sysctlbyname("machdep.cpu.brand_string", c->brand, &len, NULL, 0) != 0)
+        c->brand[0] = '\0';
+#else
+    c->vendor[0] = '\0';
+    c->brand[0] = '\0';
+#endif
+}
+#endif
+
+/* ---- core topology ----------------------------------------------------- */
+
+/* One physical core: its logical processors, and which last-level cache it shares.
+ * `domain` only has to separate the caches from one another, its value means nothing. */
+typedef struct {
+    int domain;
+    int n_cpu;
+    tr_cpu_slot cpu[TR_CPU_MAX_SMT];
+} core_desc;
+
+static void core_add_cpu(core_desc *co, unsigned group, unsigned lcpu) {
+    if (co->n_cpu >= TR_CPU_MAX_SMT) return;
+    co->cpu[co->n_cpu].group = (unsigned short)group;
+    co->cpu[co->n_cpu].lcpu = (unsigned short)lcpu;
+    co->n_cpu++;
+    /* every sibling carries the whole core: slot.core[0] stays the sibling itself, so
+     * pinning to one processor and pinning to the core are the same call with a different n */
+    for (int i = 0; i < co->n_cpu; i++) {
+        tr_cpu_slot *s = &co->cpu[i];
+        s->core[0] = s->lcpu;
+        s->n_core = 1;
+        for (int j = 0; j < co->n_cpu; j++)
+            if (co->cpu[j].lcpu != s->lcpu && s->n_core < TR_CPU_MAX_SMT)
+                s->core[s->n_core++] = co->cpu[j].lcpu;
+    }
+}
+
+/* Fills c->slot from the cores, best placement first: one logical processor per physical
+ * core before any second sibling (two threads on one core measured 30% slower than one
+ * per core), and the cores taken round robin over the last-level caches (4+4 over the two
+ * chiplets of a 7940HX beat 8 on one by 7-9%). Both numbers: docs/MEASUREMENTS.md. */
+static void order_slots(tr_cpu_info *c, const core_desc *cores, int n_cores) {

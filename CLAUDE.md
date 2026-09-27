@@ -93,7 +93,7 @@ by" column): no mistake should reach Marcello if a test could have caught it fir
 | If this changed… | Write in |
 |---|---|
 | code (every commit) | `docs/archive/DONE.md`: `### <date> — <title>`, what it is and how to try it |
-| a significant implementation: a capability a user sees, a number against llama.cpp, a milestone step (Marcello, 2026-09-26: without being asked) | `README.md`: §What we have done, the speed table, the race with llama.cpp, §What is missing; only what is offered, never the roads left. The commit hook asks for it on every commit that changes `src/`, or for `no-readme: <why>` in the message |
+| a significant implementation: a capability a user sees, a number against llama.cpp, a milestone step (Marcello, 2026-09-26: without being asked) | `README.md`, the way `docs/README_GUIDE.md` says: the results, what is unique, what is conquered; every number today's (raced again, never left with a note that it is old); only what is offered. The commit hook asks for it on every commit that changes `src/`, or for `no-readme: <why>` in the message |
 | a mistake, a discovery, a debt | `docs/LESSONS.md`, with the prevention and who found it |
 | code ported from colibri or ds4 | `docs/ORIGINS.md` + the file header |
 | a decision, a debt, a measurement, the next step | `docs/STATUS.md` (replace, do not append; 40 KB cap) |
@@ -121,6 +121,7 @@ by" column): no mistake should reach Marcello if a test could have caught it fir
 | where we stand, as a picture (milestones, dependencies, state) | `docs/status.json` → `tools/status_html.py` → artifact `6mx3NS4KtQrBFPRLkAYupr`; updated together with `docs/STATUS.md` |
 | how colibri, ds4, llama.cpp or ik_llama.cpp do something | `ref/colibri`, `ref/ds4`, `ref/llama.cpp`, `ref/ik_llama.cpp` (read-only, commits in ORIGINS) |
 | which piece has been read and measured against the three references, which is owed | `docs/ORIGINS.md` §Every piece against the references |
+| how the README is written and when it changes | `docs/README_GUIDE.md` |
 
 ---
 

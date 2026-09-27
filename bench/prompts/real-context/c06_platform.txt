@@ -1,0 +1,356 @@
+/* platform.c — Windows, Linux and macOS implementations of platform.h.
+ *
+ * No third-party code: only libc and OS APIs (Win32, POSIX, Mach). Windows
+ * uses CreateFileW opened with FILE_FLAG_OVERLAPPED so tr_file_pread can pass
+ * a fresh OVERLAPPED (offset + private event) per call, which is what makes
+ * concurrent positional reads on the same handle thread-safe: the offset never
+ * goes through a shared file pointer. Linux and macOS use pread(2), which is
+ * positional and thread-safe by definition. */
+
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE /* sched_setaffinity and the CPU_* macros */
+#endif
+#if defined(__linux__) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+#if defined(__linux__) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE
+#endif
+
+#include "platform.h"
+
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#if defined(_WIN32)
+#  include <windows.h>
+#  include <fcntl.h>
+#  include <io.h>
+#else
+#  include <dlfcn.h>
+#  include <errno.h>
+#  include <fcntl.h>
+#  include <sched.h>
+#  include <time.h>
+#  include <unistd.h>
+#  include <sys/stat.h>
+#  if defined(__APPLE__)
+#    include <mach/mach.h>
+#    include <mach/mach_host.h>
+#    include <sys/sysctl.h>
+#  endif
+#endif
+
+struct tr_file {
+#if defined(_WIN32)
+    HANDLE handle;
+#else
+    int fd;
+#endif
+    int direct; /* opened with tr_file_open_direct: tr_file_pread applies its EOF rule */
+};
+
+static void set_err(char *err, size_t err_len, const char *fmt, ...) {
+    if (err == NULL || err_len == 0) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(err, err_len, fmt, ap);
+    va_end(ap);
+}
+
+#if defined(_WIN32)
+
+static wchar_t *utf8_to_utf16(const char *path) {
+    int needed = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+    if (needed <= 0) return NULL;
+    wchar_t *w = malloc((size_t)needed * sizeof(wchar_t));
+    if (w == NULL) return NULL;
+    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, w, needed) <= 0) {
+        free(w);
+        return NULL;
+    }
+    return w;
+}
+
+void tr_utf8_argv_free(int argc, char **argv) {
+    if (argv == NULL) return;
+    for (int i = 0; i < argc; i++) free(argv[i]);
+    free(argv);
+}
+
+char **tr_utf8_argv(int argc, wchar_t **wargv) {
+    char **argv = calloc((size_t)argc + 1, sizeof(char *));
+    if (argv == NULL) return NULL;
+    for (int i = 0; i < argc; i++) {
+        int needed = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, NULL, 0, NULL, NULL);
+        if (needed <= 0 || (argv[i] = malloc((size_t)needed)) == NULL ||
+            WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, argv[i], needed, NULL, NULL) <= 0) {
+            tr_utf8_argv_free(argc, argv);
+            return NULL;
+        }
+    }
+    return argv;
+}
+
+void tr_console_utf8(void) {
+    SetConsoleOutputCP(CP_UTF8);
+}
+
+void tr_stdout_binary(void) {
+    fflush(stdout);
+    _setmode(_fileno(stdout), _O_BINARY);
+}
+
+tr_file *tr_file_open(const char *path, char *err, size_t err_len) {
+    wchar_t *wpath = utf8_to_utf16(path);
+    if (wpath == NULL) {
+        set_err(err, err_len, "invalid UTF-8 path");
+        return NULL;
+    }
+
+    HANDLE h = CreateFileW(wpath, GENERIC_READ, FILE_SHARE_READ, NULL,
+                            OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+    free(wpath);
+    if (h == INVALID_HANDLE_VALUE) {
+        set_err(err, err_len, "CreateFileW failed: error %lu",
+                (unsigned long)GetLastError());
+        return NULL;
+    }
+
+    tr_file *f = malloc(sizeof *f);
+    if (f == NULL) {
+        set_err(err, err_len, "out of memory");
+        CloseHandle(h);
+        return NULL;
+    }
+    f->handle = h;
+    f->direct = 0;
+    return f;
+}
+
+tr_file *tr_file_open_direct(const char *path, char *err, size_t err_len) {
+    wchar_t *wpath = utf8_to_utf16(path);
+    if (wpath == NULL) {
+        set_err(err, err_len, "invalid UTF-8 path");
+        return NULL;
+    }
+
+    HANDLE h = CreateFileW(wpath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                            FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, NULL);
+    free(wpath);
+    if (h == INVALID_HANDLE_VALUE) {
+        set_err(err, err_len, "CreateFileW (unbuffered) failed: error %lu", (unsigned long)GetLastError());
+        return NULL;
+    }
+
+    tr_file *f = malloc(sizeof *f);
+    if (f == NULL) {
+        set_err(err, err_len, "out of memory");
+        CloseHandle(h);
+        return NULL;
+    }
+    f->handle = h;
+    f->direct = 1;
+    return f;
+}
+
+void tr_file_close(tr_file *f) {
+    if (f == NULL) return;
+    CloseHandle(f->handle);
+    free(f);
+}
+
+int64_t tr_file_size(const tr_file *f) {
+    LARGE_INTEGER size;
+    if (!GetFileSizeEx(f->handle, &size)) return -1;
+    return (int64_t)size.QuadPart;
+}
+
+int64_t tr_file_alignment(const tr_file *f) {
+    return f->direct ? TR_FILE_DIRECT_ALIGN : 1;
+}
+
+int tr_file_pread(const tr_file *f, void *buf, size_t n, uint64_t offset) {
+    unsigned char *p = (unsigned char *)buf;
+    while (n > 0) {
+        DWORD want = (n > 0x10000000u) ? 0x10000000u : (DWORD)n; /* 256 MiB cap per call */
+
+        OVERLAPPED ov;
+        memset(&ov, 0, sizeof ov);
+        ov.Offset = (DWORD)(offset & 0xFFFFFFFFu);
+        ov.OffsetHigh = (DWORD)(offset >> 32);
+        ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+        if (ov.hEvent == NULL) return -1;
+
+        DWORD got = 0;
+        int eof = 0;
+        BOOL ok = ReadFile(f->handle, p, want, &got, &ov);
+        if (!ok) {
+            DWORD gle = GetLastError();
+            if (gle == ERROR_IO_PENDING) {
+                BOOL waited = GetOverlappedResult(f->handle, &ov, &got, TRUE);
+                DWORD wait_err = waited ? 0 : GetLastError();
+                CloseHandle(ov.hEvent);
+                if (!waited) {
+                    if (f->direct && wait_err == ERROR_HANDLE_EOF) eof = 1;
+                    else return -1;
+                }
+            } else {
+                CloseHandle(ov.hEvent);
+                if (f->direct && gle == ERROR_HANDLE_EOF) eof = 1;
+                else return -1; /* includes ERROR_HANDLE_EOF for a buffered read starting past EOF */
+            }
+        } else {
+            CloseHandle(ov.hEvent);
+        }
+
+        /* a direct handle's aligned range can run past the file's real end: the last, partial
+         * sector then comes back short (eof, or got == 0), which is not an error (platform.h) */
+        if (eof) return 0;
+        if (got == 0) return f->direct ? 0 : -1; /* end of file before n bytes were read */
+        /* short of a sector boundary: the real end; the rest, asked from here, is error 87 */
+        if (f->direct && got % TR_FILE_DIRECT_ALIGN != 0) return 0;
+        p += got;
+        offset += got;
+        n -= got;
+    }
+    return 0;
+}
+
+void *tr_alloc_aligned(size_t n, size_t align) {
+    return _aligned_malloc(n, align);
+}
+
+void tr_free_aligned(void *p) {
+    _aligned_free(p);
+}
+
+double tr_time_sec(void) {
+    static LARGE_INTEGER freq;   /* global-ok: the performance counter frequency is fixed at boot */
+    static int have_freq = 0;    /* global-ok: same value from every thread */
+    if (!have_freq) {
+        QueryPerformanceFrequency(&freq); /* idempotent: every thread computes the same value */
+        have_freq = 1;
+    }
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return (double)now.QuadPart / (double)freq.QuadPart;
+}
+
+int tr_thread_pin(unsigned group, const unsigned short *lcpus, int n, tr_affinity *prev) {
+    if (lcpus == NULL || n <= 0) return -1;
+    GROUP_AFFINITY want, had;
+    ZeroMemory(&want, sizeof want);
+    ZeroMemory(&had, sizeof had);
+    want.Group = (WORD)group;
+    for (int i = 0; i < n; i++) {
+        if (lcpus[i] >= sizeof(KAFFINITY) * 8) return -1; /* a group never has more than 64 */
+        want.Mask |= (KAFFINITY)1 << lcpus[i];
+    }
+    /* SetThreadGroupAffinity, not SetThreadAffinityMask: the latter only reaches the
+     * thread's current processor group, so on a machine with more than 64 processors it
+     * cannot name half of them (llama.cpp has that limit, see docs/UPSTREAM.md). */
+    if (!SetThreadGroupAffinity(GetCurrentThread(), &want, &had)) return -1;
+    if (prev != NULL) {
+        prev->valid = 1;
+        prev->group = had.Group;
+        memset(prev->mask, 0, sizeof prev->mask);
+        memcpy(prev->mask, &had.Mask, sizeof had.Mask);
+    }
+    return 0;
+}
+
+int tr_thread_affinity_restore(const tr_affinity *prev) {
+    if (prev == NULL || !prev->valid) return 0;
+    GROUP_AFFINITY back;
+    ZeroMemory(&back, sizeof back);
+    back.Group = (WORD)prev->group;
+    memcpy(&back.Mask, prev->mask, sizeof back.Mask);
+    if (back.Mask == 0) return -1;
+    return SetThreadGroupAffinity(GetCurrentThread(), &back, NULL) ? 0 : -1;
+}
+
+int tr_mem_info(tr_meminfo *out) {
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof ms;
+    if (!GlobalMemoryStatusEx(&ms)) {
+        out->total_bytes = 0;
+        out->available_bytes = 0;
+        return -1;
+    }
+    out->total_bytes = ms.ullTotalPhys;
+    out->available_bytes = ms.ullAvailPhys;
+    return 0;
+}
+
+#else /* POSIX: Linux and macOS */
+
+void tr_stdout_binary(void) {
+}
+
+tr_file *tr_file_open(const char *path, char *err, size_t err_len) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        set_err(err, err_len, "open failed: %s", strerror(errno));
+        return NULL;
+    }
+    tr_file *f = malloc(sizeof *f);
+    if (f == NULL) {
+        set_err(err, err_len, "out of memory");
+        close(fd);
+        return NULL;
+    }
+    f->fd = fd;
+    f->direct = 0;
+    return f;
+}
+
+tr_file *tr_file_open_direct(const char *path, char *err, size_t err_len) {
+#if defined(__APPLE__)
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        set_err(err, err_len, "open failed: %s", strerror(errno));
+        return NULL;
+    }
+    if (fcntl(fd, F_NOCACHE, 1) == -1) {
+        set_err(err, err_len, "F_NOCACHE failed: %s", strerror(errno));
+        close(fd);
+        return NULL;
+    }
+#else
+    int fd = open(path, O_RDONLY | O_DIRECT);
+    if (fd < 0) {
+        set_err(err, err_len, "open (O_DIRECT) failed: %s", strerror(errno));
+        return NULL;
+    }
+#endif
+    tr_file *f = malloc(sizeof *f);
+    if (f == NULL) {
+        set_err(err, err_len, "out of memory");
+        close(fd);
+        return NULL;
+    }
+    f->fd = fd;
+    f->direct = 1;
+    return f;
+}
+
+void tr_file_close(tr_file *f) {
+    if (f == NULL) return;
+    close(f->fd);
+    free(f);
+}
+
+int64_t tr_file_size(const tr_file *f) {
+    struct stat st;
+    if (fstat(f->fd, &st) != 0) return -1;
+    return (int64_t)st.st_size;
+}
+
+int64_t tr_file_alignment(const tr_file *f) {
+    return f->direct ? TR_FILE_DIRECT_ALIGN : 1;
+}
+
+int tr_file_pread(const tr_file *f, void *buf, size_t n, uint64_t offset) {

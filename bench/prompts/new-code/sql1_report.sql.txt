@@ -1,0 +1,9 @@
+-- Schema for a small shop, and the monthly sales report.
+CREATE TABLE customers (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    email TEXT UNIQUE,
+    created_at DATE NOT NULL
+);
+
+CREATE TABLE orders (

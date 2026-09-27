@@ -1,0 +1,16 @@
+"""A tiny REST API for notes, with Flask and SQLite."""
+import sqlite3
+from flask import Flask, jsonify, request, abort
+
+app = Flask(__name__)
+DB = "notes.db"
+
+
+def get_db():
+    conn = sqlite3.connect(DB)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+@app.route("/notes", methods=["GET"])
+def list_notes():

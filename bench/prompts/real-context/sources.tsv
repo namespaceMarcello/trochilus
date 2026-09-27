@@ -1,0 +1,25 @@
+# Prompts with a real context (written by cut.py; tools/draft_ctx_gen.sh, draft_gate_sim.py --sources): each <name>.txt is
+# the file at the commit up to the end of the line that opens the function's body (the `{` of C and shell,
+# the `:` of Python), mid-file, 1770-3798 tokens (the context is 4096: 256 generated and a draft of 8 fit);
+# a short file comes after its neighbours, each file then after a `// file: <path>` or `# file: <path>` line.
+# name	file under test	function (#k: its k-th definition)	neighbours prepended	commit
+c01_tokenizer	src/tokenizer/tokenizer.c	tr_tokenizer_load	-	6b4f45e
+c02_threads	src/base/threads.c	worker_loop	-	6b4f45e
+c03_experts	src/memory/experts.c	tr_experts_create	-	6b4f45e
+c04_cpu	src/base/cpu.c	order_slots	-	6b4f45e
+c05_olmoe	src/models/olmoe.c	check_shape	-	6b4f45e
+c06_platform	src/base/platform.c	tr_file_pread#2	-	6b4f45e
+c07_model	src/models/model.c	tr_session_create	-	6b4f45e
+c08_bar	src/app/bar.c	tr_bar_render	-	6b4f45e
+c09_unicode	src/tokenizer/unicode.c	tr_decompose_one	-	6b4f45e
+c10_prof	src/base/prof.c	tr_prof_print	src/base/prof.h	6b4f45e
+c11_greedy	src/gen/greedy.c	tr_greedy_step	src/gen/lookup.h,src/gen/greedy.h	6b4f45e
+py01_lint	tools/lint.py	check_hot_zones	-	6b4f45e
+py02_oracle	tools/oracle.py	run_single	-	6b4f45e
+py03_route_trace	tools/route_trace_report.py	time_model	-	6b4f45e
+py04_profile_suite	tools/profile_suite.py	print_report	-	6b4f45e
+py05_check_gguf	tools/check_gguf.py	hf_reference_for	-	6b4f45e
+py06_tokenizer_oracle	tools/tokenizer_oracle.py	run_mode	-	6b4f45e
+sh01_measure_guard	tools/measure_guard.lib	measure_begin	tools/cleanup.lib	6b4f45e
+sh02_serve_first_prompt	tools/serve_first_prompt.sh	server_down	-	6b4f45e
+sh03_decode_context	tools/decode_context.sh	session	-	6b4f45e

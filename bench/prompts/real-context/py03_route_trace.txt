@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""route_trace_report.py — docs/MEASUREMENTS.md domande 13-15, from a trace written by
+`trochilus run ... --route-trace <file>` (src/models/model.h: tr_route_trace).
+
+Usage:
+    route_trace_report.py <trace.bin> [--disk-mib-s 1430] [--compute-ms 33]
+                                        prints the tables below; the two numbers feed the time
+                                        model only (the disk of tests/bench_disk.c, a decode token)
+    route_trace_report.py --check       a handmade trace, hand-computed answers (see run_check);
+                                         exit 1 on any mismatch (wired into `make lint`)
+
+File format (little-endian): 8 bytes "TRROUTE1"; int64 x 8 (n_tokens, n_prompt, n_layers,
+n_expert, n_used, n_pred, expert_bytes, layer_bytes); then chosen [n_tokens][n_layers][n_used],
+pred_in and pred_out [n_tokens][n_layers][n_pred], all uint16 (0xFFFF: no prediction, the last
+layer). No dependencies beyond the standard library.
+
+Q13: does layer L+1's router already know, from layer L's own state, which experts it will
+     pick? Share of chosen[t][L+1] found in the predicted top 8/12/16 of pred_in[t][L] and
+     pred_out[t][L] (best-first, so "top K" is just the first K entries).
+Q14: with an LRU cache of (layer, expert) units sized 25/50/75% of the model, how many misses
+     (and MiB, at expert_bytes each) does a generated token cost? Simulated over the whole
+     trace in order, counted from the generated tokens only (n_prompt..n_tokens). A static pin
+     (the units used most during the prompt, fixed for the rest of the run) is measured the
+     same way, for comparison.
+     Then the same LRU with a prefetch of pred_in's first k units of the next layer: stalls,
+     reads and wasted reads per generated token; and a MODEL on a clock (one disk, one read at a
+     time) of what that means in tokens per second. A model, never a measurement.
+Q15: for comparison, streaming whole layers instead of experts: every token touches every
+     layer, so caching 25/50/75% of the layers still streams the rest, at layer_bytes each.
+"""
+import struct
+import sys
+from array import array
+from collections import Counter, OrderedDict
+
+MAGIC = b"TRROUTE1"
+MAGIC2 = b"TRROUTE2"  # the same, then token ids and router margins (tools/route_graph_report.py)
+HEADER_FIELDS = ("n_tokens", "n_prompt", "n_layers", "n_expert", "n_used", "n_pred",
+                  "expert_bytes", "layer_bytes")
+K_VALUES = (8, 12, 16)          # docs/MEASUREMENTS.md domanda 13
+CACHE_FRACTIONS = (0.25, 0.50, 0.75)  # domande 14-15
+MIB = 1024.0 * 1024.0
+
+
+class Trace:
+    """Parses the bytes of a route trace file (or a handmade one, for --check)."""
+
+    def __init__(self, data):
+        if data[:8] not in (MAGIC, MAGIC2):
+            raise ValueError("not a route trace (bad magic)")
+        header = struct.unpack_from("<8q", data, 8)
+        for name, value in zip(HEADER_FIELDS, header):
+            setattr(self, name, value)
+        off = 8 + 8 * 8
+        n_chosen = self.n_tokens * self.n_layers * self.n_used
+        n_pred = self.n_tokens * self.n_layers * self.n_pred
+
+        def take(n):
+            nonlocal off
+            a = array("H")
+            a.frombytes(data[off:off + n * 2])
+            off += n * 2
+            return a
+
+        self.chosen = take(n_chosen)
+        self.pred_in = take(n_pred)
+        self.pred_out = take(n_pred)
+        # version 2: the id of every token (int32) and, per token and layer, the router
+        # probability of the last expert chosen and of the first one left out (float32 pairs)
+        self.tokens = self.margins = None
+        if data[:8] == MAGIC2:
+            self.tokens = array("i")
+            self.tokens.frombytes(data[off:off + self.n_tokens * 4])
+            off += self.n_tokens * 4
+            self.margins = array("f")
+            self.margins.frombytes(data[off:off + self.n_tokens * self.n_layers * 2 * 4])
+
+    def chosen_row(self, t, L):
+        i = (t * self.n_layers + L) * self.n_used
+        return self.chosen[i:i + self.n_used]
+
+    def pred_row(self, which, t, L):
+        arr = self.pred_in if which == "in" else self.pred_out
+        i = (t * self.n_layers + L) * self.n_pred
+        return arr[i:i + self.n_pred]
+
+
+def to_bytes(trace_fields, chosen, pred_in, pred_out):
+    """The inverse of Trace(): builds the file bytes from plain lists, for run_check()."""
+    header = tuple(trace_fields[name] for name in HEADER_FIELDS)
+    out = bytearray(MAGIC)
+    out += struct.pack("<8q", *header)
+    for values in (chosen, pred_in, pred_out):
+        out += array("H", values).tobytes()
+    return bytes(out)
+
+
+# ---- Q13: does the next layer's router already know? ---------------------------------------
+
+def q13_layer_shares(trace, which, layer, tokens):
+    """{k: (hits, total)} of chosen[t][layer+1] found in the top-k of pred_{which}[t][layer],
+    over `tokens`, for every k in K_VALUES (clipped to n_pred, the most this trace stored)."""
+    out = {}
+    for k in K_VALUES:
+        kk = min(k, trace.n_pred)
+        hits = total = 0
+        for t in tokens:
+            topk = set(trace.pred_row(which, t, layer)[:kk])
+            for e in trace.chosen_row(t, layer + 1):
+                total += 1
+                if e in topk:
+                    hits += 1
+        out[k] = (hits, total)
+    return out
+
+
+def q13_combine(trace, which, tokens):
+    """Sums q13_layer_shares over every layer with a next one, for the given tokens."""
+    totals = {k: [0, 0] for k in K_VALUES}
+    for layer in range(trace.n_layers - 1):
+        for k, (hits, total) in q13_layer_shares(trace, which, layer, tokens).items():
+            totals[k][0] += hits
+            totals[k][1] += total
+    return {k: tuple(v) for k, v in totals.items()}
+
+
+def q13_worst_layer(trace, which):
+    """The layer (of n_layers - 1 candidates) with the lowest all-tokens share at the
+    strictest column (top 8, the fewest predictions): the one a top-8 preloader would miss
+    the most. Returns (layer, {k: (hits, total)}) for that layer, over all tokens."""
+    all_tokens = range(trace.n_tokens)
+    best_layer, best_share, best_shares = None, None, None
+    for layer in range(trace.n_layers - 1):
+        shares = q13_layer_shares(trace, which, layer, all_tokens)
+        hits, total = shares[K_VALUES[0]]
+        share = hits / total if total else 1.0
+        if best_share is None or share < best_share:
+            best_layer, best_share, best_shares = layer, share, shares
+    return best_layer, best_shares
+
+
+def share_str(hits, total):
+    return f"{100.0 * hits / total:5.1f}%" if total else "  n/a"
+
+
+def print_q13(trace):
+    print("Q13: share of layer L+1's chosen experts found in the predicted top-K")
+    print(f"{'':16s}{'pred_in':>24s}{'pred_out':>24s}")
+    print(f"{'row':16s}" + "".join(f"{'top' + str(k):>8s}" for k in K_VALUES) * 2)
+    all_tokens, prompt, generated = (range(trace.n_tokens), range(min(trace.n_prompt, trace.n_tokens)),
+                                      range(trace.n_prompt, trace.n_tokens))
+    rows = [("all tokens", all_tokens), ("prompt only", prompt), ("generated only", generated)]
+    for label, tokens in rows:
+        cells = []
+        for which in ("in", "out"):
+            shares = q13_combine(trace, which, tokens)
+            cells.append("".join(f"{share_str(*shares[k]):>8s}" for k in K_VALUES))
+        print(f"{label:16s}" + "".join(cells))
+    worst_in_layer, worst_in = q13_worst_layer(trace, "in")
+    worst_out_layer, worst_out = q13_worst_layer(trace, "out")
+    label = "worst layer"
+    cells = "".join(f"{share_str(*worst_in[k]):>8s}" for k in K_VALUES) + \
+            "".join(f"{share_str(*worst_out[k]):>8s}" for k in K_VALUES)
+    print(f"{label:16s}" + cells)
+    print(f"  (worst layer: pred_in L={worst_in_layer}, pred_out L={worst_out_layer}, by top-{K_VALUES[0]})")
+
+
+# ---- Q14: LRU cache of (layer, expert) units, and a static pin from the prompt --------------
+
+def lru_misses(trace, capacity):
+    """LRU over the whole trace in order; misses and tokens counted from the generated tokens
+    (t >= n_prompt) only. capacity is a count of (layer, expert) units."""
+    cache = OrderedDict()
+    misses = tokens = 0
+    for t in range(trace.n_tokens):
+        generated = t >= trace.n_prompt
+        if generated:
+            tokens += 1
+        for layer in range(trace.n_layers):
+            for e in trace.chosen_row(t, layer):
+                unit = (layer, e)
+                if unit in cache:
+                    cache.move_to_end(unit)
+                    continue
+                if generated:
+                    misses += 1
+                if len(cache) >= capacity:
+                    cache.popitem(last=False)
+                cache[unit] = True
+    return misses, tokens
+
+
+def static_pin_misses(trace, capacity):
+    """The `capacity` units used most during the prompt, pinned and never evicted; every other
+    unit is always a miss. Misses and tokens counted from the generated tokens only."""
+    freq = Counter()
+    for t in range(min(trace.n_prompt, trace.n_tokens)):
+        for layer in range(trace.n_layers):
+            for e in trace.chosen_row(t, layer):
+                freq[(layer, e)] += 1
+    pinned = {unit for unit, _ in freq.most_common(capacity)}
+    misses = tokens = 0
+    for t in range(trace.n_prompt, trace.n_tokens):
+        tokens += 1
+        for layer in range(trace.n_layers):
+            for e in trace.chosen_row(t, layer):
+                if (layer, e) not in pinned:
+                    misses += 1
+    return misses, tokens
+
+
+def lru_prefetch(trace, capacity, k):
+    """The same LRU with a prefetch: after layer L's experts are known, the first k of pred_in
+    (layer L+1's router on layer L's FFN input, known before L's experts run) are read if absent
+    and touched if present. Layer 0 has no prediction. Counted on the generated tokens only:
+    stalls (a chosen unit absent when its layer runs: compute waits for the disk), stalls at
+    layer 0, reads (stalls + prefetch reads: what the disk does) and wasted reads (a prefetched
+    unit its token did not choose at that layer). Returns (stalls, stalls0, reads, wasted, tokens)."""
+    cache = OrderedDict()
+
+    def load(unit):
+        if len(cache) >= capacity:
+            cache.popitem(last=False)
+        cache[unit] = True
+
+    stalls = stalls0 = reads = wasted = tokens = 0
+    for t in range(trace.n_tokens):
+        generated = t >= trace.n_prompt
+        if generated:
+            tokens += 1
+        for layer in range(trace.n_layers):
+            for e in trace.chosen_row(t, layer):
+                unit = (layer, e)
+                if unit in cache:
+                    cache.move_to_end(unit)
+                    continue
+                if generated:
+                    stalls += 1
+                    reads += 1
+                    stalls0 += layer == 0
+                load(unit)
+            if layer + 1 == trace.n_layers:
+                continue
+            coming = set(trace.chosen_row(t, layer + 1))
+            for e in trace.pred_row("in", t, layer)[:k]:
+                unit = (layer + 1, e)
+                if unit in cache:
+                    cache.move_to_end(unit)
+                    continue
+                if generated:
+                    reads += 1
+                    wasted += e not in coming
+                load(unit)
+    return stalls, stalls0, reads, wasted, tokens
+
+
+def time_model(trace, capacity, k, read_ms, layer_ms):
