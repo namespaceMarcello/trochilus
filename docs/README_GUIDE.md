@@ -59,3 +59,6 @@ What the three references share, in the order that serves a reader who has never
   `sh tools/race_llama.sh 5` (Q8_0, 8 and 16 threads, prompts of 512 and 2048), on a free machine and with
   no file written in the repo while they run (LESSONS #222); a run marked NOT FREE is not used.
 - A section is rewritten to today's state, never appended to.
+- **Before every update the whole README is read again**, and what is useless or said twice is cut
+  (Marcello, 2026-09-27): a claim lives in one place (the capabilities, the results, or what makes it
+  different), and a count that would go stale is not written.
