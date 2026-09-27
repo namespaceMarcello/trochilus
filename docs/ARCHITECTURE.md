@@ -93,7 +93,7 @@ not assumed (`docs/LESSONS.md` #84–#88: four forgotten processes under two day
 | every script finishes what it launched, and a signal stops it right away | `tools/cleanup.lib` in every `tools/*.sh` (required by `tools/lint.py`); `tools/test_cleanup.sh` in `make check`, red without the trap at every run |
 | nothing starts next to something the project left on | `tools/orphans.sh` at head of `make check` and every measurement (`measure_begin`) |
 | the machine is loaded on purpose in one way only | `tools/busy_machine.sh <n> <command>`: load generators die with it |
-| the machine is still before the session and before every run | `measure_still` and `tools/machine_still.sh` in `AB_GUARD`: occupied processors and container; waits, then stops and says who is holding the CPU |
+| the machine is still before the session and before every run | `measure_still` and `tools/machine_still.sh` in `AB_GUARD`: occupied processors and container; waits saying who is holding the CPU (the three processes using the most, the protected ones too), then stops |
 | every measurement declares the background load; if it is not low conclusions are not drawn | `measure_declare` writes to log occupied processors and quota of `System` before the first run and after the last |
 | a comparison has its own A/A, and a choice is judged from distribution, not from median | `tools/ab_modes.sh`; `tools/decode_context_report.py speed` prints choices and width changes |
 | a change to the decode is measured with the short protocol by default (Marcello, 2026-09-24): exactness first, the decode forced on 8 at 512 / 2048 / 4000 with A/A, the profile after; ~40 min. **Short** for what grows with the context: attention (CPU or GPU), the KV cache and its layout, anything whose cost is per cached position. **Long** (~90 min: adds context 32, the measured width, bench_mem) for what every token pays at any context: the weights' kernels and quantized types, the expert store, norms, RoPE, router and experts' path, the thread pool, pinning, threads per phase and the width's estimator; and whenever the short one shows a surprise at 512 | `sh tools/decode_context.sh change-short <before>` / `change <before>` |
@@ -136,7 +136,7 @@ remain.
 | `src/kernels/` | CPU kernels per quantized type: scalar + AVX2 + AVX-512 (+VNNI) + NEON, dispatch table | colibri `quant.h`, `expert_ffn.h`; ds4 K-quant references |
 | `src/backend/` | backend interface (tensors on device, graph per token) and CPU backend; today `gpu_attn.{h,c}`: the decode's attention on an NVIDIA GPU with the CPU's bits (driver `nvcuda.dll`/`libcuda.so.1` opened at run time, PTX written in C and compiled by the driver, every float op `.rn`, `tr_expf` ported whole, the KV mirrored in VRAM, zero copy, one warp keeping the GPU awake between layers; `TR_GPU=0` keeps it on the CPU) | execution model: ds4 `ds4_gpu.h`, reduced to generic primitives; the attention kernels: new code, from measurements (`docs/MEASUREMENTS.md` §The decode's attention on the GPU) |
 | `src/memory/` | expert store (M1: RAM / disk; VRAM at M3): units (layer, expert), slots allocated once, direct index and LRU O(1), reads on demand from GGUF | ideas: colibri `olmoe.c` (expert index → slot, expert in one slot), ds4 streaming; choices from our measurements (`docs/MEASUREMENTS.md` §M1): LRU not pin from use, no I/O pool, no prediction-based preloading on slow disks; in the layer-major prompt one I/O thread reads the next layer while this one computes (1.22× at 2048); new code |
-| `src/kv/` | KV cache `[layer][head][position]`: a head's positions in row, so attention reads them at RAM bandwidth (`docs/MEASUREMENTS.md` §Decode at long context); then prefix reuse, checkpoint to disk with decay-weighted score | layout: new code, from measurements; ideas for the rest: colibri `kv_prefix.h`, `kv_fp8.h`; ds4 `ds4_kvstore.c` |
+| `src/kv/` | KV cache `[layer][head][position]`: a head's positions in row, so attention reads them at RAM bandwidth (`docs/MEASUREMENTS.md` §Decode at long context); every head's stream starting a page, so a pass faults the pages it enters over the pool in one call and never past its end (§The KV's pages touched in time); then prefix reuse, checkpoint to disk with decay-weighted score | layout: new code, from measurements; ideas for the rest: colibri `kv_prefix.h`, `kv_fp8.h`; ds4 `ds4_kvstore.c` |
 | `src/tokenizer/` | byte-level BPE from GGUF metadata (pretokenizer families allowed only with oracle), NFC and Unicode classes probed from HF `tokenizers`, chat template per architecture | ideas: colibri `tok.h` (regex replayed in C), ds4 `vocab_load` (from GGUF); new code |
 | `src/models/` | one graph per family, built from primitives | colibri `olmoe.c`, ds4 / colibri DeepSeek V4 |
 | `src/gen/` | how the token is chosen after the model: greedy, draft from prompt and verify in one pass (then sampling and stop criteria) | ideas: colibri `v4_ngram_draft`, llama.cpp `examples/lookup`; new code |
@@ -200,14 +200,16 @@ remain.
 - **Threads**: pool persistent, sized on **physical cores** (colibri: +2.3x on Zen 3 versus
   logical cores; two threads a core add nothing at the decode's width, MEASUREMENTS §SMT in the
   decode), `parallel_for` on row ranges, the decode's balanced at the tail (a thread done takes the
-  blocks others have not started: §The pool's tail). Counting is not enough: if not pinned to
+  blocks others have not started: §The pool's tail). A worker waiting for work can bring the next
+  call's first bytes in (`tr_pool_hint`), off: the serial steps between calls pay it back (§The idle
+  workers, and what lies past a region's end). Counting is not enough: if not pinned to
   cores, Windows places two on the same physical core and prefill loses 30% (`docs/MEASUREMENTS.md`
   §Where do threads go). **Threads per phase**: a long pass (the prompt) is bound by compute
   and uses the whole pool; a short pass (decode, short draft: up to 4 rows) is bound by weight
   reads and uses the first n slots of the pool, its matmuls cut by weight rows and balanced (a
   verify pass of 2-3 rows too, each weight row read once for all its rows: §The short verify pass
-  at its bytes; for Q4_K the W16 panel's rows brought ahead and a 2-row group by pairs: §The Q4_K short
-  passes). n is not a constant: every session **measures** it for each kind of short pass, the
+  at its bytes; for Q4_K two weight rows decoded once for the group's 2-3 rows, `q4x_dot_xt`: §A Q4_K
+  weight row decoded once for 2-3 tokens). n is not a constant: every session **measures** it for each kind of short pass, the
   one-token passes (whole pool, half, quarter, never below 4 threads) and each size of verify pass
   on its own (the narrowest of those widths skipped: more rows, more work a byte read), keeps the
   tightest within measured noise on those same passes, remeasures every doubling of context, and
@@ -224,7 +226,7 @@ remain.
 | Level | What it compares | Where |
 |---|---|---|
 | kernel | every SIMD/asm variant against scalar, bit by bit, on random input | `tests/test_kernels.c` |
-| Q4_K's integer definition | the scalar definition against one written again from the math in the test (the shift found by trying, nearest-even by `nearbyint`, T and M in int64, the f64 steps; blocks of zeros, of subnormals, holding a NaN or an infinity); every tier's prepared rows and W16 panels byte for byte, its pairs and tiles of every width against scalar's dot_row; 26 mutations seen red | `tests/test_kernels.c` (`test_dot_row_q4_k`, `q4x_diffs`), `tools/mutate_q4x.sh` |
+| Q4_K's integer definition | the scalar definition against one written again from the math in the test (the shift found by trying, nearest-even by `nearbyint`, T and M in int64, the f64 steps; blocks of zeros, of subnormals, holding a NaN or an infinity); every tier's prepared rows and W16 panels byte for byte, its pairs, runs of 2-3 rows (`q4x_dot_xt`: the rows at the end of an exact buffer, canaries past the outputs) and tiles of every width against scalar's dot_row; three witnesses on every kernel of every tier, which random inputs cannot be (a signed zero, cancelling mins, the blocks' order: the f64 steps' roundings and order); a short pass's calls counted exactly; 47 mutations seen red | `tests/test_kernels.c` (`test_dot_row_q4_k`, `q4x_diffs`, `test_q4x_witnesses`, `test_short_pass_q4k`), `tools/mutate_q4x.sh` |
 | tier | the whole engine under every tier (`TR_CPU_MAX`): model test, and logits byte-identical across tiers, threads, `-b` | `make tier-check` (`tools/tier_check.sh`) |
 | tier is used | same numbers do not say which code ran: every hot entry of every tier is its own function, per weight type; and in the engine products counted on the active table, type by type, are exactly rows × tokens | `tests/test_tier_used.c`, also under every tier in `make tier-check` |
 | tiny model | greedy tokens **identical** to transformers (f32, f16); logits within tolerance per position; q8_0 report only, because reference is not quantized | `tools/make_tiny_olmoe.py` → `tools/oracle.py` (`make oracle`) |

@@ -137,8 +137,9 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
   process is respected. `TR_POOL_PIN=0/1/2` for comparisons.
 - 2026-09-18, repriced 2026-09-27 — **On a MoE a draft row is not free**: its new experts (2.3–4.7
   of 8 a layer) are its price. 09-18: 17.6 ms alone, 13.7 each at eight, of a 31.3 ms pass; today
-  (`tools/row_price.sh`, MEASUREMENTS §The post-it taken apart) 0.50–0.72 of a pass at 2–3 rows
-  (above their bytes: LESSONS #224), 0.23–0.30 at 9. The adaptive draft stops after an all-wrong
+  (`tools/row_price.sh`, MEASUREMENTS §The post-it taken apart) 0.31–0.43 of a pass at 2–3 rows on
+  Q8_0 and 0.33–0.39 on Q4_K since question 78 (0.50–0.72 before, above their bytes: LESSONS #224),
+  0.23–0.30 at 9. The adaptive draft stops after an all-wrong
   draft for 1, 3, 7, 15, then 16 steps (LESSONS #60). `--spec` stays **off by default** (point 1).
 - 2026-09-18 — **When a difference is a conclusion**: comparisons with `tools/ab_modes.sh` (8
   rounds, rotating order, one mode given twice as A/A control). A single A/A pair is noisy (same
@@ -302,34 +303,46 @@ interleaved, 2 MB pages, drafts in the high bits, question 75's 8-bit draft KV o
   `q4x_*`) at the float's speed; the races for the README (container, free machine): Q4_K 4 threads prompt
   level with llama.cpp (220.0 against 220.6), decode 1.03x; Q8_0 16 threads prompt 1.33-1.42x. The
   GPU-against-CPU decode A/B is still owed at a free machine with no writes (LESSONS #222).
-- **2026-09-27: the post-it, the short verify passes at their bytes** (MEASUREMENTS §The post-it taken
-  apart to §The verify passes' own width; LESSONS #223-#236): at 09-27's prices a calibrated gate gives
-  1.077x on new code, and with a real context (question 81) the lookup 1.067x, the gate 1.146x. **Question
-  78**: Q8_0's short pass on phase-major's balanced items and `dot_row_xt` (8 threads: 3 rows 62.7 -> 43.0
-  ms, 2 rows 41.3 -> 35.9); Q4_K's W16 panel read its 16 rows on demand (#233): each row's block s + 2 and
-  the next item's rows brought ahead, a 2-row group by `q4x_dot2` pairs: 3 rows 28.00 -> 26.53 ms, 2 rows
-  22.92 -> 22.19, one row and the prompt unchanged. **Question 82**: every size of verify pass measures its
-  own width, the narrowest skipped: on a pool of 16 Q8_0's verify passes 0.961-0.966 of the whole pool's time (0.943-0.981 of the decode's width's), Q4_K 0.982-1.005, 8 threads picked everywhere (measuring every width lost on Q4_K: #236). The decode's change-short (before the Q4_K change): logits
-  identical, decode 0.987-1.005 (A/A 0.993-1.014). `make check` green; `tools/mutate_tune.sh` 23 of 23 red under ASan.
-- **next, one piece at a time**: road (c), a Q4_K weight row decoded once for 2-3 prepared tokens (the
-  dense's +0.5-0.9 ms a row; the design in `build/prompt-next-postit.md`); the rest's +0.35-0.41 a row
-  (q, k, v prepared three times); the row price at 2048 and 4000 positions; #229; questions 79, 80; the gate
-  in C; `--spec` by default (Marcello). Then: the GPU A/B at a free machine with no writes; the engine's
-  deletion series of a W16 item (0.83 of the microbench); the prep once a token for gate and up; AVX2's W16
-  tile; `dot_row2` is dead code (remove it with `tools/mutate_row2.sh`'s lines); `tests/bench_q4k_genome.c`
-  sequences a kernel that is gone. Queued: questions 74 (**does the GPU count?**) and 76; the interleave
-  shared by gate/up and by q/k/v; Q6_K's panel; tile-block stealing; question 68; M3's dense weights on the
-  GPU. **For Marcello, 59 and 60**. 61 after M4.
+- **2026-09-27** (MEASUREMENTS from §The post-it taken apart to §The routers as bf16; LESSONS #223-#253):
+  a calibrated gate 1.077x on new code (with a real context 1.146x); the short verify passes at their bytes
+  (question 78: Q8_0's 3 rows 62.7 -> 43.0 ms; Q4_K's panel rows brought ahead, then **road (c)**, `q4x_dot_xt`
+  decoding two weight rows once for 2-3 tokens: 3 rows 28.00 -> 26.45 ms); every verify size its own width
+  (question 82). #242's decode +1% did not reproduce: two files of the same bytes differ by 1-2% (#243), so small
+  changes race inside one process (`generate --ab`, `tools/ab_inproc.sh`, 0.28%; the arms aperiodic, #247).
+  **Question 83** (Marcello: half a prep a token): q/k/v from one prep, gate/up through a map, no gather, the swiglu
+  with the down's prep: the prompt **1.058 x 1.0087**, the decode **1.025**, a 3-row pass 1.026; then the argmax
+  split over the pool (116-118 -> 6 us a token): a token ~0.7%, a 3-row pass 1.0175. Every bit the same.
+  The KV's pages a pass enters, touched over the pool before its layers (every stream starts a page): kv_write 80 ->
+  50 us a token, the decode +0.17%, a first prompt +0.4%; touched a window ahead instead, they cost the attention 2.4%:
+  **pages present past the streams' ends slow the reads 1-2.4%** (#250; question 84: do the weights' ends pay it too?).
+  Races of environment switches process against process: `tools/ab_env.sh` (A/A 0.2%). The routers kept as bf16
+  where every value fits (all of OLMoE's): the router zone 179-186 -> 120-130 us a token (1.40-1.48x, ~0.4%), the
+  same bits. And the parallel argmax had never run outside `generate --ab` (the session's struct from `malloc`, a field
+  never set, #252): fixed, every run's sample zone 118 -> 5.5 us (+0.74%); the lint now refuses `malloc(sizeof *x)`.
+  The night (MEASUREMENTS §The idle workers, and what lies past a region's end; #254-#256): benches compare layouts
+  by racing them set by set (a round of passes saw the RAM drift 10-30%). **Question 84 answered**: a thread's region
+  end costs ~0.8% of a dense call (a guard page), a thread's q, k, v, o regions one after the other 1.0-1.75%, the
+  experts' nothing: 0.2-0.4% of a token in the dense layout. **The idle workers (piece 3, B)**: `tr_pool_hint` and
+  `tr_matmul_hint`, 1.02-1.14 a call in the bench, **level in the engine** (12 runs 0.9962 +- 0.0039): the serial step
+  after each hint pays what the call gains (#255, question 85). Kept off by default (`TR_POOL_HINT=2` on), tested,
+  16 mutations.
+- **next, one piece at a time** (the thinker's order for the decode, `build/prep/predictions.txt`): q/k/v and
+  gate/up in one call each, with question 84's layout (a thread's rows of q, k, v one after the other); the serial
+  steps as messages (question 85: the add and the mix inside the calls that make their rows, normed and the prepared
+  row in buffers the workers have not read; then the hints again, and `pretouch`, never raced); the pool's messages
+  (release stores, `shutdown` off `remaining`'s line); last the prep's bit arithmetic. The
+  README's numbers raced again after them (Marcello approves the README first). Then the post-it's rest: the dense at
+  3 rows (xt(3)'s block end batched across its tokens), AVX2's own xt, the row price at 2048 and 4000 positions,
+  #229, questions 79, 80, the gate in C, `--spec` by default (Marcello). Then: the GPU A/B at a free machine with no
+  writes; the engine's deletion series of a W16 item; AVX2's W16 tile; `dot_row2` is dead code (remove it with
+  `tools/mutate_row2.sh`'s lines); `tests/bench_q4k_genome.c` sequences a kernel that is gone; the race of whole
+  binaries with copies and a rotated order (#243), and its disturbed rounds named (#244). Queued: questions 74
+  (**does the GPU count?**) and 76; Q6_K's panel; tile-block stealing; question 68; M3's dense weights on the GPU.
+  **For Marcello, 59 and 60**. 61 after M4.
 
-**Night of 2026-09-24**: the gate 428 → 238 s; **M2: Q4_K and Q6_K** exact (Q4_K decode 1.5× the
-Q8_0; Q4_K_M runs).
-
-**Tests and gate** (2026-09-24/25): `mutate_auto.py` lists the mutants no check runs (gcov) and
-runs ASan on the survivors only; `gguf.c`, `experts.c`, `threads.c`, `platform.c` mutated for the
-first time (MEASUREMENTS, after §Generated mutations). `gguf.c`: 40 survivors → 12, every one read.
-Open: `threads.c`'s 22 (speed, not bits), `platform.c`'s Windows half never mutated, the gate's
-time with the native tests beside the container.
-Review of 2026-09-22/23: LESSONS #102–#125. The native measurements follow the machine's marker.
+**2026-09-24**: the gate 428 → 238 s; **M2: Q4_K and Q6_K** exact. **Tests** (09-24/25): `mutate_auto.py`
+lists the mutants no check runs (gcov); open: `threads.c`'s 22 (speed, not bits), `platform.c`'s Windows
+half never mutated. Review of 09-22/23: LESSONS #102–#125.
 
 Steps of 17–20/09: `docs/archive/DONE.md`; their numbers: `docs/MEASUREMENTS.md`.
 

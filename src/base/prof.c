@@ -20,6 +20,7 @@ static const char *const zone_names[TR_PROF_ZONE_COUNT] = {
     [TR_PROF_QK_NORM] = "qk_norm",
     [TR_PROF_ROPE] = "rope",
     [TR_PROF_KV_WRITE] = "kv_write",
+    [TR_PROF_KV_TOUCH] = "kv_touch",
     [TR_PROF_ATTENTION] = "attention",
     [TR_PROF_ATTN_OUT_PROJ] = "attn_out_proj",
     [TR_PROF_FFN_NORM] = "ffn_norm",
@@ -36,7 +37,7 @@ static const char *const zone_names[TR_PROF_ZONE_COUNT] = {
     [TR_PROF_POOL_WAIT] = "pool_wait",
 };
 
-static const char *const phase_names[TR_PHASE_COUNT] = {"prefill", "decode"};
+static const char *const phase_names[TR_PHASE_COUNT] = {"prefill", "decode", "decode_b"};
 
 const char *tr_prof_zone_name(tr_prof_zone z) {
     return (unsigned)z < TR_PROF_ZONE_COUNT ? zone_names[z] : "?";
@@ -171,6 +172,8 @@ void tr_prof_write_json(const tr_prof *p, FILE *out) {
     fprintf(out, "{\"tick_source\":\"%s\",\"phases\":{", tick_mode == 1 ? "rdtsc" : "os_clock");
     for (int ph = 0; ph < TR_PHASE_COUNT; ph++) {
         const tr_prof_acc *acc = p->acc[ph];
+        /* an A/B's second arm only when there was one: every other run's JSON stays as it was */
+        if (ph == TR_PHASE_DECODE_B && acc[TR_PROF_TOKEN].calls == 0 && p->tokens[ph] == 0) continue;
         double token_s = (double)acc[TR_PROF_TOKEN].ticks / rate;
         fprintf(out, "%s\"%s\":{\"tokens\":%llu,\"seconds\":%.9f,\"tokens_per_sec\":%.6f,"
                      "\"weight_bytes\":%llu,\"kv_bytes\":%llu,\"io_bytes\":%llu,\"zones\":{",

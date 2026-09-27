@@ -55,6 +55,8 @@
  * tile of prepared input rows, the bytes of a 16-row panel of n columns, the largest |X| of an input element
  * (the two balanced 16-bit digits' reach, 32295 + 64591 * 32295) and the digits' base. */
 #define TR_Q4X_TILE_MAX 4
+/* The most prepared input rows a q4x_dot_xt call takes (a short verify pass's run). */
+#define TR_Q4X_XT_MAX 3
 #define TR_Q4X_PANEL_BYTES(n) ((size_t)(n) / 256 * 9728)
 #define TR_Q4X_XMAX 2085998640.0
 #define TR_Q4X_BASE 64591
@@ -77,8 +79,14 @@ typedef struct {
 size_t tr_row_bytes(tr_type type, int64_t n);
 /* 1 if the matmul and dequant kernels support this type. */
 int tr_kernels_support(tr_type type);
+/* n F32 values at data rewritten in place as n bfloat16 (their top halves, the first 2n bytes) when every one has
+ * a zero low half, so that nothing is lost: 1 then, and a BF16 row gives dot_row's bits of the F32 row it came from
+ * (the same products in the same lanes, widened by a shift). 0, the data untouched, when one value does not fit.
+ * An F32 tensor of a model converted from bf16 fits whole (OLMoE's routers: half their bytes). */
+int tr_f32_to_bf16_exact(void *data, int64_t n);
 /* Bytes of one input row of n columns prepared for Q4_K's integer definition (the table's q4x_prep; a
- * multiple of 64). */
+ * multiple of 64: the rounded tail is never written, so two prepared rows compare equal only past what their
+ * buffers held before, LESSONS #246). */
 size_t tr_q4x_bytes(int64_t n);
 
 /* Kernel table. Filled once by tr_kernels_init from tr_cpu(); read-only afterwards. */
@@ -156,15 +164,20 @@ typedef struct {
      * prepared once (its digits, the windows' token terms, the sub-blocks' sums and the shifts):
      * q4x_prep: x (n floats) -> xq (tr_q4x_bytes(n) bytes, 64-byte aligned);
      * q4x_dot2: out[0], out[1] = rows row0 and row1 against the prepared row xq (the decode's road);
+     * q4x_dot_xt: rows row0 and row1 against T prepared rows xq[0], ..., xq[T - 1] (anywhere: a group's rows
+     *   read in place from the rows a pass prepared once), T from 2 to TR_Q4X_XT_MAX: y[t * y_stride + r] = row
+     *   r against input row t, each weight decoded once for the T of them (a short verify pass's groups);
      * q4x_panel: TR_PM_ROWS consecutive rows (row_bytes apart) -> panel (TR_Q4X_PANEL_BYTES(n) bytes,
      *   64-byte aligned); next, when not NULL, is the TR_PM_ROWS rows the caller builds after these (the
      *   same row_bytes and n), which a tier may bring toward its caches while it builds (never read);
-     * q4x_tile: the panel against T prepared rows xq, xq + xq_stride, ..., T from 1 to TR_Q4X_TILE_MAX:
+     * q4x_tile: the panel against T prepared rows xq[0], ..., xq[T - 1], T from 1 to TR_Q4X_TILE_MAX:
      *   y[t * y_stride + r] = the panel's row r against input row t. */
     void (*q4x_prep)(const float *x, int64_t n, void *xq);
     void (*q4x_dot2)(const void *row0, const void *row1, const void *xq, int64_t n, float *out);
+    void (*q4x_dot_xt)(const void *row0, const void *row1, const void *const *xq, int64_t n, int T, float *y,
+                       int64_t y_stride);
     void (*q4x_panel)(const void *rows, size_t row_bytes, int64_t n, void *panel, const void *next);
-    void (*q4x_tile)(const void *panel, const void *xq, size_t xq_stride, int64_t n, int T, float *y, int64_t y_stride);
+    void (*q4x_tile)(const void *panel, const void *const *xq, int64_t n, int T, float *y, int64_t y_stride);
     /* decode one row of n elements to f32 */
     void (*dequant_row[TR_TYPE_COUNT])(const void *row, float *out, int64_t n);
     /* y[i] = tr_expf(x[i]) for i < n, element-wise; y may be x (in place). The exponential of the
@@ -221,17 +234,38 @@ uint64_t tr_pm_scratch_bytes(int n_workers, int64_t max_groups, int64_t max_toke
  * pass (no group of 4 input rows, one of 2 or 3: a verify pass of 2-3 rows) takes the road on any tier,
  * items cut by weight rows and balanced; one input row a group stays on tr_matmul_grouped's. A Q4_K weight takes its
  * integer road where the call fits s: every input row prepared once (q4x_prep), then the W16 panel and
- * tiles for a group of 2 input rows or more where the tier has them, q4x_dot2 otherwise; each output is
- * dot_row[TR_TYPE_Q4_K]'s. s == NULL: the old road (for Q4_K, dot_row from the floats). */
+ * tiles for a group of 4 input rows or more where the tier has them, a smaller group's runs of 2-3 input
+ * rows by q4x_dot_xt and a lone input row by q4x_dot2; each output is dot_row[TR_TYPE_Q4_K]'s. s == NULL:
+ * the old road (for Q4_K, dot_row from the floats). */
 void tr_matmul_grouped_s(tr_pool *pool, const tr_mat *w, const int64_t *offsets, int64_t n_groups, const float *x,
                          float *y, const tr_pm_scratch *s);
 void tr_matmul_s(tr_pool *pool, const tr_mat *w, const float *x, int64_t n_tokens, float *y, const tr_pm_scratch *s);
+/* Q4_K's integer road on rows prepared once for several calls (docs/MEASUREMENTS.md §The prep once a row): a
+ * pass's distinct input rows (the tokens) prepared by tr_q4x_prepare into the caller's buffer (n *
+ * tr_q4x_bytes(cols) bytes, 64-byte aligned; never s->xq, which a phase-major call between two readers
+ * overwrites), then every call reading them: q, k and v from the same rows, gate and up from the tokens'
+ * rows through a map, each group's input row p reading prepared row map[p] (NULL: row p) without a copy.
+ * tr_q4x_road: 1 when a call of these weights and groups can take the road on pool and s;
+ * tr_matmul_q4x_prepared: tr_matmul_grouped_s's y, bit for bit, from the prepared rows; 0 (y untouched) when the
+ * road cannot take the call, whose caller then gathers the floats and takes tr_matmul_grouped_s. */
+void tr_q4x_prepare(tr_pool *pool, const float *x, int64_t n, int64_t cols, void *xq);
+int tr_q4x_road(tr_pool *pool, const tr_mat *w, const int64_t *offsets, int64_t n_groups, const tr_pm_scratch *s);
+int tr_matmul_q4x_prepared(tr_pool *pool, const tr_mat *w, const int64_t *offsets, int64_t n_groups, const void *xq,
+                           const int64_t *map, float *y, const tr_pm_scratch *s);
 /* 1 if no group of tr_matmul_grouped's has more than one input row: a decode token's projections
  * (one group, one row) and its experts (n_expert groups, the used ones one row each, the rest
  * empty), whose call is only weight rows to stream and runs balanced at its tail. Until
  * 2026-09-26 the test was "rows == groups", never true for the experts' 64 groups and 8 rows
  * (docs/LESSONS.md #192). */
 int tr_matmul_one_row_per_group(const int64_t *offsets, int64_t n_groups);
+/* The idle workers' hints for the next call of these weights and groups (threads.h tr_pool_hint): one input row a
+ * group only (a decode token's calls; any other call, and a pool whose hints are off, posts nothing). Each chunk
+ * but the calling thread's gets the first bytes its thread will read in that call, as tr_matmul_grouped_s (s) or
+ * tr_matmul_q4x_prepared (s), or tr_matmul and tr_matmul_grouped (s NULL) split it: at most max_bytes, at most
+ * half its region, never past its first group's matrix. Called by the pool's dispatcher before the serial steps
+ * that precede the call; it moves no data the call reads. */
+void tr_matmul_hint(tr_pool *pool, const tr_mat *w, const int64_t *offsets, int64_t n_groups, const tr_pm_scratch *s,
+                    size_t max_bytes);
 /* out = dequantized row `row` of w (cols elements): an embedding lookup. */
 void tr_get_row(const tr_mat *w, int64_t row, float *out);
 /* x[i] = x[i] / sqrt(mean(x^2) + eps) * weight[i], mean via the lane contract, f32. */
@@ -263,6 +297,18 @@ void tr_softmax(float *x, int64_t n);
 /* x[i] = silu(x[i]) * y[i], silu(v) = v / (1 + tr_expf(-v)); element-wise, split over the pool
  * (p == NULL: serial). */
 void tr_swiglu(tr_pool *pool, float *x, const float *y, int64_t n);
+/* tr_swiglu on n_rows rows of n, split by whole rows, each row then prepared for Q4_K's integer road into xq (row r
+ * at r * tr_q4x_bytes(n), the table's q4x_prep) while it is in its core's cache: the down's rows prepared in the
+ * call that makes them (docs/MEASUREMENTS.md §The prep once a row). x's floats are tr_swiglu's, xq's bytes are
+ * q4x_prep's of them. */
+void tr_swiglu_prepare(tr_pool *pool, float *x, const float *y, int64_t n_rows, int64_t n, void *xq);
+/* The first index of the largest x[i] (0 <= i < n), the serial scan `if (x[i] > x[best]) best = i` from best = 0: a
+ * NaN never wins, ties go to the lower index, and index 0 stands when nothing is larger (a NaN there, or every value
+ * -inf). Split over the pool (NULL: serial) by chunks of TR_PM_ROWS-aligned rows, each worker the logits the head's
+ * matmul left in its cache: each chunk from (-inf, none) with strict >, eight interleaved lanes, the chunks merged in
+ * order from (x[0], 0) with the same strict >: the scan's index by construction (docs/MEASUREMENTS.md §The argmax in
+ * parallel). */
+int32_t tr_argmax_f32(tr_pool *pool, const float *x, int64_t n);
 /* Causal attention of one query head over n_pos cached positions. `keys` and `values`
  * hold n_pos slots of `stride` floats; this head reads head_dim floats at `offset` in
  * each slot. scores[t] = dot_f32(q, k_t) * scale, softmax over t < n_pos, then

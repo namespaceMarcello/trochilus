@@ -35,6 +35,7 @@ typedef enum {
     TR_PROF_QK_NORM,
     TR_PROF_ROPE,
     TR_PROF_KV_WRITE,
+    TR_PROF_KV_TOUCH,         /* the cache's pages a pass enters, faulted in over the pool (src/kv/kv.h) */
     TR_PROF_ATTENTION,        /* scores, softmax, weighted sum over the context */
     TR_PROF_ATTN_OUT_PROJ,
     TR_PROF_FFN_NORM,
@@ -52,7 +53,10 @@ typedef enum {
     TR_PROF_ZONE_COUNT
 } tr_prof_zone;
 
-typedef enum { TR_PHASE_PREFILL = 0, TR_PHASE_DECODE = 1, TR_PHASE_COUNT = 2 } tr_prof_phase;
+/* TR_PHASE_DECODE_B: the passes of an in-process A/B's second arm (generate --ab), timed apart from the first
+ * arm's (TR_PHASE_DECODE) in the same process: one file, one memory, one set of threads for both arms, where two
+ * files of the same bytes differ by 1-2% (docs/LESSONS.md #243). */
+typedef enum { TR_PHASE_PREFILL = 0, TR_PHASE_DECODE = 1, TR_PHASE_DECODE_B = 2, TR_PHASE_COUNT = 3 } tr_prof_phase;
 
 typedef struct {
     uint64_t calls;

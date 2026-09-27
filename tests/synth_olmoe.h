@@ -75,6 +75,9 @@ static tr_type synth_retype_to = TR_TYPE_F32;
 /* A tensor written F32 whose every value is exactly the F16 value the same seed gives as F16, so
  * that an F16 copy of it must give the same bits (tests/test_model_load.c: mixed types per part). */
 static const char *synth_f16_as_f32 = NULL;
+/* Set to 1 before synth_write: every F32 ffn_gate_inp.weight holds values whose low 16 bits are zero, as a real
+ * OLMoE GGUF converted from bf16, so the engine keeps it as BF16 (kernels.h tr_f32_to_bf16_exact). */
+static int synth_bf16_router = 0;
 
 /* the next F16 weight of a seed's sequence (synth_tensor) */
 static uint16_t synth_f16_bits(uint32_t *seed) {
@@ -295,6 +298,12 @@ static void synth_tensor(synth_buf *hdr, synth_buf *data, const char *name, int 
         }
         seed = seed * 1103515245u + 12345u;
         float v = ((float)((seed >> 16) & 0xFFFFu) / 65535.0f - 0.5f) * 0.2f;
+        if (synth_bf16_router && strstr(name, "ffn_gate_inp") != NULL) {
+            uint32_t bits;
+            memcpy(&bits, &v, sizeof bits);
+            bits &= 0xFFFF0000u;
+            memcpy(&v, &bits, sizeof bits);
+        }
         synth_put(data, &v, sizeof v);
     }
 }

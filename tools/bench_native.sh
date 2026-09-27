@@ -6,6 +6,9 @@
 #
 #   sh tools/bench_native.sh <bench> [args...]    e.g. bench_peak, or bench_kvpack time --run all
 #
+# BENCH_BUILD=<dir>: build <dir>/tests/<bench>.exe and run it as it is, no copy: a second build in another
+# folder is another hash, which Smart App Control often lets run at once while a copy of the first waits.
+#
 # Results in build/bench_native/<bench>/ (bench.txt, load.txt, commit.txt); lines above 10% spread
 # named in noisy.txt.
 set -e
@@ -16,7 +19,8 @@ B=$1
 shift
 OUT=build/bench_native/$B
 mkdir -p $OUT
-make WERROR=1 build/tests/$B.exe > /dev/null
+BB=${BENCH_BUILD:-build}
+make WERROR=1 BUILD=$BB $BB/tests/$B.exe > /dev/null
 . tools/measure_guard.lib
 trap measure_end EXIT
 trap 'exit 130' INT TERM
@@ -26,9 +30,13 @@ measure_machine $B
 measure_still $B
 measure_declare "before" > $OUT/load.txt
 cat $OUT/load.txt
-cp build/tests/$B.exe build/tests/${B}_run.exe
-printf 'x' >> build/tests/${B}_run.exe
-cleanup_run ./build/tests/${B}_run.exe "$@" > $OUT/bench.txt 2>&1 ||
+RUN=$BB/tests/$B.exe
+if [ -z "${BENCH_BUILD:-}" ]; then
+  RUN=build/tests/${B}_run.exe
+  cp build/tests/$B.exe $RUN
+  printf 'x' >> $RUN
+fi
+cleanup_run ./$RUN "$@" > $OUT/bench.txt 2>&1 ||
   { echo "$B: the copy did not run (Smart App Control?)"; tail -3 $OUT/bench.txt; exit 1; }
 measure_declare "after" >> $OUT/load.txt
 tail -1 $OUT/load.txt

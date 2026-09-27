@@ -212,6 +212,21 @@ static void test_reports_known(void) {
         line = nl != NULL ? nl + 1 : "";
     }
     TR_CHECK_EQ_INT(rows, TR_PROF_ZONE_COUNT);
+
+    /* E: an A/B's two arms (generate --ab): the second arm is a phase of its own, printed and in the JSON after
+     * the decode; without one (A above, compared byte for byte) the JSON has no "decode_b" */
+    memset(&p, 0, sizeof p);
+    p.tokens[TR_PHASE_DECODE] = 2;
+    zone(&p, TR_PHASE_DECODE, TR_PROF_TOKEN, 2, 4, 0);
+    p.tokens[TR_PHASE_DECODE_B] = 3;
+    zone(&p, TR_PHASE_DECODE_B, TR_PROF_TOKEN, 3, 3, 0);
+    capture(tr_prof_print, &p, buf, sizeof buf);
+    TR_CHECK(strstr(buf, "\n== decode: 2 tokens in 4.000 s = 0.50 tokens/s\n") != NULL);
+    TR_CHECK(strstr(buf, "\n== decode_b: 3 tokens in 3.000 s = 1.00 tokens/s\n") != NULL);
+    capture(tr_prof_write_json, &p, buf, sizeof buf);
+    const char *arm_b = strstr(buf, "\"decode_b\":{\"tokens\":3,\"seconds\":3.000000000,");
+    const char *arm_a = strstr(buf, "\"decode\":{\"tokens\":2,");
+    TR_CHECK(arm_a != NULL && arm_b != NULL && arm_a < arm_b);
 }
 
 int main(int argc, char **argv) {

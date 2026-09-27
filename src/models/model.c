@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include "../base/platform.h"
+#include "../kernels/kernels.h" /* tr_argmax_f32 */
 
 extern const tr_arch_vtable tr_olmoe_vtable;
 
@@ -59,6 +60,7 @@ struct tr_session {
     tr_decode_choice history[TR_DECODE_TUNE_HISTORY]; /* what every decode measurement decided, oldest first */
     int n_history;         /* measurements finished; past the array the newest takes the last slot */
     double (*tune_now)(void *ctx); /* a probe's clock; NULL (the default): tr_time_sec() */
+    int ab_serial_argmax;  /* generate --ab argmax's arm B: tr_session_argmax's serial scan */
     void *tune_now_ctx;
 };
 
@@ -150,7 +152,7 @@ tr_model *tr_model_load_progress(const char *path, tr_pool *pool, uint64_t exper
     void *impl = vt->load(path, g, pool, expert_budget, progress, err, err_len);
     if (impl == NULL) return NULL;
 
-    tr_model *m = (tr_model *)malloc(sizeof *m);
+    tr_model *m = (tr_model *)calloc(1, sizeof *m);
     if (m == NULL) {
         vt->free(impl);
         snprintf(err, err_len, "out of memory");
@@ -248,7 +250,7 @@ tr_session *tr_session_create(tr_model *m, int64_t n_ctx, int64_t n_batch, char 
     void *impl = m->vt->session_create(m->impl, n_ctx, n_batch, err, err_len);
     if (impl == NULL) return NULL;
 
-    tr_session *s = (tr_session *)malloc(sizeof *s);
+    tr_session *s = (tr_session *)calloc(1, sizeof *s); /* every field zero: the parallel argmax, no switch (#252) */
     if (s == NULL) {
         m->vt->session_free(impl);
         snprintf(err, err_len, "out of memory");
@@ -464,6 +466,17 @@ const float *tr_session_logits_back(const tr_session *s, int64_t back) {
     return s->vt->logits(s->impl, back);
 }
 
+int32_t tr_session_argmax(const tr_session *s, int64_t back, int64_t n) {
+    const float *x = tr_session_logits_back(s, back);
+    if (s->ab_serial_argmax) { /* the scan the parallel one is defined by, on this thread */
+        int64_t best = 0;
+        for (int64_t i = 1; i < n; i++)
+            if (x[i] > x[best]) best = i;
+        return (int32_t)best;
+    }
+    return tr_argmax_f32(s->model->pool, x, n);
+}
+
 const float *tr_session_logits(const tr_session *s) {
     return s->vt->logits(s->impl, 0);
 }
@@ -516,6 +529,20 @@ int tr_session_rows_threads(const tr_session *s, int64_t n) {
 int tr_session_decode_history(const tr_session *s, const tr_decode_choice **out) {
     *out = s->history;
     return s->n_history;
+}
+
+/* the session's own switches, above any architecture's ids */
+enum { TR_AB_ARGMAX = 1 << 16 };
+
+int tr_session_ab_switch(const tr_session *s, const char *name) {
+    if (strcmp(name, "none") == 0) return 0;
+    if (strcmp(name, "argmax") == 0) return TR_AB_ARGMAX;
+    return s->vt->ab_switch != NULL ? s->vt->ab_switch(name) : -1;
+}
+
+void tr_session_ab_set(tr_session *s, int sw, int arm) {
+    if (sw == TR_AB_ARGMAX) s->ab_serial_argmax = arm;
+    else if (sw > 0 && s->vt->ab_set != NULL) s->vt->ab_set(s->impl, sw, arm);
 }
 
 int tr_session_last_threads(const tr_session *s) {

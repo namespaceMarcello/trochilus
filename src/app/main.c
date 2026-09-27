@@ -194,12 +194,6 @@ static int parse_tokens(const char *s, int32_t **out, int64_t *out_n) {
     return 0;
 }
 
-static int32_t argmax_f32(const float *x, int64_t n) {
-    int64_t best = 0;
-    for (int64_t i = 1; i < n; i++)
-        if (x[i] > x[best]) best = i;
-    return (int32_t)best;
-}
 
 /* Deterministic synthetic prompt for -p <n>: no tokenizer needed, so scenarios
  * can ask for a prompt of any length within the model's vocabulary. */
@@ -420,8 +414,13 @@ static void print_threads(const tr_pool *pool, const tr_session *sess, int force
  * (actual pool size), "decode_threads" (0: the session had not finished measuring), "rows_threads"
  * (the same for the verify passes of 2 .. TR_DECODE_ROWS rows, tr_session_rows_threads), "cpu",
  * "kernel_tier"} — the raw material for tools/profile_suite.py. */
+static int ab_arm(int64_t pass);
+
+/* ab_ms: with generate --ab, every decode pass's wall in order (pass i is ab_arm(i)'s), n_ab of them; abp, the
+ * --ab-prompt evaluations' walls, n_abp of them; NULL otherwise. Each with its arms beside it. */
 static int write_profile_json(const char *path, tr_prof *prof, const char *model_path, int64_t n_prompt,
-                               int64_t n_gen, int actual_threads, const tr_session *sess) {
+                               int64_t n_gen, int actual_threads, const tr_session *sess, const double *ab_ms,
+                               int64_t n_ab, const double *abp, int64_t n_abp) {
     int decode_threads = tr_session_decode_threads(sess);
     FILE *out = fopen(path, "w");
     if (out == NULL) return -1;
@@ -441,6 +440,20 @@ static int write_profile_json(const char *path, tr_prof *prof, const char *model
     write_json_string(out, cpu_line);
     fprintf(out, ",\"kernel_tier\":");
     write_json_string(out, tr_kernels_get()->tier);
+    if (ab_ms != NULL) {
+        fprintf(out, ",\"ab_pass_ms\":[");
+        for (int64_t i = 0; i < n_ab; i++) fprintf(out, "%s%.6f", i ? "," : "", ab_ms[i]);
+        fprintf(out, "],\"ab_pass_arm\":[");
+        for (int64_t i = 0; i < n_ab; i++) fprintf(out, "%s%d", i ? "," : "", ab_arm(i));
+        fprintf(out, "]");
+    }
+    if (abp != NULL) {
+        fprintf(out, ",\"ab_prompt_ms\":[");
+        for (int64_t i = 0; i < n_abp; i++) fprintf(out, "%s%.6f", i ? "," : "", abp[i]);
+        fprintf(out, "],\"ab_prompt_arm\":[");
+        for (int64_t i = 0; i < n_abp; i++) fprintf(out, "%s%d", i ? "," : "", ab_arm(i));
+        fprintf(out, "]");
+    }
     fprintf(out, "}\n");
 
     fclose(out);
@@ -449,9 +462,24 @@ static int write_profile_json(const char *path, tr_prof *prof, const char *model
 
 /* ---- generate -------------------------------------------------------------- */
 
+/* --ab: the arm of pass i. Blocks of four passes, each A B B A or B A A B as a fixed hash of the block's index
+ * picks: within a block each arm follows each arm alike, so a drift over the run (the context growing, the machine
+ * warming) falls on both arms; across blocks no period, so a cost that comes back every k positions (the KV's
+ * fresh pages every 8, which A B B A A B B A put on arm A alone: docs/LESSONS.md #247) falls on both too. The
+ * arms are written beside the walls (ab_pass_arm), for the report. */
+static int ab_arm(int64_t pass) {
+    static const int abba[4] = {0, 1, 1, 0};
+    uint64_t z = (uint64_t)(pass / 4) + 0x9E3779B97F4A7C15ull; /* splitmix64 of the block's index */
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    z ^= z >> 31;
+    return abba[pass % 4] ^ (int)(z & 1);
+}
+
 static int cmd_generate(int argc, char **argv) {
-    const char *model_path = NULL, *tokens_str = NULL, *profile_json_path = NULL;
-    int64_t n_gen = -1, n_prompt_synth = -1, n_ctx = 0, n_batch = 0, n_draft = 0, n_threads = 0, decode_threads = 0;
+    const char *model_path = NULL, *tokens_str = NULL, *profile_json_path = NULL, *ab_name = NULL;
+    int64_t n_gen = -1, n_prompt_synth = -1, n_ctx = 0, n_batch = 0, n_draft = 0, n_threads = 0, decode_threads = 0,
+            ab_prompt = 0;
     int do_profile = 0, spec_fixed = 0;
     uint64_t expert_budget = 0;
     const opt opts[] = {OPT_STR("-m", &model_path),
@@ -466,17 +494,25 @@ static int cmd_generate(int argc, char **argv) {
                         OPT_BUDGET(&expert_budget),
                         OPT_FLAG("--spec-fixed", &spec_fixed),
                         OPT_FLAG("--profile", &do_profile),
-                        OPT_STR("--profile-json", &profile_json_path)};
-    /* exactly one of --tokens / -p */
+                        OPT_STR("--profile-json", &profile_json_path),
+                        OPT_STR("--ab", &ab_name),
+                        OPT_NUM("--ab-prompt", &ab_prompt, 0, 256)};
+    /* exactly one of --tokens / -p; --ab-prompt only with --ab */
     if (parse_opts("generate", argc, argv, opts, N_OPTS(opts)) != 0 || model_path == NULL || n_gen < 0 ||
-        (tokens_str == NULL) == (n_prompt_synth < 0)) {
+        (tokens_str == NULL) == (n_prompt_synth < 0) || (ab_prompt > 0 && ab_name == NULL)) {
         fprintf(stderr,
                 "usage: trochilus generate -m <file.gguf> (--tokens id,id,... | -p <n>) -n <count>\n"
                 "                   [-t threads] [-c context] [-b batch] [--spec <draft>]\n"
                 "                   [--decode-threads <n>]  (threads of the decode; default 0: measured)\n"
                 "                   [--expert-budget <MiB|min>]  (experts kept in RAM; default: automatic)\n"
                 "                   [--spec-fixed]  (fixed draft length instead of adaptive, for measurement)\n"
-                "                   [--profile] [--profile-json <file>]\n");
+                "                   [--profile] [--profile-json <file>]\n"
+                "                   [--ab <switch>]  (an in-process A/B: the passes alternate A B B A, each arm's\n"
+                "                    zones timed apart, \"decode\" and \"decode_b\"; none: both arms the same code;\n"
+                "                    prep: arm B prepares every matmul's own rows and gathers the experts'; act: the\n"
+                "                    swiglu apart; argmax: the greedy token by the serial scan)\n"
+                "                   [--ab-prompt <R>]  (with --ab: the prompt evaluated R times more, rewound to\n"
+                "                    nothing each time, its arms A B B A, each eval's wall kept)\n");
         return 2;
     }
 
@@ -500,6 +536,14 @@ static int cmd_generate(int argc, char **argv) {
         fprintf(stderr, "error: %s\n", err);
         app_release(model, pool);
         return 1;
+    }
+    /* the switch an A/B flips: none (the A/A, the tool's own noise) or one the model knows */
+    int ab_sw = 0;
+    if (ab_name != NULL && (ab_sw = tr_session_ab_switch(sess, ab_name)) < 0) {
+        fprintf(stderr, "generate: --ab: unknown switch '%s' (known: none and the model's own)\n", ab_name);
+        tr_session_free(sess);
+        app_release(model, pool);
+        return 2;
     }
     const tr_model_info *info = tr_model_get_info(model);
     /* Every buffer below is sized from the context, never from -p or -n alone: n * sizeof(int32_t)
@@ -537,7 +581,7 @@ static int cmd_generate(int argc, char **argv) {
     }
 
     tr_prof *prof = tr_session_prof(sess);
-    if (do_profile || profile_json_path != NULL) prof->enabled = 1;
+    if (do_profile || profile_json_path != NULL || ab_name != NULL) prof->enabled = 1;
     prof->phase = TR_PHASE_PREFILL;
 
     double t0 = tr_time_sec();
@@ -549,13 +593,37 @@ static int cmd_generate(int argc, char **argv) {
         return 1;
     }
     double t1 = tr_time_sec();
+    /* --ab-prompt R: the prompt R times more, rewound to nothing each time, the switch's arms A B B A (the eval
+     * above warmed the caches and stays out of it), each eval's wall kept; the last leaves the prompt in the
+     * cache for the decode, as the eval above did */
+    double ab_prompt_ms[256];
+    for (int64_t r = 0; r < ab_prompt; r++) {
+        tr_session_ab_set(sess, ab_sw, ab_arm(r));
+        const double ta = tr_time_sec();
+        if (tr_session_rewind(sess, 0) != 0 || tr_session_eval(sess, prompt, n_prompt) != 0) {
+            fprintf(stderr, "generate: --ab-prompt: evaluation %" PRId64 " of the prompt failed\n", r + 1);
+            free(prompt);
+            tr_session_free(sess);
+            app_release(model, pool);
+            return 1;
+        }
+        ab_prompt_ms[r] = (tr_time_sec() - ta) * 1e3;
+        t1 = tr_time_sec();
+    }
     prof->phase = TR_PHASE_DECODE;
 
     /* at most every position left, plus the token the prompt's logits give */
     int64_t n_room = ctx - n_prompt + 1;
     int32_t *generated = (int32_t *)malloc((size_t)(n_gen < n_room ? n_gen : n_room) * sizeof(int32_t));
-    if (generated == NULL && n_gen > 0) {
+    /* --ab: every pass's wall in order, for the report's A B B A blocks (tools/ab_inproc.py); a pass makes a
+     * token at least, so the passes are fewer than the tokens */
+    double *ab_ms = ab_name != NULL ? (double *)malloc((size_t)((n_gen < n_room ? n_gen : n_room) + 1) * sizeof(double))
+                                    : NULL;
+    int64_t n_ab = 0;
+    if ((generated == NULL && n_gen > 0) || (ab_name != NULL && ab_ms == NULL)) {
         fprintf(stderr, "generate: out of memory\n");
+        free(ab_ms);
+        free(generated);
         free(prompt);
         tr_session_free(sess);
         app_release(model, pool);
@@ -568,18 +636,23 @@ static int cmd_generate(int argc, char **argv) {
     int32_t *hist = NULL;
     if (n_draft == 0) {
         for (int64_t i = 0; i < n_gen; i++) {
-            const float *logits = tr_session_logits(sess);
             uint64_t ts = tr_prof_begin(prof);
-            int32_t next = argmax_f32(logits, info->vocab_size);
+            int32_t next = tr_session_argmax(sess, 0, info->vocab_size);
             tr_prof_end(prof, TR_PROF_SAMPLE, ts);
             generated[i] = next;
             produced++;
             if (i + 1 < n_gen) {
+                if (ab_name != NULL) {
+                    prof->phase = ab_arm(i) ? TR_PHASE_DECODE_B : TR_PHASE_DECODE;
+                    tr_session_ab_set(sess, ab_sw, ab_arm(i));
+                }
+                const double ta = ab_ms != NULL ? tr_time_sec() : 0.0;
                 if (tr_session_eval(sess, &next, 1) != 0) {
                     fprintf(stderr, "generate: context full while generating\n");
                     context_full = 1;
                     break;
                 }
+                if (ab_ms != NULL) ab_ms[n_ab++] = (tr_time_sec() - ta) * 1e3;
             }
         }
     } else {
@@ -588,6 +661,7 @@ static int cmd_generate(int argc, char **argv) {
         hist = (int32_t *)malloc((size_t)ctx * sizeof(int32_t));
         if (hist == NULL) {
             fprintf(stderr, "generate: out of memory\n");
+            free(ab_ms);
             free(generated);
             free(prompt);
             tr_session_free(sess);
@@ -599,6 +673,7 @@ static int cmd_generate(int argc, char **argv) {
         if (tr_greedy_init(&g, sess, info->vocab_size, ctx, n_draft, policy, hist, n_prompt) != 0) {
             fprintf(stderr, "generate: could not start speculation\n");
             free(hist);
+            free(ab_ms);
             free(generated);
             free(prompt);
             tr_session_free(sess);
@@ -606,13 +681,21 @@ static int cmd_generate(int argc, char **argv) {
             return 1;
         }
         int32_t step[1 + TR_GREEDY_DRAFT_MAX] = {0}; /* a step fills its first `got`; no stale id past them */
+        int64_t pass = 0; /* a step is one verify pass */
         while (produced < n_gen) {
+            if (ab_name != NULL) {
+                prof->phase = ab_arm(pass) ? TR_PHASE_DECODE_B : TR_PHASE_DECODE;
+                tr_session_ab_set(sess, ab_sw, ab_arm(pass));
+                pass++;
+            }
+            const double ta = ab_ms != NULL ? tr_time_sec() : 0.0;
             int64_t got = tr_greedy_step(&g, step);
             if (got < 0) {
                 fprintf(stderr, "generate: context full while generating\n");
                 context_full = 1;
                 break;
             }
+            if (ab_ms != NULL) ab_ms[n_ab++] = (tr_time_sec() - ta) * 1e3;
             for (int64_t j = 0; j < got && produced < n_gen; j++) generated[produced++] = step[j];
         }
     }
@@ -640,16 +723,38 @@ static int cmd_generate(int argc, char **argv) {
     print_threads(pool, sess, (int)decode_threads);
     print_experts(model);
     print_gpu(model, sess);
+    if (ab_name != NULL) {
+        /* each arm's mean pass: its passes' wall over their count (the profiler's token zone) */
+        const double rate = tr_prof_ticks_per_sec();
+        const tr_prof_acc *a = &prof->acc[TR_PHASE_DECODE][TR_PROF_TOKEN], *b = &prof->acc[TR_PHASE_DECODE_B][TR_PROF_TOKEN];
+        const double ma = a->calls > 0 ? (double)a->ticks / rate / (double)a->calls * 1e3 : 0.0;
+        const double mb = b->calls > 0 ? (double)b->ticks / rate / (double)b->calls * 1e3 : 0.0;
+        fprintf(stderr, "ab: %s, arm A %" PRIu64 " passes %.3f ms, arm B %" PRIu64 " passes %.3f ms, B/A %.4f\n", ab_name,
+                a->calls, ma, b->calls, mb, ma > 0 ? mb / ma : 0.0);
+        if (ab_prompt > 0) {
+            double sa = 0.0, sb = 0.0;
+            int64_t na = 0, nb = 0;
+            for (int64_t r = 0; r < ab_prompt; r++) {
+                if (ab_arm(r)) sb += ab_prompt_ms[r], nb++;
+                else sa += ab_prompt_ms[r], na++;
+            }
+            fprintf(stderr, "ab prompt: arm A %" PRId64 " evals %.3f ms, arm B %" PRId64 " evals %.3f ms, B/A %.4f\n", na,
+                    na > 0 ? sa / (double)na : 0.0, nb, nb > 0 ? sb / (double)nb : 0.0,
+                    na > 0 && nb > 0 && sa > 0 ? (sb / (double)nb) / (sa / (double)na) : 0.0);
+        }
+    }
 
     if (do_profile) tr_prof_print(prof, stderr);
     /* fewer tokens than asked is a failure, not a success with short output (LESSONS #17) */
     int rc = context_full ? 3 : 0;
     if (profile_json_path != NULL &&
-        write_profile_json(profile_json_path, prof, model_path, n_prompt, produced, tr_pool_size(pool), sess) != 0) {
+        write_profile_json(profile_json_path, prof, model_path, n_prompt, produced, tr_pool_size(pool), sess, ab_ms,
+                           n_ab, ab_prompt > 0 ? ab_prompt_ms : NULL, ab_prompt) != 0) {
         fprintf(stderr, "generate: could not write --profile-json '%s'\n", profile_json_path);
         rc = 1;
     }
 
+    free(ab_ms);
     free(hist);
     free(generated);
     free(prompt);
@@ -1360,7 +1465,7 @@ static int cmd_chat(int argc, char **argv) {
         int64_t produced = 0;
         int full = 0;
         for (;;) {
-            int32_t next = argmax_f32(tr_session_logits(sess), info->vocab_size);
+            int32_t next = tr_session_argmax(sess, 0, info->vocab_size);
             if (next == eos || tr_tokenizer_type(tok, next) == TR_TOKEN_CONTROL) break;
             size_t pl;
             const char *piece = tr_tokenizer_piece(tok, next, &pl);

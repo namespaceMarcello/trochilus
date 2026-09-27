@@ -5,18 +5,8 @@
 
 /* hot: begin */
 
-/* First maximum wins, as everywhere else: the tie-break is part of the result. */
-static int32_t argmax_f32(const float *x, int64_t n) {
-    int32_t best = 0;
-    float bv = x[0];
-    for (int64_t i = 1; i < n; i++) {
-        if (x[i] > bv) {
-            bv = x[i];
-            best = (int32_t)i;
-        }
-    }
-    return best;
-}
+/* The greedy token is tr_session_argmax's: the first maximum wins, as everywhere else (the tie-break is part of the
+ * result), on the model's pool. */
 
 int tr_greedy_init(tr_greedy *g, tr_session *s, int64_t vocab, int64_t n_ctx, int64_t n_draft,
                    tr_draft_policy policy, int32_t *hist, int64_t n_hist) {
@@ -36,7 +26,7 @@ int tr_greedy_init(tr_greedy *g, tr_session *s, int64_t vocab, int64_t n_ctx, in
     g->back = 0;
     g->hist = hist;
     g->n_hist = n_hist;
-    g->next = argmax_f32(logits, vocab);
+    g->next = tr_session_argmax(s, 0, vocab);
     g->n_steps = g->n_drafted = g->n_accepted = 0;
     return 0;
 }
@@ -70,12 +60,12 @@ int64_t tr_greedy_step(tr_greedy *g, int32_t *out) {
     /* Row `back` of the pass is the logits after buf[k - back]: back = k - a is the model's
      * own choice after the first a drafted tokens were accepted. */
     int64_t a = 0;
-    while (a < k && argmax_f32(tr_session_logits_back(s, k - a), g->vocab) == g->draft[a]) {
+    while (a < k && tr_session_argmax(s, k - a, g->vocab) == g->draft[a]) {
         out[1 + a] = g->draft[a];
         g->hist[g->n_hist++] = g->draft[a];
         a++;
     }
-    g->next = argmax_f32(tr_session_logits_back(s, k - a), g->vocab);
+    g->next = tr_session_argmax(s, k - a, g->vocab);
 
     /* Anything past the accepted prefix was never emitted: forget those cache rows. Must come
      * after the line above, because a rewind invalidates the logits. */

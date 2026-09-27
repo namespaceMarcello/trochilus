@@ -8,7 +8,9 @@
 #   sh tools/machine_still.sh [limit, default 3.0] [seconds to wait, default 600] [window, default 10]
 #
 # Exit 0 when the machine is still; exit 1 after the wait, with the processes that are using the
-# CPU. The measuring scripts call it before the first run (tools/measure_guard.lib,
+# CPU. Every waiting line names them too, the protected ones included (a look of one window more:
+# on 2026-09-27 a session waited seven times and nobody could say for whom, docs/LESSONS.md #241).
+# The measuring scripts call it before the first run (tools/measure_guard.lib,
 # measure_still) and, through AB_GUARD of tools/ab_modes.sh, before every run: a machine that
 # gets busy half way stops the comparison instead of ending up inside a median.
 # The limit is this machine's: with the containers stopped it idles at 1.8 logical processors
@@ -38,9 +40,11 @@ while :; do
   BUSY=$(busy | head -1)
   if awk -v b="$BUSY" -v l="$LIMIT" 'BEGIN { exit !(b != "" && b + 0 <= l + 0) }'; then exit 0; fi
   [ "$T" -lt "$WAIT" ] || break
-  echo "machine_still: $BUSY logical processors busy (limit $LIMIT), waiting" >&2
+  # who: the processes of one window more (none on /proc/stat)
+  WHO=$(busy -Top | sed -n 2p)
+  echo "machine_still: $BUSY logical processors busy (limit $LIMIT), waiting${WHO:+ ($WHO)}" >&2
   sleep 8
-  T=$((T + WINDOW + 9))
+  T=$((T + 2 * WINDOW + 9))
 done
 echo "machine_still: $BUSY logical processors busy after $WAIT s (limit $LIMIT): the machine is not still" >&2
 busy -Top | tail -n +2 >&2

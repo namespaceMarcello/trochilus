@@ -65,12 +65,21 @@ typedef struct {
 #if defined(TR_POOL_TRACE)
     int trace_call, trace_chunk; /* where this chunk's start and end go, -1: not traced */
 #endif
+    /* The idle hint (tr_pool_hint): the dispatcher stores base, bytes and level, then hint_seq
+     * (release); the worker, spinning for work, sees hint_seq move and brings the bytes in. A torn
+     * pair (a new base with the old bytes) only prefetches other bytes: prefetches never fault. */
+    atomic_uint hint_seq;
+    atomic_uintptr_t hint_base;
+    atomic_size_t hint_bytes;
+    atomic_int hint_level;
+    unsigned hint_seen;           /* the worker's own: the last hint_seq it took */
+    atomic_uint_fast64_t hint_taken, hint_lines; /* written by the worker alone (tr_pool_hint_counts) */
 } slot;
 
 /* Slots on lines of their own: a worker polling its state never shares a line with another
- * slot. The slot is 72 bytes, so a union with char[64] packed them at 72-byte strides and put
+ * slot. The slot was 72 bytes, so a union with char[64] packed them at 72-byte strides and put
  * worker k's state on the line of worker k-1's begin/end, which the dispatcher writes on every
- * call (docs/LESSONS.md #104). */
+ * call (docs/LESSONS.md #104). With the hint it spans two lines, both its own. */
 typedef struct {
     _Alignas(64) slot s;
 } slot_line;
@@ -89,6 +98,7 @@ _Static_assert(sizeof(region_line) % 64 == 0, "a region_line must fill whole cac
 struct tr_pool {
     int size; /* includes the calling thread */
     int active; /* threads a parallel_for may use, 1..size: the dispatcher's own, no worker reads it */
+    int hint_level; /* tr_pool_set_hints: the dispatcher's own, posted with every hint */
     double spin_sec;
     int blocks;         /* blocks a region is claimed in (TR_POOL_BLOCKS); 1: one block, no help */
     int call_chunks;    /* the current call's regions: written before its READY stores */
@@ -219,12 +229,40 @@ static void run_chunk(tr_pool *p, int own, tr_range_fn fn, void *ctx, int worker
     }
 }
 
+/* The hint the dispatcher posted, brought in two lines at a time between checks of the slot: the
+ * moment a call arrives the worker leaves the rest and runs it. Level 1 into L1 (T0), 2 into L2 (T2). */
+static void hint_run(slot *w) {
+    w->hint_seen = atomic_load_explicit(&w->hint_seq, memory_order_acquire);
+    const char *b = (const char *)atomic_load_explicit(&w->hint_base, memory_order_relaxed);
+    const size_t n = atomic_load_explicit(&w->hint_bytes, memory_order_relaxed);
+    const int level = atomic_load_explicit(&w->hint_level, memory_order_relaxed);
+    atomic_store_explicit(&w->hint_taken, atomic_load_explicit(&w->hint_taken, memory_order_relaxed) + 1,
+                          memory_order_relaxed); /* counted as it starts: a test can wait for it */
+    uint64_t lines = 0;
+    for (size_t o = 0; o < n; o += 128, lines += 2) {
+        if (atomic_load_explicit(&w->state, memory_order_relaxed) == SLOT_READY) break;
+        if (level == 1) {
+            __builtin_prefetch(b + o, 0, 3);
+            __builtin_prefetch(b + o + 64, 0, 3);
+        } else {
+            __builtin_prefetch(b + o, 0, 1);
+            __builtin_prefetch(b + o + 64, 0, 1);
+        }
+    }
+    atomic_store_explicit(&w->hint_lines, atomic_load_explicit(&w->hint_lines, memory_order_relaxed) + lines,
+                          memory_order_relaxed);
+}
+
 static void worker_loop(slot *w) {
     tr_pool *p = w->pool;
     t_worker_id = w->id;
     for (;;) {
         double t0 = tr_time_sec();
         for (unsigned i = 1; atomic_load(&w->state) != SLOT_READY && !atomic_load(&p->shutdown); i++) {
+            if (atomic_load_explicit(&w->hint_seq, memory_order_relaxed) != w->hint_seen) {
+                hint_run(w);
+                continue;
+            }
             CPU_RELAX();
             if ((i & 63u) == 0 && tr_time_sec() - t0 > p->spin_sec) {
                 POOL_LOCK(p);
@@ -300,7 +338,7 @@ tr_pool *tr_pool_create(int n_threads) {
     p->active = n_threads;
     p->slots = tr_alloc_aligned(sizeof(slot_line) * (size_t)n_threads, 64);
     p->regions = tr_alloc_aligned(sizeof(region_line) * (size_t)n_threads, 64);
-    p->workers = n_threads > 1 ? malloc(sizeof *p->workers * (size_t)(n_threads - 1)) : NULL;
+    p->workers = n_threads > 1 ? calloc((size_t)(n_threads - 1), sizeof *p->workers) : NULL;
     if (p->slots == NULL || p->regions == NULL || (n_threads > 1 && p->workers == NULL)) {
         tr_free_aligned(p->slots);
         tr_free_aligned(p->regions);
@@ -321,6 +359,12 @@ tr_pool *tr_pool_create(int n_threads) {
     p->blocks = TR_POOL_BLOCKS;
     const char *blocks_env = getenv("TR_POOL_BLOCKS");
     if (blocks_env != NULL && atoi(blocks_env) >= 1) p->blocks = atoi(blocks_env);
+    /* Idle hints (tr_pool_hint): off. In the bench a call after a serial step gains up to the step's
+     * length; in the engine the serial steps after the hints lose as much (docs/MEASUREMENTS.md §The idle
+     * workers). TR_POOL_HINT=1 or 2 turns them on (into L1, into L2), for measurements. */
+    tr_pool_set_hints(p, 0);
+    const char *hint_env = getenv("TR_POOL_HINT");
+    if (hint_env != NULL) tr_pool_set_hints(p, atoi(hint_env));
 
     /* One thread per slot, in the order cpu.c ranked them: physical cores first, spread
      * over the last-level caches. More threads than slots means the extra ones are left
@@ -341,6 +385,13 @@ tr_pool *tr_pool_create(int n_threads) {
         slot *w = &p->slots[i].s;
         atomic_init(&w->state, SLOT_IDLE);
         atomic_init(&w->sleeping, 0);
+        atomic_init(&w->hint_seq, 0);
+        atomic_init(&w->hint_base, 0);
+        atomic_init(&w->hint_bytes, 0);
+        atomic_init(&w->hint_level, 0);
+        atomic_init(&w->hint_taken, 0);
+        atomic_init(&w->hint_lines, 0);
+        w->hint_seen = 0;
         w->fn = NULL;
         w->ctx = NULL;
         w->chunk = i;
@@ -441,17 +492,64 @@ int tr_pool_active(const tr_pool *p) {
     return p != NULL ? p->active : 1;
 }
 
+void tr_pool_set_hints(tr_pool *p, int level) {
+    if (p != NULL) p->hint_level = level == 1 || level == 2 ? level : 0;
+}
+
+int tr_pool_hints(const tr_pool *p) {
+    return p != NULL ? p->hint_level : 0;
+}
+
+void tr_pool_hint_counts(const tr_pool *p, int worker, uint64_t *hints, uint64_t *lines) {
+    *hints = *lines = 0;
+    if (p == NULL || worker < 1 || worker >= p->size) return;
+    *hints = atomic_load_explicit(&p->slots[worker].s.hint_taken, memory_order_relaxed);
+    *lines = atomic_load_explicit(&p->slots[worker].s.hint_lines, memory_order_relaxed);
+}
+
+void tr_pool_hint_peek(const tr_pool *p, int chunk, const void **base, size_t *bytes) {
+    *base = NULL;
+    *bytes = 0;
+    if (p == NULL || chunk < 1 || chunk >= p->size) return;
+    *base = (const void *)atomic_load_explicit(&p->slots[chunk].s.hint_base, memory_order_relaxed);
+    *bytes = atomic_load_explicit(&p->slots[chunk].s.hint_bytes, memory_order_relaxed);
+}
+
 /* hot: begin */
+/* The chunks a call of n indices is split into (1: it runs on the calling thread). */
+static int pool_chunks(const tr_pool *p, int64_t n, int64_t min_chunk) {
+    if (min_chunk < 1) min_chunk = 1;
+    if (p == NULL || t_depth != 0 || n < min_chunk) return 1;
+    int64_t max_chunks = n / min_chunk;
+    return p->active < max_chunks ? p->active : (int)max_chunks;
+}
+
+int tr_pool_region(const tr_pool *p, int64_t n, int64_t min_chunk, int chunk, int64_t *begin, int64_t *end) {
+    const int chunks = n > 0 ? pool_chunks(p, n, min_chunk) : 1;
+    *begin = *end = 0;
+    if (n <= 0 || chunk < 0 || chunk >= chunks) return chunks;
+    const int64_t base = n / chunks, rem = n % chunks;
+    *begin = (int64_t)chunk * base + (chunk < rem ? chunk : rem);
+    *end = *begin + base + (chunk < rem ? 1 : 0);
+    return chunks;
+}
+
+void tr_pool_hint(tr_pool *p, int chunk, const void *base, size_t bytes) {
+    if (p == NULL || p->hint_level == 0 || chunk < 1 || chunk >= p->active || bytes == 0) return;
+    slot *w = &p->slots[chunk].s;
+    atomic_store_explicit(&w->hint_base, (uintptr_t)base, memory_order_relaxed);
+    atomic_store_explicit(&w->hint_bytes, bytes, memory_order_relaxed);
+    atomic_store_explicit(&w->hint_level, p->hint_level, memory_order_relaxed);
+    atomic_store_explicit(&w->hint_seq, atomic_load_explicit(&w->hint_seq, memory_order_relaxed) + 1,
+                          memory_order_release);
+}
+
 /* blocks: how many blocks a region is claimed in, 1 for the static split. */
 static void pool_run(tr_pool *p, int64_t n, int64_t min_chunk, tr_range_fn fn, void *ctx, int blocks) {
     if (n <= 0) return;
     if (min_chunk < 1) min_chunk = 1;
 
-    int chunks = 1;
-    if (p != NULL && t_depth == 0 && n >= min_chunk) {
-        int64_t max_chunks = n / min_chunk;
-        chunks = p->active < max_chunks ? p->active : (int)max_chunks;
-    }
+    int chunks = pool_chunks(p, n, min_chunk);
     if (chunks <= 1) {
         int worker = t_worker_id >= 0 ? t_worker_id : 0;
 #if defined(TR_POOL_TRACE)

@@ -1393,3 +1393,146 @@ ROW_PRICE_AA=1 sh tools/row_price.sh <after> 4 <before>`.
 Check: `make check` (test_phase's `test_session_rows` and `test_rows_env`, test_cli's verify line and JSON);
 `MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src trochilus-dev:local sh tools/mutate_tune.sh`
 (twenty-three mutations, all red, under ASan); `generate ... --spec 2 --spec-fixed` prints the verify widths.
+
+### 2026-09-27 — A Q4_K weight row decoded once for 2-3 tokens (question 78's road (c))
+- `src/kernels/kernels.h`: `q4x_dot_xt`, two Q4_K rows against T = 2 or 3 prepared rows (`TR_Q4X_XT_MAX`),
+  y[t * y_stride + r]. `kernels.c`: the scalar definition (the pairs one input row after the other); the driver
+  (`matmul_q4x`) sends a group under 4 input rows (`Q4X_MIN_TILE_ROWS` 4, 3 on a tier without xt) to `q4x_rows`,
+  which cuts it into runs of 3, or of 2 when 2 or 4 are left, and pairs a lone row with `q4x_dot2`.
+  `kernels_x86.c`: AVX-512 (`q4x_dot_xt_t`, instances 2 and 3 in `g_q4x_xts`: the weight side once a window for the
+  run, 4 `vpdpwssd` a token, `q4x_dot2`'s header pre-pass and block end in `q4x_headers2` and `q4x_end2`; the
+  decode's `q4x_dot2` left as committed), AVX2 and the novbmi tier by AVX2's pairs.
+- `tests/bench_q4x.c`, `tools/bench_q4x.sh`: the kernels in L1 and from RAM on P threads (dot2 a token at a time,
+  xt, the W16 panel and a tile). In the engine, Q4_K at 8 threads: 2 rows 0.94-0.98, 3 rows 0.96-0.985 in three sessions (21.45 and 26.45 ms on a free machine); the prompt unchanged, the one-row pass +0.8-1.7% spread over every zone (LESSONS #242) (MEASUREMENTS §A Q4_K weight row
+  decoded once for 2-3 tokens).
+- Tests: xt against scalar's dot_row on every tier (an exact buffer, canaries), `test_q4x_witnesses` (a signed
+  zero, cancelling mins, the blocks' order on every Q4_K kernel), `test_short_pass_q4k` (the calls counted
+  exactly), test_tier_used (each tier's own xt, its products counted); `tools/mutate_q4x.sh` 47 mutations.
+Check: `make check`; `MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src trochilus-dev:local sh
+tools/mutate_q4x.sh` (47 red); `NATIVE=1 sh tools/bench_q4x.sh 11 --ram 8`; `ROW_PRICE_FORCED=1 ROW_PRICE_CFGS="Q4_K 8"
+ROW_PRICE_MODES="0,1,2" ROW_PRICE_AA=1 ROW_PRICE_OUT=build/rp-<name> sh tools/row_price.sh <after> 6 <before>`.
+
+### 2026-09-27 — The still check names who keeps the machine busy
+- `tools/cpu_busy.ps1 -Top`: the three processes that used the most in the window, in cores, and the kernel's
+  System apart, from the raw per-process counters (the protected processes too: the antivirus, the indexer,
+  the WSL VM, which Get-Process could not read). `tools/machine_still.sh`: every waiting line names them
+  (LESSONS #241); the /proc/stat branch prints the number alone, as before.
+- LESSONS #222 corrected: the repo is excluded from Windows Search (its indexed locations, 2026-09-27).
+Check: `sh tools/busy_machine.sh 6 sh tools/machine_still.sh 3.0 20 3` (waiting lines with "yes 6.00" first,
+exit 1); `sh tools/machine_still.sh 3.0 0 3` on a quiet machine (exit 0).
+
+### 2026-09-27 — An A/B inside one process (generate --ab); the decode's +1% was a file's own
+- `generate --ab <switch>`: the passes (a step with --spec) alternate A B B A, each arm's zones in its own phase of the
+  profile (`TR_PHASE_DECODE_B`, "decode_b"), every pass's wall in `--profile-json` (`ab_pass_ms`), a line "ab: ..."
+  with each arm's passes and mean. Only `none` today (the A/A: both arms the same code); a switch the model reads
+  comes with the first change that needs one. `tools/ab_inproc.sh` runs it under the native guards,
+  `tools/ab_inproc.py` prints each arm, the A B B A blocks and THE ESTIMATE (the arms' means without the first block):
+  the A/A 1.0004 +- 0.0028 over 6 runs (MEASUREMENTS §An A/B inside one process).
+- LESSONS #242 not reproduced: the road (c) binary 0.997 of HEAD's over 14 rounds, its kernels at HEAD's places and
+  all its code 64 bytes on level too; two files of the same bytes differ by 1-2% (#243), a load the CPU guard cannot
+  see slowed 8 runs by 30-60% (#244) (MEASUREMENTS §The decode's +1% and the code's layout).
+- Tests: test_cli (the arms' passes 5 and 6 of 11, the phases' tokens in the JSON, the 11 walls, the tokens identical
+  to a run without --ab, with --spec too, an unknown switch refused); red when every pass goes to arm A.
+Check: `make check`; `AB_INPROC_OUT=build/ab-x sh tools/ab_inproc.sh build/trochilus.exe none 6` (a copy one byte
+longer where Smart App Control holds it): THE ESTIMATE within +-0.3%.
+
+### 2026-09-27 — The prep once a row: q/k/v from one prep, gate and up through a map (question 83, P1 + P2)
+- `src/kernels/kernels.h`, `kernels.c`: `tr_q4x_prepare` (a pass's rows prepared once into the caller's buffer),
+  `tr_q4x_road` and `tr_matmul_q4x_prepared` (a call on those rows, group row p reading prepared row map[p]);
+  `q4x_dot_xt` and `q4x_tile` take a pointer a prepared row (scalar, AVX2, AVX-512). `src/models/olmoe.c`: the
+  session's `xq_tok` and `xmap`; q, k and v from one prep (a matrix of another type from the floats), gate and up from
+  the ffn-normed rows through the map, no gather on that road; the switch `prep` (arm B, the old road).
+- `generate --ab prep`, `--ab-prompt R` (the prompt again R times, rewound, A B B A, its walls in `ab_prompt_ms`);
+  `tools/ab_inproc.sh` takes AB_INPROC_PROMPT, `tools/ab_inproc.py` prints THE PROMPT'S ESTIMATE.
+- Measured in one process (MEASUREMENTS §The prep once a row): the prompt 1.058, a 3-row verify pass 1.026, the decode
+  1.010 (the old road over the new; with P4 1.025 once the arms were aperiodic, LESSONS #247); the real model's logits
+  identical.
+- Tests: test_tier_used (412 preps, 888 on prep's arm B, every pass's logits the same bits), test_kernels (xt and tile
+  with their rows in reverse), test_cli (`--ab prep --ab-prompt 4`, `--ab-prompt` without `--ab` refused);
+  `tools/mutate_q4x.sh` 54 mutations, 7 new, all red, and a first pass without builds that stops on a stale text
+  (LESSONS #245; MUTATE_DRY=1 runs only it).
+Check: `make check`; `MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src trochilus-dev:local sh
+tools/mutate_q4x.sh`; `AB_INPROC_PROMPT=8 sh tools/ab_inproc.sh build/trochilus.exe prep 4` (a copy one byte
+longer where Smart App Control holds it): THE ESTIMATE ~1.01, THE PROMPT'S ESTIMATE ~1.06.
+
+### 2026-09-27 — The swiglu and the down's prep in one call (question 83, P4)
+- `src/kernels/kernels.c`, `kernels.h`: `tr_swiglu_prepare` (the swiglu by whole rows, each row prepared while it is
+  in its core's cache; tr_swiglu's floats, q4x_prep's bytes). `src/models/olmoe.c`: on Q4_K's road the down reads the
+  rows the act prepared (`pm.xq`, no call between); the switch `act` (arm B, the old act and down).
+- `tests/bench_q4x.c`: a line for the prep alone (one row of 2048 in L1: 699.6 ns).
+- Measured in one process (MEASUREMENTS §The prep once a row): the prompt 1.0087, the decode level.
+- Tests: `test_swiglu_prepare` (every tier and pool, special values), test_tier_used (412 preps on act's arm B too,
+  every pass's logits the same bits); three mutations in `tools/mutate_q4x.sh` (58).
+Check: `make check`; `AB_INPROC_PROMPT=8 sh tools/ab_inproc.sh build/trochilus.exe act 8`.
+
+### 2026-09-27 — The in-process A/B's arms without a period (LESSONS #247)
+- `src/app/main.c` `ab_arm`: each block of four passes A B B A or B A A B by a hash of its index; the arms written
+  beside the walls (`ab_pass_arm`, `ab_prompt_arm`); `tools/ab_inproc.py` reads them (older runs: A B B A).
+- Why: every 8 positions a pass writes the KV into fresh pages, and A B B A put that pass on arm A alone; the decode's
+  prep work read 1.010 aliased, 1.025 aperiodic.
+- Test: test_cli sees both arms at every position mod 8 over 39 passes, red with the old order.
+Check: `make check`.
+
+### 2026-09-27 — The argmax split over the pool
+- `src/kernels/kernels.c`, `kernels.h`: `tr_argmax_f32` (chunks on the head's items, eight lanes, merged in order: the
+  serial scan's index). `src/models/model.c`, `model.h`: `tr_session_argmax(s, back, n)` on the model's pool, the
+  session's switch `argmax` (arm B the serial scan). `src/app/main.c`, `src/gen/greedy.c`: every greedy token through it.
+- Measured in one process (MEASUREMENTS §The argmax in parallel): the sample zone 116-118 -> 5.6-6.9 us, a token ~0.7%;
+  a 3-row verify pass 1.0175.
+- Tests: `test_argmax`; test_spec and test_cli unchanged (the narrower vocabulary, LESSONS #248); four mutations in
+  `tools/mutate_q4x.sh` (62).
+Check: `make check`; `sh tools/ab_inproc.sh build/trochilus.exe argmax 6` (the sample zone per arm).
+
+### 2026-09-27 — The KV's pages touched in time
+- `src/kv/kv.c`, `kv.h`: every head's stream starts a page (the blocks page-aligned, a stream padded to whole pages:
+  `tr_kv.stream`); `tr_kv_fresh_page` (a pass's positions enter a page no earlier position reached), `tr_kv_touch` (a
+  zero at a range's first byte and at every page boundary), `tr_kv_touch_pass` (the pages a pass enters, over the
+  pool, never past its end). `src/models/olmoe.c`: `kv_touch_pass` before every pass's layers, the zone `kv_touch`
+  (`src/base/prof.{h,c}`), `TR_KV_TOUCH=0` off.
+- Measured (MEASUREMENTS §The KV's pages touched in time): the decode's kv_write 80.2 -> 49.7 us a token, the touch
+  4.9 (+0.17%), a first prompt 3.8 ms (+0.4%), the attention level. A window touched ahead cost the attention 2.4%:
+  pages present past the streams' ends slow the reads (LESSONS #250), closed.
+- Tools: `tools/ab_env.sh` + `tools/ab_env.py` (an environment switch raced process against process, every run's zones);
+  `bench_mem faults` and `bench_mem kvend`; `BENCH_BUILD` in `tools/bench_native.sh` (LESSONS #251).
+- Tests: `test_kv` (every byte of a touch and of a pass's touch, the fresh-page rule against every stream's pages at
+  their addresses), `test_session` (a model whose pages hold 8 positions: the same logits with the touch on and off
+  through a prompt, a decode, a rewind and the context's end, 24 touches); `tools/mutate_kv.sh` 22 mutations.
+Check: `make check`; `AB_ENV_OUT=build/<name> sh tools/ab_env.sh build/trochilus.exe 12 "on=TR_KV_TOUCH=1"
+"off=TR_KV_TOUCH=0" "on2=TR_KV_TOUCH=1"` (the kv_write and kv_touch zones).
+
+### 2026-09-27 — The routers as bf16, and the argmax in parallel for every run
+- `src/kernels/kernels.c`, `kernels.h`, `kernels_internal.h`, `kernels_x86.c`: `tr_f32_to_bf16_exact` (an F32 matrix
+  narrowed in place when every value's low half is zero), `tr_bf16_to_float`, the BF16 rows of every tier (`dot_row`,
+  `dot_row_x4`, `dequant_row`: scalar, AVX2, AVX-512), an F32 row's bits by construction. `src/models/olmoe.c`:
+  `read_mat` narrows every F32 matrix that fits (OLMoE's 16 routers), `TR_BF16_EXACT=0` keeps F32. BF16 is not a
+  file's type (`tr_kernels_support`).
+- `src/models/model.c`: the session's (and the model's) struct from `calloc`: the parallel argmax had run only inside
+  `generate --ab` (LESSONS #252); `src/format/gguf.c`, `src/base/platform.c`, `src/base/threads.c` likewise.
+  `tools/lint.py`: `malloc(sizeof *x)` refused in `src/`.
+- Measured (MEASUREMENTS §The routers as bf16): the router zone 179-186 -> 120-130 us a token (~0.4%); every run's
+  sample zone 118 -> 5.5 us (+0.74%).
+- Tests: `test_kernels` (BF16 rows against the F32 rows they widen to, every tier and scalar; the narrowing),
+  `test_tier_used` (a Q8_0 and a Q4_K model whose router fits bf16: its products through the BF16 entries, logits the
+  bits of the router kept F32); `tests/synth_olmoe.h` `synth_bf16_router`; `tools/mutate_bf16.sh` 17 mutations.
+Check: `make check`; `sh tools/ab_env.sh build/trochilus.exe 12 "on=TR_BF16_EXACT=1" "off=TR_BF16_EXACT=0"
+"on2=TR_BF16_EXACT=1"` (the router and sample zones).
+
+### 2026-09-27 — What lies past a region's end, and the idle workers (off)
+- `tests/bench_q4x.c`: `--ends P` (question 84: what lies past a thread's region, guard, own, ownrev, next, next0,
+  raced set by set) and `--idle P` (a serial step of W us then a call from RAM, the idle hints off against on, T0 and
+  T2, raced set by set).
+- `src/base/threads.{h,c}`: each slot a mailbox (`tr_pool_hint`: the next call's first bytes for a chunk's thread,
+  brought in two lines at a time while it spins, left the moment a call comes; `tr_pool_set_hints`, off as a pool
+  starts, `TR_POOL_HINT=1|2`; `tr_pool_hint_counts`, `tr_pool_hint_peek` for the tests); `tr_pool_region` (a chunk's
+  region as `pool_run` cuts it). `src/kernels/kernels.{h,c}`: `tr_matmul_hint` (the hints as the call splits it: the
+  Q4_K road's items, tr_matmul_grouped's rows). `src/models/olmoe.c`: hints before q, the router, gate and the output
+  matrix, the `idle` switch (generate --ab), `TR_HINT_KB` (research).
+- Measured (MEASUREMENTS §The idle workers, and what lies past a region's end): question 84 answered (a dense call
+  ~0.8% for its region ends, the experts' nothing); the idle hints 1.02-1.14 a call in the bench, level in the engine
+  (12 runs 0.9962 +- 0.0039): the serial step after each hint pays what the call gains (LESSONS #255), so off.
+- Tests: `test_base` (regions against the calls that run them; a hint taken whole, left for a call, ignored three
+  ways with the workers awake), `test_kernels` (each worker's hint where its first block reads, two roads, 8 and 3
+  threads, the caps), `test_tier_used` (a decode's hints taken; the idle switch's arm B hints nothing, the same bits);
+  `tools/mutate_idle.sh` 16 mutations.
+Check: `make check`; `BENCH_BUILD=build/<dir> sh tools/bench_native.sh bench_q4x --idle 8`; `TR_POOL_HINT=2
+AB_INPROC_OUT=build/<name> sh tools/ab_inproc.sh build/trochilus.exe idle 12`.

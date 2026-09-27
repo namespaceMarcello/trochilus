@@ -33,6 +33,12 @@
  *                            rows     [position][head]: a head reads 512 B every 8 KiB
  *                            heads    [head][position]: a head reads its positions in a row
  *
+ *   bench_mem kvend <n>    a decode token's attention over n written positions of the engine's own
+ *                          KV cache, with the pages past the streams' ends absent or touched ahead
+ *   bench_mem faults       the first write to each page of the KV cache: the decode's writes on
+ *                          fresh pages and on pages touched ahead, and tr_kv_touch alone on 1 to
+ *                          16 threads, with the faults the OS counted
+ *
  *   bench_mem <group> [--runs N]
  *
  * Threads are the engine's pool, so they sit on the cores the engine would use. Every line is
@@ -47,7 +53,17 @@
 #include "../src/base/platform.h"
 #include "../src/base/threads.h"
 #include "../src/kernels/kernels.h"
+#include "../src/kv/kv.h"
 #include "../src/models/model_internal.h"
+
+#if defined(_WIN32)
+#  define WIN32_LEAN_AND_MEAN
+#  define NOMINMAX
+#  include <windows.h>
+#  include <psapi.h>
+#else
+#  include <sys/resource.h>
+#endif
 
 #define MAX_RUNS 31
 #define MAX_WORKERS 64
@@ -632,6 +648,191 @@ static int group_kv(int64_t n_pos) {
     return 0;
 }
 
+/* ---- kvend: what lies past the streams' ends ------------------------------------------------------ */
+/* A decode token's attention reads each head's positions [0, n) as one ascending stream (tr_attention_head).
+ * Past the end the cache's next pages are either not there yet (each write faults its own page) or already
+ * faulted in (tr_kv_touch ahead); in the engine, touching ahead cost the decode's attention 1.5-2.3%
+ * (docs/MEASUREMENTS.md §The KV's pages touched ahead). The engine's cache (tr_kv_init, context 4096), positions
+ * [0, n) written (tr_kv_write), then nothing, or the next 8 or 64 positions touched. Every repetition gives each
+ * variant a new cache (so no cache's physical pages favor a variant), the variants in a rotating order; one
+ * token's attention over the 16 layers on 8 threads, 64 MiB read between two layers, and a plain read of the
+ * same streams. */
+
+static const int kvend_ahead[] = {0, 8, 64};
+#define KVEND_V ((int)(sizeof kvend_ahead / sizeof kvend_ahead[0]))
+
+static int group_kvend(int64_t n_pos) {
+    if (n_pos < 1 || n_pos + 64 > KV_CTX) {
+        fprintf(stderr, "bench_mem: kvend wants 1 to %d positions\n", KV_CTX - 64);
+        return 2;
+    }
+    const int T = tr_cpu()->physical_cores < 8 ? tr_cpu()->physical_cores : 8;
+    unsigned char *other = (unsigned char *)tr_alloc_aligned(4 * FLUSH_BYTES, 4096);
+    float *q = (float *)tr_alloc_aligned((size_t)(3 * N_KV) * sizeof(float), 64);
+    float *scores = (float *)tr_alloc_aligned((size_t)MAX_WORKERS * KV_CTX * sizeof(float), 64);
+    tr_pool *pool = tr_pool_create(T);
+    if (other == NULL || q == NULL || scores == NULL || pool == NULL) {
+        fprintf(stderr, "bench_mem: out of memory\n");
+        return 1;
+    }
+    float *out = q + N_KV, *row = q + 2 * N_KV; /* row: one token's K (and V) as the projections leave it */
+    fill(pool, other, 4 * FLUSH_BYTES, 0);
+    fill(pool, (unsigned char *)q, (size_t)N_KV * sizeof(float), 1);
+    fill(pool, (unsigned char *)row, (size_t)N_KV * sizeof(float), 1);
+    ram_ctx flush;
+    flush.block = (FLUSH_BYTES / (size_t)T) & ~(size_t)4095;
+    flush.order = NULL;
+    double secs[2][KVEND_V][MAX_RUNS];
+    for (int r = -1; r < n_runs; r++) {
+        for (int i = 0; i < KVEND_V; i++) {
+            int v = (r + 1 + i) % KVEND_V;
+            tr_kv kv;
+            if (tr_kv_init(&kv, N_LAYER, N_HEAD, HEAD_DIM, KV_CTX) != 0) {
+                fprintf(stderr, "bench_mem: out of memory\n");
+                return 1;
+            }
+            for (int64_t p = 0; p < n_pos; p++)
+                for (int64_t L = 0; L < N_LAYER; L++) tr_kv_write(&kv, L, p, 1, row, row);
+            tr_kv_touch(&kv, 0, tr_kv_streams(&kv), n_pos, n_pos + kvend_ahead[v]);
+            for (int plain = 0; plain <= 1; plain++) {
+                kv_ctx c = {NULL, NULL, q, scores, out, n_pos, 1, plain};
+                double sum = 0.0;
+                for (int L = 0; L < N_LAYER; L++) {
+                    c.keys = tr_kv_keys(&kv, L, 0);
+                    c.values = tr_kv_values(&kv, L, 0);
+                    flush.base = other + (size_t)(L % 4) * FLUSH_BYTES;
+                    tr_parallel_for(pool, T, 1, ram_body, &flush);
+                    double t0 = tr_time_sec();
+                    tr_parallel_for(pool, N_HEAD, 1, kv_body, &c);
+                    sum += tr_time_sec() - t0;
+                }
+                if (r >= 0) secs[plain][v][r] = sum;
+            }
+            tr_kv_free(&kv);
+        }
+    }
+    sinks[0].sum += float_bits(out);
+    for (int plain = 0; plain <= 1; plain++)
+        for (int v = 0; v < KVEND_V; v++) {
+            char name[64];
+            snprintf(name, sizeof name, "kvend %4d +%-2d %s", (int)n_pos, kvend_ahead[v], plain ? "read" : "attention");
+            report(name, T, secs[plain][v], n_runs, (double)N_LAYER * (double)n_pos * N_KV * 2 * sizeof(float), 0);
+        }
+    tr_pool_destroy(pool);
+    tr_free_aligned(scores);
+    tr_free_aligned(q);
+    tr_free_aligned(other);
+    return 0;
+}
+
+/* ---- faults: the first write to a page ---------------------------------------------------------- */
+/* The KV cache is allocated untouched (src/kv/kv.c): a page becomes memory at its first write. A
+ * decode token writes a row of 512 B into each of 512 streams, so every 8 positions each stream
+ * enters a fresh page: 512 faults inside one pass's writes, on the thread that writes
+ * (docs/MEASUREMENTS.md §The KV's pages touched ahead). Every repetition allocates the engine's own
+ * cache anew (tr_kv_init, OLMoE-1B-7B's shape at a context of 4096), writes window 0 (positions
+ * 0-63: the page tables) untimed, reads 64 MiB, then times window 1 (positions 64-127):
+ *   rows fresh     the decode's writes (tr_kv_write, 16 layers a position) on fresh pages
+ *   rows touched   the same, the window touched before the 64 MiB read (tr_kv_touch)
+ *   touch          tr_kv_touch on the window alone, the streams split over T threads
+ * Each line: the window's median time, per position (a decode token's share) and per page, and the
+ * faults the process took in it by the OS's own count (median). */
+
+#define WIN_POS 64
+
+static uint64_t page_faults(void) {
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS c;
+    return K32GetProcessMemoryInfo(GetCurrentProcess(), &c, sizeof c) ? (uint64_t)c.PageFaultCount : 0;
+#else
+    struct rusage u;
+    return getrusage(RUSAGE_SELF, &u) == 0 ? (uint64_t)u.ru_minflt + (uint64_t)u.ru_majflt : 0;
+#endif
+}
+
+typedef struct {
+    tr_kv *kv;
+    int64_t lo, hi;
+} touch_ctx;
+
+static void touch_body(void *ctx_, int64_t begin, int64_t end, int worker) {
+    (void)worker;
+    const touch_ctx *c = (const touch_ctx *)ctx_;
+    tr_kv_touch(c->kv, begin, end, c->lo, c->hi);
+}
+
+static void write_window(tr_kv *kv, int64_t pos0, const float *k, const float *v) {
+    for (int64_t p = pos0; p < pos0 + WIN_POS; p++)
+        for (int64_t L = 0; L < N_LAYER; L++) tr_kv_write(kv, L, p, 1, k, v);
+}
+
+static double median(double *a, int n) {
+    qsort(a, (size_t)n, sizeof a[0], cmp_double);
+    return (n % 2) ? a[n / 2] : 0.5 * (a[n / 2 - 1] + a[n / 2]);
+}
+
+static int group_faults(void) {
+    unsigned char *other = (unsigned char *)tr_alloc_aligned(FLUSH_BYTES, 4096);
+    float *k = (float *)tr_alloc_aligned(2 * N_KV * sizeof(float), 64);
+    if (other == NULL || k == NULL) {
+        fprintf(stderr, "bench_mem: out of memory\n");
+        return 1;
+    }
+    float *v = k + N_KV;
+    uint64_t seed = 0x5EEDull;
+    for (int64_t i = 0; i < 2 * N_KV; i++) k[i] = (float)(int32_t)(rng_next(&seed) >> 40) * (1.0f / 8388608.0f) - 1.0f;
+    tr_pool *all = tr_pool_create(0);
+    fill(all, other, FLUSH_BYTES, 0);
+    tr_pool_destroy(all);
+
+    const double pages = 2.0 * N_LAYER * N_HEAD * WIN_POS * HEAD_DIM * sizeof(float) / 4096.0;
+    int counts[16], n_counts = thread_counts(counts);
+    /* variant -2: rows fresh, -1: rows touched, i >= 0: touch on counts[i] threads */
+    for (int variant = -2; variant < n_counts; variant++) {
+        int T = variant < 0 ? 1 : counts[variant];
+        tr_pool *pool = tr_pool_create(T); /* T = 1 pins the writing thread, as the engine's */
+        if (pool == NULL) return 1;
+        double secs[MAX_RUNS], faults[MAX_RUNS];
+        for (int r = -1; r < n_runs; r++) {
+            tr_kv kv;
+            if (tr_kv_init(&kv, N_LAYER, N_HEAD, HEAD_DIM, KV_CTX) != 0) {
+                fprintf(stderr, "bench_mem: out of memory\n");
+                return 1;
+            }
+            touch_ctx c = {&kv, WIN_POS, 2 * WIN_POS};
+            write_window(&kv, 0, k, v);
+            if (variant == -1) tr_kv_touch(&kv, 0, tr_kv_streams(&kv), c.lo, c.hi);
+            sinks[0].sum += read_bytes(other, FLUSH_BYTES);
+            uint64_t f0 = page_faults();
+            double t0 = tr_time_sec();
+            if (variant < 0) write_window(&kv, WIN_POS, k, v);
+            else tr_parallel_for(pool, tr_kv_streams(&kv), 1, touch_body, &c);
+            double t1 = tr_time_sec();
+            uint64_t f1 = page_faults();
+            if (r >= 0) {
+                secs[r] = t1 - t0;
+                faults[r] = (double)(f1 - f0);
+            }
+            tr_kv_free(&kv);
+        }
+        double lo = secs[0], hi = secs[0];
+        for (int r = 1; r < n_runs; r++) {
+            if (secs[r] < lo) lo = secs[r];
+            if (secs[r] > hi) hi = secs[r];
+        }
+        double med = median(secs, n_runs), fmed = median(faults, n_runs);
+        printf("%-13s t=%-2d  %7.3f ms a window  %6.2f us a position  %6.1f ns a page  (min %.3f  max %.3f  "
+               "spread %4.1f%%)  faults %.0f\n",
+               variant == -2 ? "rows fresh" : variant == -1 ? "rows touched" : "touch", T, med * 1e3,
+               med * 1e6 / WIN_POS, med * 1e9 / pages, lo * 1e3, hi * 1e3, (hi - lo) / med * 100.0, fmed);
+        fflush(stdout);
+        tr_pool_destroy(pool);
+    }
+    tr_free_aligned(k);
+    tr_free_aligned(other);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *group = argc > 1 ? argv[1] : "";
     int64_t n_pos = 0;
@@ -642,9 +843,10 @@ int main(int argc, char **argv) {
     if (n_runs < 3) n_runs = 3;
     if (n_runs > MAX_RUNS) n_runs = MAX_RUNS;
     int known = strcmp(group, "ram") == 0 || strcmp(group, "streams") == 0 || strcmp(group, "weights") == 0 ||
-                strcmp(group, "gateup") == 0 || strcmp(group, "kv") == 0;
+                strcmp(group, "gateup") == 0 || strcmp(group, "kv") == 0 || strcmp(group, "faults") == 0 ||
+                strcmp(group, "kvend") == 0;
     if (!known) {
-        fprintf(stderr, "usage: bench_mem ram | streams | weights | gateup | kv <n_pos>   [--runs N]\n");
+        fprintf(stderr, "usage: bench_mem ram | streams | weights | gateup | kv <n_pos> | kvend <n_pos> | faults   [--runs N]\n");
         return 2;
     }
 
@@ -664,6 +866,8 @@ int main(int argc, char **argv) {
              : strcmp(group, "streams") == 0 ? group_streams()
              : strcmp(group, "weights") == 0 ? group_weights()
              : strcmp(group, "gateup") == 0  ? group_gateup()
+             : strcmp(group, "faults") == 0  ? group_faults()
+             : strcmp(group, "kvend") == 0   ? group_kvend(n_pos)
                                              : group_kv(n_pos);
     printf("elapsed %.1f s\n", tr_time_sec() - t0);
     return rc;

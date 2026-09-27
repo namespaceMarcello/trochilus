@@ -119,6 +119,11 @@ const float *tr_session_logits(const tr_session *s);
 /* vocab_size logits of the token `back` positions before the last one (back = 0: the last).
  * Only the rows the previous eval kept are valid; NULL for any other `back`. */
 const float *tr_session_logits_back(const tr_session *s, int64_t back);
+/* The greedy token of logit row `back` (as tr_session_logits_back) among its first n logits (the vocabulary a
+ * caller reads: tr_greedy's may be narrower than the model's): the first index of the largest, a NaN never
+ * winning, index 0 when nothing is larger; on the model's pool (tr_argmax_f32), each worker the logits the head's
+ * matmul left in its cache. */
+int32_t tr_session_argmax(const tr_session *s, int64_t back, int64_t n);
 /* Number of tokens already in the KV cache. */
 int64_t tr_session_pos(const tr_session *s);
 /* Tokens the session has room for (what tr_session_create settled on). */
@@ -233,6 +238,14 @@ typedef struct {
 } tr_decode_choice;
 int tr_session_decode_history(const tr_session *s, const tr_decode_choice **out);
 
+/* An in-process A/B (generate --ab <name>, docs/MEASUREMENTS.md §An A/B inside one process): the switch named
+ * name, >= 1; 0 for "none" (the A/A: both arms the same code); -1 for a name neither the session nor the
+ * architecture knows. The session's own: argmax (arm B, tr_session_argmax's serial scan on the calling thread).
+ * tr_session_ab_set gives switch sw its arm before a pass: 0 the engine's road, 1 the other one, which gives the
+ * same bits (a switch of 0 does nothing). */
+int tr_session_ab_switch(const tr_session *s, const char *name);
+void tr_session_ab_set(tr_session *s, int sw, int arm);
+
 /* ---- implemented once per architecture ----
  * model.c wraps the architecture's own objects: struct tr_model is
  * { const tr_arch_vtable *vt; void *impl; } and struct tr_session likewise, so an
@@ -264,6 +277,10 @@ typedef struct {
     /* the device new sessions use for the decode's attention, NULL: none (not owned) */
     void (*set_gpu)(void *model, tr_gpu *gpu);
     int64_t (*gpu_tokens)(const void *session);
+    /* an in-process A/B's switches (tr_session_ab_switch): the id (>= 1) of the one named name, -1 for none by
+     * that name; then before a pass its arm. NULL: the architecture has none. */
+    int (*ab_switch)(const char *name);
+    void (*ab_set)(void *session, int sw, int arm);
 } tr_arch_vtable;
 
 #endif

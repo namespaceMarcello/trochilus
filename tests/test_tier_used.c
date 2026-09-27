@@ -20,8 +20,14 @@
  *                exact, rows x tokens by the model's shapes: a matrix that took another road
  *                (scalar called directly, a private copy of a table) leaves it short.
  *
+ * A router whose values fit bfloat16 (as every real OLMoE GGUF's) is kept BF16 at load: its products go through
+ * the BF16 entries, counted exactly, and every pass's logits are the bits of the same model loaded with it F32.
+ *
  * tools/tier_check.sh runs this under TR_CPU_MAX=scalar and avx2 too, so the engine half sees
  * every tier as the active one. */
+#if defined(__linux__) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L /* setenv/unsetenv */
+#endif
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -29,10 +35,22 @@
 
 #include "test.h"
 #include "../src/base/cpu.h"
+#include "../src/base/platform.h"
+#include "../src/base/threads.h"
 #include "../src/kernels/kernels.h"
 #include "../src/kernels/kernels_internal.h"
 #include "../src/models/model.h"
 #include "synth_olmoe.h"
+
+/* NULL clears the variable */
+static void set_env(const char *name, const char *value) {
+#if defined(_WIN32)
+    _putenv_s(name, value != NULL ? value : "");
+#else
+    if (value != NULL) setenv(name, value, 1);
+    else unsetenv(name);
+#endif
+}
 
 /* ---- the table -------------------------------------------------------------------------- */
 
@@ -58,7 +76,8 @@ static void test_table(void) {
             printf("  tier %s: %d of dot_f32, axpy_f32, their x4 and 4x4 are scalar's\n", K->tier, missing);
         int types = 0;
         for (int type = 0; type < TR_TYPE_COUNT; type++) {
-            if (!tr_kernels_support((tr_type)type)) continue;
+            /* BF16: no file's type, the F32 matrices narrowed at load (tr_f32_to_bf16_exact) */
+            if (!tr_kernels_support((tr_type)type) && type != TR_TYPE_BF16) continue;
             /* F16 rows convert with F16C: an AVX2 CPU without it (none is known) keeps scalar's */
             if (type == TR_TYPE_F16 && !tr_cpu()->f16c) continue;
             /* Q4_K's dot_row is its definition from the floats, off the hot path: the engine's Q4_K products
@@ -102,8 +121,9 @@ static void test_table(void) {
         const tr_cpu_info *ci = tr_cpu();
         const int w16 = strcmp(K->tier, "avx512") == 0 && ci->avx512bw && ci->avx512vl && ci->avx512dq &&
                         ci->avx512vnni && ci->avx512vbmi && ci->f16c;
-        if (K->q4x_prep == S->q4x_prep || K->q4x_dot2 == S->q4x_dot2) {
-            printf("  tier %s: q4x_prep or q4x_dot2 is scalar's\n", K->tier);
+        if (K->q4x_prep == S->q4x_prep || K->q4x_dot2 == S->q4x_dot2 || K->q4x_dot_xt == NULL ||
+            K->q4x_dot_xt == S->q4x_dot_xt) {
+            printf("  tier %s: q4x_prep, q4x_dot2 or q4x_dot_xt is scalar's or missing\n", K->tier);
             missing++;
         }
         if (w16 && (K->q4x_panel == NULL || K->q4x_panel == S->q4x_panel || K->q4x_tile == NULL ||
@@ -213,6 +233,7 @@ static atomic_ullong n_dot_x4, n_axpy_x4, n_dot_4x4, n_axpy_4x4;
     }
 COUNTED(TR_TYPE_F32, f32)
 COUNTED(TR_TYPE_F16, f16)
+COUNTED(TR_TYPE_BF16, bf16)
 COUNTED(TR_TYPE_Q8_0, q8_0)
 COUNTED(TR_TYPE_Q4_K, q4_k)
 COUNTED(TR_TYPE_Q6_K, q6_k)
@@ -234,9 +255,9 @@ static void counted_pm_tile(const float *panel, const float *xil, int64_t n, int
     g_real->pm_tile(panel, xil, n, T, part, y, y_stride);
 }
 
-/* Q4_K's integer road (kernels.h q4x_*): the prepared rows, the pairs (two products a call) and the tiles'
- * products */
-static atomic_ullong n_q4x_prep, n_q4x_dot2, n_q4x_products;
+/* Q4_K's integer road (kernels.h q4x_*): the prepared rows, the pairs (two products a call), the runs of the
+ * short passes' pairs (2 T products a call) and the tiles' products */
+static atomic_ullong n_q4x_prep, n_q4x_dot2, n_q4x_xt, n_q4x_products;
 static void counted_q4x_prep(const float *x, int64_t n, void *xq) {
     atomic_fetch_add(&n_q4x_prep, 1);
     g_real->q4x_prep(x, n, xq);
@@ -245,10 +266,15 @@ static void counted_q4x_dot2(const void *row0, const void *row1, const void *xq,
     atomic_fetch_add(&n_q4x_dot2, 1);
     g_real->q4x_dot2(row0, row1, xq, n, out);
 }
-static void counted_q4x_tile(const void *panel, const void *xq, size_t xq_stride, int64_t n, int T, float *y,
-                             int64_t y_stride) {
+static void counted_q4x_dot_xt(const void *row0, const void *row1, const void *const *xq, int64_t n, int T, float *y,
+                               int64_t y_stride) {
+    atomic_fetch_add(&n_q4x_xt, 1);
+    atomic_fetch_add(&n_q4x_products, (unsigned long long)(2 * T));
+    g_real->q4x_dot_xt(row0, row1, xq, n, T, y, y_stride);
+}
+static void counted_q4x_tile(const void *panel, const void *const *xq, int64_t n, int T, float *y, int64_t y_stride) {
     atomic_fetch_add(&n_q4x_products, (unsigned long long)(TR_PM_ROWS * T));
-    g_real->q4x_tile(panel, xq, xq_stride, n, T, y, y_stride);
+    g_real->q4x_tile(panel, xq, n, T, y, y_stride);
 }
 
 static void counted_dot_f32_x4(const float *a, const float *b, int64_t stride, int64_t n, float *out) {
@@ -279,12 +305,30 @@ enum { LAYERS = 2, N_EMBD = 64, N_HEAD = 4, N_HEAD_KV = 2, N_FF = 64, N_EXPERT =
  * one token a pass */
 enum { N_PROMPT = 29, N_SINGLE = 2, N_SHORT = 3 };
 
-static void test_engine(const char *argv0, tr_type type, const char *name, long long n_embd, long long n_ff) {
+/* the hints the pool's workers have taken (threads.h tr_pool_hint_counts) */
+static uint64_t pool_hints(const tr_pool *p) {
+    uint64_t sum = 0;
+    for (int w = 1; p != NULL && w < tr_pool_size(p); w++) {
+        uint64_t h, l;
+        tr_pool_hint_counts(p, w, &h, &l);
+        sum += h;
+    }
+    return sum;
+}
+
+static void test_engine(const char *argv0, tr_type type, const char *name, long long n_embd, long long n_ff,
+                        int bf16_router) {
     static tr_kernels counting;
     g_real = tr_kernels_get();
     counting = *g_real;
     counting.dot_row[TR_TYPE_F32] = row_f32;
     counting.dot_row[TR_TYPE_F16] = row_f16;
+    counting.dot_row[TR_TYPE_BF16] = row_bf16;
+    if (g_real->dot_row_x4[TR_TYPE_BF16] != NULL) counting.dot_row_x4[TR_TYPE_BF16] = x4_bf16;
+    if (g_real->dot_row2_x4[TR_TYPE_BF16] != NULL) counting.dot_row2_x4[TR_TYPE_BF16] = r2_bf16;
+    if (g_real->dot_row2_x8[TR_TYPE_BF16] != NULL) counting.dot_row2_x8[TR_TYPE_BF16] = r8_bf16;
+    if (g_real->dot_row2[TR_TYPE_BF16] != NULL) counting.dot_row2[TR_TYPE_BF16] = p2_bf16;
+    if (g_real->dot_row_xt[TR_TYPE_BF16] != NULL) counting.dot_row_xt[TR_TYPE_BF16] = xt_bf16;
     counting.dot_row[TR_TYPE_Q8_0] = row_q8_0;
     counting.dot_row[TR_TYPE_Q4_K] = row_q4_k;
     counting.dot_row[TR_TYPE_Q6_K] = row_q6_k;
@@ -323,9 +367,11 @@ static void test_engine(const char *argv0, tr_type type, const char *name, long 
     if (g_real->pm_tile != NULL) counting.pm_tile = counted_pm_tile;
     counting.q4x_prep = counted_q4x_prep;
     counting.q4x_dot2 = counted_q4x_dot2;
+    if (g_real->q4x_dot_xt != NULL) counting.q4x_dot_xt = counted_q4x_dot_xt;
     if (g_real->q4x_tile != NULL) counting.q4x_tile = counted_q4x_tile;
     atomic_store(&n_q4x_prep, 0);
     atomic_store(&n_q4x_dot2, 0);
+    atomic_store(&n_q4x_xt, 0);
     atomic_store(&n_q4x_products, 0);
     atomic_store(&n_pm_products, 0);
     for (int i = 0; i < TR_TYPE_COUNT; i++) {
@@ -345,30 +391,41 @@ static void test_engine(const char *argv0, tr_type type, const char *name, long 
     const synth_params P = {LAYERS, (uint32_t)n_embd, N_HEAD, N_HEAD_KV, (uint32_t)n_ff, N_EXPERT, N_USED, VOCAB, CTX, type};
     char path[512], err[256];
     synth_f32_router = 1;
+    synth_bf16_router = bf16_router; /* the router's values fit bf16: the engine keeps it BF16 */
     TR_CHECK(synth_write(&P, argv0, "test_tier_used_tmp.gguf", path, sizeof path) == 0);
+    synth_bf16_router = 0;
+    const tr_type router = bf16_router ? TR_TYPE_BF16 : TR_TYPE_F32;
     tr_pool *pool = tr_pool_create(3); /* chunk borders fall inside input rows: both matmul paths */
     tr_model *model = pool != NULL ? tr_model_load(path, pool, err, sizeof err) : NULL;
     tr_session *s = model != NULL ? tr_session_create(model, 0, 0, err, sizeof err) : NULL;
     TR_CHECK(s != NULL);
+    int32_t tok[N_PROMPT + N_SINGLE + N_SHORT];
+    for (int i = 0; i < N_PROMPT + N_SINGLE + N_SHORT; i++) tok[i] = (int32_t)((i * 7 + 3) % VOCAB);
+    static float logits[2][1 + N_SINGLE + 1][VOCAB]; /* each pass's last logit row, the engine's road and prep's arm B */
+    tr_pool_set_hints(pool, 2); /* off as a pool starts: on here, to see the engine's hints taken */
+    const uint64_t hints0 = pool_hints(pool);
     if (s != NULL) {
-        int32_t tok[N_PROMPT + N_SINGLE + N_SHORT];
-        for (int i = 0; i < N_PROMPT + N_SINGLE + N_SHORT; i++) tok[i] = (int32_t)((i * 7 + 3) % VOCAB);
         tr_kernels_set_active(&counting);
         TR_CHECK(tr_session_eval(s, tok, N_PROMPT) == 0);
-        for (int i = 0; i < N_SINGLE; i++) TR_CHECK(tr_session_eval(s, tok + N_PROMPT + i, 1) == 0);
+        memcpy(logits[0][0], tr_session_logits(s), sizeof logits[0][0]);
+        for (int i = 0; i < N_SINGLE; i++) {
+            TR_CHECK(tr_session_eval(s, tok + N_PROMPT + i, 1) == 0);
+            memcpy(logits[0][1 + i], tr_session_logits(s), sizeof logits[0][0]);
+        }
         /* and a short pass, a verify pass of 3 rows: its groups of 2 and 3 through dot_row_xt */
         TR_CHECK(tr_session_eval(s, tok + N_PROMPT + N_SINGLE, N_SHORT) == 0);
+        memcpy(logits[0][1 + N_SINGLE], tr_session_logits(s), sizeof logits[0][0]);
         tr_kernels_set_active(NULL);
 
         /* products a token asks of the matrices of `type`, layer by layer: q, k, v, the output
-         * projection, and gate, up and down of each expert it uses; the router's are F32; the
-         * logits are one row of the vocabulary per call */
+         * projection, and gate, up and down of each expert it uses; the router's are F32, or BF16 where its
+         * values fit; the logits are one row of the vocabulary per call */
         long long tokens = N_PROMPT + N_SINGLE + N_SHORT, evals = 1 + N_SINGLE + 1;
         long long n_kv = (long long)N_HEAD_KV * (n_embd / N_HEAD);
         long long of_type = tokens * LAYERS * (n_embd + 2 * n_kv + n_embd + N_USED * (2 * n_ff + n_embd)) + evals * VOCAB;
         long long of_router = tokens * LAYERS * N_EXPERT;
         for (int i = 0; i < TR_TYPE_COUNT; i++) {
-            long long want = (i == (int)type ? of_type : 0) + (i == TR_TYPE_F32 ? of_router : 0);
+            long long want = (i == (int)type ? of_type : 0) + (i == (int)router ? of_router : 0);
             long long got = (long long)atomic_load(&n_row[i]) + 4 * (long long)atomic_load(&n_x4[i]) +
                             8 * (long long)atomic_load(&n_r2[i]) + 16 * (long long)atomic_load(&n_r8[i]) +
                             2 * (long long)atomic_load(&n_p2[i]) + (long long)atomic_load(&n_xt[i]) +
@@ -394,16 +451,21 @@ static void test_engine(const char *argv0, tr_type type, const char *name, long 
         if (g_real->dot_row_xt[type] != NULL) TR_CHECK(atomic_load(&n_xt[type]) > 0);
         /* and a one-token pass must take the decode's pair where the tier has it */
         if (g_real->dot_row2[type] != NULL) TR_CHECK(atomic_load(&n_p2[type]) > 0);
-        /* Q4_K: every call prepares its rows; the one-token passes pair rows, and the prompt's pass runs tiles
-         * where the tier has the W16 panel */
+        /* Q4_K: every call prepares its rows; the one-token passes pair rows, the short pass runs its groups of
+         * 2-3 rows through the runs' pairs, and the prompt's pass runs tiles where the tier has the W16 panel */
         if (type == TR_TYPE_Q4_K) {
-            TR_CHECK(atomic_load(&n_q4x_prep) > 0);
+            /* each pass's token rows prepared once for q, k and v and once for gate and up (a grouped row reads its
+             * token's through the map), o's and down's rows by their own calls, and a logit row a pass
+             * (docs/MEASUREMENTS.md §The prep once a row): 412 here, where every call preparing its own rows
+             * made 888 */
+            TR_CHECK_EQ_INT(atomic_load(&n_q4x_prep), (3 + N_USED) * tokens * LAYERS + evals);
             TR_CHECK(atomic_load(&n_q4x_dot2) > 0);
+            TR_CHECK(atomic_load(&n_q4x_xt) > 0);
             if (g_real->q4x_panel != NULL && g_real->q4x_tile != NULL) TR_CHECK(atomic_load(&n_q4x_products) > 0);
             TR_CHECK_EQ_INT(atomic_load(&n_row[type]), 0); /* nothing left to the definition from the floats */
-            printf("  q4_k  model: %llu rows prepared, %llu pairs, %llu tile products\n",
+            printf("  q4_k  model: %llu rows prepared, %llu pairs, %llu runs of 2-3 rows, %llu run and tile products\n",
                    (unsigned long long)atomic_load(&n_q4x_prep), (unsigned long long)atomic_load(&n_q4x_dot2),
-                   (unsigned long long)atomic_load(&n_q4x_products));
+                   (unsigned long long)atomic_load(&n_q4x_xt), (unsigned long long)atomic_load(&n_q4x_products));
         }
         printf("  %-5s model: %llu phase-major products in %llu panels, %llu calls of 2 rows x 8 tokens, %llu of "
                "2 x 4, %llu of 1 x 4, %llu products of 1 x 2-3, %llu dots\n",
@@ -420,15 +482,81 @@ static void test_engine(const char *argv0, tr_type type, const char *name, long 
         else if (g_real->dot_row_x4[type] != NULL) TR_CHECK(atomic_load(&n_x4[type]) > 0);
         /* the router's x4 road at n_embd 64 only: at 256 tr_matmul_grouped's chunks (4096 / cols + 1
          * products) hold fewer than 4 whole tokens of its 8 rows, and every product goes one dot at a time */
-        if (g_real->dot_row_x4[TR_TYPE_F32] != NULL && n_embd == N_EMBD) TR_CHECK(atomic_load(&n_x4[TR_TYPE_F32]) > 0);
+        if (g_real->dot_row_x4[router] != NULL && n_embd == N_EMBD) TR_CHECK(atomic_load(&n_x4[router]) > 0);
         TR_CHECK(atomic_load(&n_dot_x4) > 0);
         TR_CHECK(atomic_load(&n_axpy_x4) > 0);
         /* the prompt's tiles: a pass of 29 tokens has groups of 16 with quads that see 4 positions */
         TR_CHECK(atomic_load(&n_dot_4x4) > 0);
         TR_CHECK(atomic_load(&n_axpy_4x4) > 0);
-        printf("  %-5s model on tier %-7s %lld products of its type and %lld of the F32 router, all through the "
+        /* the one-token passes hinted their next calls to the idle workers (threads.h tr_pool_hint), and the
+         * workers took them (the counts move as each hint starts) */
+        uint64_t hints1 = pool_hints(pool);
+        for (double t0 = tr_time_sec(); hints1 == hints0 && tr_time_sec() - t0 < 1.0;) hints1 = pool_hints(pool);
+        TR_CHECK(hints1 > hints0);
+        /* Q4_K: the same passes on a second session with a switch at arm B (generate --ab): prep, every call
+         * preparing its own rows and the experts' gathered, 888 rows here; act, the swiglu apart and the down
+         * preparing its own rows, the same 412; idle, no hint to the idle workers (none taken), the same 412;
+         * every pass's logits the bits of the first session's */
+        static const char *const sw_names[3] = {"prep", "act", "idle"};
+        const long long sw_preps[3] = {(4 + 3 * N_USED) * tokens * LAYERS + evals, (3 + N_USED) * tokens * LAYERS + evals,
+                                       (3 + N_USED) * tokens * LAYERS + evals};
+        for (int si = 0; si < 3 && type == TR_TYPE_Q4_K; si++) {
+            tr_session *s2 = tr_session_create(model, 0, 0, err, sizeof err);
+            const int sw = s2 != NULL ? tr_session_ab_switch(s2, sw_names[si]) : -1;
+            TR_CHECK(s2 != NULL && sw > 0);
+            if (s2 != NULL && sw > 0) {
+                tr_session_ab_set(s2, sw, 1);
+                atomic_store(&n_q4x_prep, 0);
+                const double settle = tr_time_sec(); /* the first session's last hints taken before counting */
+                while (tr_time_sec() - settle < 0.02) {
+                }
+                const uint64_t h_before = pool_hints(pool);
+                tr_kernels_set_active(&counting);
+                TR_CHECK(tr_session_eval(s2, tok, N_PROMPT) == 0);
+                memcpy(logits[1][0], tr_session_logits(s2), sizeof logits[1][0]);
+                for (int i = 0; i < N_SINGLE; i++) {
+                    TR_CHECK(tr_session_eval(s2, tok + N_PROMPT + i, 1) == 0);
+                    memcpy(logits[1][1 + i], tr_session_logits(s2), sizeof logits[1][0]);
+                }
+                TR_CHECK(tr_session_eval(s2, tok + N_PROMPT + N_SINGLE, N_SHORT) == 0);
+                memcpy(logits[1][1 + N_SINGLE], tr_session_logits(s2), sizeof logits[1][0]);
+                tr_kernels_set_active(NULL);
+                TR_CHECK_EQ_INT(atomic_load(&n_q4x_prep), sw_preps[si]);
+                TR_CHECK(memcmp(logits[0], logits[1], sizeof logits[0]) == 0);
+                const double t1 = tr_time_sec();
+                while (tr_time_sec() - t1 < 0.02) {
+                }
+                if (si == 2) TR_CHECK_EQ_INT(pool_hints(pool), h_before);
+                printf("  q4_k  model, %s's arm B: %llu rows prepared, every pass's logits the engine's bits\n",
+                       sw_names[si], (unsigned long long)atomic_load(&n_q4x_prep));
+            }
+            tr_session_free(s2);
+        }
+        /* a router kept BF16 gives, pass by pass, the bits of the same model loaded with it F32 (TR_BF16_EXACT=0) */
+        if (bf16_router) {
+            set_env("TR_BF16_EXACT", "0");
+            tr_model *m32 = tr_model_load(path, pool, err, sizeof err);
+            set_env("TR_BF16_EXACT", NULL);
+            tr_session *s32 = m32 != NULL ? tr_session_create(m32, 0, 0, err, sizeof err) : NULL;
+            TR_CHECK(s32 != NULL);
+            if (s32 != NULL) {
+                TR_CHECK(tr_session_eval(s32, tok, N_PROMPT) == 0);
+                memcpy(logits[1][0], tr_session_logits(s32), sizeof logits[1][0]);
+                for (int i = 0; i < N_SINGLE; i++) {
+                    TR_CHECK(tr_session_eval(s32, tok + N_PROMPT + i, 1) == 0);
+                    memcpy(logits[1][1 + i], tr_session_logits(s32), sizeof logits[1][0]);
+                }
+                TR_CHECK(tr_session_eval(s32, tok + N_PROMPT + N_SINGLE, N_SHORT) == 0);
+                memcpy(logits[1][1 + N_SINGLE], tr_session_logits(s32), sizeof logits[1][0]);
+                TR_CHECK(memcmp(logits[0], logits[1], sizeof logits[0]) == 0);
+                printf("  %-5s model: every pass's logits with the BF16 router the bits of the router kept F32\n", name);
+            }
+            tr_session_free(s32);
+            tr_model_free(m32);
+        }
+        printf("  %-5s model on tier %-7s %lld products of its type and %lld of the %s router, all through the "
                "active table\n",
-               name, g_real->tier, of_type, of_router);
+               name, g_real->tier, of_type, of_router, bf16_router ? "BF16" : "F32");
     } else {
         fprintf(stderr, "setup failed: %s\n", err);
     }
@@ -443,10 +571,12 @@ int main(int argc, char **argv) {
     const char *argv0 = argc > 0 ? argv[0] : "";
     test_table();
     test_ops();
-    test_engine(argv0, TR_TYPE_F32, "f32", N_EMBD, N_FF);
-    test_engine(argv0, TR_TYPE_F16, "f16", N_EMBD, N_FF);
-    test_engine(argv0, TR_TYPE_Q8_0, "q8_0", N_EMBD, N_FF);
-    test_engine(argv0, TR_TYPE_Q4_K, "q4_k", 256, 256);   /* rows of whole 256-element blocks */
-    test_engine(argv0, TR_TYPE_Q6_K, "q6_k", 256, 256);
+    test_engine(argv0, TR_TYPE_F32, "f32", N_EMBD, N_FF, 0);
+    test_engine(argv0, TR_TYPE_F16, "f16", N_EMBD, N_FF, 0);
+    test_engine(argv0, TR_TYPE_Q8_0, "q8_0", N_EMBD, N_FF, 0);
+    test_engine(argv0, TR_TYPE_Q8_0, "q8_0", N_EMBD, N_FF, 1); /* a router whose values fit bf16: kept BF16 */
+    test_engine(argv0, TR_TYPE_Q4_K, "q4_k", 256, 256, 0);   /* rows of whole 256-element blocks */
+    test_engine(argv0, TR_TYPE_Q4_K, "q4_k", 256, 256, 1);   /* as the real model: its router BF16 */
+    test_engine(argv0, TR_TYPE_Q6_K, "q6_k", 256, 256, 0);
     TR_TEST_EXIT();
 }

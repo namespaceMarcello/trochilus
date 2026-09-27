@@ -71,6 +71,9 @@ typedef struct {
     int64_t n_expert, n_expert_used, vocab, n_ctx_train;
     float rms_eps, rope_freq_base, clamp;
     int have_clamp, norm_topk;
+    /* an F32 matrix whose values all fit bfloat16 is kept as BF16 (read_mat, tr_f32_to_bf16_exact): OLMoE's routers,
+     * half their bytes, the same bits; TR_BF16_EXACT=0 keeps them F32 */
+    int bf16_exact;
 
     float *output_norm; /* [n_embd] */
     tr_mat token_embd;    /* rows=vocab, cols=n_embd */
@@ -102,6 +105,9 @@ typedef struct {
  * router's choice, the rows copied for the experts) is split over the pool by token, at least
  * this many to a chunk: a decode token or a short pass stays on the calling thread. */
 #define OLMOE_TOKENS_PER_CHUNK 8
+/* The idle workers' bytes a hint (hint_next): the first 256 KiB of a worker's region of the next call, at most half
+ * the region (docs/MEASUREMENTS.md §The idle workers). */
+#define OLMOE_HINT_BYTES ((size_t)256 << 10)
 
 typedef struct {
     olmoe_model *m; /* not owned */
@@ -111,6 +117,11 @@ typedef struct {
     tr_prof prof; /* disabled by default (zero-initialized in olmoe_session_create) */
 
     tr_kv kv; /* [n_layers][n_head_kv][n_ctx][head_dim]: one head's positions in a row (src/kv/kv.h) */
+    /* The cache's pages of positions [0, kv_touched) are faulted in (kv_touch_pass): every write so far fell below
+     * it, so no position from it on holds anything a result reads. kv_touch 0 (TR_KV_TOUCH=0): kv_write faults
+     * them one at a time, as before. */
+    int64_t kv_touched;
+    int kv_touch;
     /* The same keys and values in VRAM, and a decode token's attention run there with the same
      * bits (src/backend/gpu_attn.h); NULL: the CPU. Every pass writes both caches, so the CPU's is
      * always whole: a driver error sets gpu_failed and the session goes on without the GPU. */
@@ -134,7 +145,15 @@ typedef struct {
     int64_t *acquire_ids; /* [n_expert] scratch: this pass's non-empty experts of the current layer,
                            * for tr_experts_acquire (olmoe_refresh_experts, outside the hot zone) */
     unsigned char *taken; /* [n_workers][n_expert] scratch of the router's choice, a row per pool worker */
-    float *xg;        /* [B*U][n_embd] expert inputs, grouped by expert */
+    float *xg;        /* [B*U][n_embd] expert inputs, grouped by expert (the roads that read floats) */
+    /* [B][tr_q4x_bytes(n_embd)]: the pass's token rows prepared once for Q4_K's integer road, read by q, k and
+     * v, then by gate and up through xmap (never pm.xq, which a phase-major call between them overwrites) */
+    unsigned char *xq_tok;
+    int64_t *xmap;    /* [B*U] the token row of each grouped row */
+    int ab_old_prep;  /* generate --ab prep's arm B: every matmul prepares its own rows, the experts' gathered */
+    int ab_old_act;   /* generate --ab act's arm B: the swiglu apart, the down preparing its own rows */
+    int ab_no_idle;   /* generate --ab idle's arm B: no hints to the idle workers (hint_next) */
+    size_t hint_bytes; /* a hint's bytes a worker: OLMOE_HINT_BYTES, or TR_HINT_KB (research) */
     float *h1, *h2;   /* [B*U][n_ff] gate and up outputs */
     float *h3;        /* [B*U][n_embd] down outputs */
     float *logits;    /* [n_logits_max][vocab], oldest kept position first */
@@ -265,7 +284,8 @@ static float *read_vec(tr_gguf *g, olmoe_model *m, load_progress *lp, const char
     return out;
 }
 
-/* Loads a 2-D matmul weight, kept in its on-disk type (F32/F16/Q8_0). */
+/* Loads a 2-D matmul weight, kept in its on-disk type, but an F32 whose values all fit bfloat16 kept as BF16 (half the
+ * bytes, the same products: tr_f32_to_bf16_exact; m->bf16_exact). */
 static int read_mat(tr_gguf *g, olmoe_model *m, load_progress *lp, const char *name, int64_t cols, int64_t rows,
                     tr_mat *out, char *err, size_t err_len) {
     const tr_gguf_tensor *t = tr_gguf_find_tensor(g, name);
@@ -295,6 +315,7 @@ static int read_mat(tr_gguf *g, olmoe_model *m, load_progress *lp, const char *n
         return -1;
     }
     out->type = t->type;
+    if (t->type == TR_TYPE_F32 && m->bf16_exact && tr_f32_to_bf16_exact(raw, rows * cols)) out->type = TR_TYPE_BF16;
     out->rows = rows;
     out->cols = cols;
     out->data = raw;
@@ -368,6 +389,8 @@ static void *olmoe_load(const char *path, tr_gguf *g, tr_pool *pool, uint64_t ex
     }
     m->pool = pool;
     m->gguf = g; /* kept open for the model's life; olmoe_free closes it, not this function */
+    const char *bf16 = getenv("TR_BF16_EXACT");
+    m->bf16_exact = bf16 == NULL || strcmp(bf16, "0") != 0;
 
     uint32_t block_count = 0, n_embd32 = 0, n_ff32 = 0, n_head32 = 0, n_head_kv32 = 0;
     uint32_t n_expert32 = 0, n_expert_used32 = 0, key_length = 0, ctx_length = 0;
@@ -815,6 +838,8 @@ static void olmoe_session_free(void *session) {
     tr_free_aligned(s->acquire_ids);
     tr_free_aligned(s->taken);
     tr_free_aligned(s->xg);
+    tr_free_aligned(s->xq_tok);
+    tr_free_aligned(s->xmap);
     tr_free_aligned(s->h1);
     tr_free_aligned(s->h2);
     tr_free_aligned(s->h3);
@@ -853,13 +878,14 @@ static void *olmoe_session_create(void *model, int64_t n_ctx, int64_t n_batch, c
                            (uint64_t)B * (uint64_t)U * (uint64_t)(m->n_embd * 2 + m->n_ff * 2) +
                            (uint64_t)(n_workers * OLMOE_ATTN_QUERIES * score_row_stride(actual_ctx) + m->vocab) +
                            rope_elems * 2;
-    uint64_t scratch_i64 = (uint64_t)B * (uint64_t)U * 2 + (uint64_t)m->n_expert + 1 + (uint64_t)m->n_expert;
+    uint64_t scratch_i64 = (uint64_t)B * (uint64_t)U * 3 + (uint64_t)m->n_expert + 1 + (uint64_t)m->n_expert;
+    const uint64_t xq_tok_bytes = (uint64_t)B * tr_q4x_bytes(m->n_embd);
     /* the phase-major matmul's scratch: the largest input a prompt's call passes (the experts' gathered rows),
      * the widest row, a panel per worker */
     const int64_t pm_cols = m->n_embd > m->n_ff ? (m->n_embd > m->n_qkv ? m->n_embd : m->n_qkv)
                                                 : (m->n_ff > m->n_qkv ? m->n_ff : m->n_qkv);
     const int64_t pm_x = B * U * pm_cols > B * pm_cols ? B * U * pm_cols : B * pm_cols;
-    uint64_t scratch_bytes = scratch_f32 * sizeof(float) + scratch_i64 * sizeof(int64_t) +
+    uint64_t scratch_bytes = scratch_f32 * sizeof(float) + scratch_i64 * sizeof(int64_t) + xq_tok_bytes +
                              (uint64_t)(n_workers * m->n_expert) +
                              tr_pm_scratch_bytes((int)n_workers, m->n_expert, B * U, pm_cols, pm_x);
 
@@ -888,6 +914,10 @@ static void *olmoe_session_create(void *model, int64_t n_ctx, int64_t n_batch, c
     s->n_batch = B;
     s->pos = 0;
     s->prefetch_layer = -1;
+    const char *touch = getenv("TR_KV_TOUCH");
+    s->kv_touch = touch == NULL || strcmp(touch, "0") != 0;
+    const char *hint_kb = getenv("TR_HINT_KB"); /* research: the idle workers' bytes a hint, in KiB */
+    s->hint_bytes = hint_kb != NULL && atoi(hint_kb) > 0 ? (size_t)atoi(hint_kb) << 10 : OLMOE_HINT_BYTES;
 
     int kv_rc = tr_kv_init(&s->kv, m->n_layers, m->n_head_kv, m->head_dim, actual_ctx);
     s->rope_cos = (float *)tr_alloc_aligned((size_t)rope_elems * sizeof(float), 64);
@@ -909,6 +939,8 @@ static void *olmoe_session_create(void *model, int64_t n_ctx, int64_t n_batch, c
     s->acquire_ids = (int64_t *)tr_alloc_aligned((size_t)m->n_expert * sizeof(int64_t), 64);
     s->taken = (unsigned char *)tr_alloc_aligned((size_t)(n_workers * m->n_expert), 64);
     s->xg = alloc_f32(B * U * m->n_embd);
+    s->xq_tok = (unsigned char *)tr_alloc_aligned((size_t)xq_tok_bytes, 64);
+    s->xmap = (int64_t *)tr_alloc_aligned((size_t)(B * U) * sizeof(int64_t), 64);
     s->h1 = alloc_f32(B * U * m->n_ff);
     s->h2 = alloc_f32(B * U * m->n_ff);
     s->h3 = alloc_f32(B * U * m->n_embd);
@@ -924,7 +956,8 @@ static void *olmoe_session_create(void *model, int64_t n_ctx, int64_t n_batch, c
         s->normed == NULL || s->attn_out == NULL || s->ffn_out == NULL || s->q == NULL || s->attn_concat == NULL ||
         s->k == NULL || s->v == NULL || s->router == NULL || s->sel_id == NULL || s->sel_w == NULL ||
         s->place == NULL || s->offsets == NULL || s->acquire_ids == NULL || s->taken == NULL || s->xg == NULL ||
-        s->h1 == NULL || s->h2 == NULL || s->h3 == NULL || s->logits == NULL || s->scores == NULL ||
+        s->xq_tok == NULL || s->xmap == NULL || s->h1 == NULL || s->h2 == NULL || s->h3 == NULL || s->logits == NULL ||
+        s->scores == NULL ||
         (store_partial && s->x_all == NULL)) {
         if (err != NULL) snprintf(err, err_len, "out of memory allocating session");
         olmoe_session_free(s);
@@ -1080,6 +1113,16 @@ static void kv_write_body(void *ctx_, int64_t begin, int64_t end, int worker) {
     (void)worker;
     const kv_write_ctx *c = (const kv_write_ctx *)ctx_;
     tr_kv_write(c->kv, c->layer, c->pos0 + begin, end - begin, c->k + begin * c->n_kv, c->v + begin * c->n_kv);
+}
+
+/* The cache's pages a pass enters, faulted in by the pool before its layers (tr_kv_touch_pass): without it a
+ * decode token's main thread takes 512 faults inside kv_write every 8 positions (~250 us). The positions from
+ * kv_touched on were never written, so the touch's zeros land where no result reads. */
+static void kv_touch_pass(olmoe_model *m, olmoe_session *s, int64_t end) {
+    if (!s->kv_touch || end <= s->kv_touched) return;
+    uint64_t t = tr_prof_begin(&s->prof);
+    if (tr_kv_touch_pass(&s->kv, m->pool, s->kv_touched, end)) tr_prof_end(&s->prof, TR_PROF_KV_TOUCH, t);
+    s->kv_touched = end;
 }
 
 /* y[j] += x[j] over the elements of tokens [begin, end) */
@@ -1247,6 +1290,14 @@ static void forward_embed(olmoe_model *m, olmoe_session *s, const int32_t *token
                   (uint64_t)n_tok * (uint64_t)tr_row_bytes(m->token_embd.type, m->token_embd.cols), 0);
 }
 
+/* The idle workers' hint for the call after the serial steps about to run (kernels.h tr_matmul_hint: a decode's
+ * calls only, one input row a group; docs/MEASUREMENTS.md §The idle workers): s->hint_bytes a worker, at most half
+ * its region. Moves no data the call reads. */
+static void hint_next(const olmoe_model *m, olmoe_session *s, const tr_mat *w, const int64_t *offsets,
+                      int64_t n_groups, const tr_pm_scratch *pm) {
+    if (!s->ab_no_idle) tr_matmul_hint(m->pool, w, offsets, n_groups, pm, s->hint_bytes);
+}
+
 /* One layer over n_tok tokens (1 <= n_tok <= n_batch) at positions pos0..pos0+n_tok-1, in place
  * on x ([n_tok][n_embd]: read as this layer's input, written as its output). Every value is
  * computed with the same kernel call as when the tokens run one per pass: a matmul element is
@@ -1275,8 +1326,10 @@ static int forward_layer(olmoe_model *m, olmoe_session *s, int64_t L, const int3
     uint64_t t;
 
     olmoe_layer *layer = &m->layers[L];
+    const int64_t tok_off[2] = {0, n_tok};
 
     /* ---- attention ---- */
+    hint_next(m, s, &layer->wq, tok_off, 1, &s->pm); /* the mix before it has read the workers' rows */
     t = tr_prof_begin(prof);
     nc.src = x;
     nc.dst = s->normed;
@@ -1286,9 +1339,18 @@ static int forward_layer(olmoe_model *m, olmoe_session *s, int64_t L, const int3
     tr_prof_end(prof, TR_PROF_ATTN_NORM, t);
 
     t = tr_prof_begin(prof);
-    tr_matmul_s(pool, &layer->wq, s->normed, n_tok, s->q, &s->pm);
-    tr_matmul_s(pool, &layer->wk, s->normed, n_tok, s->k, &s->pm);
-    tr_matmul_s(pool, &layer->wv, s->normed, n_tok, s->v, &s->pm);
+    {
+        /* q, k and v read the same rows: prepared once for the Q4_K ones (docs/MEASUREMENTS.md §The prep once a
+         * row), a matrix of another type from the floats */
+        const tr_mat *wqkv[3] = {&layer->wq, &layer->wk, &layer->wv};
+        float *yqkv[3] = {s->q, s->k, s->v};
+        int road[3], any = 0;
+        for (int i = 0; i < 3; i++) any |= road[i] = !s->ab_old_prep && tr_q4x_road(pool, wqkv[i], tok_off, 1, &s->pm);
+        if (any) tr_q4x_prepare(pool, s->normed, n_tok, n_embd, s->xq_tok);
+        for (int i = 0; i < 3; i++)
+            if (!road[i] || !tr_matmul_q4x_prepared(pool, wqkv[i], tok_off, 1, s->xq_tok, NULL, yqkv[i], &s->pm))
+                tr_matmul_s(pool, wqkv[i], s->normed, n_tok, yqkv[i], &s->pm);
+    }
     tr_prof_end(prof, TR_PROF_QKV_PROJ, t);
     tr_prof_count(prof, TR_PROF_QKV_PROJ, mat_bytes(&layer->wq) + mat_bytes(&layer->wk) + mat_bytes(&layer->wv),
                   0);
@@ -1384,6 +1446,7 @@ static int forward_layer(olmoe_model *m, olmoe_session *s, int64_t L, const int3
     tr_prof_count(prof, TR_PROF_ATTN_OUT_PROJ, mat_bytes(&layer->wo), 0);
 
     /* ---- MoE FFN ---- */
+    hint_next(m, s, &layer->gate_inp, tok_off, 1, NULL); /* tr_matmul's road; the add has read the workers' rows */
     t = tr_prof_begin(prof);
     nc.src = x;
     nc.dst = s->normed;
@@ -1418,29 +1481,52 @@ static int forward_layer(olmoe_model *m, olmoe_session *s, int64_t L, const int3
      * ones read from disk here) and refresh every expert's data pointer, NULL for the ones
      * not in RAM -- a wrong read then crashes instead of reading stale bytes. */
     if (olmoe_refresh_experts(m, s, L) != 0) return -1;
+    hint_next(m, s, layer->gate_exps, s->offsets, n_expert, &s->pm); /* its pointers refreshed; after the prep */
 
-    /* experts in stages, each one job over every (token, slot) row grouped by expert */
+    /* experts in stages, each one job over every (token, slot) row grouped by expert. Gate and up on Q4_K's
+     * road read each token's row prepared once, a grouped row through xmap (no copy); on a road that reads
+     * floats, the rows gathered */
     t = tr_prof_begin(prof);
-    gather_ctx gc;
-    gc.normed = s->normed;
-    gc.place = s->place;
-    gc.xg = s->xg;
-    gc.n_embd = n_embd;
-    gc.n_used = n_used;
-    tr_parallel_for(pool, n_rows, per_chunk * n_used, gather_body, &gc);
+    const int gu_road = !s->ab_old_prep && tr_q4x_road(pool, layer->gate_exps, s->offsets, n_expert, &s->pm) &&
+                        tr_q4x_road(pool, layer->up_exps, s->offsets, n_expert, &s->pm);
+    if (gu_road) {
+        tr_q4x_prepare(pool, s->normed, n_tok, n_embd, s->xq_tok);
+        for (int64_t j = 0; j < n_rows; j++) s->xmap[s->place[j]] = j / n_used;
+    } else {
+        gather_ctx gc;
+        gc.normed = s->normed;
+        gc.place = s->place;
+        gc.xg = s->xg;
+        gc.n_embd = n_embd;
+        gc.n_used = n_used;
+        tr_parallel_for(pool, n_rows, per_chunk * n_used, gather_body, &gc);
+    }
     tr_prof_end(prof, TR_PROF_EXPERT_GATHER, t);
 
     t = tr_prof_begin(prof);
-    tr_matmul_grouped_s(pool, layer->gate_exps, s->offsets, n_expert, s->xg, s->h1, &s->pm);
-    tr_matmul_grouped_s(pool, layer->up_exps, s->offsets, n_expert, s->xg, s->h2, &s->pm);
+    if (gu_road) { /* tr_q4x_road said yes: both calls take the road (the same test inside) */
+        tr_matmul_q4x_prepared(pool, layer->gate_exps, s->offsets, n_expert, s->xq_tok, s->xmap, s->h1, &s->pm);
+        tr_matmul_q4x_prepared(pool, layer->up_exps, s->offsets, n_expert, s->xq_tok, s->xmap, s->h2, &s->pm);
+    } else {
+        tr_matmul_grouped_s(pool, layer->gate_exps, s->offsets, n_expert, s->xg, s->h1, &s->pm);
+        tr_matmul_grouped_s(pool, layer->up_exps, s->offsets, n_expert, s->xg, s->h2, &s->pm);
+    }
     tr_prof_end(prof, TR_PROF_EXPERT_GATE_UP, t);
 
+    /* on Q4_K's road the down's rows are prepared by the call that makes them, each row while it is in its core's
+     * cache, into pm.xq: the down reads them right after, no call between (the phase-major road, which shares that
+     * memory, never runs in between) */
+    const int act_road = !s->ab_old_prep && !s->ab_old_act &&
+                         tr_q4x_road(pool, layer->down_exps, s->offsets, n_expert, &s->pm) && s->pm.xq != NULL &&
+                         (uint64_t)n_rows * tr_q4x_bytes(n_ff) <= (uint64_t)s->pm.xq_bytes;
     t = tr_prof_begin(prof);
-    tr_swiglu(pool, s->h1, s->h2, n_rows * n_ff);
+    if (act_road) tr_swiglu_prepare(pool, s->h1, s->h2, n_rows, n_ff, s->pm.xq);
+    else tr_swiglu(pool, s->h1, s->h2, n_rows * n_ff);
     tr_prof_end(prof, TR_PROF_EXPERT_ACT, t);
 
     t = tr_prof_begin(prof);
-    tr_matmul_grouped_s(pool, layer->down_exps, s->offsets, n_expert, s->h1, s->h3, &s->pm);
+    if (act_road) tr_matmul_q4x_prepared(pool, layer->down_exps, s->offsets, n_expert, s->pm.xq, NULL, s->h3, &s->pm);
+    else tr_matmul_grouped_s(pool, layer->down_exps, s->offsets, n_expert, s->h1, s->h3, &s->pm);
     tr_prof_end(prof, TR_PROF_EXPERT_DOWN, t);
     if (prof->enabled) {
         for (int64_t e = 0; e < n_expert; e++)
@@ -1477,6 +1563,8 @@ static void forward_logits(olmoe_model *m, olmoe_session *s, float *x, int64_t n
     tr_pool *pool = m->pool;
     int64_t n_embd = m->n_embd;
     float *rows = x + (n_tok - n_logits) * n_embd;
+    const int64_t off[2] = {0, n_logits};
+    hint_next(m, s, &m->output, off, 1, &s->pm); /* one row of logits; the last mix has read the workers' rows */
 
     uint64_t t = tr_prof_begin(prof);
     for (int64_t i = 0; i < n_logits; i++) tr_rmsnorm(rows + i * n_embd, m->output_norm, n_embd, m->rms_eps);
@@ -1496,6 +1584,7 @@ static int forward_pass(olmoe_model *m, olmoe_session *s, const int32_t *tokens,
     uint64_t t_pass = tr_prof_begin(prof);
     const int64_t pos0 = s->pos;
 
+    kv_touch_pass(m, s, pos0 + n_tok);
     forward_embed(m, s, tokens, n_tok, s->x);
     for (int64_t L = 0; L < m->n_layers; L++) {
         if (forward_layer(m, s, L, tokens, n_tok, pos0, s->x) != 0) return -1;
@@ -1525,6 +1614,7 @@ static int forward_prompt_layer_major(olmoe_model *m, olmoe_session *s, const in
     const int64_t pos_base = s->pos;
     int64_t n_embd = m->n_embd;
 
+    kv_touch_pass(m, s, pos_base + n);
     for (int64_t off = 0; off < n; off += s->n_batch) {
         int64_t len = n - off < s->n_batch ? n - off : s->n_batch;
         forward_embed(m, s, tokens + off, len, s->x_all + off * n_embd);
@@ -1859,6 +1949,25 @@ static void route_trace_record(olmoe_session *s, int64_t L, const int32_t *token
     if (L == n_layers - 1) tr->pub.n_tokens += rec;
 }
 
+/* the in-process A/B's switches (tr_session_ab_switch), arm 1 the road before: prep, the prep once a row (every
+ * matmul preparing its own rows, the experts' rows gathered, the swiglu apart); act, only the swiglu and the down's
+ * prep in one call; idle, no hints to the idle workers */
+enum { OLMOE_AB_PREP = 1, OLMOE_AB_ACT = 2, OLMOE_AB_IDLE = 3 };
+
+static int olmoe_ab_switch(const char *name) {
+    if (strcmp(name, "prep") == 0) return OLMOE_AB_PREP;
+    if (strcmp(name, "act") == 0) return OLMOE_AB_ACT;
+    if (strcmp(name, "idle") == 0) return OLMOE_AB_IDLE;
+    return -1;
+}
+
+static void olmoe_ab_set(void *session, int sw, int arm) {
+    olmoe_session *s = (olmoe_session *)session;
+    if (sw == OLMOE_AB_PREP) s->ab_old_prep = arm;
+    if (sw == OLMOE_AB_ACT) s->ab_old_act = arm;
+    if (sw == OLMOE_AB_IDLE) s->ab_no_idle = arm;
+}
+
 const tr_arch_vtable tr_olmoe_vtable = {
     "olmoe",
     olmoe_load,
@@ -1880,4 +1989,6 @@ const tr_arch_vtable tr_olmoe_vtable = {
     olmoe_set_expert_mask,
     olmoe_set_gpu,
     olmoe_gpu_tokens,
+    olmoe_ab_switch,
+    olmoe_ab_set,
 };

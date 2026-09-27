@@ -11,6 +11,7 @@
 #ifndef TR_THREADS_H
 #define TR_THREADS_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 typedef struct tr_pool tr_pool;
@@ -70,6 +71,29 @@ void tr_parallel_for_balanced(tr_pool *p, int64_t n, int64_t min_chunk, tr_range
 /* Blocks per chunk of tr_parallel_for_balanced; TR_POOL_BLOCKS in the environment, read at
  * tr_pool_create, overrides it for measurements, and 1 is the static split. */
 #define TR_POOL_BLOCKS 64
+
+/* The region [*begin, *end) chunk `chunk` owns in the next tr_parallel_for or
+ * tr_parallel_for_balanced of n indices and min_chunk (empty when the call has no such chunk);
+ * returns the call's chunks, 1 when it runs on the calling thread. Called by the dispatcher. */
+int tr_pool_region(const tr_pool *p, int64_t n, int64_t min_chunk, int chunk, int64_t *begin, int64_t *end);
+
+/* Idle workers bringing the next call's first bytes toward their caches (docs/MEASUREMENTS.md
+ * §The idle workers): before a serial step the dispatcher posts, for chunk `chunk` of the next call,
+ * the bytes [base, base + bytes) its thread will read first; that worker, spinning for its next call,
+ * brings them in two lines at a time between checks of its slot, and leaves the rest the moment a
+ * call arrives. A hint moves no data the code reads: a wrong or stale one costs bandwidth, never a
+ * result. Ignored for chunk 0 (the calling thread, busy with the serial step), for a chunk at or past
+ * tr_pool_active, and while the pool's hints are off. A newer hint replaces an older one. */
+void tr_pool_hint(tr_pool *p, int chunk, const void *base, size_t bytes);
+/* 0: hints off, how a pool starts (TR_POOL_HINT at creation overrides it, for measurements); 1: into L1
+ * (prefetcht0); 2: into L2 (prefetcht2). Called by the dispatcher, between calls. */
+void tr_pool_set_hints(tr_pool *p, int level);
+int tr_pool_hints(const tr_pool *p);
+/* Worker `worker`'s hints taken (counted as each starts) and lines brought in (as each ends) since the
+ * pool was made (tests). Zero for worker 0 and outside the pool. */
+void tr_pool_hint_counts(const tr_pool *p, int worker, uint64_t *hints, uint64_t *lines);
+/* The hint last posted for chunk `chunk` (tests): its base and bytes; NULL and 0 when none ever was. */
+void tr_pool_hint_peek(const tr_pool *p, int chunk, const void **base, size_t *bytes);
 
 /* The token's timeline (research build only, -DTR_POOL_TRACE; docs/MEASUREMENTS.md §The engine
  * read as entangled pairs): the bytes the calling thread's next parallel_for reads, the shape

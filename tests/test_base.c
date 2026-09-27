@@ -581,6 +581,195 @@ static void test_parallel_balanced(void) {
     tr_pool_destroy(p);
 }
 
+/* tr_pool_region: the region a chunk runs first, as the call splits it (the idle hints stand on it: kernels.h
+ * tr_matmul_hint). For many widths, n and min_chunk: a static call's worker c ran exactly its chunk's [begin, end),
+ * the chunks tile [0, n) in order, a chunk past the call's is empty, and a balanced call's worker c began its
+ * first block at begin (run_chunk: a thread's first block is its own region's front). */
+typedef struct {
+    atomic_llong first[64];
+} first_ctx;
+
+static void first_fn(void *ctx_, int64_t begin, int64_t end, int worker) {
+    (void)end;
+    first_ctx *c = (first_ctx *)ctx_;
+    long long none = -1;
+    atomic_compare_exchange_strong(&c->first[worker], &none, (long long)begin);
+}
+
+static void test_pool_region(void) {
+    static const int widths[] = {8, 3, 1, 5, 8};
+    static const int64_t min_chunks[] = {1, 3, 64};
+    unsigned char count[3000], worker_id[3000];
+    tr_pool *p = tr_pool_create(8);
+    TR_CHECK(p != NULL);
+    if (p == NULL) return;
+    int split = 0; /* calls of more than one chunk: the branch the hints use */
+    for (int iter = 0; iter < 600; iter++) {
+        const int w = widths[iter % 5];
+        const int64_t n = 1 + (iter * 37) % 3000, mc = min_chunks[iter % 3];
+        tr_pool_set_active(p, w);
+        memset(count, 0, (size_t)n);
+        cov_ctx ctx = {count, worker_id};
+        tr_parallel_for(p, n, mc, cov_fn, &ctx);
+        int64_t b, e, next = 0;
+        const int chunks = tr_pool_region(p, n, mc, 0, &b, &e);
+        for (int c = 0; c < chunks; c++) {
+            tr_pool_region(p, n, mc, c, &b, &e);
+            TR_CHECK_EQ_INT(b, next);
+            TR_CHECK(e > b);
+            next = e;
+            for (int64_t i = b; i < e; i++) TR_CHECK_EQ_INT(worker_id[i], c);
+        }
+        TR_CHECK_EQ_INT(next, n);
+        tr_pool_region(p, n, mc, chunks, &b, &e);
+        TR_CHECK(b == 0 && e == 0);
+        first_ctx fc;
+        for (int k = 0; k < 64; k++) atomic_init(&fc.first[k], -1);
+        tr_parallel_for_balanced(p, n, mc, first_fn, &fc);
+        for (int c = 0; c < chunks; c++) {
+            tr_pool_region(p, n, mc, c, &b, &e);
+            TR_CHECK_EQ_INT(atomic_load(&fc.first[c]), b);
+        }
+        split += chunks > 1;
+    }
+    TR_CHECK(split > 0);
+    tr_pool_destroy(p);
+}
+
+/* The idle hint (tr_pool_hint): a worker spinning for work takes it (its counters), whole when no call comes and
+ * left the moment one does; nothing reaches a worker for chunk 0, past the width, or with hints off. The branch
+ * that leaves a hint for a call is counted over three calls and must have run. */
+static uint64_t hints_all(const tr_pool *p, uint64_t *lines) {
+    uint64_t h = 0, l = 0;
+    for (int wk = 1; wk < tr_pool_size(p); wk++) {
+        uint64_t a, b;
+        tr_pool_hint_counts(p, wk, &a, &b);
+        h += a;
+        l += b;
+    }
+    *lines = l;
+    return h;
+}
+
+/* until worker wk's hints reach `hints` and its lines move past `lines0` (at most 2 s): its lines */
+static uint64_t wait_hint(const tr_pool *p, int wk, uint64_t hints, uint64_t lines0) {
+    uint64_t h = 0, l = lines0;
+    const double t0 = tr_time_sec();
+    while (tr_time_sec() - t0 < 2.0) {
+        tr_pool_hint_counts(p, wk, &h, &l);
+        if (h >= hints && l != lines0) break;
+    }
+    return l;
+}
+
+/* A worker asleep (2 ms without work: threads.c spin_sec) sees no hint, and a hint that should be ignored could not be
+ * told from one missed: the test's pool spins 5 s before it sleeps (TR_POOL_SPIN_US at its creation; under the gate's
+ * load the main thread was preempted for more than 2 ms between a call and a post, LESSONS #256), and a call before
+ * each post has every worker back in its spin. */
+static void hint_set_env(const char *name, const char *value) {
+#if defined(_WIN32)
+    _putenv_s(name, value != NULL ? value : "");
+#else
+    if (value != NULL) setenv(name, value, 1);
+    else unsetenv(name);
+#endif
+}
+
+static void wake_fn(void *ctx, int64_t begin, int64_t end, int worker) {
+    (void)ctx, (void)begin, (void)end, (void)worker;
+}
+
+static void wake(tr_pool *p) {
+    tr_parallel_for(p, tr_pool_size(p), 1, wake_fn, NULL);
+}
+
+static void spin_ms(double ms) {
+    const double t0 = tr_time_sec();
+    while (tr_time_sec() - t0 < ms * 1e-3) {
+    }
+}
+
+static void test_pool_hints(void) {
+    hint_set_env("TR_POOL_SPIN_US", "5000000");
+    tr_pool *p = tr_pool_create(4);
+    hint_set_env("TR_POOL_SPIN_US", NULL);
+    TR_CHECK(p != NULL);
+    if (p == NULL) return;
+    if (getenv("TR_POOL_HINT") == NULL) TR_CHECK_EQ_INT(tr_pool_hints(p), 0); /* off as a pool starts */
+    tr_pool_set_hints(p, 2);
+    const size_t big = (size_t)64 << 20;
+    unsigned char *buf = (unsigned char *)tr_alloc_aligned(big, 4096);
+    TR_CHECK(buf != NULL);
+    if (buf == NULL) {
+        tr_pool_destroy(p);
+        return;
+    }
+    memset(buf, 1, big);
+    uint64_t h0, l0, h1, l1;
+
+    /* taken whole, into L2 and into L1 */
+    tr_pool_hint_counts(p, 1, &h0, &l0);
+    wake(p);
+    tr_pool_hint(p, 1, buf, (size_t)64 << 10);
+    TR_CHECK_EQ_INT(wait_hint(p, 1, h0 + 1, l0) - l0, 1024);
+    tr_pool_set_hints(p, 1);
+    tr_pool_hint_counts(p, 2, &h0, &l0);
+    wake(p);
+    tr_pool_hint(p, 2, buf + 4096, 4096);
+    TR_CHECK_EQ_INT(wait_hint(p, 2, h0 + 1, l0) - l0, 64);
+    const void *base;
+    size_t bytes;
+    tr_pool_hint_peek(p, 2, &base, &bytes);
+    TR_CHECK(base == buf + 4096 && bytes == 4096);
+    tr_pool_set_hints(p, 2);
+
+    /* ignored, each with the workers spinning: chunk 0, a chunk past the width, hints off */
+    for (int way = 0; way < 3; way++) {
+        h0 = hints_all(p, &l0);
+        wake(p);
+        if (way == 0) tr_pool_hint(p, 0, buf, 4096);
+        if (way == 1) {
+            tr_pool_set_active(p, 2);
+            tr_pool_hint(p, 3, buf, 4096);
+            tr_pool_set_active(p, 4);
+        }
+        if (way == 2) {
+            tr_pool_set_hints(p, 0);
+            TR_CHECK_EQ_INT(tr_pool_hints(p), 0);
+            tr_pool_hint(p, 1, buf, 4096);
+            tr_pool_set_hints(p, 2);
+        }
+        spin_ms(1.0);
+        h1 = hints_all(p, &l1);
+        TR_CHECK_EQ_INT(h1, h0);
+        TR_CHECK_EQ_INT(l1, l0);
+    }
+    tr_pool_hint_peek(p, 3, &base, &bytes);
+    TR_CHECK(base == NULL && bytes == 0);
+
+    /* left for a call: a 64 MiB hint under way when the call comes */
+    unsigned char count[100], worker_id[100];
+    int left = 0;
+    for (int round = 0; round < 3; round++) {
+        tr_pool_hint_counts(p, 1, &h0, &l0);
+        wake(p);
+        tr_pool_hint(p, 1, buf, big);
+        const double t1 = tr_time_sec();
+        do tr_pool_hint_counts(p, 1, &h1, &l1);
+        while (h1 == h0 && tr_time_sec() - t1 < 2.0);
+        memset(count, 0, sizeof count);
+        cov_ctx ctx = {count, worker_id};
+        tr_parallel_for(p, 100, 1, cov_fn, &ctx);
+        check_coverage(100, count, worker_id, 4);
+        tr_pool_hint_counts(p, 1, &h1, &l1);
+        left += h1 == h0 + 1 && l1 - l0 < big / 64;
+    }
+    TR_CHECK_EQ_INT(left, 3);
+    printf("  hints: whole 1024 and 64 lines, ignored three ways, left for a call %d of 3\n", left);
+    tr_free_aligned(buf);
+    tr_pool_destroy(p);
+}
+
 /* ---- thread placement ---------------------------------------------------- */
 
 /* Every slot names a different logical processor, and the first physical_cores of them
@@ -903,6 +1092,8 @@ int main(int argc, char **argv) {
     test_parallel_varying_chunks();
     test_pool_active();
     test_parallel_balanced();
+    test_pool_region();
+    test_pool_hints();
     test_cpu_slots();
     test_pool_pinned();
     test_pool_caller_affinity_any_order();

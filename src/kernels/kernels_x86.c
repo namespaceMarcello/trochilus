@@ -223,6 +223,78 @@ static void avx2_dot_row_x4_f16(const void *row, const float *x, int64_t stride,
     out[3] = tr_lane_combine(l3);
 }
 
+/* BF16 rows: 8 halves zero-extended and shifted into the top of 8 words are 8 exact floats (the F32 values they were
+ * cut from, tr_f32_to_bf16_exact), then the products go into the lanes as in dot_f32: an F32 row's bits. */
+TR_TARGET_AVX2
+static inline __m256 avx2_bf16_to_ps(const unsigned char *p) {
+    __m256i w = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)(const void *)p));
+    return _mm256_castsi256_ps(_mm256_slli_epi32(w, 16));
+}
+
+static inline float tail_bf16(const unsigned char *row, int64_t k) {
+    uint16_t b;
+    memcpy(&b, row + 2 * (size_t)k, sizeof b);
+    return tr_bf16_to_float(b);
+}
+
+TR_TARGET_AVX2
+static float avx2_dot_row_bf16(const void *row, const float *x, int64_t n) {
+    const unsigned char *p = (const unsigned char *)row;
+    __m256 lo = _mm256_setzero_ps(), hi = _mm256_setzero_ps();
+    int64_t k = 0;
+    for (; k + TR_LANES <= n; k += TR_LANES) {
+        lo = _mm256_add_ps(lo, _mm256_mul_ps(avx2_bf16_to_ps(p + 2 * k), _mm256_loadu_ps(x + k)));
+        hi = _mm256_add_ps(hi, _mm256_mul_ps(avx2_bf16_to_ps(p + 2 * k + 16), _mm256_loadu_ps(x + k + 8)));
+    }
+    float lane[TR_LANES];
+    _mm256_storeu_ps(lane, lo);
+    _mm256_storeu_ps(lane + 8, hi);
+    for (; k < n; k++) lane[k % TR_LANES] += tail_bf16(p, k) * x[k];
+    return tr_lane_combine(lane);
+}
+
+TR_TARGET_AVX2
+static void avx2_dot_row_x4_bf16(const void *row, const float *x, int64_t stride, int64_t n, float *out) {
+    const unsigned char *p = (const unsigned char *)row;
+    const float *x0 = x, *x1 = x0 + stride, *x2 = x1 + stride, *x3 = x2 + stride;
+    __m256 lo0 = _mm256_setzero_ps(), lo1 = _mm256_setzero_ps(), lo2 = _mm256_setzero_ps(),
+           lo3 = _mm256_setzero_ps();
+    __m256 hi0 = _mm256_setzero_ps(), hi1 = _mm256_setzero_ps(), hi2 = _mm256_setzero_ps(),
+           hi3 = _mm256_setzero_ps();
+    int64_t k = 0;
+    for (; k + TR_LANES <= n; k += TR_LANES) {
+        __m256 w0 = avx2_bf16_to_ps(p + 2 * k), w1 = avx2_bf16_to_ps(p + 2 * k + 16);
+        lo0 = _mm256_add_ps(lo0, _mm256_mul_ps(w0, _mm256_loadu_ps(x0 + k)));
+        hi0 = _mm256_add_ps(hi0, _mm256_mul_ps(w1, _mm256_loadu_ps(x0 + k + 8)));
+        lo1 = _mm256_add_ps(lo1, _mm256_mul_ps(w0, _mm256_loadu_ps(x1 + k)));
+        hi1 = _mm256_add_ps(hi1, _mm256_mul_ps(w1, _mm256_loadu_ps(x1 + k + 8)));
+        lo2 = _mm256_add_ps(lo2, _mm256_mul_ps(w0, _mm256_loadu_ps(x2 + k)));
+        hi2 = _mm256_add_ps(hi2, _mm256_mul_ps(w1, _mm256_loadu_ps(x2 + k + 8)));
+        lo3 = _mm256_add_ps(lo3, _mm256_mul_ps(w0, _mm256_loadu_ps(x3 + k)));
+        hi3 = _mm256_add_ps(hi3, _mm256_mul_ps(w1, _mm256_loadu_ps(x3 + k + 8)));
+    }
+    float l0[TR_LANES], l1[TR_LANES], l2[TR_LANES], l3[TR_LANES];
+    _mm256_storeu_ps(l0, lo0);
+    _mm256_storeu_ps(l0 + 8, hi0);
+    _mm256_storeu_ps(l1, lo1);
+    _mm256_storeu_ps(l1 + 8, hi1);
+    _mm256_storeu_ps(l2, lo2);
+    _mm256_storeu_ps(l2 + 8, hi2);
+    _mm256_storeu_ps(l3, lo3);
+    _mm256_storeu_ps(l3 + 8, hi3);
+    for (; k < n; k++) {
+        float w = tail_bf16(p, k);
+        l0[k % TR_LANES] += w * x0[k];
+        l1[k % TR_LANES] += w * x1[k];
+        l2[k % TR_LANES] += w * x2[k];
+        l3[k % TR_LANES] += w * x3[k];
+    }
+    out[0] = tr_lane_combine(l0);
+    out[1] = tr_lane_combine(l1);
+    out[2] = tr_lane_combine(l2);
+    out[3] = tr_lane_combine(l3);
+}
+
 /* 8 int8 at p -> 8 exact floats */
 TR_TARGET_AVX2
 static inline __m256 avx2_i8_to_ps(const unsigned char *p) {
@@ -380,6 +452,19 @@ static void avx2_q4x_dot2(const void *row0, const void *row1, const void *xq, in
     out[1] = (float)y[1];
 }
 
+/* A short verify pass's pairs by AVX2: the pairs one input row after the other (the same bits; each weight
+ * decoded once for all of them, as AVX-512's, is owed here) */
+TR_TARGET_AVX2
+static void avx2_q4x_dot_xt(const void *row0, const void *row1, const void *const *xq, int64_t n, int T, float *y,
+                            int64_t y_stride) {
+    for (int t = 0; t < T; t++) {
+        float o[2];
+        avx2_q4x_dot2(row0, row1, xq[t], n, o);
+        y[(int64_t)t * y_stride] = o[0];
+        y[(int64_t)t * y_stride + 1] = o[1];
+    }
+}
+
 /* ---- AVX-512: lanes 0..15 in one register -------------------------------- */
 
 TR_TARGET_AVX512
@@ -523,6 +608,58 @@ static void avx512_dot_row_x4_f16(const void *row, const float *x, int64_t strid
     _mm512_storeu_ps(l3, acc3);
     for (; k < n; k++) {
         float w = tail_half(p, k);
+        l0[k % TR_LANES] += w * x0[k];
+        l1[k % TR_LANES] += w * x1[k];
+        l2[k % TR_LANES] += w * x2[k];
+        l3[k % TR_LANES] += w * x3[k];
+    }
+    out[0] = tr_lane_combine(l0);
+    out[1] = tr_lane_combine(l1);
+    out[2] = tr_lane_combine(l2);
+    out[3] = tr_lane_combine(l3);
+}
+
+/* BF16 rows: 16 halves zero-extended and shifted into the top of 16 words (exact), then as dot_f32. */
+TR_TARGET_AVX512
+static inline __m512 avx512_bf16_to_ps(const unsigned char *p) {
+    __m512i w = _mm512_cvtepu16_epi32(_mm256_loadu_si256((const __m256i *)(const void *)p));
+    return _mm512_castsi512_ps(_mm512_slli_epi32(w, 16));
+}
+
+TR_TARGET_AVX512
+static float avx512_dot_row_bf16(const void *row, const float *x, int64_t n) {
+    const unsigned char *p = (const unsigned char *)row;
+    __m512 acc = _mm512_setzero_ps();
+    int64_t k = 0;
+    for (; k + TR_LANES <= n; k += TR_LANES)
+        acc = _mm512_add_ps(acc, _mm512_mul_ps(avx512_bf16_to_ps(p + 2 * k), _mm512_loadu_ps(x + k)));
+    float lane[TR_LANES];
+    _mm512_storeu_ps(lane, acc);
+    for (; k < n; k++) lane[k % TR_LANES] += tail_bf16(p, k) * x[k];
+    return tr_lane_combine(lane);
+}
+
+TR_TARGET_AVX512
+static void avx512_dot_row_x4_bf16(const void *row, const float *x, int64_t stride, int64_t n, float *out) {
+    const unsigned char *p = (const unsigned char *)row;
+    const float *x0 = x, *x1 = x0 + stride, *x2 = x1 + stride, *x3 = x2 + stride;
+    __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps(), acc2 = _mm512_setzero_ps(),
+           acc3 = _mm512_setzero_ps();
+    int64_t k = 0;
+    for (; k + TR_LANES <= n; k += TR_LANES) {
+        __m512 w = avx512_bf16_to_ps(p + 2 * k);
+        acc0 = _mm512_add_ps(acc0, _mm512_mul_ps(w, _mm512_loadu_ps(x0 + k)));
+        acc1 = _mm512_add_ps(acc1, _mm512_mul_ps(w, _mm512_loadu_ps(x1 + k)));
+        acc2 = _mm512_add_ps(acc2, _mm512_mul_ps(w, _mm512_loadu_ps(x2 + k)));
+        acc3 = _mm512_add_ps(acc3, _mm512_mul_ps(w, _mm512_loadu_ps(x3 + k)));
+    }
+    float l0[TR_LANES], l1[TR_LANES], l2[TR_LANES], l3[TR_LANES];
+    _mm512_storeu_ps(l0, acc0);
+    _mm512_storeu_ps(l1, acc1);
+    _mm512_storeu_ps(l2, acc2);
+    _mm512_storeu_ps(l3, acc3);
+    for (; k < n; k++) {
+        float w = tail_bf16(p, k);
         l0[k % TR_LANES] += w * x0[k];
         l1[k % TR_LANES] += w * x1[k];
         l2[k % TR_LANES] += w * x2[k];
@@ -1915,6 +2052,154 @@ static void avx512_q4x_dot2(const void *row0, const void *row1, const void *xq, 
     out[1] = (float)y[1];
 }
 
+/* The pairs' header pre-pass and block end, for the short passes' kernel below: the same statements as
+ * avx512_q4x_dot2's, which keeps them inline (the decode's kernel stays the code measured, LESSONS #239).
+ * The headers of blocks sp..se-1 of rows p[0] and p[1] into a span's tables, both rows a ymm, a row a 128-bit
+ * lane: tr_q4_k_sc_m's byte shuffles, then d and dmin of both rows by one vcvtph2ps. hsc: each block's sc0..7
+ * and m0..7 as words; hmf: its m0..7; hdm: d, dmin of row 0, then of row 1 */
+TR_TARGET_Q4X
+static inline __attribute__((always_inline)) void q4x_headers2(const unsigned char *const p[2], int64_t sp, int64_t se,
+                                                               int16_t hsc[][2][16], double hmf[][2][8], double hdm[][4]) {
+    const __m256i sA = _mm256_broadcastsi128_si256(_mm_setr_epi8(4, 5, 6, 7, 12, 13, 14, 15, 8, 9, 10, 11, 12, 13, 14, 15));
+    const __m256i sB = _mm256_broadcastsi128_si256(_mm_setr_epi8(-1, -1, -1, -1, 4, 5, 6, 7, -1, -1, -1, -1, 8, 9, 10, 11));
+    const __m256i mlow = _mm256_broadcastsi128_si256(_mm_setr_epi8(63, 63, 63, 63, 15, 15, 15, 15, 63, 63, 63, 63, 15, 15, 15, 15));
+    for (int64_t b = sp; b < se; b++) {
+        const unsigned char *k0 = p[0] + (size_t)b * TR_Q4_K_BLOCK_BYTES, *k1 = p[1] + (size_t)b * TR_Q4_K_BLOCK_BYTES;
+        const __m256i hdr = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)(const void *)k0)),
+                                                    _mm_loadu_si128((const __m128i *)(const void *)k1), 1);
+        const __m256i a = _mm256_shuffle_epi8(hdr, sA), hb = _mm256_shuffle_epi8(hdr, sB);
+        const __m256i sel = _mm256_blend_epi16(a, _mm256_and_si256(_mm256_srli_epi16(a, 4), _mm256_set1_epi8(0x0F)), 0xC0);
+        const __m256i sm = _mm256_or_si256(_mm256_and_si256(sel, mlow),
+                                           _mm256_srli_epi16(_mm256_and_si256(hb, _mm256_set1_epi8((char)0xC0)), 2));
+        _mm256_storeu_si256((__m256i *)(void *)hsc[b - sp][0], _mm256_cvtepu8_epi16(_mm256_castsi256_si128(sm)));
+        _mm256_storeu_si256((__m256i *)(void *)hsc[b - sp][1], _mm256_cvtepu8_epi16(_mm256_extracti128_si256(sm, 1)));
+        _mm512_storeu_pd(hmf[b - sp][0], _mm512_cvtepi64_pd(_mm512_cvtepu8_epi64(_mm_srli_si128(_mm256_castsi256_si128(sm), 8))));
+        _mm512_storeu_pd(hmf[b - sp][1], _mm512_cvtepi64_pd(_mm512_cvtepu8_epi64(_mm_srli_si128(_mm256_extracti128_si256(sm, 1), 8))));
+        const __m128i dd = _mm_unpacklo_epi32(_mm256_castsi256_si128(hdr), _mm256_extracti128_si256(hdr, 1));
+        _mm256_storeu_pd(hdm[b - sp], _mm256_cvtps_pd(_mm_cvtph_ps(dd)));
+    }
+}
+
+/* a block's end for two rows against one prepared row (acc: each row's lanes of digit 0 and 1; bf8: the row's
+ * sub-block sums; hmf, hdm: the block's entries of the span's tables): each row's lanes to f64, its two digits
+ * joined beside its mins' products, the four sums reduced together, then kernels.c's f64 steps into y[0], y[1] */
+TR_TARGET_Q4X
+static inline __attribute__((always_inline)) void q4x_end2(__m512i acc[2][2], const double *bf8, const double hmf[2][8],
+                                                           const double hdm[4], double scale, double y[2]) {
+    const __m512d b16 = _mm512_set1_pd((double)TR_Q4X_BASE);
+    const __m512d bf = _mm512_loadu_pd(bf8);
+    __m512d t[2], mm[2];
+#pragma GCC unroll 2
+    for (int r = 0; r < 2; r++) {
+        const __m512d s0 = _mm512_add_pd(_mm512_cvtepi32_pd(_mm512_castsi512_si256(acc[r][0])),
+                                         _mm512_cvtepi32_pd(_mm512_extracti64x4_epi64(acc[r][0], 1)));
+        const __m512d s1 = _mm512_add_pd(_mm512_cvtepi32_pd(_mm512_castsi512_si256(acc[r][1])),
+                                         _mm512_cvtepi32_pd(_mm512_extracti64x4_epi64(acc[r][1], 1)));
+        t[r] = _mm512_fmadd_pd(s1, b16, s0);
+        mm[r] = _mm512_mul_pd(_mm512_loadu_pd(hmf[r]), bf);
+    }
+    /* [T0 | M0] and [T1 | M1] by 256-bit halves, then [T0 M0 T1 M1] by 128-bit quarters, then the pairs */
+    const __m512d A = _mm512_add_pd(_mm512_shuffle_f64x2(t[0], mm[0], 0x44), _mm512_shuffle_f64x2(t[0], mm[0], 0xEE));
+    const __m512d B = _mm512_add_pd(_mm512_shuffle_f64x2(t[1], mm[1], 0x44), _mm512_shuffle_f64x2(t[1], mm[1], 0xEE));
+    const __m512d Q = _mm512_add_pd(_mm512_shuffle_f64x2(A, B, 0x88), _mm512_shuffle_f64x2(A, B, 0xDD));
+    double sums[8];
+    _mm512_storeu_pd(sums, _mm512_add_pd(Q, _mm512_permute_pd(Q, 0x55)));
+#pragma GCC unroll 2
+    for (int r = 0; r < 2; r++) {
+        const double val = hdm[2 * r] * sums[4 * r] - hdm[2 * r + 1] * sums[4 * r + 2];
+        y[r] = y[r] + val * scale;
+    }
+}
+
+/* A short verify pass's pairs: two rows against T prepared rows (T a constant in every caller, 2 or 3), each
+ * weight decoded once for all of them: per block and row the quants widened to words and split into nibbles,
+ * times their sub-block's scale, once a window; then per token what avx512_q4x_dot2 does with them (one vpdpwssd
+ * per 32 columns, digit and row; q4x_end2), each (token, row) its own chain. The headers of TR_Q4_K_SPAN blocks
+ * of both rows are read first, as the pairs read them (LESSONS #178, #181). From RAM at 8 threads it reads a
+ * dense matrix at 0.97 (T = 2) and 0.88 (T = 3) of a plain read, the W16 panel and a tile at 0.85 and 0.76
+ * (docs/MEASUREMENTS.md §A Q4_K weight row decoded once for 2-3 tokens). */
+TR_TARGET_Q4X
+static inline __attribute__((always_inline)) void q4x_dot_xt_t(const unsigned char *row0, const unsigned char *row1,
+                                                               const void *const *xq, int64_t n, float *out, int64_t ys,
+                                                               const int T) {
+    const unsigned char *p[2] = {row0, row1};
+    tr_q4x_view v[TR_Q4X_XT_MAX];
+    double y[TR_Q4X_XT_MAX][2];
+#pragma GCC unroll 3
+    for (int t = 0; t < T; t++) {
+        v[t] = tr_q4x_view_of(xq[t], n);
+        y[t][0] = y[t][1] = 0.0;
+    }
+    const __m512i m15 = _mm512_set1_epi16(15);
+    const int64_t nb = n / TR_Q4_K_BLOCK_ELEMS;
+    int16_t hsc[TR_Q4_K_SPAN][2][16];
+    double hmf[TR_Q4_K_SPAN][2][8];
+    double hdm[TR_Q4_K_SPAN][4];
+    for (int64_t sp = 0; sp < nb; sp += TR_Q4_K_SPAN) {
+        const int64_t se = sp + TR_Q4_K_SPAN < nb ? sp + TR_Q4_K_SPAN : nb;
+        q4x_headers2(p, sp, se, hsc, hmf, hdm);
+        for (int64_t s = sp; s < se; s++) {
+            const int64_t h = s - sp;
+            const unsigned char *bq[2] = {p[0] + (size_t)s * TR_Q4_K_BLOCK_BYTES + TR_Q4_K_QS_OFFSET,
+                                          p[1] + (size_t)s * TR_Q4_K_BLOCK_BYTES + TR_Q4_K_QS_OFFSET};
+            __m512i acc[TR_Q4X_XT_MAX][2][2];
+#pragma GCC unroll 2
+            for (int r = 0; r < 2; r++) {
+                const unsigned char *blk = p[r] + (size_t)s * TR_Q4_K_BLOCK_BYTES;
+                _mm_prefetch((const char *)blk + TR_Q4_K_PREFETCH, _MM_HINT_T0);
+                _mm_prefetch((const char *)blk + TR_Q4_K_PREFETCH + 64, _MM_HINT_T0);
+                _mm_prefetch((const char *)blk + TR_Q4_K_PREFETCH + 128, _MM_HINT_T0);
+            }
+#pragma GCC unroll 3
+            for (int t = 0; t < T; t++) acc[t][0][0] = acc[t][0][1] = acc[t][1][0] = acc[t][1][1] = _mm512_setzero_si512();
+#pragma GCC unroll 4
+            for (int c = 0; c < 4; c++) {
+                __m512i wl[2], wh[2];
+#pragma GCC unroll 2
+                for (int r = 0; r < 2; r++) {
+                    const __m512i q = _mm512_cvtepu8_epi16(_mm256_loadu_si256((const __m256i *)(const void *)(bq[r] + 32 * c)));
+                    wl[r] = _mm512_mullo_epi16(_mm512_and_si512(q, m15), _mm512_set1_epi16(hsc[h][r][2 * c]));
+                    wh[r] = _mm512_mullo_epi16(_mm512_srli_epi16(q, 4), _mm512_set1_epi16(hsc[h][r][2 * c + 1]));
+                }
+#pragma GCC unroll 3
+                for (int t = 0; t < T; t++) {
+                    const int16_t *d0 = v[t].v0 + s * TR_Q4_K_BLOCK_ELEMS + 64 * c, *d1 = v[t].v1 + s * TR_Q4_K_BLOCK_ELEMS + 64 * c;
+                    const __m512i a0 = _mm512_loadu_si512(d0), a1 = _mm512_loadu_si512(d1);
+                    const __m512i b0 = _mm512_loadu_si512(d0 + 32), b1 = _mm512_loadu_si512(d1 + 32);
+#pragma GCC unroll 2
+                    for (int r = 0; r < 2; r++) {
+                        acc[t][r][0] = _mm512_dpwssd_epi32(_mm512_dpwssd_epi32(acc[t][r][0], wl[r], a0), wh[r], b0);
+                        acc[t][r][1] = _mm512_dpwssd_epi32(_mm512_dpwssd_epi32(acc[t][r][1], wl[r], a1), wh[r], b1);
+                    }
+                }
+            }
+#pragma GCC unroll 3
+            for (int t = 0; t < T; t++) q4x_end2(acc[t], v[t].bf + 8 * s, hmf[h], hdm[h], v[t].scale[s], y[t]);
+        }
+    }
+#pragma GCC unroll 3
+    for (int t = 0; t < T; t++) {
+        out[(int64_t)t * ys] = (float)y[t][0];
+        out[(int64_t)t * ys + 1] = (float)y[t][1];
+    }
+}
+
+#define Q4X_XT_FN(T)                                                                                           \
+    TR_TARGET_Q4X static void avx512_q4x_dot_xt_##T(const unsigned char *row0, const unsigned char *row1,        \
+                                                    const void *const *xq, int64_t n, float *y, int64_t ys) {    \
+        q4x_dot_xt_t(row0, row1, xq, n, y, ys, T);                                                             \
+    }
+Q4X_XT_FN(2) Q4X_XT_FN(3)
+#undef Q4X_XT_FN
+
+typedef void (*q4x_xt_fn)(const unsigned char *, const unsigned char *, const void *const *, int64_t, float *, int64_t);
+static const q4x_xt_fn g_q4x_xts[TR_Q4X_XT_MAX + 1] = {NULL, NULL, avx512_q4x_dot_xt_2, avx512_q4x_dot_xt_3};
+
+static void avx512_q4x_dot_xt(const void *row0, const void *row1, const void *const *xq, int64_t n, int T, float *y,
+                              int64_t y_stride) {
+    g_q4x_xts[T]((const unsigned char *)row0, (const unsigned char *)row1, xq, n, y, y_stride);
+}
+
 /* 16 rows into the panel: per block the rows' headers 4 a zmm, their scales and mins transposed to [j][16 rows]
  * by the 16 x 16 byte transpose, d and dmin gathered to the even/odd order by three dword permutes; per window
  * the quants transposed to [byte pair][16 rows], the nibbles widened to words, times the rows' scales plus
@@ -2059,13 +2344,13 @@ static void avx512_q4x_panel(const void *rows, size_t row_bytes, int64_t n, void
  * by exact fmas, then the f64 steps; the even rows' outputs in one vector, the odd rows' in another */
 typedef int __attribute__((may_alias)) q4x_i32;
 TR_TARGET_Q4X
-static inline __attribute__((always_inline)) void q4x_tile_t(const unsigned char *panel, const unsigned char *xq,
-                                                             size_t xs, int64_t n, float *y, int64_t ys, const int T) {
+static inline __attribute__((always_inline)) void q4x_tile_t(const unsigned char *panel, const void *const *xq,
+                                                             int64_t n, float *y, int64_t ys, const int T) {
     tr_q4x_view v[TR_Q4X_TILE_MAX];
     __m512d ye[TR_Q4X_TILE_MAX], yo[TR_Q4X_TILE_MAX];
 #pragma GCC unroll 4
     for (int t = 0; t < T; t++) {
-        v[t] = tr_q4x_view_of(xq + (size_t)t * xs, n);
+        v[t] = tr_q4x_view_of(xq[t], n);
         ye[t] = yo[t] = _mm512_setzero_pd();
     }
     const __m512i bias4 = _mm512_set1_epi64(4ll << 31);
@@ -2138,20 +2423,19 @@ static inline __attribute__((always_inline)) void q4x_tile_t(const unsigned char
 }
 
 #define Q4X_TILE_FN(T)                                                                                         \
-    TR_TARGET_Q4X static void avx512_q4x_tile_##T(const unsigned char *panel, const unsigned char *xq, size_t xs,  \
-                                                  int64_t n, float *y, int64_t ys) {                          \
-        q4x_tile_t(panel, xq, xs, n, y, ys, T);                                                               \
+    TR_TARGET_Q4X static void avx512_q4x_tile_##T(const unsigned char *panel, const void *const *xq, int64_t n,   \
+                                                  float *y, int64_t ys) {                                     \
+        q4x_tile_t(panel, xq, n, y, ys, T);                                                                   \
     }
 Q4X_TILE_FN(1) Q4X_TILE_FN(2) Q4X_TILE_FN(3) Q4X_TILE_FN(4)
 #undef Q4X_TILE_FN
 
-typedef void (*q4x_tile_fn)(const unsigned char *, const unsigned char *, size_t, int64_t, float *, int64_t);
+typedef void (*q4x_tile_fn)(const unsigned char *, const void *const *, int64_t, float *, int64_t);
 static const q4x_tile_fn g_q4x_tiles[TR_Q4X_TILE_MAX + 1] = {NULL, avx512_q4x_tile_1, avx512_q4x_tile_2,
                                                              avx512_q4x_tile_3, avx512_q4x_tile_4};
 
-static void avx512_q4x_tile(const void *panel, const void *xq, size_t xq_stride, int64_t n, int T, float *y,
-                            int64_t y_stride) {
-    g_q4x_tiles[T]((const unsigned char *)panel, (const unsigned char *)xq, xq_stride, n, y, y_stride);
+static void avx512_q4x_tile(const void *panel, const void *const *xq, int64_t n, int T, float *y, int64_t y_stride) {
+    g_q4x_tiles[T]((const unsigned char *)panel, xq, n, y, y_stride);
 }
 
 /* hot: end */
@@ -2181,12 +2465,15 @@ const tr_kernels *tr_kernels_x86_tier(const char *tier) {
                 g_avx2.dot_row[TR_TYPE_F16] = avx2_dot_row_f16;
                 g_avx2.dot_row_x4[TR_TYPE_F16] = avx2_dot_row_x4_f16;
             }
+            g_avx2.dot_row[TR_TYPE_BF16] = avx2_dot_row_bf16;
+            g_avx2.dot_row_x4[TR_TYPE_BF16] = avx2_dot_row_x4_bf16;
             g_avx2.dot_row[TR_TYPE_Q8_0] = avx2_dot_row_q8_0;
             g_avx2.dot_row_x4[TR_TYPE_Q8_0] = avx2_dot_row_x4_q8_0;
             g_avx2.dot_row_xt[TR_TYPE_Q8_0] = avx2_dot_row_xt_q8_0;
             /* Q4_K's integer definition by rows (no panel road) */
             g_avx2.q4x_prep = avx2_q4x_prep;
             g_avx2.q4x_dot2 = avx2_q4x_dot2;
+            g_avx2.q4x_dot_xt = avx2_q4x_dot_xt;
             g_avx2.q4x_panel = NULL;
             g_avx2.q4x_tile = NULL;
             g_avx2.dot_row[TR_TYPE_Q6_K] = avx2_dot_row_q6_k;
@@ -2211,6 +2498,8 @@ const tr_kernels *tr_kernels_x86_tier(const char *tier) {
             g_avx512.dot_row_x4[TR_TYPE_F32] = avx512_dot_row_x4_f32;
             g_avx512.dot_row[TR_TYPE_F16] = avx512_dot_row_f16;
             g_avx512.dot_row_x4[TR_TYPE_F16] = avx512_dot_row_x4_f16;
+            g_avx512.dot_row[TR_TYPE_BF16] = avx512_dot_row_bf16;
+            g_avx512.dot_row_x4[TR_TYPE_BF16] = avx512_dot_row_x4_bf16;
             g_avx512.dot_row[TR_TYPE_Q8_0] = avx512_dot_row_q8_0;
             g_avx512.dot_row_x4[TR_TYPE_Q8_0] = avx512_dot_row_x4_q8_0;
             g_avx512.dot_row_xt[TR_TYPE_Q8_0] = avx512_dot_row_xt_q8_0;
@@ -2228,11 +2517,13 @@ const tr_kernels *tr_kernels_x86_tier(const char *tier) {
                 q4x_build_idx();
                 g_avx512.q4x_prep = avx512_q4x_prep;
                 g_avx512.q4x_dot2 = avx512_q4x_dot2;
+                g_avx512.q4x_dot_xt = avx512_q4x_dot_xt;
                 g_avx512.q4x_panel = avx512_q4x_panel;
                 g_avx512.q4x_tile = avx512_q4x_tile;
             } else {
                 g_avx512.q4x_prep = avx2_q4x_prep;
                 g_avx512.q4x_dot2 = avx2_q4x_dot2;
+                g_avx512.q4x_dot_xt = avx2_q4x_dot_xt;
                 g_avx512.q4x_panel = NULL;
                 g_avx512.q4x_tile = NULL;
             }

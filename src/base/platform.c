@@ -119,7 +119,7 @@ tr_file *tr_file_open(const char *path, char *err, size_t err_len) {
         return NULL;
     }
 
-    tr_file *f = malloc(sizeof *f);
+    tr_file *f = calloc(1, sizeof *f);
     if (f == NULL) {
         set_err(err, err_len, "out of memory");
         CloseHandle(h);
@@ -145,7 +145,7 @@ tr_file *tr_file_open_direct(const char *path, char *err, size_t err_len) {
         return NULL;
     }
 
-    tr_file *f = malloc(sizeof *f);
+    tr_file *f = calloc(1, sizeof *f);
     if (f == NULL) {
         set_err(err, err_len, "out of memory");
         CloseHandle(h);
@@ -296,7 +296,7 @@ tr_file *tr_file_open(const char *path, char *err, size_t err_len) {
         set_err(err, err_len, "open failed: %s", strerror(errno));
         return NULL;
     }
-    tr_file *f = malloc(sizeof *f);
+    tr_file *f = calloc(1, sizeof *f);
     if (f == NULL) {
         set_err(err, err_len, "out of memory");
         close(fd);
@@ -326,7 +326,7 @@ tr_file *tr_file_open_direct(const char *path, char *err, size_t err_len) {
         return NULL;
     }
 #endif
-    tr_file *f = malloc(sizeof *f);
+    tr_file *f = calloc(1, sizeof *f);
     if (f == NULL) {
         set_err(err, err_len, "out of memory");
         close(fd);

@@ -195,11 +195,14 @@ decides | — | — |
 | 74 | The draft on the GPU: the Q8_0 high-nibble planes and the draft's KV in VRAM, the CPU verifying from RAM, overlapped (the idea bounce of 2026-09-26, `build/entangled/bounce.md`): ~2.2x overlapped, ~1.7x serial in time (model). For Marcello: does the GPU count in the race (the GPU attention did) | a ~50-line CUDA probe timing one batch-1 draft step (plane 635 MiB + KV halves 256): pass <= 6 ms a draft token, fail > 15 ms | the draft's 891 MiB a draft token off the RAM bus |
 | 75 | ~~A draft KV in int4 (or int8) written once per position, and a draft head of the top ~16k rows~~ **Measured 2026-09-26** (§The draft's KV in 8 and 4 bits): the 8-bit copy changes no draft token and lifts every cell 0.02-0.14x; out of sample prose 0.93-1.09x, Italian 0.95-1.12x, code 1.14-1.26x; the 16k head covers 85-93% of the exact tokens: out. Prose does not pass 1.1x: the draft's weight plane is what is left | — | — |
 | 76 | Why does a 4-bit draft KV agree with the exact model more often than a 16-bit one (18 flips won, 3 lost, mostly where the exact margin is under 1 nat)? A guess: noise on the old keys inflates their softmax weight (Jensen) against the last 64 kept at 16 bits | kv4 with no positions kept at 16 bits; Gaussian noise on the 16-bit draft's old keys | a draft that is cheaper and closer at once |
-| 78 | The verify pass of 2-4 rows at its bytes (§The post-it taken apart): while no group reaches 4 rows the grouped matmul cut by weight rows and balanced (every input row of a group against a weight row while it is in cache), a kernel decoding a weight row once for 2-3 tokens. **Q8_0 done 2026-09-27** (§The short verify pass at its bytes: 3 rows at its bytes, a row 0.31 of a pass; 2 rows 0.43). **Q4_K 2026-09-27** (§The Q4_K short passes: the W16 panel's rows brought ahead, a 2-row group by `q4x_dot2` pairs: 3 rows 28.0 -> 26.5 ms, 2 rows 22.9 -> 22.2 at 8 threads); left: the dense's +0.5-0.9 ms a row (road (c): a Q4_K weight row decoded once for 2-3 prepared tokens) and the rest's +0.35-0.41 | `sh tools/row_price.sh` before and after (2, 3, 5, 9 rows), also with a 2048 and 4000-position prefix (the context is modelled today); then `tools/draft_gate_sim.py` | new code's drafts are short: a row costs 0.50-0.72 of a pass today, 0.31-0.36 at its bytes; every draft source gains |
+| 78 | The verify pass of 2-4 rows at its bytes (§The post-it taken apart): while no group reaches 4 rows the grouped matmul cut by weight rows and balanced (every input row of a group against a weight row while it is in cache), a kernel decoding a weight row once for 2-3 tokens. **Q8_0 done 2026-09-27** (§The short verify pass at its bytes: 3 rows at its bytes, a row 0.31 of a pass; 2 rows 0.43). **Q4_K 2026-09-27** (§The Q4_K short passes: the W16 panel's rows brought ahead, a 2-row group by `q4x_dot2` pairs: 3 rows 28.0 -> 26.5 ms, 2 rows 22.9 -> 22.2 at 8 threads); then **road (c)** (§A Q4_K weight row decoded once for 2-3 tokens: `q4x_dot_xt`, two weight rows decoded once for a group's 2-3 rows: 2 rows 0.94-0.98, 3 rows 0.96-0.985 in three sessions, the prompt unchanged, the decode +0.8-1.7% spread over every zone: open, the code's layout?); left: the rest's +0.30-0.42 ms a row and the dense at 3 rows, +0.39-0.45 (xt(3) reads at 0.88 of the bytes at 8 threads) | `sh tools/row_price.sh` before and after (2, 3, 5, 9 rows), also with a 2048 and 4000-position prefix (the context is modelled today); then `tools/draft_gate_sim.py` | new code's drafts are short: a row costs 0.50-0.72 of a pass today, 0.31-0.36 at its bytes; every draft source gains |
 | 79 | A row that costs no bytes: the model restricted to the experts the pass already reads (the union of its exact rows'), as a draft, or as a filter of the gate's draft before its exact rows (two-stage verification) | a `draft_probe` variant: agreement with the exact argmax by margin, restricted to the union of 1 and of 2 exact rows | the model's knowledge of names at ~0.03-0.05 of a pass a row, where the table knows 22% of them |
 | 80 | Drop a draft row mid-pass when the main row's intermediate state says its draft is wrong (logit lens on the draft's and the gate's candidates' rows of the head, a few KB) | per layer, the draft's logit-lens rank among the candidates on the replay's positions | a wrong row then costs its new experts only up to the layer where it is dropped |
 | 81 | The drafts on code written with a real context: a function of a real file continued mid-file with the rest of the file and its neighbours in the prompt, and a table built from the user's own repository. **Answered 2026-09-27** (§Drafts with a real context): the engine's lookup 1.067x, the gate 1.146x at the measured prices (1.27-1.32x with the context modelled), the repo table adds nothing to the gate; left: the row's price measured at ~3000 positions | the 18-prompt pipeline (`tools/draft_table_gen.sh`, `tools/draft_gate_sim.py`) on prompts cut from this repo's `src/` and `tools/`, the table from the repo minus the file under test | the 18 prompts are file beginnings (~100-200 positions): real use has thousands, and the context sources are the best drafters measured |
 | 82 | The short passes' width when every pass drafts (LESSONS #228): the tuner probes one-row passes only, so a session with a draft on every pass runs its 2-4-row passes on the whole pool. **Answered 2026-09-27** (§The verify passes' own width): every size of verify pass measures its own width, the narrowest skipped; on a pool of 16 Q8_0 0.961-0.966 of the pool, Q4_K 0.982-1.005, 8 threads picked everywhere; left: the probes' cost on long sessions (a re-measure every doubling) | the passes of 1, 2 and 3 rows at 4, 8 and 16 threads forced (`--decode-threads`) on a pool of 16, alternated; then the tuner fed the short passes too | after question 78 the short passes are still 1.04-1.09x slower at 16 threads than at 8 |
+| 83 | Half a prep a token, or less (Marcello): Q4_K's input rows prepared once a distinct row, in the call that makes them, with fewer pool calls a layer. **P1 + P2 done 2026-09-27** (§The prep once a row: q/k/v from one prep, gate and up from the tokens' rows through a map, no gather: the prompt 1.058, a 3-row pass 1.026, the same bits; the decode with P4 1.025, the arms aperiodic); **P4** (swiglu with the down's prep in one call): the prompt 1.0087, the decode level; left: gate and up in one call, countdown epilogues, the idle workers prefetching their next call, then the prep's bit arithmetic (0.70 us a prep: ~0.1 us to take) | `tools/ab_inproc.sh <bin> <switch>` (prompt: AB_INPROC_PROMPT=8), each piece with its own switch; the traced timeline's no-weight calls | the prompt's preps and gather were 8.6% of a 512-token prompt, 3% of a decode pass |
+| 84 | ~~Does the run past a stream's end cost the weights' reads too?~~ **Answered 2026-09-27** (§The idle workers, and what lies past a region's end): the page after each thread's region dropped, a dense call 0.8% faster (the read 1.7%), an expert's call level; a thread's regions of consecutive calls one after the other, a dense call 1.0-1.75% faster. A lever of 0.2-0.4% of a token in the dense calls' layout, none in the experts'; taken with piece 4 (q, k, v in one call lays them out again) | — | — |
+| 85 | The serial steps as messages (LESSONS #255): the idle workers' hints gain the next call up to the serial step's length in the bench (0.85-0.96 W) and nothing in the engine, where the step after each hint reads the rows the workers wrote (attn_out, h3) and stores over lines they share (normed, the prepared row). If the steps stop touching the workers' lines (the add and the mix inside the calls that make their rows, normed and the prepared row in buffers the workers have not read since), do the serial steps get faster by themselves, and do the hints then pay? The first step not raced: `pretouch` (the calling thread's own next lines asked before each hint) | the steps' zones with `TR_POOL_HINT=2` against 0 in one process (`idle`), then each step's lines moved | the serial zones are ~260 us a token (1.7%); the hints' gross gain 150-190 us |
 
 Reference machine: Ryzen 9 7940HX (Zen 4, 16 core / 32 thread, AVX-512 VNNI/BF16), 31 GB
 RAM (2×16 GB DDR5-5200), NVMe Micron 1 TB, GPU RTX 4070 Laptop 8 GB and Radeon 610M (not used
@@ -4780,6 +4783,437 @@ Q8_0, 8 for Q4_K: the engine before once the decode has measured). Pass ms:
   slower (in); the narrowest skipped, Q8_0 better than predicted, Q4_K in, no size more than 1% slower than
   the pool (in).
 
+## A Q4_K weight row decoded once for 2-3 tokens (question 78's road (c), 2026-09-27)
+
+Until this step a Q4_K group of 2 input rows went by `q4x_dot2` pairs, a token at a time (each weight row decoded
+twice), and a group of 3 by the W16 panel and one tile (§The Q4_K short passes). `q4x_dot_xt` (kernels.h) takes two
+weight rows against 2 or 3 prepared rows: per 64 columns and row the weight side once (the quants widened, the two
+nibbles, two `vpmullw` by the sub-block scales), 4 `vpdpwssd` a token; its header pre-pass and block end are
+`q4x_dot2`'s statements (`q4x_headers2`, `q4x_end2`), so every value is dot2's. The driver cuts a group under 4 rows
+(`Q4X_MIN_TILE_ROWS` 4) into runs of 3, or of 2 when 2 or 4 are left, 8 calls a run; a lone row keeps `q4x_dot2`.
+Scalar and AVX2 take the pairs one input row after the other (the same bits; AVX2's own kernel is owed).
+Predictions in `build/rowprice-q80/predictions.txt`, written before any code or run. The kernel alone:
+`tools/bench_q4x.sh` (tests/bench_q4x.c, every output checked against scalar first).
+
+**In L1** (container, one core, 11 runs; two rows and T prepared rows hot, then an item of 16 rows of 2048 with its
+T prepared rows in L1/L2), ns and the ratio to the same work by `q4x_dot2`:
+
+| line | T = 2 | T = 3 |
+|---|---|---|
+| 2 rows of 1024: T x `q4x_dot2`, `q4x_dot_xt` | 158.8, 122.4 (**0.771**) | 237.3, 170.1 (**0.717**) |
+| 2 rows of 2048 | 310.8, 238.8 (0.768) | 468.1, 333.2 (0.712) |
+| an item of 16 rows: dot2, xt, the panel and a tile | 2492.7, 1914.9 (0.768), 1935.3 (0.776) | 3743.4, 2666.6 (0.712), **2269.5 (0.606)** |
+
+- Predicted 0.80-0.88 (T = 2) and 0.73-0.83 (T = 3): both better. The task's first drop line (xt(3) above 0.8 of
+  three dot2) is passed. In cache the panel is the fastest road at 3 tokens.
+- The disassembly: the window loop unrolled, 96 `vpdpwssd` and 16 `vpmullw` a call at T = 3, the 12 accumulators in
+  registers, no zmm on the stack (LESSONS #208, #209).
+
+**From RAM** (native, `--ram P`: 1 GiB of Q4_K rows of 2048 (256 MiB on one thread) in items of 16 rows, one
+contiguous chunk of items a thread, the same prepared rows every item; GB/s of weight bytes, medians of 14-22
+passes; spreads 2-10% on one thread, 3-20% on 4, 7-17% on 8; background 1.2-1.5):
+
+| line | 1 thread | 4 threads | 8 threads |
+|---|---|---|---|
+| a plain read (the ceiling) | 26.6 | 58.5 | 55.6 |
+| T = 1: `q4x_dot2` (the decode) | 13.3 | 50.6 | 55.7 |
+| T = 2: dot2 a token at a time (the road before) | 6.7 | 27.5 | 49.1 |
+| T = 2: **xt** | **9.4** | **35.9** | **54.1 (0.97 of the read)** |
+| T = 2: the panel and a tile | 9.0 | 28.8 | 47.1 |
+| T = 3: dot2 a token at a time | 4.5 | 18.5 | 34.7 |
+| T = 3: **xt** | 6.8 | **26.4** | **49.0 (0.88)** |
+| T = 3: the panel and a tile (the road before) | **7.7** | 23.6 | 42.2 |
+
+- New prepared rows every item (a pool of 48, LESSONS #219): within 3% of the same rows on every line.
+- **The panel is the faster road on one core and the slower one from 4 threads** (LESSONS #240): from 1 to 8
+  threads xt keeps 0.90 of its one-thread rate a thread, the panel 0.69 (16 short streams a thread, 128 at 8).
+- Predictions (1 thread / 8 threads): xt(2) 6.3-7.8 / 46-54, xt(3) 4.7-5.9 / 38-46, the panel 4.0-5.2 / 33-40,
+  dot2 x 3 3.7-4.4 / 30-35: every road faster than predicted on one core; at 8 threads xt and the panel above my
+  ranges. The task's second drop line (xt(3) at 8 threads under 0.95 of the bytes' rate) trips, as predicted: 0.88.
+  xt(3) went to the engine for what it gains on the panel there (1.16x at 8 threads, 1.12x at 4).
+
+**The engine** (`tools/row_price.sh`, Q4_K, every pass forced on 8 threads, code-edit with the draft fixed at 0, 1, 2,
+the first binary swapped every round, an A/A; pass ms). First A/B (4 rounds, background 2.19 / 1.57, `build/rp-q80`):
+
+| rows | before | after | A/A | one more row: dense, new experts |
+|---|---|---|---|---|
+| 1 | 15.42 | 15.91 (1.032) | 0.985 | |
+| 2 | 22.31 | **21.22 (0.951)** | 0.999 | +0.87 -> +0.07 ms; 45.4 -> 51.7 MiB/ms |
+| 3 | 26.68 | **26.28 (0.985)** | 1.001 | +0.49 -> +0.39 ms; 45.6 -> 49.3 MiB/ms |
+
+- The one-row pass (the decode, which stays on `q4x_dot2`) read 1.032: 16.31-16.38 ms in rounds 0-2, 15.45-15.52
+  in rounds 3-4, against 15.30-15.75 and 15.17-15.49 for the two copies of before; every zone +2-6%, the attention
+  (+3.9%) and the F32 router (+6%) as much as the Q4_K matmuls. In that binary `q4x_dot2` shared the new kernel's
+  header pre-pass and block end (the same instructions, other registers). It went back to the committed text, its
+  instructions identical to HEAD's but for addresses (LESSONS #239), and the final binary was measured again.
+
+**The final binary** (`q4x_dot2` as committed) against HEAD's, 6 rounds, a busier machine (background 1.65 / 1.85; the
+still check waited six times at 3.1-4.9 logical processors busy; `build/rp-q80b`):
+
+| rows | before | final | A/A | one more row: dense, new experts |
+|---|---|---|---|---|
+| 1 | 15.75 | 15.85 (**1.006**) | 0.996 | |
+| 2 | 22.23 | 21.97 (0.988) | 1.018 | +0.77 -> +0.27 ms; 47.5 -> 47.8 MiB/ms |
+| 3 | 27.32 | 26.90 (0.985) | 1.026 | +0.51 -> +0.45 ms; 44.7 -> 46.7 MiB/ms |
+
+- The one-row pass is level (1.006, A/A 0.996).
+- Against the mean of the two copies of before: 2 rows 0.979 (the first session 0.952), 3 rows 0.972 (0.984). The two
+  sessions agree on the sign and differ at 2 rows by more than a session's A/A (LESSONS #230).
+
+**The final binary again, on a free machine** (6 rounds, background 1.62 / 1.29; the still check waited four times,
+three for spikes gone in the next window and once for another project's `node` at 1.0 core, LESSONS #241;
+`build/rp-q80c`):
+
+| rows | before | final | A/A | one more row: dense, new experts |
+|---|---|---|---|---|
+| 1 | 15.73 | 15.90 (1.011) | 0.988 | |
+| 2 | 22.95 | **21.45 (0.934)** | 0.980 | +0.99 -> +0.19 ms; 44.0 -> 51.0 MiB/ms |
+| 3 | 27.66 | **26.45 (0.956)** | 0.983 | +0.58 -> +0.44 ms; 43.9 -> 49.1 MiB/ms |
+
+- Against the mean of before's two copies: 2 rows 0.944, 3 rows 0.964. Over the three sessions: **2 rows 0.94-0.98,
+  3 rows 0.96-0.985**.
+- **The one-row pass** of the final binary: 1.008 and 1.017 of the mean of before's copies in sessions 2 and 3
+  (their A/A 0.996, 0.988), spread over every zone, the attention (+1.1%, +1.7%) and the F32 router as much as the
+  Q4_K matmuls: not `q4x_dot2`, whose instructions are HEAD's. Every function after the new AVX2 kernel moved by
+  some tens of bytes, the attention's kernels too: the hot loops' alignment, or the machine; open (a HEAD binary with
+  the same bytes inserted and no new code, or the hot kernels aligned so that no insertion moves them).
+- A row's share of a pass: 0.45 -> 0.33 at 2 rows and 0.37 -> 0.33 at 3 in the first session; 0.41 -> 0.39 and 0.37
+  -> 0.35 in the second; 0.46 -> 0.35 and 0.38 -> 0.33 in the third.
+- The prompt (411 tokens, 12, 18, 18 runs a binary): 405.0 / 407.6 (A/A) / 404.9 tok/s, then 403.5 / 404.3 / 404.6,
+  then 406.9 / 404.8 / 402.3: unchanged.
+- Predictions (the first A/B): 1 row 1.000 +-1%: out; 2 rows 21.6-21.95: better (21.22); 3 rows 25.8-26.3: in
+  (26.28); one more row's dense at 3 rows +0.2-0.45: in (+0.39); the prompt 1.00 +-1%: in. The final binary, second
+  session: 1 row 1.000 +-1%: in (1.006); 2 rows 21.1-21.5: above (21.97, a slower session: before's own 3-row pass
+  27.32 against 26.68); 3 rows 26.1-26.5: above (26.90). Third session: 1 row 1.000 +-1%: out (1.011); 2 rows
+  21.2-21.7: in (21.45); 3 rows 26.2-26.5: in (26.45); the prompt: in (0.989, 0.994 of the A/A copy).
+- The targets: 2 rows <= ~21.6 reached in the first and third sessions (21.22, 21.45), not in the second (21.97);
+  3 rows <= ~26 not reached (26.28, 26.90, 26.45).
+- Left at 3 rows, one more row: the dense +0.39-0.45 ms (xt(3) reads at 0.88 of the bytes at 8 threads: its block
+  end, per token, is the largest piece after the `vpdpwssd`; batching it across the tokens is the lever), the rest
+  +0.42; at 2 rows the dense is near its bytes (+0.07-0.27) and the rest +0.30-0.41.
+- Correctness: every tier's xt against scalar's dot_row (the prepared rows at the end of an exact buffer, canaries past
+  the outputs), three witnesses on every Q4_K kernel (a signed zero, cancelling mins, the blocks' order: LESSONS #237,
+  #238), a short pass's calls counted exactly (`test_short_pass_q4k`), 47 mutations in `tools/mutate_q4x.sh` all red;
+  the real model's text identical with drafts of 1 and 2; `make check` green.
+
+## The decode's +1% and the code's layout (LESSONS #242, 2026-09-27)
+
+Road (c)'s binary read 1.006-1.017 of HEAD's on the one-row pass in three sessions, spread over every zone, the F32
+router too, though `avx512_q4x_dot2` is HEAD's byte for byte. **The layout, read first** (nm, objdump): every object's
+.text is 64-aligned, and GCC 15 aligns each tight loop to the power of two above its size (`.p2align 5` / `6`, the
+"align tight loops" tuning): each such loop is an anchor, and an insertion shifts the code mod 64 only up to the next
+anchor (a pad before `avx2_axpy_f32_x4` was absorbed by it). In the final binary the chunk `avx512_q4x_tile ..
+avx512_axpy_f32` moved 16 -> 0 mod 64 (the new 48-byte dispatcher before it); `q4x_dot2`'s 1080-byte main loop spans
+18 64-byte windows at both places; its 47-byte "loop" at +1715 is the early exit for n < 256, never run. Data: only
+`g_pm_tiles` and `xexp_tab` moved mod 64.
+
+**The race** (`build/rp-q81b`, one-row passes, Q4_K 8 threads forced, 16 rounds, 9 binaries alternated, the order
+reversed every other round; predictions in `build/rowprice-q81/predictions.txt`). Variants of the final binary with
+the dispatcher lengthened (it never runs in the decode): F08 puts the chunk back at HEAD's places, F16 and F32 at the
+two others (and `avx512_expf_f32` at 32), F48 keeps F's places and moves all the code after it by 64 bytes. Hc and Fc:
+HEAD's and F's bytes plus one byte (another file). Rounds 1-2 dropped: 8 runs in a row at 20.4-24.9 ms (against
+~15.6) while the CPU guard was satisfied (LESSONS #244). Median paired ratio to HEAD over 14 rounds:
+
+| binary | total | qkv | attention | attn_out | router | gate_up | down | lm_head |
+|---|---|---|---|---|---|---|---|---|
+| F (the final) | **0.997** | 1.000 | 1.005 | 0.996 | 1.006 | 0.992 | 0.999 | 0.998 |
+| HEAD again (A/A) | 0.995 | 0.987 | 0.994 | 0.994 | 0.988 | 0.995 | 0.999 | 0.994 |
+| Hc (HEAD's bytes, another file) | 0.997 | 0.998 | 1.004 | 1.004 | 0.983 | 0.994 | 0.996 | 0.997 |
+| **Fc** (F's bytes, another file) | **1.018** | 1.020 | 1.027 | 1.025 | 1.041 | 1.017 | 1.017 | 1.019 |
+| F08 (chunk at HEAD's places) | 1.000 | 1.004 | 1.004 | 1.000 | 1.002 | 0.993 | 0.996 | 1.007 |
+| F16 | 1.003 | 1.005 | 1.008 | 1.009 | 1.026 | 0.993 | 1.006 | 1.003 |
+| F32 | 1.019 | 1.032 | 1.021 | 1.022 | 1.047 | 1.018 | 1.021 | 1.026 |
+| F48 (F's places, 64 bytes on) | 0.995 | 0.996 | 1.006 | 0.999 | 0.999 | 0.995 | 0.999 | 1.010 |
+
+Pairs that ran in the same slots: F48/F 0.999, F32/HEAD 1.019, F16/HEAD-again 1.013, F08/Hc 1.004; Fc/F 1.010.
+
+- **The final binary is level with HEAD** (0.997; F08 and F48 too): #242's +0.8-1.7% does not reproduce.
+- **Two files of the same bytes differ by 1.0-1.8%** (Fc against F and HEAD, every zone alike, the router +4%): a
+  file's own effect (its image base, its pages; or its slot, the middle one) is as large as what was chased. One file
+  a side with the slots fixed cannot resolve under ~2% (LESSONS #243); F32's +1.9% and F16's +0.3-1.3% are inside it.
+- Predictions: F 1.000-1.012 (0.997: in at the low end); F08/F, F48/F within +-0.5% (in); Fc/F within +-0.7% (out:
+  1.010, 1.018 against HEAD); the router within +-1.5% everywhere (out for Fc, F16, F32).
+- The design's critique came from the Opus thinker (a pad between objects moves nothing mod 64: every object is
+  64-aligned; the same file as its own A/A cannot see a file's effect; the forward/backward order pins the middle
+  slots: before2/before read 0.984-0.995 in earlier sessions; paths of different lengths move the CRT's heap).
+
+## An A/B inside one process (2026-09-27)
+
+What the race above cannot resolve (a file's own 1-2%, the slots), one process can: `generate --ab <switch>` runs
+the decode's passes (or the verify passes: a step is a pass) A B B A A B B A..., each arm's zones in its own phase of
+the profile ("decode", "decode_b"), every pass's wall kept (`ab_pass_ms`); both arms run in one file, one memory,
+one set of threads, one routing history. `tools/ab_inproc.sh <binary> <switch> [runs]` takes the runs under the
+native guards, `tools/ab_inproc.py` reports: each run's arms, the A B B A blocks' B/A, and the estimate, the arms'
+means from the walls without the first block (the first pass after the prompt is always A's). `--ab none` is the
+A/A: both arms the same code, the tool's own noise. Q4_K, 8 threads, one row a pass, 200 tokens, 6 runs:
+
+| session | runs' speed | arms' means B/A | without the first block | blocks' median |
+|---|---|---|---|---|
+| ab-aa1 | 15.5-22.3 ms a pass (a load the guard does not see in runs 1, 5, 6) | 0.988, every run < 1 | - | - |
+| ab-aa2 | 15.2-17.4 | 1.0002 +- 0.0029 | **1.0004 +- 0.0028** | 0.9972 +- 0.0053 |
+
+- **The resolution: 0.28% over 6 runs** (a run's B/A spreads 0.7%), against 1-2% between two files of the same bytes:
+  a 1% change reads at 3.5 standard errors in about two minutes.
+- ab-aa1's bias came from the first pass (15-24 ms against a median of 16, always arm A) and chance; the estimate
+  leaves the first block out. A load that slowed whole runs by 40% left their B/A in place: both arms carry it.
+- A pass spreads 5-7% with its experts, so the blocks' median is robust but noisier than the arms' means. Finer:
+  the same token twice (arm A, the KV rewound, arm B, the order swapped every token), which would also compare
+  every pass's logits bit for bit between the arms.
+- Predictions (`build/rowprice-q81/predictions.txt`): a run within +-0.5% (ab-aa2: 5 of 6); the estimate within
+  +-0.3% (in); the first pass >= 1.3x the median (3 of 6).
+
+## The prep once a row (2026-09-27)
+
+Q4_K's integer road prepares every input row before a matmul (`q4x_prep`: the shifts, the two digits, the sums;
+~8.8 KB for 2048 columns). A call prepared its own rows: q, k and v the same attention-normed rows three times, gate
+and up each the 8 gathered copies of a token's ffn-normed row (16 preps a token for one row). The references prepare
+once a distinct row (ORIGINS §Every piece, row 12): ds4 once a token for every expert with gate and up in one pair
+kernel, colibri once a layer with the experts' int8 rows copied, ik_llama.cpp with q/k/v merged at load and up/gate
+fused; llama.cpp once an op. Marcello's question was half a prep a token; the Opus thinker's floor is 7 rows of 2048
+a token and layer against 24 (0.29), ~0.2 with a cheaper prep (the scalar tail's `frexp`/`ldexp`, the token terms
+only a tile reads). Predictions in `build/prep/predictions.txt`, each written before its run.
+
+**Step 0, the traces** (`build/prep/traces`, the traced binary, native, 8 threads; a traced pass ~10% slower): a
+decode layer spends ~33 us on preps, the gather and the swiglu (gate's prep 7.1, up's 3.2, down's 2.4 in the pool;
+q, k, v, o 1.2-2.4 inline; the gather 4.4 inline; the swiglu 9.4), 3% of a pass; a 3-row layer ~36 us removable (the
+gather 13-18, gate/up preps 8.4-12.2); a 512-token prompt 91-96 ms of preps (6.9-7.2%) and 23 ms of gather (1.7%).
+
+**Built** (P1 and P2 of the thinker's order): `tr_q4x_prepare` prepares a pass's token rows once into the session's
+own buffer (never `pm.xq`, which a phase-major call between two readers would overwrite), `tr_matmul_q4x_prepared`
+runs a call on them, each group's row p reading prepared row map[p]: q, k and v from the attention-normed rows, gate
+and up from the ffn-normed rows through `xmap` (grouped row -> token), with no gather and no copy. A matrix of another
+type takes its road from the floats (the gather stays for those). `q4x_dot_xt` and `q4x_tile` take a pointer a
+prepared row instead of a stride (a group's tokens are not consecutive rows). The old road stays as the switch `prep`
+of `generate --ab` (arm B), for the A/B inside one process and for the tests.
+
+**Correctness**: `test_tier_used` pins the preps exactly, 412 on the Q4_K model where every call preparing its own
+rows made 888 (the thinker's count), and runs the same passes on prep's arm B: every pass's logits the same bits;
+`test_kernels` hands xt and tile their rows in reverse (pointers, not a stride; the xt rows at the end of an exact
+buffer); the real model's logits of 160 positions identical to the last binary's, one pass and one row a pass; 7 new
+mutations (the map ignored, a run's and a tile's rows in reverse, every token reading the first row in xt and the
+tile, the model's map by slot, q/k/v on rows nobody prepared) among 54, all red.
+
+**The A/B inside one process** (`tools/ab_inproc.sh build/q82/p2a.exe prep`; B/A = the old road over the new):
+
+| pass | B/A | predicted | background |
+|---|---|---|---|
+| the prompt, 411 tokens (8 evals a run, 4 runs) | **1.0577 +- 0.0027** | 1.04-1.07 | 1.20 / 2.04 |
+| a verify pass of 3 rows (6 runs) | **1.0262 +- 0.0040** | 1.012-1.025 | 2.22 / 1.63 |
+| the decode, one row (4 runs, the prompt's session) | **1.0103 +- 0.0013** | 1.007-1.017 | 1.20 / 2.04 |
+| the decode (6 runs, headless Chrome at 6.4 cores between runs) | 1.0044 +- 0.0048; blocks 1.0128 +- 0.0041 | | 1.68 / 5.28 |
+
+- **The prompt 5.8% faster, a verify pass of 3 rows 2.6%, the decode 1.0%**, every bit the same. The decode's arms were aliased with the KV's fresh pages (LESSONS #247: arm A, the new road, paid them): with the arms aperiodic, P1 + P2 + P4 read **1.0252 +- 0.0044** on the decode (blocks 1.0220; 6 runs, background 1.30 / 1.12), kv_write level between the arms.
+- When a load comes and goes, the blocks' median holds (1.0128) where the arms' means move (1.0044).
+
+**P4, the swiglu and the down's prep in one call**: `tr_swiglu_prepare` splits the swiglu by whole rows and prepares
+each row while it is in its core's cache, into `pm.xq` (the down reads it right after, no call between); the switch
+`act` puts back the swiglu apart and the down preparing its own rows. `test_swiglu_prepare`: its floats tr_swiglu's and
+its bytes scalar's q4x_prep of them on every tier and pool (a -0 from exp's overflow, zeros, subnormals, NaN); the tier
+test's 412 preps on both roads and every pass's logits the same bits; the real model's logits identical. In one process
+on a free machine (8 runs): **the prompt 1.0087 +- 0.0027** (every run 1.004-1.015; predicted 1.006-1.015), the decode
+0.9982 +- 0.0027 (level). A first session with another window's node at 3-4 cores read 1.0045 +- 0.0042: structure only.
+
+**The prep alone** (`bench_q4x`'s new line, one row of 2048 in L1, one core): 699.6 ns (spread 1.6%; a run inside
+another window's node job read 703 at 30%). Its bit arithmetic (3 UCRT calls a block) and the token terms no road but
+the tile reads are 10-25% and ~16% of it: ~0.1 us a prep, 0.04% of a decode token, 0.1-0.2% of the prompt: last.
+- Left, by size: gate and up in one call, the calls' tails by countdowns, the idle workers prefetching; then the prep's
+  bit arithmetic.
+
+## The argmax in parallel (2026-09-27)
+
+The Opus thinker read the decode's zones per arm on the untraced engine (build/ab-act-prompt2) and found the greedy
+token's argmax on the main thread: 116-120 us a token (0.78%), the serial scan `if (x[i] > x[best])` over the 201 KB of
+logits the head's 8 workers had just written into their own caches; a 3-row verify pass pays it once a row, inside its
+step. `tr_argmax_f32` splits the scan over the pool by chunks on the head's 16-row items, each chunk from (-inf, none)
+with strict > on eight interleaved lanes, the chunks merged in order from (x[0], 0) with the same strict >: the scan's
+index by construction (a NaN never wins, the first of equal values, index 0 for a NaN there or all -inf).
+`tr_session_argmax(s, back, n)` runs it on the model's pool for main.c and tr_greedy (whose vocabulary may be narrower:
+LESSONS #248); the switch `argmax` (the session's own, arm B the serial scan).
+
+- **Correctness**: `test_argmax` (2480 calls: sizes 1 to 50304, pools of none to 16, a NaN at 0 and inside, all -inf,
+  +-0 ties, every value tied, +inf twice, the largest planted at every chunk border with a later tie); the tokens of
+  every generate and speculation test unchanged; four mutations (ties to the later index in a lane and across lanes,
+  the merge from -inf, the chunks merged backwards), all red.
+- **In one process** (6 runs each, background 1.13-1.19): the sample zone 116-118 us -> **5.6-6.9 us** (17x; predicted
+  12-25x), the decode's pass walls level (0.998 +- 0.003), so a token ~0.7% faster; a 3-row verify pass **1.0175 +-
+  0.0044** (predicted 1.008-1.015). The serial scan also slowed the next kv_write by 18-20% (the main thread's caches
+  filled with logits).
+- Outside `generate --ab` it did not run until 2026-09-27 evening: the session's switch field was never set, and a
+  heap's leftover byte kept the serial scan (every process race read 118 us; LESSONS #252). Fixed: every run 5.5 us.
+
+## The KV's pages touched in time (2026-09-27)
+
+The KV cache is allocated untouched: a page becomes memory at its first write. A decode token writes a 512-byte row
+into each of the 512 streams (16 layers x 16 heads, K and V), so every 8 positions each stream enters a fresh page:
+512 faults inside kv_write on the main thread, ~250 us a crossing, ~31 us a token (the Opus thinker's piece 1). Every
+prediction in `build/prep/predictions.txt`, written before its run.
+
+**The faults alone** (`bench_mem faults`: the engine's cache allocated anew each repetition, window 0 written, window
+1 of 64 positions timed): 4096 faults a window by the OS's count, none on touched pages; the decode's writes 80.9 us a
+position on fresh pages against 27.0 on touched ones (0.84 us a fault); `tr_kv_touch` alone 787 ns a page on one
+thread and only 1.58x faster on 8 (1.62x on 16). That serialization is the bench's own: it churned 4.3 GB of fresh
+pages in 2.4 s and emptied the zeroed list (LESSONS #249); the engine's decode ran the same faults ~7x on 8 threads.
+
+**A window of 64 touched ahead** (the design given: one parallel call when a pass reaches untouched positions;
+`sh tools/ab_env.sh`, process against process, 12 rounds, `TR_KV_TOUCH=0` off):
+
+| decode, a token | off | touched ahead |
+|---|---|---|
+| kv_write | 80.2 us | 51.1 |
+| kv_touch | - | 4.1 (12288 faults in 820 us: 0.5 us a fault a thread) |
+| attention | 2475 | **2535 (+2.4%)** |
+| the pass | 15.24 ms | 15.32: the touch costs 0.4% |
+
+The prompt (411 tokens, 8 threads): kv_write 16.1 -> 4.5 ms (its faults serialized over 8 threads, 0.40 us a fault of
+wall), the touch 7.1 ms (~1.8x: right after the load the zeroed list is short), the prompt 0.5% faster.
+
+**The attention's 2.4%, taken apart** (12 rounds each, the attention against off): the same touch position-major, as
+kv_write's faults place the pages, +1.8%; only the decode's windows touched, the prompt's pages left to kv_write,
++1.5% (they are ~13% of what the attention reads: no cost per touched page explains it); the touch on the main thread
+alone +2.2%; the pool's call with nothing touched +0.1%. The cause is pages faulted **ahead** of their writes, whoever
+faults them, in whatever order. `bench_mem kvend` isolates it: the engine's cache written to 500 positions, then 0, 8
+or 64 positions past the streams' ends touched, a new cache each repetition, four runs of 15-31: the attention 51.85 /
+51.34 / 50.80 GB/s, a plain read of the same streams 54.17 / 53.31 / 52.85. **Pages present past the streams' ends
+slow the streaming reads by 1-2.4%** (a prefetcher running on into present memory, by all appearances: the decode's
+kernel reads exactly positions [0, n)); the spread of a single run (26-152%) hides it, four runs agree.
+
+**Built: the pages a pass enters, touched in time.** Every stream starts a page (the blocks page-aligned, a stream
+padded to whole pages: under 4 KiB a stream), so the positions whose rows enter a fresh page are the same in every
+stream (`tr_kv_fresh_page`); a pass whose new positions enter one touches exactly them over the pool
+(`tr_kv_touch_pass`), never past its end, and a pass that enters none calls nothing. `TR_KV_TOUCH=0` turns it off.
+
+| 12 rounds, on / off / on again | off/on | on2/on (the A/A) |
+|---|---|---|
+| decode, a token | 1.0023 +- 0.0022 | 1.0009 +- 0.0018 |
+| the decode's attention | 1.0032 +- 0.0028 | 0.9986 +- 0.0019 |
+| the prompt, 411 tokens | 1.0029 +- 0.0038 | 0.9931 +- 0.0028 |
+
+- By the zones: the decode's kv_write 80.2 -> 49.7 us a token, kv_touch 4.9 (25 crossings of 512 faults on 8
+  threads): **26 us a token, +0.17%**; the prompt's kv_write 15.9 -> 5.1 ms and kv_touch 7.0 ms: **3.8 ms, +0.4%** of
+  a first prompt. The attention level with off. Every bit the same: `test_session` evaluates a model whose pages hold
+  8 positions, as the real one's, pass by pass with TR_KV_TOUCH on and off (a prompt, a decode, a rewind, the
+  context's end): the logits identical, 24 touches exactly; `test_kv` checks every byte of a touch, a pass's pages
+  never past its end, and the fresh-page rule against every stream's pages at their own addresses.
+- Predictions: the bench's cost a fault and its scaling out (its churn); the window ahead: kv_write and kv_touch in,
+  the decode out (the attention); the placement out (the position-major touch), my guess of the other cores out
+  (the main thread alone); kvend in; the pass's own pages: in (the decode 1.0010-1.0020, the attention level).
+- The references: llama.cpp clears the whole KV when it creates a context (`ggml_backend_buffer_clear`: every page
+  faulted before the prompt, the whole context present); colibri allocates it to the prompt plus the tokens asked,
+  grown when needed (`kv_alloc`). Neither touches in time; llama.cpp's cleared context is all "present past the end".
+
+## The routers as bf16 (2026-09-27)
+
+Every F32 tensor of OLMoE's GGUFs has zero low 16 bits (the thinker's `f32bits2.py`: 81 tensors, 8.5 MiB, not one
+value with a nonzero low half): the model was converted from bf16. Its 16 routers (64 x 2048, 512 KiB each) are read
+every token, 8.4 MB at 46 GB/s: 179-186 us. `tr_f32_to_bf16_exact` narrows an F32 matrix at load when every value
+fits (in place, the top halves), and the BF16 rows of every tier (`dot_row`, `dot_row_x4`: scalar, AVX2, AVX-512)
+widen each half by a shift into the same lanes as `dot_f32`: the F32 row's bits by construction. `TR_BF16_EXACT=0`
+keeps F32. BF16 stays an internal type: a GGUF tensor stored as BF16 is still refused (LESSONS #253).
+
+| 12 rounds, on / off / on again | router, us a token | the decode, off/on | the A/A |
+|---|---|---|---|
+| build/bf16/ab1 (the serial argmax still in, #252) | 129.9 / 186.3 / 123.5 (1.396 +- 0.031) | 0.9984 +- 0.0033 | 0.9979 +- 0.0038 |
+| build/bf16/ab2 (the argmax fixed) | 120.1 / 178.8 / 122.8 (**1.483 +- 0.025**) | 1.0027 +- 0.0024 | 1.0016 +- 0.0034 |
+
+- **The router 1.40-1.48x, 56-63 us a token: 0.37-0.4% of a token by the zone**; the pass itself sits inside the
+  process race's noise (the two sessions' A/A 0.998 and 1.002). The prompt level (its router 12.8 -> 11.4 us a
+  token, 0.6 ms of 943). Predictions: the router 100-125 (in, ab2; ab1's first arm 130 just out), the decode
+  1.004-1.006 (the zone in, the pass unresolved), the prompt level (in).
+- Correctness: `test_kernels` (BF16 rows against the F32 rows they widen to on every tier and on scalar, special
+  values, every tail, `dot_row` and `dot_row_x4`; the narrowing refused for a nonzero low half at every position,
+  done otherwise); `test_tier_used` (a Q8_0 and a Q4_K model whose router fits bf16: its 544 products through the BF16
+  entries, counted, every pass's logits the bits of the same model loaded with the router F32); 17 mutations red
+  (`tools/mutate_bf16.sh`).
+- The references keep the router F32: colibri ("norms, router, bias stay f32: small and sensitive"), ds4 on the CPU
+  (`tensor_expect_layout(..., DS4_TENSOR_F32, ...)`; an F16 router kernel on its GPU for its own format), llama.cpp
+  (ggml's F32 dot). Narrowed only where exact, it is neither small nor sensitive: the same bits at half the bytes.
+- **The fixed argmax**: this race's first session read the sample zone at 118 us a token in every mode, where the
+  argmax in parallel measures 5.6-6.9 (§The argmax in parallel): outside `generate --ab` the session's switch field
+  was never set (LESSONS #252). With the struct from `calloc`, every run: **5.45-5.53 us, -113 us a token, +0.74%**.
+
+## The idle workers, and what lies past a region's end (2026-09-27 night)
+
+Question 84, then piece 3 of the decode in the thinker's order: while the calling thread runs a serial step, the
+other threads bring their first bytes of the next call toward their caches. Every prediction in
+`build/prep/predictions.txt`, written before its run; the runs in `build/q84/`.
+
+**A bench that compares layouts races them** (LESSONS #254): the first two runs of question 84 (whole passes of each
+layout, the order rotated by round) read spreads of 10-60% round to round, the RAM's speed drifting faster than a
+round. `bench_q4x --ends` and `--idle` now race two layouts or two arms set by set (a pair of 0.2-0.7 ms sets, the
+order by a hash, a round's value the median pair): standard errors of 0.05-0.2%.
+
+**Question 84: present memory past a thread's region.** `bench_q4x --ends 8`: the decode's kernel (`q4x_dot2`, one
+token) and a plain read, 8 threads, sequences of 4 calls from RAM, a region a thread a call. guard: the page after
+every region dropped (nothing present past an end) against present memory there (next); own: a thread's regions of
+consecutive calls one after the other (its run past an end is its next call's first lines) against the same slots
+in reverse (ownrev) and against today's layout (next0). 21 rounds (`ends-race1.txt`):
+
+| shape, a region | guard/next | own/ownrev | own/next0 |
+|---|---|---|---|
+| the dense call, 288 KiB | **1.0079 +- 0.0010** (read 1.0168) | **1.0102 +- 0.0009** (read 1.0024) | **1.0175 +- 0.0009** (read 1.0243) |
+| the experts' call, 1152 KiB | 1.0012 +- 0.0016 (read 1.0070) | 1.0018 +- 0.0020 (read 1.0048) | 1.0020 +- 0.0012 (read 1.0074) |
+
+- The weights pay what the KV paid, a region end at a time: ~0.8% of a dense call, nothing measurable on an expert's
+  (one end for 4x the bytes). The dense calls are 3.2 ms of a token: a guard page at each thread's rows would give
+  0.17%, a thread's regions of q, k, v, o laid one after the other 0.2-0.37%. **Question 84 closed: a lever of
+  0.2-0.4% of a token in the dense calls' layout, none in the experts'**; it goes with piece 4 (q, k and v in one
+  call lays the dense matrices out again at load).
+
+**Piece 3, B: the idle workers.** `tr_pool_hint` (threads.h): the dispatcher posts, for chunk t of the next call,
+the bytes its thread will read first; the worker, spinning for work, brings them in two lines at a time between
+checks of its slot (T0 or T2) and leaves the rest the moment a call comes. `tr_matmul_hint` (kernels.h) computes
+the hints as the call will split it (the Q4_K road's items of 16 rows, tr_matmul_grouped's rows; one input row a
+group only): at most max_bytes, half the region, never past its first group. `tr_pool_region` gives a chunk's region
+as `pool_run` cuts it.
+
+The bench (`bench_q4x --idle 8`: a serial step of W us on the calling thread, then a call from RAM, hints off
+against on, raced set by set; the serial step of three kinds: the clock alone, sums in L2, reads of a cold buffer;
+`idle-grid1.txt`, `idle-grid2.txt`, 11 rounds a race): **every one of 180 races faster with the hints**, none slower.
+
+| call, X a worker (T2) | W 1.5 us | W 3 us | W 6 us |
+|---|---|---|---|
+| dense 2.25 MiB, 64 KiB | 1.021-1.038 | 1.053-1.065 | 1.056-1.064 |
+| dense, 128-256 KiB | 1.032-1.033 | 1.067-1.070 | **1.118-1.142** |
+| experts 9 MiB, 64 KiB | 1.006-1.011 | 1.015-1.016 | 1.016-1.019 |
+| experts, 128-256 KiB | 1.009-1.011 | 1.017-1.019 | 1.027-1.038 |
+
+- The gain a step reaches 0.85-0.96 W once X >= 128 KiB: the RAM works through the whole serial step. T0 and T2
+  alike, T2 ahead at large X; a serial step reading a cold buffer takes nothing away.
+
+**In the engine it is level.** Hints before q, the router, gate and the output matrix, 256 KiB a worker at most
+half a region; the in-process A/B `idle` (arm B no hints; `TR_POOL_HINT=2 sh tools/ab_inproc.sh <bin> idle N`), us a
+token by the zones (the calls' gain, the serial steps' loss):
+
+| race | hints | THE ESTIMATE B/A | the calls gained | the serial steps paid |
+|---|---|---|---|---|
+| ab-idle1, 6 runs | early (q after the down, the router after o) | 1.0053 +- 0.0038 | qkv 88, gate_up 102, router 14 | the prep 66, the mix 47, the add 15 |
+| ab-idle-x64, 6 | early, 64 KiB | 0.9931 +- 0.0026 | nothing | the prep 22, the mix 14, the add 15 |
+| ab-idle-late, 6 | late (q after the mix, the router after the add) | 0.9990 +- 0.0053 | qkv 41, gate_up 70, router 14 | attn_norm 54, the prep 67 |
+| ab-idle-early12, 12 | early | **0.9962 +- 0.0039** | qkv 62, gate_up 85 | the prep 75, the mix 52, the add 27 |
+
+- The serial step after a hint pays about what the call gains (LESSONS #255): the calling thread's steps read the
+  rows the workers wrote (attn_out for the add, h3 for the mix) and store over lines they share (normed, the prepared
+  row); with seven cores filling their caches from the RAM those messages wait. The bench's serial steps touched no
+  line of theirs. Predicted 1.006-1.012 (the thinker's 1.010-1.028): out.
+- Kept, off: the pool starts with its hints off (`TR_POOL_HINT=1|2` turns them on), the engine posts them (a call
+  that returns at once while they are off), the `idle` switch races them, `TR_HINT_KB` sizes them (research).
+  Written and never raced (Smart App Control held its three binaries for over an hour), then taken out (its
+  `prefetchw` was a string in the hot zone, which the lint refuses): the calling thread asking for its own next lines
+  before each hint (the norms' weights, prefetchw over normed and the prepared row), predicted 1.008-1.015 if the steps
+  pay their own lines' latency, level if the workers' busy caches are slow to answer any probe (question 85).
+- Tests: test_base (each chunk's region as the call runs it, a static and a balanced call; a hint taken whole, left
+  the moment a call comes 3 of 3, ignored for chunk 0, past the width and with hints off, the workers awake for
+  every case: LESSONS #256), test_kernels (each worker's hint where its first block reads: the dense Q4_K matrix at 8
+  and at 3 threads, the experts' 8 of 64 groups, the float road at 64 and 16 rows, the caps; nothing for two rows a
+  group or with hints off), test_tier_used (a decode's hints taken; none with the idle switch's arm B, the same 412
+  preps and every pass's logits the engine's bits); `tools/mutate_idle.sh`.
+- The references (read 09-27): llama.cpp's workers spin on `ggml_barrier` with a pause and no budget (ggml-cpu.c
+  576-610), no prefetch in the thread pool nor in `vec_dot_q4_K_q8_K`; ik_llama.cpp spins 100 000 pauses then yields
+  (ggml.c 4778-4810) and faults the MoE's expert pages in from a pool of its own (`ggml-moe-prefetch.cpp`,
+  `MADV_POPULATE_READ`, Linux), not from the idle workers; colibri keeps OpenMP's team hot (`OMP_WAIT_POLICY=active`),
+  no prefetch; ds4's workers sleep on a condition variable, no spin. None brings the next call's weights with the
+  idle workers.
+
 ## Attempts
 
 | Data | Cosa | Prima | Dopo | Spread | Esito |
@@ -4847,3 +5281,11 @@ Q8_0, 8 for Q4_K: the engine before once the decode has measured). Pass ms:
 | 2026-09-27 | the final (pf3 + m3), every pass forced on 8 threads | 15.50 / 22.92 / 28.00 ms | 15.44 / 22.19 (0.968) / 26.53 (0.947) | native, free, 4 rounds, A/A within 0.6% | **kept** |
 | 2026-09-27 | every size of verify pass measuring its own width, on every width (question 82) | pool of 16, the pool: Q8_0 2 / 3 rows 36.97 / 44.37, Q4_K 22.01 / 27.06 ms | 0.972 / 0.978, Q4_K 1.017 / 1.024 | native, free, 4 rounds, three ways alternated | no: the probes on 4 threads cost Q4_K more than they win (§The verify passes' own width) |
 | 2026-09-27 | the same, the narrowest width skipped | 37.08 / 44.31, Q4_K 22.11 / 27.00 | 0.961 / 0.966, Q4_K 1.005 / 0.982; 8 picked in 16 of 16 | native, free, 4 rounds | **kept** |
+| 2026-09-27 | `q4x_dot_xt` alone (road (c)): two Q4_K rows against 2-3 prepared rows, each weight decoded once for them, against `q4x_dot2` a token at a time and the W16 panel with a tile | L1: dot2 x 3 468.1 ns; RAM, 8 threads: dot2 x 3 34.7, the panel 42.2 GB/s | xt(3) 333.2 ns (0.712), 49.0 GB/s (0.88 of the read); xt(2) 0.768, 54.1 GB/s (0.97) | L1 1-7% (two lines 21-51%), RAM 7-17% | to the engine (§A Q4_K weight row decoded once for 2-3 tokens) |
+| 2026-09-27 | Q4_K's groups of 2-3 rows by runs of `q4x_dot_xt` (`Q4X_MIN_TILE_ROWS` 4) | Q4_K 8 threads: 1 / 2 / 3 rows 15.42 / 22.31 / 26.68 ms (the second session 15.75 / 22.23 / 27.32) | 15.91 (1.032) / 21.22 (0.951) / 26.28 (0.985); with `q4x_dot2` as committed 15.85 (1.006) / 21.97 (0.988) / 26.90 (0.985), again on a free machine 15.90 (1.011) / 21.45 (0.934) / 26.45 (0.956) | native, 4, 6 and 6 rounds, A/A 0.980-1.026 | **kept**; `q4x_dot2` stays the committed text (LESSONS #239) |
+| 2026-09-27 | the KV's pages touched a window of 64 positions ahead, one parallel call when a pass reaches untouched positions (the thinker's design) | kv_write 80.2 us a token, the attention 2475, the pass 15.24 ms | kv_write 51.1, kv_touch 4.1, **the attention 2535 (+2.4%)**, the pass 15.32 (0.9963); the prompt 1.0054 | native, 12 rounds, process against process, A/A 1.0014 | **no**: pages present past the streams' ends slow the reads (§The KV's pages touched in time) |
+| 2026-09-27 | the KV's pages a pass enters, touched over the pool in time, never past the pass's end (the streams page-aligned) | as above | kv_write 49.7, kv_touch 4.9, the attention level (1.0032 +- 0.0028); the decode 1.0023 +- 0.0022 (zones +0.17%), the prompt 1.0029 (zones +0.4%) | native, 12 rounds, A/A 1.0009 | **kept**, on by default (`TR_KV_TOUCH=0` off) |
+| 2026-09-27 | the routers (F32, every value's low half zero) narrowed to bf16 at load, widened by a shift into dot_f32's lanes | the router zone 179-186 us a token | 120-130 (1.40-1.48x); the decode 1.0027 +- 0.0024 and 0.9984 +- 0.0033 in two sessions (A/A 1.0016, 0.9979); the prompt level | native, 12 rounds twice, process against process | **kept**, on by default (`TR_BF16_EXACT=0` off): 0.37-0.4% of a token by the zone |
+| 2026-09-27 | the session's struct from calloc: the parallel argmax outside generate --ab (LESSONS #252) | the sample zone 118 us a token in every process race | 5.45-5.53 us | native, 36 runs | **kept**: +0.74% of a token |
+| 2026-09-27 | question 84: the page after each thread's region dropped (guard), a thread's regions of consecutive calls one after the other (own); `bench_q4x --ends 8`, raced set by set | a dense call from RAM, 288 KiB a region | guard 1.0079 +- 0.0010, own 1.0102-1.0175; the experts' calls 1.001-1.002 (level) | 21 rounds, SE 0.05-0.2% | **measured**: 0.2-0.4% of a token in the dense layout, taken with piece 4; nothing on the experts |
+| 2026-09-27 | the idle workers bring the next call's first 256 KiB in during the serial steps (`tr_pool_hint`, T2) | the decode, no hints | the bench 1.02-1.14 a call after a 1.5-6 us step; the engine 1.0053, 0.9931 (64 KiB), 0.9990 (late), 0.9962 +- 0.0039 (12 runs) | in-process A/B, 6-12 runs | **off by default** (`TR_POOL_HINT=2` on): the serial step after a hint pays what the call gains (LESSONS #255, question 85) |

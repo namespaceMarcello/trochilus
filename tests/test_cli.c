@@ -352,6 +352,64 @@ static void test_generate(const char *m) {
     TR_CHECK(memcmp(gen, spec, sizeof gen) == 0);
     expect("--spec 4 -n 3", cli("generate -m %s --tokens 5,7,9,11 -n 3 -c 16 --spec 4", m), 0);
     TR_CHECK_EQ_INT(count_tokens(), 3);
+    /* --ab none: the passes alternate A B B A between the profiler's two decode phases, and the tokens stay the
+     * ones above (the A/A: both arms the same code). 11 evaluations: A takes passes 0, 3, 4, 7, 8, B the six
+     * others; with --spec a step is a pass. An unknown switch is refused. */
+    char ab_json[700];
+    static char ab_text[16384];
+    int32_t ab[12];
+    in_dir(ab_json, sizeof ab_json, "test_cli_ab.json");
+    expect("--ab none", cli("generate -m %s --tokens 5,7,9,11 -n 12 -c 16 --ab none --profile-json %s", m, ab_json), 0);
+    TR_CHECK_EQ_INT(parse_ids(ab, 12), 12);
+    TR_CHECK(memcmp(gen, ab, sizeof gen) == 0);
+    ERR_HAS("ab: none, arm A 5 passes ");
+    ERR_HAS(", arm B 6 passes ");
+    slurp(ab_json, ab_text, sizeof ab_text);
+    TR_CHECK(strstr(ab_text, "\"decode\":{\"tokens\":5,") != NULL);
+    TR_CHECK(strstr(ab_text, "\"decode_b\":{\"tokens\":6,") != NULL);
+    /* and every pass's wall in order, 11 of them: the report's A B B A blocks */
+    const char *walls = strstr(ab_text, "\"ab_pass_ms\":[");
+    TR_CHECK(walls != NULL);
+    int n_walls = 0;
+    for (const char *q = walls; q != NULL && *q != ']' && *q != '\0'; q++) n_walls += *q == '.';
+    TR_CHECK_EQ_INT(n_walls, 11);
+    remove(ab_json);
+    expect("--ab none --spec 4", cli("generate -m %s --tokens 5,7,9,11 -n 12 -c 16 --spec 4 --ab none", m), 0);
+    TR_CHECK_EQ_INT(parse_ids(ab, 12), 12);
+    TR_CHECK(memcmp(gen, ab, sizeof gen) == 0);
+    ERR_HAS("ab: none, arm A ");
+    ERR_LACKS("arm B 0 passes");
+    /* --ab-prompt 4: the prompt four times more, rewound each time, arms A B B A: two walls an arm, the tokens
+     * unchanged; without --ab it is a usage error */
+    expect("--ab prep --ab-prompt 4",
+           cli("generate -m %s --tokens 5,7,9,11 -n 12 -c 16 --ab prep --ab-prompt 4 --profile-json %s", m, ab_json), 0);
+    TR_CHECK_EQ_INT(parse_ids(ab, 12), 12);
+    TR_CHECK(memcmp(gen, ab, sizeof gen) == 0);
+    ERR_HAS("ab prompt: arm A 2 evals ");
+    ERR_HAS(", arm B 2 evals ");
+    slurp(ab_json, ab_text, sizeof ab_text);
+    walls = strstr(ab_text, "\"ab_prompt_ms\":[");
+    TR_CHECK(walls != NULL);
+    n_walls = 0;
+    for (const char *q = walls; q != NULL && *q != ']' && *q != '\0'; q++) n_walls += *q == '.';
+    TR_CHECK_EQ_INT(n_walls, 4);
+    remove(ab_json);
+    expect("--ab-prompt without --ab", cli("generate -m %s --tokens 5,7,9,11 -n 2 -c 16 --ab-prompt 4", m), 2);
+    /* the arms have no period (docs/LESSONS.md #247): over 39 passes every position mod 8 falls on both arms, which
+     * A B B A A B B A never gave (a cost every 8 positions, the KV's fresh pages, went to arm A alone) */
+    expect("--ab none, 39 passes",
+           cli("generate -m %s --tokens 5,7,9,11 -n 40 -c 64 --ab none --profile-json %s", m, ab_json), 0);
+    slurp(ab_json, ab_text, sizeof ab_text);
+    const char *arms = strstr(ab_text, "\"ab_pass_arm\":[");
+    TR_CHECK(arms != NULL);
+    int seen[8][2] = {{0}}, n_arms = 0;
+    for (const char *q = arms != NULL ? arms + strlen("\"ab_pass_arm\":[") : ""; *q == '0' || *q == '1'; q += 2)
+        seen[n_arms++ % 8][*q - '0'] = 1;
+    TR_CHECK_EQ_INT(n_arms, 39);
+    for (int r = 0; r < 8; r++) TR_CHECK(seen[r][0] && seen[r][1]);
+    remove(ab_json);
+    expect("--ab bogus", cli("generate -m %s --tokens 5,7,9,11 -n 2 -c 16 --ab bogus", m), 2);
+    ERR_HAS("generate: --ab: unknown switch 'bogus' (known: none and the model's own)");
     if (n_gen == 12) {
         char ids[256], logits_path[700];
         int k = snprintf(ids, sizeof ids, "5,7,9,11");

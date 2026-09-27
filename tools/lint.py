@@ -352,6 +352,39 @@ def check_no_failure_into_tee():
                      "scrivi su file e mostra il file con cat")
 
 
+def struct_malloc_problems(text):
+    """lines that allocate one object with malloc(sizeof *x): its fields start as whatever the heap held."""
+    problems = []
+    for i, line in enumerate(text.split("\n"), 1):
+        if re.search(r"\bmalloc\s*\(\s*sizeof\s*\(?\s*\*", line) and "malloc-ok" not in line:
+            problems.append(i)
+    return problems
+
+
+def check_struct_calloc():
+    """#252: tr_session_create took its struct from malloc and set its fields one by one; the field the argmax
+    switch added was never set, so a heap's leftover byte turned the parallel argmax into the serial scan (118
+    against 6 us a token) outside generate --ab, with every result the same. An object comes from calloc: a field a
+    later edit forgets starts at zero."""
+    samples = [
+        ("    tr_session *s = (tr_session *)malloc(sizeof *s);\n", 1),
+        ("    reader *r = malloc(sizeof(*r));\n", 1),
+        ("    p->workers = malloc(sizeof *p->workers * (size_t)(n - 1));\n", 1),
+        ("    tr_session *s = (tr_session *)calloc(1, sizeof *s);\n", 0),
+        ("    float *x = malloc((size_t)n * sizeof(float));\n", 0),
+        ("    t *q = malloc(sizeof *q); /* malloc-ok: every field set below */\n", 0),
+    ]
+    for n, (text, want) in enumerate(samples, 1):
+        got = len(struct_malloc_problems(text))
+        if got != want:
+            fail(252, f"il controllo delle struct da malloc è rotto: campione {n} dà {got} problemi invece di {want}")
+            return
+    for path in sorted((ROOT / "src").rglob("*.c")):
+        rel = path.relative_to(ROOT).as_posix()
+        for line in struct_malloc_problems(path.read_text(encoding="utf-8")):
+            fail(252, f"{rel}:{line}: malloc(sizeof *x) lascia i campi a ciò che c'era nello heap: usa calloc(1, sizeof *x)")
+
+
 def check_expf_table():
     """#83: src/kernels/expf_table.h is generated (tools/gen_expf_table.py, mpmath at 200 bits). A
     constant edited by hand, or a script changed without running it, would leave the header and
@@ -392,7 +425,7 @@ def main():
     for check in (check_docs_control_chars, check_line_endings, check_doc_limits, check_no_future_dates, check_lessons_table,
                   check_type_table, check_tests_no_tmpfile, check_hot_zones, check_global_state,
                   check_makefile_recipes_ascii, check_shell_scripts_whole, check_scripts_clean_up,
-                  check_no_failure_into_tee, check_expf_table, check_readme_numbers):
+                  check_no_failure_into_tee, check_struct_calloc, check_expf_table, check_readme_numbers):
         check()
     for f in failures:
         print(f)

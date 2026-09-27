@@ -319,7 +319,7 @@ tr_gguf *tr_gguf_open(const char *path, char *err, size_t err_len) {
         return NULL;
     }
     tr_gguf *g = calloc(1, sizeof *g);
-    reader *r = malloc(sizeof *r);
+    reader *r = calloc(1, sizeof *r);
     if (g == NULL || r == NULL) {
         free(g); free(r);
         if (err && err_len) snprintf(err, err_len, "out of memory");

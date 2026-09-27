@@ -47,6 +47,14 @@ static inline float tr_half_to_float(uint16_t h) {
     return f;
 }
 
+/* bfloat16 -> binary32: the top half of a float, the low half zero; exact for every value, NaN included. */
+static inline float tr_bf16_to_float(uint16_t b) {
+    uint32_t bits = (uint32_t)b << 16;
+    float f;
+    memcpy(&f, &bits, sizeof f);
+    return f;
+}
+
 static inline float tr_q8_0_block_scale(const unsigned char *blk) {
     uint16_t dbits;
     memcpy(&dbits, blk, TR_Q8_0_SCALE_BYTES);
