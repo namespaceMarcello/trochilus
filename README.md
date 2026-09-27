@@ -55,15 +55,40 @@ product and keeps its attention cache in 16 bits; Trochilus computes what `trans
 activations in float (for Q4_K, exact integers) and the cache in 32 bits. Every number, the conditions,
 and the optimizations that did not pay are in [`docs/MEASUREMENTS.md`](docs/MEASUREMENTS.md).
 
-Some milestones on the same laptop:
+Under a RAM budget the model is not read twice: with a partial expert budget a 2048-token prompt runs
+1.89x faster reading 6 273 MiB instead of 22 880, and 1.22x more with the disk reading the next layer
+while the cores compute this one.
 
-- **The float at its peak, with the same bits.** The prompt's matrix-product tile runs at 164.7
-  GFLOP/s on one core, 98.6% of what the CPU can do in float without fused multiply-adds, while every
-  output is still the scalar definition's, bit for bit (phase-major order: sixteen weight rows run as
-  the sixteen lanes of a register).
-- **Under a RAM budget, without reading the model twice.** With a partial expert budget a 2048-token
-  prompt runs 1.89x faster reading 6 273 MiB instead of 22 880, and 1.22x more with the disk reading
-  the next layer while the cores compute this one.
+## How it keeps up, bit for bit
+
+Every tier must give the scalar definition's bits, so the speed has to come from how the work is
+arranged, not from rounding. Four ideas do it, each checked in the gate:
+
+**Sixteen rows in sixteen lanes.** The scalar definition adds a row's products in sixteen interleaved
+chains and joins them with a fixed tree. Rather than spread one row across a register's sixteen lanes,
+which must then be joined at the end of every row, Trochilus gives each lane its own weight row: every
+chain sums in the scalar order, the input is broadcast to sixteen rows at once, and nothing is decoded,
+scaled or joined inside the loop. The prompt's matrix-product tile runs at 164.7 GFLOP/s on one core,
+98.6% of what the CPU can do in float without fused multiply-adds (which would round once where the
+scalar definition rounds twice), and every output is the scalar definition's, bit for bit.
+
+**Q4_K in exact integers, each input converted once.** A Q4_K matrix product takes each block of 256
+inputs as 32-bit fixed point and sums exact integers, then rounds once: the input's 32 bits are the only
+approximation, where a float dot product rounds at every step. The order of the sums no longer matters,
+so any thread count or SIMD width gives the same bits, as fast as the float kernels this replaced. Each
+input row is converted once and shared: q, k and v read the same converted rows, gate and up read a
+token's row through a map instead of eight gathered copies, and the SwiGLU converts the down
+projection's input while it is still in the core's cache.
+
+**A byte that can be deduced is not read.** In OLMoE's GGUF files the router matrices are 32-bit floats
+whose low 16 bits are all zero: the model was converted from bf16. The load checks every value, keeps
+only the top halves, and each row widens them back with a shift: the 32-bit row's bits, from half the
+bytes, every token. A matrix with one value that does not fit stays in 32 bits.
+
+**A correctly rounded `exp`, proved on every float.** Our `expf` is a 64-entry table and a polynomial,
+with the eight hard cases computed at 200 bits; the gate checks it on **all 4 278 190 082** float
+arguments that are not NaN, against the exact value, in every SIMD tier. (glibc's rounds 0.004% of
+them otherwise; ggml's 3.36%, by up to 2 units in the last place.)
 
 ## What makes it different
 
@@ -71,16 +96,6 @@ Some milestones on the same laptop:
 on the real model; tiny models built for the purpose are compared with `transformers` in every gate,
 and so is the real model cut to two layers. Speculative decoding cannot change the answer: every
 verified row is bit for bit the computation of a single-token pass.
-
-**Q4_K without rounding in the middle.** A Q4_K matrix product takes each block of 256 inputs as 32-bit
-fixed point and sums exact integers, then rounds once: the input's 32 bits are the only approximation,
-where a float dot product rounds at every step. The order of the sums no longer matters, so any thread
-count, SIMD width or device gives the same bits, as fast as the float kernels this replaced.
-
-**A correctly rounded `exp`, proved on every float.** Our `expf` is a 64-entry table and a polynomial,
-with the eight hard cases computed at 200 bits; the gate checks it on **all 4 278 190 082** float
-arguments that are not NaN, against the exact value, in every SIMD tier. (glibc's rounds 0.004% of
-them otherwise; ggml's 3.36%, by up to 2 units in the last place.)
 
 **Nothing to configure.** At startup the engine measures the cores, the instructions, the free RAM
 and the disk, and places the work itself; while it runs it times how many threads each kind of pass
