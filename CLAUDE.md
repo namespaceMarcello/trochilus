@@ -61,6 +61,11 @@ The prediction is written before the run; the report to Marcello follows the sam
   ds4 and llama.cpp (with ik_llama.cpp) do it in `ref/`, measure theirs against ours, write it in
   the piece's row of `docs/ORIGINS.md` §Every piece; then build better, measure, compare again. The
   next piece starts after, never beside it.
+- **Every piece against colibri and ds4, and the verdict acts** (Marcello, 2026-10-02): a piece built and
+  measured excellent is raced against colibri's and ds4's own way on this machine; the verdict goes in
+  `docs/UPSTREAM.md` §Our pieces against colibri and ds4 (`tools/lint.py` checks one row a piece).
+  Worse: their approach is studied and adopted. Better: ours is offered to them, brought to *PR ready*
+  in the fork with the `oss-contributo` skill, opened after Marcello's yes.
 - **Marcello asks for the commit.** Prepare everything (tests green, documents written) and stop.
 - **Public repository** `namespaceMarcello/trochilus` (since 2026-09-22): everything committed is
   visible to anyone. Pushes and visibility are Marcello's call.
@@ -85,8 +90,8 @@ by" column): no mistake should reach Marcello if a test could have caught it fir
    available). An agent does not close a step: the orchestrator's verification does.
 6. **After an agent**: read the report against the code, `make check`, `docker ps` and background
    processes (LESSONS #5).
-7. **Upstream**: a bug found in colibri or ds4 goes in `docs/UPSTREAM.md` with its proof; a PR or
-   an issue only after Marcello says yes.
+7. **Upstream**: a bug found in colibri or ds4 goes in `docs/UPSTREAM.md` with its proof, a piece
+   raced against them in its verdict table; a PR or an issue only after Marcello says yes.
 8. **Documents**, per the table below.
 
 ### Before every commit: document
@@ -95,6 +100,7 @@ by" column): no mistake should reach Marcello if a test could have caught it fir
 | code (every commit) | `docs/archive/DONE.md`: `### <date> — <title>`, what it is and how to try it |
 | a significant implementation: a capability a user sees, a number against llama.cpp, a milestone step (Marcello, 2026-09-26: without being asked) | `README.md`, the way `docs/README_GUIDE.md` says: the results, what is unique, what is conquered; every number today's (raced again, never left with a note that it is old); only what is offered. The commit hook asks for it on every commit that changes `src/`, or for `no-readme: <why>` in the message |
 | a mistake, a discovery, a debt | `docs/LESSONS.md`, with the prevention and who found it |
+| a piece raced against colibri or ds4 (better, worse, level) | `docs/UPSTREAM.md` §Our pieces against colibri and ds4: the verdict and its action |
 | code ported from colibri or ds4 | `docs/ORIGINS.md` + the file header |
 | a decision, a debt, a measurement, the next step | `docs/STATUS.md` (replace, do not append; 40 KB cap) |
 | a step closed, a decision, a new question (together with STATUS) | `docs/status.json`, then `tools/status_html.py`, and republish the artifact (same URL) |
@@ -115,6 +121,7 @@ by" column): no mistake should reach Marcello if a test could have caught it fir
 | the rules for code that runs on every token | `docs/ARCHITECTURE.md` §Hot path |
 | mistakes already made, discoveries, how they are prevented | `docs/LESSONS.md` |
 | bugs found in colibri or ds4, and what was reported to their authors | `docs/UPSTREAM.md` |
+| which piece beats colibri or ds4, which is to adopt from them or offer to them | `docs/UPSTREAM.md` §Our pieces against colibri and ds4 |
 | profiling: levels, tools, scenarios | `docs/ARCHITECTURE.md` §Profiling |
 | what has already been done | `docs/archive/DONE.md` |
 | the command to do something (benches, measurements, mutations, reports) | `docs/COMMANDS.md` |

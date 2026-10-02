@@ -252,6 +252,15 @@ void tr_q4x_prepare(tr_pool *pool, const float *x, int64_t n, int64_t cols, void
 int tr_q4x_road(tr_pool *pool, const tr_mat *w, const int64_t *offsets, int64_t n_groups, const tr_pm_scratch *s);
 int tr_matmul_q4x_prepared(tr_pool *pool, const tr_mat *w, const int64_t *offsets, int64_t n_groups, const void *xq,
                            const int64_t *map, float *y, const tr_pm_scratch *s);
+/* tr_matmul_q4x_prepared over n_w (1..TR_Q4X_MATS) weights of one shape on the same groups and prepared rows (q, k and
+ * v; gate and up), in one call of the pool: each thread runs its items on w[0] into y[0], then the same items on w[1]
+ * into y[1], and so on (docs/MEASUREMENTS.md §Piece 4). y[m] is tr_matmul_q4x_prepared's on w[m], bit for bit; 0 (every
+ * y untouched) when the road cannot take one of them or their shapes differ. tr_q4x_fused_calls: the calls of n_w > 1
+ * taken since the process started (tests). */
+#define TR_Q4X_MATS 3
+int tr_matmul_q4x_prepared_n(tr_pool *pool, const tr_mat *const *w, int n_w, const int64_t *offsets, int64_t n_groups,
+                             const void *xq, const int64_t *map, float *const *y, const tr_pm_scratch *s);
+uint64_t tr_q4x_fused_calls(void);
 /* 1 if no group of tr_matmul_grouped's has more than one input row: a decode token's projections
  * (one group, one row) and its experts (n_expert groups, the used ones one row each, the rest
  * empty), whose call is only weight rows to stream and runs balanced at its tail. Until

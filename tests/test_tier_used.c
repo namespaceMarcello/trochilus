@@ -317,7 +317,7 @@ static uint64_t pool_hints(const tr_pool *p) {
 }
 
 static void test_engine(const char *argv0, tr_type type, const char *name, long long n_embd, long long n_ff,
-                        int bf16_router) {
+                        int bf16_router, int n_head_kv) {
     static tr_kernels counting;
     g_real = tr_kernels_get();
     counting = *g_real;
@@ -388,7 +388,8 @@ static void test_engine(const char *argv0, tr_type type, const char *name, long 
     atomic_store(&n_dot_4x4, 0);
     atomic_store(&n_axpy_4x4, 0);
 
-    const synth_params P = {LAYERS, (uint32_t)n_embd, N_HEAD, N_HEAD_KV, (uint32_t)n_ff, N_EXPERT, N_USED, VOCAB, CTX, type};
+    const synth_params P = {LAYERS, (uint32_t)n_embd, N_HEAD, (uint32_t)n_head_kv, (uint32_t)n_ff, N_EXPERT, N_USED, VOCAB,
+                            CTX, type};
     char path[512], err[256];
     synth_f32_router = 1;
     synth_bf16_router = bf16_router; /* the router's values fit bf16: the engine keeps it BF16 */
@@ -421,7 +422,7 @@ static void test_engine(const char *argv0, tr_type type, const char *name, long 
          * projection, and gate, up and down of each expert it uses; the router's are F32, or BF16 where its
          * values fit; the logits are one row of the vocabulary per call */
         long long tokens = N_PROMPT + N_SINGLE + N_SHORT, evals = 1 + N_SINGLE + 1;
-        long long n_kv = (long long)N_HEAD_KV * (n_embd / N_HEAD);
+        long long n_kv = (long long)n_head_kv * (n_embd / N_HEAD);
         long long of_type = tokens * LAYERS * (n_embd + 2 * n_kv + n_embd + N_USED * (2 * n_ff + n_embd)) + evals * VOCAB;
         long long of_router = tokens * LAYERS * N_EXPERT;
         for (int i = 0; i < TR_TYPE_COUNT; i++) {
@@ -496,11 +497,12 @@ static void test_engine(const char *argv0, tr_type type, const char *name, long 
         /* Q4_K: the same passes on a second session with a switch at arm B (generate --ab): prep, every call
          * preparing its own rows and the experts' gathered, 888 rows here; act, the swiglu apart and the down
          * preparing its own rows, the same 412; idle, no hint to the idle workers (none taken), the same 412;
-         * every pass's logits the bits of the first session's */
-        static const char *const sw_names[3] = {"prep", "act", "idle"};
-        const long long sw_preps[3] = {(4 + 3 * N_USED) * tokens * LAYERS + evals, (3 + N_USED) * tokens * LAYERS + evals,
-                                       (3 + N_USED) * tokens * LAYERS + evals};
-        for (int si = 0; si < 3 && type == TR_TYPE_Q4_K; si++) {
+         * fuse, q, k, v and gate, up one call each (tr_matmul_q4x_prepared_n never taken; act and idle take it,
+         * prep's floats cannot), the same 412; every pass's logits the bits of the first session's */
+        static const char *const sw_names[4] = {"prep", "act", "idle", "fuse"};
+        const long long sw_preps[4] = {(4 + 3 * N_USED) * tokens * LAYERS + evals, (3 + N_USED) * tokens * LAYERS + evals,
+                                       (3 + N_USED) * tokens * LAYERS + evals, (3 + N_USED) * tokens * LAYERS + evals};
+        for (int si = 0; si < 4 && type == TR_TYPE_Q4_K; si++) {
             tr_session *s2 = tr_session_create(model, 0, 0, err, sizeof err);
             const int sw = s2 != NULL ? tr_session_ab_switch(s2, sw_names[si]) : -1;
             TR_CHECK(s2 != NULL && sw > 0);
@@ -510,7 +512,7 @@ static void test_engine(const char *argv0, tr_type type, const char *name, long 
                 const double settle = tr_time_sec(); /* the first session's last hints taken before counting */
                 while (tr_time_sec() - settle < 0.02) {
                 }
-                const uint64_t h_before = pool_hints(pool);
+                const uint64_t h_before = pool_hints(pool), f_before = tr_q4x_fused_calls();
                 tr_kernels_set_active(&counting);
                 TR_CHECK(tr_session_eval(s2, tok, N_PROMPT) == 0);
                 memcpy(logits[1][0], tr_session_logits(s2), sizeof logits[1][0]);
@@ -527,6 +529,9 @@ static void test_engine(const char *argv0, tr_type type, const char *name, long 
                 while (tr_time_sec() - t1 < 0.02) {
                 }
                 if (si == 2) TR_CHECK_EQ_INT(pool_hints(pool), h_before);
+                if (si == 0 || si == 3) TR_CHECK_EQ_INT(tr_q4x_fused_calls(), f_before);
+                else /* gate and up a layer, and q, k and v where they share a shape (no GQA) */
+                    TR_CHECK_EQ_INT(tr_q4x_fused_calls() - f_before, (n_head_kv == N_HEAD ? 2 : 1) * LAYERS * evals);
                 printf("  q4_k  model, %s's arm B: %llu rows prepared, every pass's logits the engine's bits\n",
                        sw_names[si], (unsigned long long)atomic_load(&n_q4x_prep));
             }
@@ -571,12 +576,12 @@ int main(int argc, char **argv) {
     const char *argv0 = argc > 0 ? argv[0] : "";
     test_table();
     test_ops();
-    test_engine(argv0, TR_TYPE_F32, "f32", N_EMBD, N_FF, 0);
-    test_engine(argv0, TR_TYPE_F16, "f16", N_EMBD, N_FF, 0);
-    test_engine(argv0, TR_TYPE_Q8_0, "q8_0", N_EMBD, N_FF, 0);
-    test_engine(argv0, TR_TYPE_Q8_0, "q8_0", N_EMBD, N_FF, 1); /* a router whose values fit bf16: kept BF16 */
-    test_engine(argv0, TR_TYPE_Q4_K, "q4_k", 256, 256, 0);   /* rows of whole 256-element blocks */
-    test_engine(argv0, TR_TYPE_Q4_K, "q4_k", 256, 256, 1);   /* as the real model: its router BF16 */
-    test_engine(argv0, TR_TYPE_Q6_K, "q6_k", 256, 256, 0);
+    test_engine(argv0, TR_TYPE_F32, "f32", N_EMBD, N_FF, 0, N_HEAD_KV);
+    test_engine(argv0, TR_TYPE_F16, "f16", N_EMBD, N_FF, 0, N_HEAD_KV);
+    test_engine(argv0, TR_TYPE_Q8_0, "q8_0", N_EMBD, N_FF, 0, N_HEAD_KV);
+    test_engine(argv0, TR_TYPE_Q8_0, "q8_0", N_EMBD, N_FF, 1, N_HEAD_KV); /* a router whose values fit bf16: kept BF16 */
+    test_engine(argv0, TR_TYPE_Q4_K, "q4_k", 256, 256, 0, N_HEAD_KV);   /* rows of whole 256-element blocks; GQA */
+    test_engine(argv0, TR_TYPE_Q4_K, "q4_k", 256, 256, 1, N_HEAD);      /* as the real model: router BF16, no GQA */
+    test_engine(argv0, TR_TYPE_Q6_K, "q6_k", 256, 256, 0, N_HEAD_KV);
     TR_TEST_EXIT();
 }

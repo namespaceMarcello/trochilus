@@ -1552,3 +1552,30 @@ the Italian tags (its self-test cases in English), one comment in `olmoe.c`.
   "#undefined"; states, shapes and references now checked, red on the committed data).
 Check: `tools/.venv/Scripts/python.exe tools/lint.py`; `tools/.venv/Scripts/python.exe tools/status_html.py`, then
 open `build/status/index.html`; `make check`.
+
+### 2026-10-02 — pretouch raced: level, out; every zone in the A/B's report
+- pretouch (the calling thread asks for its own next lines before each idle-worker hint, prefetchw where the CPU has
+  PRFCHW) written again without a string in the hot zone and raced in one process: THE ESTIMATE 1.0027 +- 0.0022,
+  attn_norm's +54 us unchanged (MEASUREMENTS §The idle workers, LESSONS #259). Out of the tree; the patch in
+  `build/q102/pretouch.patch`.
+- `tools/ab_inproc.py` prints every zone both arms timed, the serial steps too (us a pass, A, B, B - A, medians over
+  the runs): the old session script moved into the tool.
+Check: `tools/.venv/Scripts/python.exe tools/ab_inproc.py build/q84/ab-idle-touch/run-*.json`.
+
+### 2026-10-02 — Piece 4: q, k, v and gate, up in one call each
+- `tr_matmul_q4x_prepared_n` (kernels.h): 2-3 Q4_K weights of one shape on the same groups and prepared rows in one
+  call of the pool, their items one flat range; `tr_q4x_fused_calls` counts the calls (tests). The engine fuses q, k,
+  v where they share a shape and gate, up on Q4_K's road; `generate --ab fuse` runs them apart (arm B).
+- The decode 1.0054 +- 0.0007 a token, the same bits (MEASUREMENTS §Piece 4, LESSONS #260-#261).
+- Tests: test_kernels (w0, w1, w1 in one call at 1-16 threads, each y its own call's bits; the refusals);
+  test_tier_used (`fuse` arm B, the fused calls counted exactly; the second Q4_K model without GQA, as the real one).
+Check: `make check`; `AB_INPROC_OUT=build/ab-fuse sh tools/ab_inproc.sh build/trochilus.exe fuse 12`.
+
+### 2026-10-02 — Every piece against colibri and ds4: the verdict table and its check
+- `docs/UPSTREAM.md` §Our pieces against colibri and ds4: one row a piece of ORIGINS §Every piece, a verdict a
+  project (not raced, better, worse, level, n/a) and its action: worse, their way studied and adopted; better, ours
+  offered to them (PR ready in the fork, opened after Marcello's yes). Today one piece raced (the exp, level).
+- `tools/lint.py` `check_upstream_verdicts`: a piece without its row, a verdict outside the five, a better or a worse
+  without its action fail it; eight samples prove the check sees each (red on the tree before the table: 14).
+- CLAUDE.md: the rule in How to work, the cycle's step 7, the document tables.
+Check: `tools/.venv/Scripts/python.exe tools/lint.py`.

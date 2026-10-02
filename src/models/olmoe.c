@@ -153,6 +153,7 @@ typedef struct {
     int ab_old_prep;  /* generate --ab prep's arm B: every matmul prepares its own rows, the experts' gathered */
     int ab_old_act;   /* generate --ab act's arm B: the swiglu apart, the down preparing its own rows */
     int ab_no_idle;   /* generate --ab idle's arm B: no hints to the idle workers (hint_next) */
+    int ab_no_fuse;   /* generate --ab fuse's arm B: q, k, v and gate, up one call each (tr_matmul_q4x_prepared_n) */
     size_t hint_bytes; /* a hint's bytes a worker: OLMOE_HINT_BYTES, or TR_HINT_KB (research) */
     float *h1, *h2;   /* [B*U][n_ff] gate and up outputs */
     float *h3;        /* [B*U][n_embd] down outputs */
@@ -1347,7 +1348,10 @@ static int forward_layer(olmoe_model *m, olmoe_session *s, int64_t L, const int3
         int road[3], any = 0;
         for (int i = 0; i < 3; i++) any |= road[i] = !s->ab_old_prep && tr_q4x_road(pool, wqkv[i], tok_off, 1, &s->pm);
         if (any) tr_q4x_prepare(pool, s->normed, n_tok, n_embd, s->xq_tok);
-        for (int i = 0; i < 3; i++)
+        /* the three in one call of the pool when they share a shape (piece 4); else one call each */
+        const int fused = road[0] && road[1] && road[2] && !s->ab_no_fuse &&
+                          tr_matmul_q4x_prepared_n(pool, wqkv, 3, tok_off, 1, s->xq_tok, NULL, yqkv, &s->pm);
+        for (int i = 0; i < 3 && !fused; i++)
             if (!road[i] || !tr_matmul_q4x_prepared(pool, wqkv[i], tok_off, 1, s->xq_tok, NULL, yqkv[i], &s->pm))
                 tr_matmul_s(pool, wqkv[i], s->normed, n_tok, yqkv[i], &s->pm);
     }
@@ -1504,9 +1508,14 @@ static int forward_layer(olmoe_model *m, olmoe_session *s, int64_t L, const int3
     tr_prof_end(prof, TR_PROF_EXPERT_GATHER, t);
 
     t = tr_prof_begin(prof);
-    if (gu_road) { /* tr_q4x_road said yes: both calls take the road (the same test inside) */
-        tr_matmul_q4x_prepared(pool, layer->gate_exps, s->offsets, n_expert, s->xq_tok, s->xmap, s->h1, &s->pm);
-        tr_matmul_q4x_prepared(pool, layer->up_exps, s->offsets, n_expert, s->xq_tok, s->xmap, s->h2, &s->pm);
+    if (gu_road) { /* tr_q4x_road said yes: both take the road (the same test inside), in one call (piece 4) */
+        const tr_mat *const wgu[2] = {layer->gate_exps, layer->up_exps};
+        float *const ygu[2] = {s->h1, s->h2};
+        if (s->ab_no_fuse ||
+            !tr_matmul_q4x_prepared_n(pool, wgu, 2, s->offsets, n_expert, s->xq_tok, s->xmap, ygu, &s->pm)) {
+            tr_matmul_q4x_prepared(pool, layer->gate_exps, s->offsets, n_expert, s->xq_tok, s->xmap, s->h1, &s->pm);
+            tr_matmul_q4x_prepared(pool, layer->up_exps, s->offsets, n_expert, s->xq_tok, s->xmap, s->h2, &s->pm);
+        }
     } else {
         tr_matmul_grouped_s(pool, layer->gate_exps, s->offsets, n_expert, s->xg, s->h1, &s->pm);
         tr_matmul_grouped_s(pool, layer->up_exps, s->offsets, n_expert, s->xg, s->h2, &s->pm);
@@ -1951,13 +1960,14 @@ static void route_trace_record(olmoe_session *s, int64_t L, const int32_t *token
 
 /* the in-process A/B's switches (tr_session_ab_switch), arm 1 the road before: prep, the prep once a row (every
  * matmul preparing its own rows, the experts' rows gathered, the swiglu apart); act, only the swiglu and the down's
- * prep in one call; idle, no hints to the idle workers */
-enum { OLMOE_AB_PREP = 1, OLMOE_AB_ACT = 2, OLMOE_AB_IDLE = 3 };
+ * prep in one call; idle, no hints to the idle workers; fuse, q, k, v and gate, up one call each */
+enum { OLMOE_AB_PREP = 1, OLMOE_AB_ACT = 2, OLMOE_AB_IDLE = 3, OLMOE_AB_FUSE = 4 };
 
 static int olmoe_ab_switch(const char *name) {
     if (strcmp(name, "prep") == 0) return OLMOE_AB_PREP;
     if (strcmp(name, "act") == 0) return OLMOE_AB_ACT;
     if (strcmp(name, "idle") == 0) return OLMOE_AB_IDLE;
+    if (strcmp(name, "fuse") == 0) return OLMOE_AB_FUSE;
     return -1;
 }
 
@@ -1966,6 +1976,7 @@ static void olmoe_ab_set(void *session, int sw, int arm) {
     if (sw == OLMOE_AB_PREP) s->ab_old_prep = arm;
     if (sw == OLMOE_AB_ACT) s->ab_old_act = arm;
     if (sw == OLMOE_AB_IDLE) s->ab_no_idle = arm;
+    if (sw == OLMOE_AB_FUSE) s->ab_no_fuse = arm;
 }
 
 const tr_arch_vtable tr_olmoe_vtable = {

@@ -547,12 +547,75 @@ def check_status_json():
         fail(258, f"docs/status.json: {msg}")
 
 
+# Every piece against colibri and ds4 (Marcello, 2026-10-02): docs/UPSTREAM.md keeps one row a piece of
+# docs/ORIGINS.md §Every piece, with a verdict a project; better is offered to them, worse is studied and adopted.
+VERDICTS = ("not raced", "better", "worse", "level", "n/a")
+PIECES_HEADING, VERDICTS_HEADING = "## Every piece against the references", "## Our pieces against colibri and ds4"
+
+
+def table_rows(text, heading):
+    """{number: cells} of the numbered rows of the table under heading, to the next '## '"""
+    part = text.split(heading, 1)[1].split("\n## ", 1)[0] if heading in text else ""
+    out = {}
+    for line in part.splitlines():
+        if re.match(r"^\| \d+ \|", line):
+            cells = [c.strip() for c in re.split(r"(?<!\\)\|", line.strip().strip("|"))]
+            out[cells[0]] = cells
+    return out
+
+
+def verdict_problems(origins, upstream):
+    """Every ORIGINS piece without its row, every verdict outside VERDICTS, every better or worse with no action."""
+    pieces, rows = table_rows(origins, PIECES_HEADING), table_rows(upstream, VERDICTS_HEADING)
+    problems = [] if pieces else ["docs/ORIGINS.md: no piece under " + PIECES_HEADING]
+    problems += [f"piece {n} of docs/ORIGINS.md has no row against colibri and ds4" for n in pieces if n not in rows]
+    for n, cells in rows.items():
+        if len(cells) != 6:
+            problems.append(f"row {n}: {len(cells)} columns, expected 6")
+            continue
+        if n not in pieces:
+            problems.append(f"row {n} names no piece of docs/ORIGINS.md")
+        for who, cell in (("colibri", cells[3]), ("ds4", cells[4])):
+            word = next((v for v in VERDICTS if cell.lstrip("*").lower().startswith(v)), None)
+            if word is None:
+                problems.append(f"row {n}: {who}'s verdict is none of {', '.join(VERDICTS)}")
+            elif word in ("better", "worse") and cells[5].strip("*") in ("", "-", "—"):
+                problems.append(f"row {n}: {word} than {who}, and no action (offer it, or study theirs)")
+    return problems
+
+
+def check_upstream_verdicts():
+    """Every piece raced against colibri and ds4, or its debt in sight; better offered, worse studied."""
+    o = PIECES_HEADING + "\n| # | a | b | c | d | e | f |\n| 1 | x | . | . | . | . | . |\n| 2 | y | . | . | . | . | . |\n"
+    head = VERDICTS_HEADING + "\n| # | Piece | Ours | colibri | ds4 | Action |\n"
+    good = "| 1 | x | 3 | **better** 1.2x | not raced | PR ready |\n| 2 | y | 4 | level | n/a | — |\n"
+    samples = [
+        (o, head + good, 0),
+        (o, head + "| 1 | x | 3 | level | level | — |\n", 1),                                  # piece 2 missing
+        (o, head + good.replace("PR ready", "—"), 1),                                         # better, no action
+        (o, head + good.replace("level | n/a", "worse | n/a"), 1),                           # worse, no action
+        (o, head + good.replace("not raced", "faster"), 1),                                  # not a verdict
+        (o, head + good + "| 3 | z | 1 | level | level | — |\n", 1),                         # no such piece
+        (o, head + good.replace("| 4 | level", "| level"), 1),                               # 5 columns
+        ("", head + good, 3),                                                                # no pieces at all
+    ]
+    for n, (orig, up, want) in enumerate(samples, 1):
+        got = len(verdict_problems(orig, up))
+        if got != want:
+            failures.append(f"[upstream] the check is broken: sample {n} gives {got} problems instead of {want}")
+            return
+    origins = (ROOT / "docs" / "ORIGINS.md").read_text(encoding="utf-8")
+    upstream = (ROOT / "docs" / "UPSTREAM.md").read_text(encoding="utf-8")
+    for p in verdict_problems(origins, upstream):
+        failures.append(f"[upstream, docs/UPSTREAM.md {VERDICTS_HEADING[3:]}] {p}")
+
+
 def main():
     for check in (check_docs_control_chars, check_line_endings, check_doc_limits, check_no_future_dates, check_lessons_table,
                   check_type_table, check_tests_no_tmpfile, check_hot_zones, check_global_state,
                   check_makefile_recipes_ascii, check_shell_scripts_whole, check_scripts_clean_up,
                   check_no_failure_into_tee, check_struct_calloc, check_expf_table, check_readme_numbers,
-                  check_english, check_status_json):
+                  check_english, check_status_json, check_upstream_verdicts):
         check()
     for f in failures:
         print(f)

@@ -202,7 +202,8 @@ decides | — | — |
 | 82 | The short passes' width when every pass drafts (LESSONS #228): the tuner probes one-row passes only, so a session with a draft on every pass runs its 2-4-row passes on the whole pool. **Answered 2026-09-27** (§The verify passes' own width): every size of verify pass measures its own width, the narrowest skipped; on a pool of 16 Q8_0 0.961-0.966 of the pool, Q4_K 0.982-1.005, 8 threads picked everywhere; left: the probes' cost on long sessions (a re-measure every doubling) | the passes of 1, 2 and 3 rows at 4, 8 and 16 threads forced (`--decode-threads`) on a pool of 16, alternated; then the tuner fed the short passes too | after question 78 the short passes are still 1.04-1.09x slower at 16 threads than at 8 |
 | 83 | Half a prep a token, or less (Marcello): Q4_K's input rows prepared once a distinct row, in the call that makes them, with fewer pool calls a layer. **P1 + P2 done 2026-09-27** (§The prep once a row: q/k/v from one prep, gate and up from the tokens' rows through a map, no gather: the prompt 1.058, a 3-row pass 1.026, the same bits; the decode with P4 1.025, the arms aperiodic); **P4** (swiglu with the down's prep in one call): the prompt 1.0087, the decode level; left: gate and up in one call, countdown epilogues, the idle workers prefetching their next call, then the prep's bit arithmetic (0.70 us a prep: ~0.1 us to take) | `tools/ab_inproc.sh <bin> <switch>` (prompt: AB_INPROC_PROMPT=8), each piece with its own switch; the traced timeline's no-weight calls | the prompt's preps and gather were 8.6% of a 512-token prompt, 3% of a decode pass |
 | 84 | ~~Does the run past a stream's end cost the weights' reads too?~~ **Answered 2026-09-27** (§The idle workers, and what lies past a region's end): the page after each thread's region dropped, a dense call 0.8% faster (the read 1.7%), an expert's call level; a thread's regions of consecutive calls one after the other, a dense call 1.0-1.75% faster. A lever of 0.2-0.4% of a token in the dense calls' layout, none in the experts'; taken with piece 4 (q, k, v in one call lays them out again) | — | — |
-| 85 | The serial steps as messages (LESSONS #255): the idle workers' hints gain the next call up to the serial step's length in the bench (0.85-0.96 W) and nothing in the engine, where the step after each hint reads the rows the workers wrote (attn_out, h3) and stores over lines they share (normed, the prepared row). If the steps stop touching the workers' lines (the add and the mix inside the calls that make their rows, normed and the prepared row in buffers the workers have not read since), do the serial steps get faster by themselves, and do the hints then pay? The first step not raced: `pretouch` (the calling thread's own next lines asked before each hint) | the steps' zones with `TR_POOL_HINT=2` against 0 in one process (`idle`), then each step's lines moved | the serial zones are ~260 us a token (1.7%); the hints' gross gain 150-190 us |
+| 85 | The serial steps as messages (LESSONS #255): the idle workers' hints gain the next call up to the serial step's length in the bench (0.85-0.96 W) and nothing in the engine, where the step after each hint reads the rows the workers wrote (attn_out, h3) and stores over lines they share (normed, the prepared row). If the steps stop touching the workers' lines (the add and the mix inside the calls that make their rows, normed and the prepared row in buffers the workers have not read since), do the serial steps get faster by themselves, and do the hints then pay? Step 1 raced 2026-10-02, `pretouch` (the calling thread's own next lines asked before each hint): level (1.0027 +- 0.0022), attn_norm's +54 us a pass unchanged, so a step does not pay its own lines' latency but a share of the core or the fabric under the flood (§The idle workers) | the steps' zones with `TR_POOL_HINT=2` against 0 in one process (`idle`), then each step's lines moved | the serial zones are ~260 us a token (1.7%); the hints' gross gain 150-190 us |
+| 86 | A team of small models (Marcello, 2026-10-01; an idea pending until the roadmap is done): can three diverse 1-3B models (different families: Qwen, Llama, Mistral...) match or beat one ~7B, and at fewer bytes read a token? Three forms: a vote on the whole answer (any tokenizer); a token-level vote (shared tokenizer: mean or product of probabilities, or the most confident model speaks); the cascade, where the cheapest model runs first and the others wake only when it is unsure (entropy). Prior art, all outside inference engines: Product of Experts (Hinton 2002), self-consistency (2022), LLM-Blender (2023), FrugalGPT (2023) and RouteLLM (2024) cascades on whole answers, Mixture-of-Agents (2024), Branch-Train-MiX (2024), mergekit-moe, DeePEn and UniTE (2024); not seen: an exact token-level team inside an engine, counted in bytes a token. Three traps found in a review by Claude Opus 5.5 at medium effort (2026-10-01; the top-1 minus top-2 gate came from DeepSeek): (1) a model woken at token t lacks tokens 0..t-1 in its KV, so the output is wrong, not just slow: it must catch up with a prefill of the skipped tokens on waking, and that catch-up cost decides whether the cascade pays; (2) the mean of logits and the product of probabilities pick the same token (logits are defined up to a constant), so the real fusion modes are the mean of probabilities after softmax, the product of probabilities, and the most confident model (top-1 minus top-2 margin, a better gate than entropy alone: a model sure and wrong wakes nobody); (3) a shared tokenizer is checked by a hash of the whole token list, not by vocab size, and n_ctx is the minimum over the models. A fusion defined as a fixed sequence of operations can be exact against a Python oracle | Python first (`tools/.venv`, transformers, no C): GSM8K (math) and MMLU (knowledge) subsets, the team against the single ~7B; accuracy and bytes read a token for each form; the prediction written before the run; the RAM guard (one model loaded at a time if the sum does not fit) | a capability nobody offers (an exact team that wakes only when needed); a zero is written and closed |
 
 Reference machine: Ryzen 9 7940HX (Zen 4, 16 core / 32 thread, AVX-512 VNNI/BF16), 31 GB
 RAM (2×16 GB DDR5-5200), NVMe Micron 1 TB, GPU RTX 4070 Laptop 8 GB and Radeon 610M (not used
@@ -5233,6 +5234,19 @@ token by the zones (the calls' gain, the serial steps' loss):
   `prefetchw` was a string in the hot zone, which the lint refuses): the calling thread asking for its own next lines
   before each hint (the norms' weights, prefetchw over normed and the prepared row), predicted 1.008-1.015 if the steps
   pay their own lines' latency, level if the workers' busy caches are slow to answer any probe (question 85).
+- **pretouch raced, 2026-10-02: level, out.** Written again without a string in the hot zone (`__builtin_prefetch`,
+  prefetchw through a per-function `target("prfchw")` where CPUID 0x80000001 ECX bit 8 says so; the patch kept in
+  `build/q102/pretouch.patch`, disassembly checked: `0f 0d`). Before q's hint the norm's weight, normed and the
+  prepared row; before the router's the ffn_norm's weight, normed and the router's row; before gate's the prepared
+  row; before the output's the output_norm's weight and the row. `TR_POOL_HINT=2 ab_inproc idle 8` (build/q102,
+  build/q84/ab-idle-touch; free machine: 1.90 and 1.77 logical processors busy before and after, 0.75 of them the
+  kernel's System; A 16.4-17.8 ms a pass): **THE ESTIMATE B/A 1.0027 +- 0.0022** (median 1.0015; the blocks pooled
+  1.0029 +- 0.0024): under 1.005 at two standard errors. The zones, us a pass, B - A against the late hints without
+  pretouch (q98): attn_norm **-54.4 (was -54.1): pretouch moved nothing there**, so the norm does not pay its own
+  lines' latency (its weight's 128 lines asked before the hint, normed and the prepared row owned): the prediction's
+  second branch; qkv_proj (the prep inside it) +95.5 (was +40.7); the prep of gate and up (expert_gather) -56.3 (was
+  -67.3); gate_up +66.9 (+70.2); router +16.5 (+14.4); the pass +27.1 (-33.5). A serial step slows by ~3.4 us a layer
+  with the workers flooding whatever lines it has: not its misses, the core's or the fabric's share under the flood.
 - Tests: test_base (each chunk's region as the call runs it, a static and a balanced call; a hint taken whole, left
   the moment a call comes 3 of 3, ignored for chunk 0, past the width and with hints off, the workers awake for
   every case: LESSONS #256), test_kernels (each worker's hint where its first block reads: the dense Q4_K matrix at 8
@@ -5245,6 +5259,33 @@ token by the zones (the calls' gain, the serial steps' loss):
   `MADV_POPULATE_READ`, Linux), not from the idle workers; colibri keeps OpenMP's team hot (`OMP_WAIT_POLICY=active`),
   no prefetch; ds4's workers sleep on a condition variable, no spin. None brings the next call's weights with the
   idle workers.
+
+## Piece 4: q, k, v and gate, up in one call (2026-10-02)
+
+The decode ran q, k and v as three calls of the pool on one prepared row, and gate and up as two: five dispatches,
+joins and tails a layer. `tr_matmul_q4x_prepared_n` (kernels.h) takes 2-3 weights of one shape on the same groups and
+prepared rows in one call; the engine fuses q, k, v when they share a shape (no GQA: OLMoE's 16 and 16 heads) and gate,
+up always on Q4_K's road. Every output is the same `q4x_dot2` or tile on the same inputs: the bits do not move
+(test_kernels at 1-16 threads, test_tier_used's `fuse` arm B, every pass's logits).
+- The references (read 10-02): ik_llama.cpp merges q, k, v into one tensor at load (`-mqkv`, `wqkv` and views) and
+  runs gate and up as one op per expert (`GGML_OP_MOE_FUSED_UP_GATE`: chunks of the same rows of both, claimed by an
+  atomic counter, the activation applied in the kernel); llama.cpp keeps them apart; colibri fuses gate and up per
+  (expert, row chunk) in `xf_moe_run` (ORIGINS row 2).
+- First form, each thread's items on w[0], then the same items on w[1], ... (the plan's blocks carry 2-3 weights):
+  `generate --ab fuse` 8 and 12 runs, **neither at a free machine** (2.59 busy after, 3.04 before): 0.9914 +- 0.0069,
+  then 1.0025 +- 0.0028; qkv_proj +13 and +24 us a pass, gate_up -27 and +17. Predicted 1.008-1.018 from a call's
+  fixed cost guessed at 3-6 us: out. A call's dispatch and join cost under ~1 us; a block 2-3 times heavier makes
+  the tail longer by what the dispatch saved (LESSONS #260).
+- **The form kept: the items of every weight as one flat range**, w[0]'s first, balanced by the pool as finely as one
+  weight's; a thread's rows cross one or two weights, one region where it had one a weight (question 84: a region's
+  end ~0.8% of a dense call). Each piece of a weight marks the thread's panel stale (the weights share their groups
+  and rows: LESSONS #261). 12 runs at a free machine (1.31 and 1.18 busy; build/q106/ab-fuse-flat, A 14.3-15.1 ms a
+  pass): **THE ESTIMATE B/A 1.0054 +- 0.0007** (median 1.0043; the blocks pooled 1.0053 +- 0.0011); qkv_proj
+  1.0283 +- 0.0014 (-55.6 us a pass), expert_gate_up 1.0077 +- 0.0009 (-38.5 us). Predicted 1.002-1.006: in.
+- Open: the idle workers' hints (off by default) still describe q's plan alone, not the flat range (with
+  `TR_POOL_HINT=2` they bring other rows than the call reads first); the activation inside the gate-up call (ik's
+  fusion, question 85's messages); q, k, v merged at load (one stream of rows, ik's `-mqkv`), the layout question 84
+  priced at 1.0-1.75% of a dense call.
 
 ## Attempts
 
@@ -5321,3 +5362,6 @@ token by the zones (the calls' gain, the serial steps' loss):
 | 2026-09-27 | the session's struct from calloc: the parallel argmax outside generate --ab (LESSONS #252) | the sample zone 118 us a token in every process race | 5.45-5.53 us | native, 36 runs | **kept**: +0.74% of a token |
 | 2026-09-27 | question 84: the page after each thread's region dropped (guard), a thread's regions of consecutive calls one after the other (own); `bench_q4x --ends 8`, raced set by set | a dense call from RAM, 288 KiB a region | guard 1.0079 +- 0.0010, own 1.0102-1.0175; the experts' calls 1.001-1.002 (level) | 21 rounds, SE 0.05-0.2% | **measured**: 0.2-0.4% of a token in the dense layout, taken with piece 4; nothing on the experts |
 | 2026-09-27 | the idle workers bring the next call's first 256 KiB in during the serial steps (`tr_pool_hint`, T2) | the decode, no hints | the bench 1.02-1.14 a call after a 1.5-6 us step; the engine 1.0053, 0.9931 (64 KiB), 0.9990 (late), 0.9962 +- 0.0039 (12 runs) | in-process A/B, 6-12 runs | **off by default** (`TR_POOL_HINT=2` on): the serial step after a hint pays what the call gains (LESSONS #255, question 85) |
+| 2026-10-02 | pretouch: before each hint the calling thread asks for its own next lines (the norms' weights; prefetchw over normed, the prepared row, the router's row) | the decode, no hints (arm B) | 1.0027 +- 0.0022 (8 runs); attn_norm still +54 us a pass, the prep inside qkv +55 us more | in-process A/B, native, free | **out** (patch in build/q102): the serial step's slowdown is not its own lines' latency (question 85) |
+| 2026-10-02 | piece 4, first form: q, k, v and gate, up one call each, a thread's items on each weight in turn | the decode, one call a weight | 0.9914 +- 0.0069 (8 runs), 1.0025 +- 0.0028 (12); qkv_proj +13/+24 us | in-process A/B, native, not free | **replaced**: the blocks 2-3 weights heavy, the tail took the dispatch's gain (LESSONS #260) |
+| 2026-10-02 | piece 4, the form kept: the weights' items as one flat range (`tr_matmul_q4x_prepared_n`) | the decode, one call a weight (14.3-15.1 ms a pass) | **1.0054 +- 0.0007** (12 runs); qkv_proj 1.0283, gate_up 1.0077 | in-process A/B, native, free | **kept**, on by default (`--ab fuse` arm B: the calls apart) |

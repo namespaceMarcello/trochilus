@@ -28,3 +28,36 @@ States: *found* → *verified* (test case reproduced, not already reported) → 
 | 10 | 2026-09-22 | colibri `9e152d4` (dev) | `make check` with gcc 13 is again not at 0 warnings: `qwen36.c:2822: 'serve_echo' used but never defined`, from `e16146c` (brio mode, 2026-09-20). `serve_echo` is defined inside `#ifndef QWEN36_NO_MAIN` (`qwen36.c:3258`) but declared and called outside it (`:2822`, `:2869`) | Gate log in fork (`tmp/gate/fix_olmoe-inflight-dedup/20260922-230634/check.log:230`) | Build hygiene in the segment build (`QWEN36_NO_MAIN`); the call is unreachable there or it would not link | **closed: merged** 2026-09-23 by JustVugg into `dev`, no review comments. Was **#1695**, opened 2026-09-22 (JustVugg/colibri, against `dev`): branch `fix/qwen36-echo-guard`, echo state and block under `#ifndef QWEN36_NO_MAIN`; full build byte-identical to `dev` (`gcc -E -P`), green gate at 0 warnings |
 | 11 | 2026-09-21 | ds4 `8db1d1d` | `ggml_type_size()` in `cuda/mmq/ds4_ggml_stubs.h` is wrong for two types: `nvfp4` gives 18 bytes where `block_nvfp4` is 4+32 = 36, and `q1_0` gives 36 bytes on a 256-weight block where ggml has 128 weights in 18 bytes. Found while reviewing #1095, not while porting | `cuda/mmq/ggml-common.h:217` (`block_nvfp4`), `gguf-tools/quants.c:72`; code read, not reproduced (CUDA, no GPU here) | `mmvq.cu:1064-1066` uses `ggml_type_size` as row stride: an `nvfp4` tensor would be walked with half the right stride. The official models do not use these types | verified by reading; separate PR offered to emilianbold in the #1095 thread, no answer yet |
 | 12 | 2026-09-21 | ds4 `8db1d1d` | `gguf_types[]` in `ds4.c` lacks `tq1_0` (34), `tq2_0` (35), `nvfp4` (40), `q1_0` (41), which `gguf-tools/quants.c` already knows. Found while reviewing #1095 | `ds4.c` `gguf_types[]` against `gguf-tools/quants.c` | Missing support, not a wrong size: `tensor_nbytes` fails closed (`block_elems == 0`) and the loader rejects the file | verified by reading; separate PR offered in the same thread, no answer yet |
+
+## Our pieces against colibri and ds4
+
+Marcello, 2026-10-02: every piece we build and measure as excellent is raced against colibri's and ds4's own way of
+doing it, on this machine, and the verdict decides the action. **Worse**: their approach is studied and adopted (a
+question in MEASUREMENTS §Da misurare, then the piece rebuilt). **Better**: our improvement is offered to them,
+brought to *PR ready* in the fork (`Desktop\colibri`, `Desktop\ds4`) with the `oss-contributo` skill and its gate,
+and opened only after Marcello's yes (the rules above). **Level**: nothing moves. A llama.cpp race does not count
+here: it is in ORIGINS. One row a piece of docs/ORIGINS.md §Every piece; `tools/lint.py` (`check_upstream_verdicts`)
+fails a piece without its row, a verdict outside *not raced, better, worse, level, n/a*, and a better or a worse
+without its action. *not raced* is the debt in sight; *n/a*: the project has no such piece. colibri runs OLMoE, so
+its engine races ours whole; ds4 runs DeepSeek only, so its pieces race ours as kernels in a bench (the pattern of
+`tools/bench_ggml_decode.sh`).
+
+State on 2026-10-02: one piece raced (the exp), level; every other is the debt. First to race, the likeliest offers:
+14, 13 and 12 (small, exact, and neither project has them).
+
+| # | Piece | Ours | colibri | ds4 | Action |
+|---|---|---|---|---|---|
+| 1 | CPU matmul, the prompt | phase-major: the tile 164.7 GFLOP/s a core; Q4_K 4 threads level with llama.cpp | not raced (`xf_moe_run`: a row by a token, F32 FMA) | not raced (a row against 2 tokens, int8) | race both in a bench beside ours |
+| 2 | CPU matmul, the decode | Q4_K 12.5 GB/s a core, exact; piece 4 1.0054 | not raced (int8 once a token, dpbusd) | not raced (scalar C on x86) | race both in `bench_q4x` |
+| 3 | Attention and the KV layout | the decode at the RAM's ceiling; the prompt's tiles 1.31-1.33x | not raced | not raced (scalar, no threads) | — |
+| 4 | Softmax and exp | exact exp, 3.5 ns a value | level (glibc expf 3.2 ns, 1 ulp off on 0.004%; MEASUREMENTS §Softmax and exp against the references) | level (the same expf) | — |
+| 5 | Thread pool, placement, widths | physical cores first (prefill +30%); tails balanced | not raced (OpenMP, the team kept hot) | not raced (a pool that sleeps) | — |
+| 6 | MoE routing and grouping | a counting sort by expert | not raced | not raced | — |
+| 7 | Experts from disk | a store under a budget, reads ahead | not raced (slots, pread) | not raced | — |
+| 8 | Speculation | the calibrated gate 1.146x with a real context | not raced (n-gram drafts) | not raced | — |
+| 9 | Quantized formats | Q4_K in exact integers | not raced | not raced | — |
+| 10 | GPU | the decode's attention 1.31-1.58x | not raced | not raced | — |
+| 11 | GGUF reader and tokenizer | the tokenizer 22 MB/s | not raced | not raced | — |
+| 12 | Activations prepared once a row | q, k, v from one prep; gate, up 16 preps to 1 a token | not raced (int8 once a layer) | not raced (q8_K once a token) | race first: a likely offer |
+| 13 | The KV's pages at their first write | touched over the pool: kv_write 80 -> 50 us a token | not raced (faults inside the writes) | not raced (calloc, faults inside the writes) | race first: a likely offer |
+| 14 | The router's matrix | kept bf16 where every value fits: 1.40-1.48x, the same bits | not raced (F32) | not raced (F32) | race first: a likely offer |

@@ -1,7 +1,7 @@
 {
   "project": "Trochilus",
   "subtitle": "inference engine for MoE models in C, no dependencies",
-  "updated": "2026-09-27",
+  "updated": "2026-10-02",
   "states": {
     "done": "finished and proven: green tests in make check",
     "in-progress": "we are working on it now",
@@ -197,6 +197,14 @@
         {
           "v": "what lies past the end of a thread's region: a guard page makes the dense call 0.8% faster, a thread's regions one after the other 1.0-1.75%; the experts nothing (0.2-0.4% of a token, in the dense layout)",
           "d": "2026-09-27"
+        },
+        {
+          "v": "pretouch: the calling thread asks for its own next lines before each hint. Even (8 runs: 1.003 ± 0.002) and the first norm still slowed by 54 us a token: a serial step under the workers' flood does not pay for its own lines. Out",
+          "d": "2026-10-02"
+        },
+        {
+          "v": "piece 4: q, k, v in one call of the pool, and gate, up in one, their work spread as one range over the threads: generation 0.54% faster (12 runs: 1.0054 ± 0.0007), the same bits",
+          "d": "2026-10-02"
         }
       ],
       "questions": [
@@ -223,7 +231,7 @@
         {
           "n": 85,
           "state": "open",
-          "text": "the serial steps as messages between cores: if they stop touching the workers' rows (add and mix inside the calls, normed and the prepared row in unread buffers), do the hints to idle workers pay off?"
+          "text": "the serial steps as messages between cores: if they stop touching the workers' rows (add and mix inside the calls, normed and the prepared row in unread buffers), do the hints to idle workers pay off? (2026-10-02: pretouch, the steps' own lines asked ahead, even: the cost is not their misses)"
         }
       ],
       "files": [

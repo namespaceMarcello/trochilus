@@ -2321,7 +2321,7 @@ static void test_matmul_grouped_s(void) {
     TR_CHECK(K->dot_row_xt[TR_TYPE_Q8_0] != NULL);
     counting.dot_row_xt[TR_TYPE_Q8_0] = pms_xt_q8_0;
     tr_kernels_set_active(&counting);
-    long taken = 0, refused = 0;
+    long taken = 0, refused = 0, fused = 0;
     for (int ti = 0; ti < 2; ti++) {
         const tr_type type = types[ti];
         const int q4x = type == TR_TYPE_Q4_K, tiles = q4x ? K->q4x_panel != NULL && K->q4x_tile != NULL : 1;
@@ -2334,8 +2334,11 @@ static void test_matmul_grouped_s(void) {
             float *x = (float *)malloc((size_t)N * COLS * sizeof(float));
             float *ref[2] = {(float *)malloc(ybytes), (float *)malloc(ybytes)};
             float *y = (float *)malloc(ybytes);
+            float *yf[2] = {(float *)malloc(ybytes), (float *)malloc(ybytes)};
+            unsigned char *xq = (unsigned char *)tr_alloc_aligned((size_t)N * tr_q4x_bytes(COLS), 64);
             tr_pm_scratch s, s4;
-            int ok = wd[0] != NULL && wd[1] != NULL && x != NULL && ref[0] != NULL && ref[1] != NULL && y != NULL;
+            int ok = wd[0] != NULL && wd[1] != NULL && x != NULL && ref[0] != NULL && ref[1] != NULL && y != NULL &&
+                     yf[0] != NULL && yf[1] != NULL && xq != NULL;
             ok = ok && tr_pm_scratch_init(&s, 16, G, N, COLS, N * COLS) == 0;
             ok = ok && tr_pm_scratch_init(&s4, 4, G, N, COLS, N * COLS) == 0;
             TR_CHECK(ok);
@@ -2376,6 +2379,40 @@ static void test_matmul_grouped_s(void) {
                             TR_CHECK(atomic_load(&g_pms_q4xt[2]) > 0 && atomic_load(&g_pms_q4xt[3]) > 0);
                         }
                         taken++;
+                    }
+                    if (q4x) {
+                        /* tr_matmul_q4x_prepared_n (piece 4): w[0], w[1], w[1] on the same groups and prepared rows in
+                         * one call, each y the bits of its own call; a thread's panel of (group, rows) for one weight
+                         * must not serve the next (red without the reset), nor the last weight's serve the first in
+                         * the thread's next block (red with the reset only from the second weight; the last weight
+                         * is not the first, so a stale panel cannot be right by chance) */
+                        tr_q4x_prepare(pool, x, N, COLS, xq);
+                        const tr_mat *const w3[3] = {w[0], w[1], w[1]};
+                        float *const y3[3] = {y, yf[0], yf[1]};
+                        for (int m = 0; m < 3; m++) memset(y3[m], 0x7F, ybytes);
+                        atomic_store(&g_pms_tiles, 0);
+                        const uint64_t f0 = tr_q4x_fused_calls();
+                        TR_CHECK_EQ_INT(tr_matmul_q4x_prepared_n(pool, w3, 3, offsets, G, xq, NULL, y3, &s), 1);
+                        TR_CHECK_EQ_INT(tr_q4x_fused_calls() - f0, 1);
+                        TR_CHECK(memcmp(y, ref[0], ybytes) == 0);
+                        TR_CHECK(memcmp(yf[0], ref[1], ybytes) == 0);
+                        TR_CHECK(memcmp(yf[1], ref[1], ybytes) == 0);
+                        if (tiles) TR_CHECK(atomic_load(&g_pms_tiles) > 0);
+                        /* the refusals, every y untouched: four weights, or two of other shapes */
+                        tr_mat wr[G];
+                        for (int g = 0; g < G; g++) wr[g] = w[1][g], wr[g].rows = R - 16;
+                        const tr_mat *const w4[4] = {w[0], w[1], w[0], w[1]};
+                        const tr_mat *const w2[2] = {w[0], wr};
+                        float *const y4[4] = {y, yf[0], yf[1], yf[1]};
+                        memset(y, 0x7F, ybytes);
+                        memset(yf[0], 0x7F, ybytes);
+                        TR_CHECK_EQ_INT(tr_matmul_q4x_prepared_n(pool, w4, 4, offsets, G, xq, NULL, y4, &s), 0);
+                        TR_CHECK_EQ_INT(tr_matmul_q4x_prepared_n(pool, w2, 2, offsets, G, xq, NULL, y4, &s), 0);
+                        size_t touched = 0;
+                        for (size_t i = 0; i < ybytes; i++)
+                            touched += ((unsigned char *)y)[i] != 0x7F || ((unsigned char *)yf[0])[i] != 0x7F;
+                        TR_CHECK_EQ_INT(touched, 0);
+                        fused++;
                     }
                     if (pool != NULL) tr_pool_destroy(pool);
                 }
@@ -2425,8 +2462,12 @@ static void test_matmul_grouped_s(void) {
             free(ref[0]);
             free(ref[1]);
             free(y);
+            free(yf[0]);
+            free(yf[1]);
+            tr_free_aligned(xq);
         }
     }
+    TR_CHECK(fused > 0);
     /* a Q4_K row of 272 columns is not whole blocks (row bytes 0): the integer road may not take it */
     {
         tr_pm_scratch s;

@@ -4,6 +4,9 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
 
 ## Decisions
 
+- 2026-10-02 — **Every piece against colibri and ds4, and the verdict acts** (Marcello): worse, their way
+  adopted; better, ours offered (PR ready, opened after his yes). `docs/UPSTREAM.md` §Our pieces against
+  colibri and ds4, checked by the lint; today 1 of 14 raced (level).
 - 2026-09-24 — **The long-context decode goes faster only exactly** (Marcello): no KV at 16 bits
   with rounding. The criterion: logits identical to the byte to today's engine, batch = token by
   token, every tier = scalar. Closes point 6's «KV at 16 bits» and order (b) as no. A GPU is a tier
@@ -290,19 +293,14 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
 
 ## Next steps
 
-**2026-09-24/26, in short** (MEASUREMENTS from §Skipping cached positions exactly to §The prompt from
-8 to 16 threads; LESSONS #152-#206): the decode's attention on the GPU, the same bytes (1.31-1.58×);
-the x8 and two-row kernels; the Q4_K decode level with llama.cpp at 4 threads, exact (50.4 against
-50.2 tok/s); the prompt's attention in tiles (1.31-1.33×); the decode's experts balanced at the tail
-(decode 1.04-1.08× at 8 threads); the softmax's and SwiGLU's exp in a vector (prefill 1.05×); the
-race of 14:28, a free machine: decode level at 512, theirs 1.04× at 2048. Closed as no: SMT, gate/up
-interleaved, 2 MB pages, drafts in the high bits, question 75's 8-bit draft KV out of sample;
+**2026-09-24/26, in short** (MEASUREMENTS §Skipping cached positions exactly to §The prompt from 8 to 16
+threads; LESSONS #152-#206): the decode's attention on the GPU (1.31-1.58×); Q4_K decode level with
+llama.cpp at 4 threads (50.4 against 50.2 tok/s); the prompt's attention in tiles (1.31-1.33×); the
+experts balanced at the tail (1.04-1.08×); exp in a vector (prefill 1.05×). Closed as no: SMT, 2 MB pages;
 - **2026-09-26: phase-major and exact Q4_K** (MEASUREMENTS §Phase-major, §Exact sums at the float's speed;
-  LESSONS #207-#222): sixteen weight rows run as SIMD lanes in the lane contract's order, the tile 164.7
-  GFLOP/s a core (98.6% of the no-FMA peak); Q4_K in exact integers (W16 panels and tiles, kernels.h
-  `q4x_*`) at the float's speed; the races for the README (container, free machine): Q4_K 4 threads prompt
-  level with llama.cpp (220.0 against 220.6), decode 1.03x; Q8_0 16 threads prompt 1.33-1.42x. The
-  GPU-against-CPU decode A/B is still owed at a free machine with no writes (LESSONS #222).
+  LESSONS #207-#222): the tile 164.7 GFLOP/s a core (98.6% of the no-FMA peak); Q4_K in exact integers
+  (kernels.h `q4x_*`) at the float's speed; Q4_K 4 threads prompt level with llama.cpp (220.0 against
+  220.6), decode 1.03x; Q8_0 16 threads prompt 1.33-1.42x.
 - **2026-09-27** (MEASUREMENTS from §The post-it taken apart to §The routers as bf16; LESSONS #223-#253):
   a calibrated gate 1.077x on new code (with a real context 1.146x); the short verify passes at their bytes
   (question 78: Q8_0's 3 rows 62.7 -> 43.0 ms; Q4_K's panel rows brought ahead, then **road (c)**, `q4x_dot_xt`
@@ -325,11 +323,12 @@ interleaved, 2 MB pages, drafts in the high bits, question 75's 8-bit draft KV o
   experts' nothing: 0.2-0.4% of a token in the dense layout. **The idle workers (piece 3, B)**: `tr_pool_hint` and
   `tr_matmul_hint`, 1.02-1.14 a call in the bench, **level in the engine** (12 runs 0.9962 +- 0.0039): the serial step
   after each hint pays what the call gains (#255, question 85). Kept off by default (`TR_POOL_HINT=2` on), tested,
-  16 mutations.
-- **next, one piece at a time** (the thinker's order for the decode, `build/prep/predictions.txt`): q/k/v and
-  gate/up in one call each, with question 84's layout (a thread's rows of q, k, v one after the other); the serial
+  16 mutations. **10-02, pretouch**: level (1.0027 +- 0.0022), attn_norm +54 us unchanged (#259): out.
+  **10-02, piece 4**: q, k, v and gate, up one call each, the weights' items one flat range
+  (`tr_matmul_q4x_prepared_n`): the decode **1.0054 +- 0.0007**, the same bits (MEASUREMENTS §Piece 4, #260-#261).
+- **next, one piece at a time** (the thinker's order for the decode, `build/prep/predictions.txt`): the serial
   steps as messages (question 85: the add and the mix inside the calls that make their rows, normed and the prepared
-  row in buffers the workers have not read; then the hints again, and `pretouch`, never raced); the pool's messages
+  row in buffers the workers have not read, measured first without hints; then the hints again); the pool's messages
   (release stores, `shutdown` off `remaining`'s line); last the prep's bit arithmetic. The
   README's numbers raced again after them (Marcello approves the README first). Then the post-it's rest: the dense at
   3 rows (xt(3)'s block end batched across its tokens), AVX2's own xt, the row price at 2048 and 4000 positions,

@@ -6,6 +6,7 @@
 #include "../base/platform.h"
 
 #include <math.h>
+#include <stdatomic.h>
 #include <string.h>
 
 #define half_to_float tr_half_to_float
@@ -995,6 +996,10 @@ typedef struct {
     int64_t min_rows;           /* a group of fewer input rows goes by rows */
     const unsigned char *xq;    /* the prepared rows: s->xq, or the caller's (tr_matmul_q4x_prepared) */
     const int64_t *map;         /* input row p reads prepared row map[p]; NULL: row p */
+    int n_w;                    /* 1, or the weights of tr_matmul_q4x_prepared_n: each item on ws[m] into ys[m] */
+    int64_t n_items;            /* one weight's items (the plan's) */
+    const tr_mat *ws[TR_Q4X_MATS];
+    float *ys[TR_Q4X_MATS];
 } q4x_ctx;
 
 /* the prepared row input row p reads */
@@ -1040,8 +1045,7 @@ static void q4x_rows(const q4x_ctx *c, int64_t g, int64_t r0, int64_t p_begin, i
     }
 }
 
-static void q4x_item_body(void *ctx_, int64_t begin, int64_t end, int worker) {
-    const q4x_ctx *c = (const q4x_ctx *)ctx_;
+static void q4x_items(const q4x_ctx *c, int64_t begin, int64_t end, int worker) {
     const pm_plan *pl = &c->plan;
     /* a worker the scratch has no panel for (a call with no pool from inside a larger pool's body): by rows */
     const int own = worker < c->s->n_workers && c->k->q4x_panel != NULL && c->k->q4x_tile != NULL;
@@ -1090,6 +1094,26 @@ static void q4x_item_body(void *ctx_, int64_t begin, int64_t end, int worker) {
     }
 }
 
+/* tr_matmul_q4x_prepared_n's items: every weight's in one range, w[0]'s first, so the pool balances them as finely as
+ * one weight's and a thread's range crosses one or two weights (one region of rows where it had one a weight). Each
+ * piece of a weight marks the thread's panel stale first: the weights share their groups and rows. */
+static void q4x_item_body(void *ctx_, int64_t begin, int64_t end, int worker) {
+    const q4x_ctx *c = (const q4x_ctx *)ctx_;
+    if (c->n_w <= 1) {
+        q4x_items(c, begin, end, worker);
+        return;
+    }
+    q4x_ctx cm = *c;
+    for (int64_t it = begin; it < end;) {
+        const int64_t m = it / c->n_items, stop = end < (m + 1) * c->n_items ? end : (m + 1) * c->n_items;
+        cm.w = c->ws[m];
+        cm.y = c->ys[m];
+        if (worker < c->s->n_workers) c->plan.last[2 * worker] = c->plan.last[2 * worker + 1] = -1;
+        q4x_items(&cm, it - m * c->n_items, stop - m * c->n_items, worker);
+        it = stop;
+    }
+}
+
 /* 1 when Q4_K's integer road can take a call of these weights and groups on s (whatever holds its prepared rows) */
 static int q4x_road(const tr_kernels *k, const tr_mat *w, const int64_t *offsets, int64_t n_groups,
                     const tr_pm_scratch *s) {
@@ -1120,8 +1144,10 @@ static void q4x_run(tr_pool *pool, q4x_ctx *c, const tr_mat *w, const int64_t *o
     const int64_t n_items = pm_plan_build(&c->plan, offsets, n_groups, c->rows, c->min_rows, TR_Q4X_TILE_MAX,
                                           s->n_workers, &n_tiles);
     (void)n_tiles;
-    TR_TRACE_NOTE(matmul_used_bytes(offsets, n_groups, c->rows, c->row_bytes), c->rows, c->cols, offsets[n_groups]);
-    tr_parallel_for_balanced(pool, n_items, 1, q4x_item_body, c);
+    TR_TRACE_NOTE(matmul_used_bytes(offsets, n_groups, c->rows, c->row_bytes) * (uint64_t)c->n_w, c->rows, c->cols,
+                  offsets[n_groups]);
+    c->n_items = n_items;
+    tr_parallel_for_balanced(pool, n_items * c->n_w, 1, q4x_item_body, c);
 }
 
 void tr_q4x_prepare(tr_pool *pool, const float *x, int64_t n, int64_t cols, void *xq) {
@@ -1147,6 +1173,7 @@ static int matmul_q4x(tr_pool *pool, const tr_mat *w, const int64_t *offsets, in
     c.k = k;
     c.xq = s->xq;
     c.map = NULL;
+    c.n_w = 1;
     q4x_run(pool, &c, w, offsets, n_groups, y, s);
     return 1;
 }
@@ -1161,7 +1188,38 @@ int tr_matmul_q4x_prepared(tr_pool *pool, const tr_mat *w, const int64_t *offset
     c.k = k;
     c.xq = (const unsigned char *)xq;
     c.map = map;
+    c.n_w = 1;
     q4x_run(pool, &c, w, offsets, n_groups, y, s);
+    return 1;
+}
+
+static _Atomic uint64_t g_q4x_fused_calls; /* global-ok: a count of the process's calls, read by tests only */
+
+uint64_t tr_q4x_fused_calls(void) {
+    return atomic_load_explicit(&g_q4x_fused_calls, memory_order_relaxed);
+}
+
+int tr_matmul_q4x_prepared_n(tr_pool *pool, const tr_mat *const *w, int n_w, const int64_t *offsets, int64_t n_groups,
+                             const void *xq, const int64_t *map, float *const *y, const tr_pm_scratch *s) {
+    if (n_w < 1 || n_w > TR_Q4X_MATS) return 0;
+    if (n_w == 1) return tr_matmul_q4x_prepared(pool, w[0], offsets, n_groups, xq, map, y[0], s);
+    if (n_groups <= 0 || offsets[n_groups] <= 0 || w[0][0].rows <= 0) return 1;
+    if (pool != NULL && s != NULL && tr_pool_size(pool) > s->n_workers) return 0;
+    const tr_kernels *k = tr_kernels_get();
+    for (int m = 0; m < n_w; m++)
+        if (!q4x_road(k, w[m], offsets, n_groups, s) || w[m][0].rows != w[0][0].rows || w[m][0].cols != w[0][0].cols)
+            return 0;
+    q4x_ctx c;
+    c.k = k;
+    c.xq = (const unsigned char *)xq;
+    c.map = map;
+    c.n_w = n_w;
+    for (int m = 0; m < n_w; m++) {
+        c.ws[m] = w[m];
+        c.ys[m] = y[m];
+    }
+    atomic_fetch_add_explicit(&g_q4x_fused_calls, 1, memory_order_relaxed);
+    q4x_run(pool, &c, w[0], offsets, n_groups, y[0], s);
     return 1;
 }
 

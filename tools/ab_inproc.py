@@ -5,7 +5,8 @@ in the same file, memory and threads, where two files of the same bytes differ b
     tools/.venv/Scripts/python.exe tools/ab_inproc.py <profile.json> [...]
 
 Per run: each arm's passes and mean ms a pass, B/A of the pass and of every zone (a zone's seconds over the arm's
-passes). Over the runs: the median of B/A, and the mean with its standard error. "--ab none" (both arms the
+passes). Over the runs: the median of B/A, and the mean with its standard error; then every zone the arms timed,
+the serial steps too, in us a pass with B - A (medians over the runs). "--ab none" (both arms the
 same code) measures the tool's own noise: its B/A is what a real switch must be told from.
 
 The blocks: passes 4j..4j+3 are A B B A or B A A B (the run's `ab_pass_arm`, since 2026-09-27: no period, so the
@@ -69,6 +70,24 @@ def trimmed(w, arm):
     return statistics.mean(b) / statistics.mean(a) if a and b else None
 
 
+def every_zone(paths):
+    """Every zone both arms timed, the serial steps too: us a pass of each arm and B - A, medians over the runs (where
+    a call's gain is paid back by the step after it, docs/MEASUREMENTS.md §The idle workers)."""
+    rows = {}
+    for p in paths:
+        phases = json.load(open(p))["engine"]["phases"]
+        a, b = phases["decode"], phases["decode_b"]
+        na, nb = a["zones"]["token"]["calls"], b["zones"]["token"]["calls"]
+        for z in a["zones"]:
+            if z in b["zones"]:
+                rows.setdefault(z, []).append((1e6 * a["zones"][z]["seconds"] / na,
+                                               1e6 * b["zones"][z]["seconds"] / nb))
+    print("every zone, us a pass, medians over %d runs:   A, B, B - A" % len(paths))
+    for z, v in rows.items():
+        print("  %-16s %9.1f %9.1f %9.1f" % (z, statistics.median(x[0] for x in v), statistics.median(x[1] for x in v),
+                                           statistics.median(x[1] - x[0] for x in v)))
+
+
 def main():
     paths = sys.argv[1:]
     if not paths:
@@ -94,6 +113,7 @@ def main():
         for k, v in ratios.items():
             se = statistics.stdev(v) / len(v) ** 0.5 if len(v) > 1 else float("nan")
             print("  %-16s %.4f  %.4f +- %.4f" % (k, statistics.median(v), statistics.mean(v), se))
+    every_zone(paths)
     if len(pooled) > 1:
         # the median's standard error, from the blocks' spread (1.2533 sd / sqrt(n) for a normal spread)
         se = 1.2533 * statistics.stdev(pooled) / len(pooled) ** 0.5
