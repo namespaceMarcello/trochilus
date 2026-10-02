@@ -1579,3 +1579,12 @@ Check: `make check`; `AB_INPROC_OUT=build/ab-fuse sh tools/ab_inproc.sh build/tr
   without its action fail it; eight samples prove the check sees each (red on the tree before the table: 14).
 - CLAUDE.md: the rule in How to work, the cycle's step 7, the document tables.
 Check: `tools/.venv/Scripts/python.exe tools/lint.py`.
+
+### 2026-10-02 — The roadmap as a ladder of models, for the machines most people own
+- ARCHITECTURE §The roadmap: the aim (Marcello), three machines (below average, average, this PC; the weaker two
+  emulated), five phases a rung (exact, studied, at the theoretical limit, usable, raced and offered), the rungs
+  R0-R4 and what is off the ladder, the old milestones mapped. CLAUDE.md: the democratic spirit, one rung at a time.
+- docs/status.json reorganized into the rungs (34 blocks; new: the three machines, Qwen's tiny oracle, tokenizer
+  and template, the real model, a team of small models); README's status table; STATUS's decision and next.
+- `tools/lint.py` `check_one_rung`: one rung in progress, a next block only there (LESSONS #262).
+Check: `tools/.venv/Scripts/python.exe tools/lint.py`; `tools/.venv/Scripts/python.exe tools/status_html.py`.

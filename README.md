@@ -121,15 +121,20 @@ the gate (lint, a 0-warning build, the tests, ASan, TSan, the oracles). The Pyth
 
 Pre-alpha, under active development, measured on one machine.
 
-| Milestone | Content | State |
+The aim is AI on the machines most people own. The roadmap is a ladder of models: each one is brought
+to the end — exact, studied piece by piece, at the theoretical limit of three machines (below average:
+4 cores, 8 GB, no GPU; average: 8 cores, 16 GB; this laptop), usable, raced — before the next one starts.
+
+| Rung | Model | State |
 |---|---|---|
-| M0 | the exact engine: GGUF, CPU kernels for every tier, the OLMoE graph, tokenizer, chat | **done** |
-| M1 | experts from disk under a RAM budget, with no options to set | the store, the budget and the overlapped reads done; the first prompt's cost next |
-| M2 | smaller weights: Q4_K, Q6_K, then Q2_K and IQ2 | Q4_K and Q6_K done, Q4_K_M runs |
-| M3 | CUDA: the attention, the dense weights, the experts in VRAM | the decode's attention done |
-| M4 | a model of hundreds of gigabytes on the same laptop | — |
-| M5 | KV checkpoints on disk, an HTTP server, a draft model | speculation from the context, `serve` |
-| M6 | Vulkan and Metal, so the GPU is not only NVIDIA | — |
+| R0 | the exact engine: GGUF, CPU kernels for every tier, tokenizer, chat | **done** |
+| R1 | OLMoE-1B-7B, to the end | exact; Q4_K, Q6_K, Q4_K_M; experts from disk under a RAM budget; the GPU's decode attention; speculation from the context, `serve`; the two weaker machines next |
+| R2 | Qwen3-Coder-30B-A3B, a coding model: on 16 GB its experts come from disk; 2-bit formats | — |
+| R3 | a MoE larger than this laptop's RAM | — |
+| R4 | DeepSeek V4 Flash, hundreds of gigabytes, on the same laptop | — |
+
+Off the ladder, when a rung needs them: Vulkan and Metal (a GPU other than NVIDIA) and hand-written
+assembly.
 
 Not there yet: one model family and one chat template; the GPU does only the decode's attention, on
 NVIDIA only; no 2-bit formats; no NEON kernels (ARM takes the scalar path); greedy decoding only, and
@@ -147,7 +152,7 @@ automatic check (a test, a lint rule, a mutation that must turn red). The engine
 
 | Document | Content |
 |---|---|
-| [`ARCHITECTURE.md`](docs/ARCHITECTURE.md) | principles, layers, the correctness ladder, milestones |
+| [`ARCHITECTURE.md`](docs/ARCHITECTURE.md) | principles, layers, the roadmap: the rungs, the three machines, the five phases |
 | [`STATUS.md`](docs/STATUS.md) | where the project stands, the decisions, the next step |
 | [`MEASUREMENTS.md`](docs/MEASUREMENTS.md) | every measurement, including the optimizations that were rejected |
 | [`LESSONS.md`](docs/LESSONS.md) | every mistake and discovery, with the check that now prevents it |

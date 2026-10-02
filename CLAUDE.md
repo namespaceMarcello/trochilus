@@ -25,6 +25,12 @@ token inside the present state, a thread's work inside its own index. Hold sever
 pass (drafts), collapsed by the exact computation to the scalar definition's bits. The win is
 counted in bytes read per exact token: the unit where llama.cpp must be passed.
 
+**The democratic spirit: AI on the machines most people own** (Marcello, 2026-10-02). The target is
+not this PC but the average and the below-average one: 4-8 cores, 8-16 GB, no dedicated GPU. One
+model at a time, slowly, to the theoretical limit of each machine, every piece studied to the bottom
+and reinvented where the numbers allow; then the next model. The roadmap is a ladder of models, five
+phases each, on three machines (`docs/ARCHITECTURE.md` §The roadmap).
+
 **The method for any speed work, in this order** (Marcello, 2026-09-25, "decisive, we use it": it
 took the Q4_K decode level with llama.cpp, MEASUREMENTS §The Q4_K decode dot sequenced):
 1. **measure before changing, one piece removed at a time**: the deletion series and each
@@ -57,6 +63,9 @@ The prediction is written before the run; the report to Marcello follows the sam
   plain words (gained? how much, where); one line per item, no jargon, 2–3 numbers, ≤ ~10 lines:
   what was done, how to try it. The why and the detail go in `docs/STATUS.md`.
 - Logic and kernels: choose, build, deliver. Questions are asked up front, not halfway through.
+- **One rung at a time** (2026-10-02): every session works on the rung in progress and closes a piece
+  of it (a block moves in `docs/status.json`); the next rung starts when its five phases are done on
+  the three machines. Speed work outside a rung's phase 3 waits; races go together at a rung's close.
 - **One piece at a time, to the end, against the three references** (2026-09-24): read how colibri,
   ds4 and llama.cpp (with ik_llama.cpp) do it in `ref/`, measure theirs against ours, write it in
   the piece's row of `docs/ORIGINS.md` §Every piece; then build better, measure, compare again. The
@@ -98,13 +107,13 @@ by" column): no mistake should reach Marcello if a test could have caught it fir
 | If this changed… | Write in |
 |---|---|
 | code (every commit) | `docs/archive/DONE.md`: `### <date> — <title>`, what it is and how to try it |
-| a significant implementation: a capability a user sees, a number against llama.cpp, a milestone step (Marcello, 2026-09-26: without being asked) | `README.md`, the way `docs/README_GUIDE.md` says: the results, what is unique, what is conquered; every number today's (raced again, never left with a note that it is old); only what is offered. The commit hook asks for it on every commit that changes `src/`, or for `no-readme: <why>` in the message |
+| a significant implementation: a capability a user sees, a number against llama.cpp, a rung's step (Marcello, 2026-09-26: without being asked) | `README.md`, the way `docs/README_GUIDE.md` says: the results, what is unique, what is conquered; every number today's (raced again, never left with a note that it is old); only what is offered. The commit hook asks for it on every commit that changes `src/`, or for `no-readme: <why>` in the message |
 | a mistake, a discovery, a debt | `docs/LESSONS.md`, with the prevention and who found it |
 | a piece raced against colibri or ds4 (better, worse, level) | `docs/UPSTREAM.md` §Our pieces against colibri and ds4: the verdict and its action |
 | code ported from colibri or ds4 | `docs/ORIGINS.md` + the file header |
 | a decision, a debt, a measurement, the next step | `docs/STATUS.md` (replace, do not append; 40 KB cap) |
 | a step closed, a decision, a new question (together with STATUS) | `docs/status.json`, then `tools/status_html.py`, and republish the artifact (same URL) |
-| layers, principles, milestones | `docs/ARCHITECTURE.md` (rewrite the line, do not add one) |
+| layers, principles, the roadmap | `docs/ARCHITECTURE.md` (rewrite the line, do not add one) |
 | a measurement or an attempt at optimisation (even a rejected one) | `docs/MEASUREMENTS.md` |
 
 ---
@@ -113,7 +122,7 @@ by" column): no mistake should reach Marcello if a test could have caught it fir
 
 | Question about… | Open |
 |---|---|
-| principles, layers, execution, milestones | `docs/ARCHITECTURE.md` |
+| principles, layers, execution, the roadmap (the rungs, the three machines, the five phases) | `docs/ARCHITECTURE.md` |
 | where we stand, decisions, the next step | `docs/STATUS.md` |
 | where a file comes from, the pinned commit | `docs/ORIGINS.md` |
 | measured numbers, optimisations that worked and that were rejected | `docs/MEASUREMENTS.md` |

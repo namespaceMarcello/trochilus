@@ -235,21 +235,50 @@ remain.
 | prefill in blocks | logits and cache with many tokens per pass identical bit-for-bit to one token per pass: `n_batch`, split calls, threads, f32/Q8_0, rewind | `tests/test_prefill.c`; `tools/oracle.py` (`logits -b 3/64/whole` to byte) on tiny and OLMoE 2-layer |
 | threads per phase | every logit byte-identical to one thread only with measured width and every forced width; the narrowed pool uses only the first n workers; choice among widths on fake times, each size of verify pass on its own | `tests/test_phase.c`, `tests/test_base.c` (`test_pool_active`), `make tier-check` (`--decode-threads`) |
 
-## Model scale
+## The roadmap: one rung at a time
 
-We start small and climb only when the rung below is **exact and measured**. At each rung
-we measure tokens/s (prefill and decode), RAM, first token, and the same model on **llama.cpp**
-and **colibri** on the same machine: it is the only way to know what Trochilus is really worth.
+**The aim** (Marcello, 2026-10-02): AI that runs on the machines most people own, the average and the
+below-average ones, not on this PC. Every model is brought there slowly, to the theoretical limit, each piece
+studied to the bottom and reinvented where the numbers allow.
 
-| Rung | Model | Size | What it tests |
-|---|---|---|---|
-| 0 | OLMoE tiny, random weights | 1 MB | correctness against transformers |
-| 1 | OLMoE-1B-7B | ~7 GB Q8_0, ~4 GB Q4 | CPU kernels, threads, tokenizer: all in RAM |
-| 2 | Qwen3-Coder-30B-A3B | ~17 GB Q4 | a MoE for code that still fits in 31 GB; long prompts, files reread |
-| 3 | a MoE larger than RAM | > 31 GB | experts from disk, VRAM + RAM + SSD plan |
-| 4 | DeepSeek V4 Flash | hundreds of GB | the target of colibri and ds4, on an ordinary machine |
+**The three machines.** Every rung's numbers are measured on all three; the two weaker ones are emulated on
+this PC with the engine's own switches. Each one's limit is its RAM's bandwidth divided by the bytes read a
+token (the theoretical tokens/s); the engine is pushed toward it.
 
-## Horizon (after M2)
+| Machine | Emulated with | RAM bandwidth for the limit |
+|---|---|---|
+| below average: 4 cores, 8 GB, no GPU, AVX2 | `-t 4`, `TR_CPU_MAX=avx2`, `TR_GPU=0`, an expert budget that leaves the model within 8 GB | DDR4 single channel, ~21 GB/s |
+| average: 8 cores, 16 GB, no dedicated GPU | `-t 8`, `TR_GPU=0`, a budget within 16 GB | DDR4-3200 dual channel, ~51 GB/s |
+| this PC: Ryzen 9 7940HX, 31 GB, RTX 4070 Laptop | as it is | DDR5-5200 dual channel, ~83 GB/s |
+
+What the emulation cannot give: a slower RAM and a slower disk (it gives fewer cores, a narrower CPU, less
+memory). A real weak machine is the final check when one is available.
+
+**The five phases of a rung.** A rung closes when all five are done on the three machines; the next one
+starts after, never beside it (`tools/lint.py` keeps one rung in progress).
+1. **exact**: a tiny oracle on random weights, then the real model, against transformers;
+2. **studied piece by piece**: each piece read in the references (ORIGINS §Every piece), sequenced as a
+   genome, reinvented where the numbers allow;
+3. **at the theoretical limit on each machine**: bytes read a token against the bandwidth, the gap named;
+4. **usable**: chat with the model's template, the server, the first token's time;
+5. **raced and offered**: llama.cpp, colibri and ds4 on the same model and machine, in one session at the
+   rung's close; better offered to them, worse adopted (UPSTREAM §Our pieces against colibri and ds4).
+
+| Rung | Model | Size | What it adds | The blocks (docs/status.json) |
+|---|---|---|---|---|
+| R0 | OLMoE tiny, random weights | 1 MB | the exact core on every CPU | core, kernels, pool, KV, prompt in blocks, exp, genome: **done** |
+| R1 | OLMoE-1B-7B | ~4 GB Q4_K, ~7 GB Q8_0 | the first model to the end; on 8 GB the Q8_0 needs its experts from disk | done: the expert store, budget, plan, layer order, disk and compute together, the GPU's decode attention, speculation; left: the three machines and their limit (**next**), the first prompt's cost, generation's fixed cost, the review, the server |
+| R2 | Qwen3-Coder-30B-A3B | ~17 GB Q4 | a real coding model; on 16 GB its experts come from disk | the tiny oracle (GQA, 128 experts, a norm per head), tokenizer and template, the real model (Q4_K_M runs already), the KV checkpoint on disk, Q2_K and IQ2 (the fewest bytes a weight) |
+| R3 | a MoE larger than RAM | > 31 GB | experts from disk at their limit, the GPU's memory | the file reordered by co-activation, the dense weights and the experts on the GPU |
+| R4 | DeepSeek V4 Flash | hundreds of GB | the target of colibri and ds4, on an ordinary machine | its architecture, on everything above |
+| X | off the ladder | — | when a rung needs it, or after the ladder | the assembly lab, Vulkan and Metal, a team of small models (question 86, after R2) |
+
+The old milestones (2026-09-17 to 10-02, named in LESSONS and MEASUREMENTS) map as: M0 → R0; M1 (experts
+from disk) → R1, its file reorder → R3; M2 (K-quant: Q4_K, Q6_K done) → R2 (Q2_K, IQ2), its assembly → X; M3 (CUDA) → R1 (the decode's
+attention), R3 (dense weights, experts in VRAM); M4 → R4; M5 → R1 (speculation, server), R2 (KV on disk);
+M6 → X. They were by technology, and six were in progress at once (LESSONS #262).
+
+## Horizon
 
 The speed limit in generation is data movement: tokens/s ≈ memory bandwidth ÷ bytes read
 per token. The directions that attack that division, one at a time, under the rule
@@ -265,15 +294,3 @@ per token. The directions that attack that division, one at a time, under the ru
 | weights at few bits (2-bit, ternary) | fewer bytes per weight; with -1/0/+1 multiplies become sums | bytes read per token |
 | JIT | machine code generated at model load with model dimensions as constants | CPU work |
 | superoptimization | automatic search for the fastest instruction sequence for tiny kernels | CPU work |
-
-## Milestones
-
-| Milestone | Contents | Done when |
-|---|---|---|
-| **M0** | base, GGUF, converter (F32/F16/Q8_0), CPU backend scalar + AVX2 + AVX-512 with dispatch, OLMoE graph, greedy, CLI | tiny oracle exact on Windows and Linux; true OLMoE-1B-7B answers |
-| M1 | experts from disk with RAM budget: slot-based store, LRU O(1), reads on demand; **auto plan** (measures RAM, picks budget); then, on fast disks, I/O threads and preloading | small forced budget → byte-identical logits; no option necessary |
-| M2 | K-quant on CPU — **Q4_K in** (2026-09-24: scalar, AVX2, AVX-512 bit-identical, gguf-py bit for bit, real model decode 1.5× Q8_0), then Q6_K, Q2_K, IQ2_XXS; assembly workshop | bit-identical kernels, microbenchmarks |
-| M3 | CUDA, exact (every op `.rn`, the CPU's orders): **the decode's attention in** (2026-09-24, logits identical to the byte through the engine), then the dense weights (Q8_0 GEMV measured exact at 97% of VRAM bandwidth), hot experts in VRAM, VRAM + RAM + disk plan (model: ~4× at 2048) | same bytes as CPU; a model larger than RAM runs on reference PC |
-| M4 | DeepSeek V4 Flash | tiny oracle exact; runs on reference PC |
-| M5 | KV checkpoint to disk, server, speculative decode | — |
-| M6 | Vulkan modules (AMD/Intel GPU, integrated; colibri has `backend_vulkan.c`) and Metal | same tokens as CPU |

@@ -1,6 +1,6 @@
 {
   "project": "Trochilus",
-  "subtitle": "inference engine for MoE models in C, no dependencies",
+  "subtitle": "AI for the machines most people own: one model at a time, to the end, exact and at the theoretical limit on three machines",
   "updated": "2026-10-02",
   "states": {
     "done": "finished and proven: green tests in make check",
@@ -11,59 +11,52 @@
   },
   "milestones": [
     {
-      "id": "M0",
+      "id": "R0",
       "title": "Foundations",
       "summary": "the exact engine that runs on every CPU",
       "state": "done",
       "criterion": "logits identical to transformers, 0 warnings, sanitizers clean"
     },
     {
-      "id": "M1",
-      "title": "Experts from disk",
-      "summary": "run a model larger than RAM",
+      "id": "R1",
+      "title": "OLMoE-1B-7B, to the end",
+      "summary": "the first model through the five phases: exact, studied piece by piece, at the theoretical limit on the three machines (below average, average, this PC), usable, raced and offered",
       "state": "in-progress",
-      "criterion": "small budget forced -> logits identical to the byte; no option needed"
+      "criterion": "the five phases closed on the three machines"
     },
     {
-      "id": "M2",
-      "title": "K-quant and assembly",
-      "summary": "fewer bytes per weight: Q4_K, Q6_K, Q2_K, IQ2_XXS",
-      "state": "in-progress",
-      "criterion": "kernels bit-identical to the scalar one, microbenchmark"
+      "id": "R2",
+      "title": "Qwen3-Coder-30B-A3B",
+      "summary": "a real coding model, ~17 GB at Q4: on a 16 GB machine its experts come from disk",
+      "state": "open",
+      "criterion": "a tiny exact oracle first; then the five phases on the three machines"
     },
     {
-      "id": "M3",
-      "title": "CUDA module",
-      "summary": "the exact GPU: first the decode's attention, then the dense weights, then the experts in VRAM",
-      "state": "in-progress",
-      "criterion": "same bytes as the CPU; a model larger than RAM runs on the reference PC"
+      "id": "R3",
+      "title": "A MoE larger than RAM",
+      "summary": "a model larger than this PC's 31 GB: the experts from disk at their limit, the GPU's memory",
+      "state": "open",
+      "criterion": "the five phases; runs on the reference PC"
     },
     {
-      "id": "M4",
+      "id": "R4",
       "title": "DeepSeek V4 Flash",
-      "summary": "a second family of models",
+      "summary": "the target of colibri and ds4, on an ordinary machine",
       "state": "open",
-      "criterion": "tiny exact oracle; runs on the reference PC"
+      "criterion": "a tiny exact oracle; the five phases; runs on the reference PC"
     },
     {
-      "id": "M5",
-      "title": "Coding levers",
-      "summary": "KV checkpoint on disk, server, speculative decoding",
-      "state": "in-progress",
+      "id": "X",
+      "title": "Off the ladder",
+      "summary": "done when a rung needs it, or after the ladder: assembly, other GPUs, experiments",
+      "state": "open",
       "criterion": "-"
-    },
-    {
-      "id": "M6",
-      "title": "Vulkan and Metal",
-      "summary": "the other GPUs, always as modules",
-      "state": "open",
-      "criterion": "same tokens as the CPU"
     }
   ],
   "blocks": [
     {
       "id": "core",
-      "milestone": "M0",
+      "milestone": "R0",
       "title": "Exact core",
       "state": "done",
       "what": "The engine that reads a GGUF file and generates text, written in C with no external libraries. «Exact» means the numbers it produces are identical to those of transformers, the Python reference: if we get it wrong, we know right away instead of noticing from strange answers.",
@@ -82,7 +75,7 @@
     },
     {
       "id": "kernel",
-      "milestone": "M0",
+      "milestone": "R0",
       "title": "SIMD kernels + tier",
       "state": "done",
       "what": "The heavy math (matrix multiplications) written in the CPU's vector instructions, with one version per family and the choice made at runtime. Every version gives the same bits as the scalar version, and a test verifies it.",
@@ -149,7 +142,7 @@
     },
     {
       "id": "pool",
-      "milestone": "M0",
+      "milestone": "R0",
       "title": "Thread pool and per-phase width",
       "state": "done",
       "what": "The laptop's cores used with no waste: the prompt on all of them, generation on the width the session measures for itself. The decode does not use every core because the limit is memory, not compute.",
@@ -253,7 +246,7 @@
     },
     {
       "id": "kv",
-      "milestone": "M0",
+      "milestone": "R0",
       "title": "KV with positions in a row",
       "state": "done",
       "what": "The context memory laid out so the CPU reads it in sequence instead of jumping around. Long context was the worst case: now it reads at RAM speed.",
@@ -322,7 +315,7 @@
     },
     {
       "id": "prefill",
-      "milestone": "M0",
+      "milestone": "R0",
       "title": "Prompt in blocks + grouped attention",
       "state": "done",
       "what": "The prompt is not processed one token at a time but in blocks of 512, so the matrices are large and the cores work full. It is also the piece the per-layer order (M1) will need to reorganize.",
@@ -387,7 +380,7 @@
     },
     {
       "id": "expf",
-      "milestone": "M0",
+      "milestone": "R0",
       "title": "Correctly-rounded tr_expf",
       "state": "done",
       "what": "The C library's exponential cost 30% of the long prompt. Rewritten: faster and correctly rounded across all 4 billion floats, checked one by one.",
@@ -429,8 +422,66 @@
       ]
     },
     {
+      "id": "genome",
+      "milestone": "R0",
+      "title": "The model read as a genome",
+      "state": "done",
+      "what": "Looking at every byte of the model, the context memory and the experts' choices, to find exact structure nobody reads: repeats, zeros, predictable parts. Where it exists, it is exploited without changing a single bit; where it does not, we know it and do not go back.",
+      "numbers": [
+        {
+          "v": "a token's timeline (tools/token_timeline.py): RAM stays idle 12-15% of the token, almost all of it waiting for the slowest thread at the end of calls, not between calls (0.6%)",
+          "d": "2026-09-26"
+        },
+        {
+          "v": "the low 16 bits of the context memory do not decide the token: 1 token changed out of 1792",
+          "d": "2026-09-26"
+        },
+        {
+          "v": "quantized weights are nearly incompressible: Q8_0 codes carry 7.6-7.7 bit out of 8, Q4_K 3.83-3.87 out of 4 (lossless compression ~7% and ~4%): closed",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "repeated blocks 0.008%: the output head's 220 identical rows are the tokens the model never learned",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "tools ready for the next model: tools/weights_genome.py, route_union_report.py, kv_repeats_report.py, draft_agreement.sh",
+          "d": "2026-09-24"
+        }
+      ],
+      "questions": [
+        {
+          "n": 56,
+          "state": "closed",
+          "text": "how much do the weights compress losslessly? ~7% Q8_0, ~4% Q4_K: not worth a format"
+        },
+        {
+          "n": 62,
+          "state": "closed",
+          "text": "is there exact structure in the model? only in the dead vocabulary and in layer 0's values"
+        },
+        {
+          "n": 73,
+          "state": "open",
+          "text": "the most likely token from the output head's high half, exact only on the rows that can still win (up to 4% of the bytes)"
+        }
+      ],
+      "files": [
+        "tools/weights_genome.py",
+        "tools/kv_repeats_report.py",
+        "tools/route_union_report.py",
+        "tools/token_timeline.py"
+      ],
+      "commands": [
+        "tools/.venv/Scripts/python.exe tools/weights_genome.py models/<file>.gguf"
+      ],
+      "depends": [
+        "core"
+      ]
+    },
+    {
       "id": "review-0922",
-      "milestone": "M0",
+      "milestone": "R1",
       "title": "Review and gate",
       "state": "in-progress",
       "what": "Review of the GGUF reader, the expert store, the pool, the platform and the gate (09/22), then of the model, the kernels, the tokenizer and the command line (09/23). On the 23rd: the command line sized -n and -p buffers (an overflow near 2^62) and truncated --tokens to 32 bit; three OLMoE options had never been checked against transformers (now there is an oracle for it); memory pressure in Docker's VM counted as killed mutants. Then read the survivors of tokenizer.c (75 -> 43) and of main.c (334 -> 43), all named: the command line has a single option parser, with numbers kept within their range (-n abc exits with 2), and test_cli tries every command. The mutation tool no longer hides survivors behind load timeouts and memory refusals, kills an expired check along with everything it launched (seven orphan processes had slowed and skewed a campaign), and is fast enough to run after every change (CHANGED=HEAD mutates only the changed lines). Still left out of mutate_files.sh: gguf.c, experts.c, threads.c and platform.c, and the measurement scripts still to move to the new machine rule (the machine-still file).",
@@ -532,66 +583,8 @@
       ]
     },
     {
-      "id": "genome",
-      "milestone": "M0",
-      "title": "The model read as a genome",
-      "state": "done",
-      "what": "Looking at every byte of the model, the context memory and the experts' choices, to find exact structure nobody reads: repeats, zeros, predictable parts. Where it exists, it is exploited without changing a single bit; where it does not, we know it and do not go back.",
-      "numbers": [
-        {
-          "v": "a token's timeline (tools/token_timeline.py): RAM stays idle 12-15% of the token, almost all of it waiting for the slowest thread at the end of calls, not between calls (0.6%)",
-          "d": "2026-09-26"
-        },
-        {
-          "v": "the low 16 bits of the context memory do not decide the token: 1 token changed out of 1792",
-          "d": "2026-09-26"
-        },
-        {
-          "v": "quantized weights are nearly incompressible: Q8_0 codes carry 7.6-7.7 bit out of 8, Q4_K 3.83-3.87 out of 4 (lossless compression ~7% and ~4%): closed",
-          "d": "2026-09-24"
-        },
-        {
-          "v": "repeated blocks 0.008%: the output head's 220 identical rows are the tokens the model never learned",
-          "d": "2026-09-24"
-        },
-        {
-          "v": "tools ready for the next model: tools/weights_genome.py, route_union_report.py, kv_repeats_report.py, draft_agreement.sh",
-          "d": "2026-09-24"
-        }
-      ],
-      "questions": [
-        {
-          "n": 56,
-          "state": "closed",
-          "text": "how much do the weights compress losslessly? ~7% Q8_0, ~4% Q4_K: not worth a format"
-        },
-        {
-          "n": 62,
-          "state": "closed",
-          "text": "is there exact structure in the model? only in the dead vocabulary and in layer 0's values"
-        },
-        {
-          "n": 73,
-          "state": "open",
-          "text": "the most likely token from the output head's high half, exact only on the rows that can still win (up to 4% of the bytes)"
-        }
-      ],
-      "files": [
-        "tools/weights_genome.py",
-        "tools/kv_repeats_report.py",
-        "tools/route_union_report.py",
-        "tools/token_timeline.py"
-      ],
-      "commands": [
-        "tools/.venv/Scripts/python.exe tools/weights_genome.py models/<file>.gguf"
-      ],
-      "depends": [
-        "core"
-      ]
-    },
-    {
       "id": "m1-store",
-      "milestone": "M1",
+      "milestone": "R1",
       "title": "Slot store + LRU",
       "state": "done",
       "what": "The experts' pantry. It keeps in RAM as many experts as fit the budget; when one that is missing is needed, it reads it from disk and drops the one unused the longest. It works because two nearby tokens ask for almost the same experts.",
@@ -620,7 +613,7 @@
     },
     {
       "id": "m1-engine",
-      "milestone": "M1",
+      "milestone": "R1",
       "title": "Budget in the engine",
       "state": "done",
       "what": "The engine takes experts from the store instead of from RAM, and `--expert-budget` says how much RAM to give it. With any budget the numbers produced are identical to the byte: the budget changes speed, never the result.",
@@ -644,7 +637,7 @@
     },
     {
       "id": "m1-direct",
-      "milestone": "M1",
+      "milestone": "R1",
       "title": "Direct read from disk",
       "state": "done",
       "what": "Reads skipping the operating system's cache. Without it, the model would sit in RAM twice and every measurement would tell the speed of RAM instead of disk.",
@@ -671,7 +664,7 @@
     },
     {
       "id": "m1-plan",
-      "milestone": "M1",
+      "milestone": "R1",
       "title": "Automatic plan",
       "state": "done",
       "what": "At startup it looks at how much RAM is free and picks the budget by itself, refusing to start if it would leave the machine without memory. No option to learn: that is the milestone's criterion.",
@@ -689,7 +682,7 @@
     },
     {
       "id": "m1-measurements",
-      "milestone": "M1",
+      "milestone": "R1",
       "title": "M1's measurements",
       "state": "done",
       "what": "Four sessions on a still machine to find out what reading experts from disk really costs. They disproved the simulation M1 had been designed around, and found the prompt's waste.",
@@ -737,7 +730,7 @@
     },
     {
       "id": "m1-layer-order",
-      "milestone": "M1",
+      "milestone": "R1",
       "title": "Per-layer order in the prompt",
       "state": "done",
       "what": "The prompt is processed in blocks of 512 tokens. Before, every block went through every layer, so under budget it reread every expert from disk at every block. Now the loops are inverted -- for each layer, every block -- and each expert is read only once per prompt. Same exact numbers: only how many times it waits for the disk changes.",
@@ -777,7 +770,7 @@
     },
     {
       "id": "m1-first-prompt-cost",
-      "milestone": "M1",
+      "milestone": "R1",
       "title": "The first prompt's cost",
       "state": "in-progress",
       "what": "Under budget every startup rereads the model from disk. `trochilus serve` keeps the engine on (threads, model, expert store) between commands, and `run`, `chat`, `generate` run inside it on their own when it is up, with the same output to the byte. Measured: with the model fully in RAM the first prompt goes from 12.8 to 7.8 seconds, the load disappears. At half budget almost nothing (13.0 -> 12.0 s): every prompt rewrites the store from scratch, so there the lever is what to drop during the prompt. While the model loads a rainbow water bar shows (variant A). Next: reading while you type (question 48).",
@@ -832,7 +825,7 @@
     },
     {
       "id": "m1-overlap",
-      "milestone": "M1",
+      "milestone": "R1",
       "title": "Disk and compute together",
       "state": "done",
       "what": "Before, the engine read, then computed, then read again: disk and cores waited on each other in turn. Now, in the long prompt, a separate thread reads the next layer's experts from disk while the cores compute the current one. Same numbers to the byte: only when the data arrives changes. Half the disk wait is still to be understood, and the short prompt (up to 512 tokens) still does not read ahead.",
@@ -871,69 +864,8 @@
       ]
     },
     {
-      "id": "m1-decode-fixed-cost",
-      "milestone": "M1",
-      "title": "Generation's fixed cost",
-      "state": "open",
-      "what": "Under budget the first tokens after the prompt cost more: about one second, once, at 25% of the model in RAM. With the model fully in RAM it does not happen, so it is not the engine warming up: it is the expert store settling after the prompt. We know where it is, not yet exactly what it is.",
-      "numbers": [
-        {
-          "v": "resident: 34.64 tok/s at 200 tokens, 33.48 at 1000 -- no fixed cost",
-          "d": "2026-09-21"
-        },
-        {
-          "v": "50%: 29.21 -> 30.79 (~0.35 s fixed); 25%: 26.53 -> 29.84 (~0.84 s)",
-          "d": "2026-09-21"
-        },
-        {
-          "v": "the extra misses of the first tokens explain ~115 ms out of 840",
-          "d": "2026-09-21"
-        }
-      ],
-      "questions": [
-        {
-          "n": 46,
-          "state": "open",
-          "text": "where does the rest of the fixed cost go: a per-zone profile of the first 64 tokens"
-        }
-      ],
-      "files": [],
-      "commands": [
-        "make profile SCENARIOS=bench/scenarios-olmoe-1b-7b.json"
-      ],
-      "depends": [
-        "m1-measurements"
-      ]
-    },
-    {
-      "id": "m1-file-reorder",
-      "milestone": "M1",
-      "title": "File reorder by co-activation",
-      "state": "open",
-      "what": "Rewriting the GGUF putting close together the experts that light up together (mbolt's idea, MIT). On our disk and with our large experts it is worth little: their own README says the gain fades above 4 MB per chunk, and ours are 6.4.",
-      "numbers": [
-        {
-          "v": "co-activation exists and grows with depth: at layers 8-15, 17-21% of pairs light up together more than double the baseline case; an expert's 3 most frequent companions make up 18-28% of its paired activations (baseline: 4.8%)",
-          "d": "2026-09-24"
-        },
-        {
-          "v": "ceiling <= 1.15x here (from our own disk bench), against the 2.23x they claim on their own reads",
-          "d": "2026-09-21"
-        }
-      ],
-      "questions": [],
-      "files": [],
-      "commands": [
-        "make bench-disk",
-        "tools/.venv/Scripts/python.exe tools/route_union_report.py build/route/*.bin"
-      ],
-      "depends": [
-        "m1-measurements"
-      ]
-    },
-    {
       "id": "m1-routing-trace",
-      "milestone": "M1",
+      "milestone": "R1",
       "title": "Routing trace",
       "state": "done",
       "what": "Recording which experts the model picks at every token, to see if they can be predicted or if only part of them can be kept in RAM. It answered four questions, all with a useful «no».",
@@ -971,150 +903,8 @@
       ]
     },
     {
-      "id": "m2-kquant",
-      "milestone": "M2",
-      "title": "K-quant on the CPU",
-      "state": "in-progress",
-      "what": "Formats that hold the weights in fewer bytes (Q4_K, Q6_K, Q2_K, IQ2_XXS): less disk and less RAM, a lever that adds to all of M1. Done on 09/24: Q4_K and Q6_K in the engine, exact against their dequantized weights (identical to the bit to gguf-py, the real models cut to 2 layers against transformers in make check). Q4_K has our own AVX-512 kernel (a sub-block's 16 values computed once); Q6_K unpacks a block's 256 quants once and then runs like Q8_0. With Q6_K, Q4_K_M runs, the file people download. The real models in Q4_K and Q4_K_M are made from our own Q8_0, with no download. Measured again: in the prefill decoding the weights does not matter, loading the activations does, so no row dequantized once per block (dropped) and instead two weight rows per load (kept). On 09/25 the Q4_K decode at 4 threads reached llama.cpp (scales in vector, two rows per call). Next: the two rows also on AVX2. Two threads per core (SMT) in the decode: measured on 09/25, not worth it at the width the engine uses.",
-      "numbers": [
-        {
-          "v": "swiglu and the down projection's prep in the same call (P4 of question 83): prompt 1.0087x, decode even, same bits; the prep alone costs 0.70 microseconds per 2048 row",
-          "d": "2026-09-27"
-        },
-        {
-          "v": "the prep once per row (question 83): q, k and v from a single prep, gate and up from the token rows through a map, no copy; prompt 1.058x, 3-row verify pass 1.026x, decode 1.025x with P4 (arms with no period), same bits",
-          "d": "2026-09-27"
-        },
-        {
-          "v": "Q4_K decode at 4 threads even with llama.cpp (50.4 against 50.2 tok/s, 1.25x over before), same bits; the prefill at 4 threads stays behind (theirs 1.6x)",
-          "d": "2026-09-25"
-        },
-        {
-          "v": "real model in Q4_K_M: decode 0.93x the Q4_K (45 against 48 tok/s at 16 threads), prefill equal; llama.cpp on the same file 1.09x in decode",
-          "d": "2026-09-24"
-        },
-        {
-          "v": "Q6_K on AVX2 remeasured: 0.85x the Q8_0 (the first series, 0.74-0.80x, was noise)",
-          "d": "2026-09-24"
-        },
-        {
-          "v": "Q6_K kernel against Q8_0 per element: AVX-512 0.85x (0.89-1.00x on four tokens), AVX2 0.74-0.80x",
-          "d": "2026-09-24"
-        },
-        {
-          "v": "oracle on the 2-layer cut in Q4_K_M (Q6_K and Q4_K together): 32/32 tokens, logits within 2e-4",
-          "d": "2026-09-24"
-        },
-        {
-          "v": "Q6_K seen red under 14 mutations out of 14",
-          "d": "2026-09-24"
-        },
-        {
-          "v": "real model in Q4_K: decode 1.5x the Q8_0 (45.8 against 30.1 tok/s at 16 threads), prefill equal",
-          "d": "2026-09-24"
-        },
-        {
-          "v": "Q4_K kernel against Q8_0 per element: AVX-512 0.84-0.90x, AVX2 0.53-0.63x",
-          "d": "2026-09-24"
-        },
-        {
-          "v": "the same table on AVX2: even on the row, -3.5% on four tokens at a time: rejected",
-          "d": "2026-09-24"
-        },
-        {
-          "v": "oracle on the 2-layer cut in Q4_K: 32/32 tokens, logits within 1.9e-4",
-          "d": "2026-09-24"
-        },
-        {
-          "v": "llama.cpp on the same Q4_K: decode 1.07x ours at 16 threads, prefill 2.1x (8-bit activations)",
-          "d": "2026-09-24"
-        },
-        {
-          "v": "experts in Q4 would halve the prompt's disk (3.3 GiB instead of 6.5)",
-          "d": "2026-09-21"
-        },
-        {
-          "v": "exact Q4_K: fixed-point 32-bit input per 256-block, exact integer sums, one rounding; the decode even with the float kernel after sequencing its dot to two rows (0.937x the float when hot)",
-          "d": "2026-09-27"
-        }
-      ],
-      "questions": [
-        {
-          "n": 83,
-          "state": "open",
-          "text": "half a prep per token, or less (Marcello): P1, P2 and P4 done; gate and up in one call remain, the calls' tails, and last the prep's bit arithmetic"
-        }
-      ],
-      "files": [
-        "src/kernels/kernels.c",
-        "src/kernels/kernels_x86.c",
-        "tools/check_dequant.py",
-        "tools/quantize_q4k.sh",
-        "tools/mutate_q6k.sh",
-        "tools/bench_kernels.sh",
-        "tools/mutate_row2.sh"
-      ],
-      "commands": [
-        "sh tools/bench_kernels.sh",
-        "sh tools/race_q4k.sh 5 m",
-        "sh tools/quantize_q4k.sh m",
-        "AB_INPROC_PROMPT=8 sh tools/ab_inproc.sh build/trochilus.exe prep 4"
-      ],
-      "depends": [
-        "m1-layer-order"
-      ]
-    },
-    {
-      "id": "m2-assembly",
-      "milestone": "M2",
-      "title": "Assembly lab",
-      "state": "next",
-      "what": "Rewriting the hottest kernels in assembly, one at a time. It stays only if the test finds it identical to the C one and the bench finds it faster; the C stays as the fallback for the other CPUs.",
-      "numbers": [
-        {
-          "v": "the 8-token microkernel did not need assembly: in C with gcc intrinsics it keeps everything in registers; the matmul now at 61% of the no-FMA peak (102 of 166), the kernel at 87% of its ideal flow",
-          "d": "2026-09-24"
-        },
-        {
-          "v": "the prefill's matmul does 49-53% of the no-FMA peak on one core (87 of 166.5 GFLOP/s); the same instruction flow in assembly with 8 tokens per weight instead of 4 reaches 119.4: 1.34x (prefill estimated 1.15-1.25x)",
-          "d": "2026-09-24"
-        },
-        {
-          "v": "on Zen 4 the order of independent instructions is worth 20%: mul and add alternated one by one 139 GFLOP/s, grouped 167",
-          "d": "2026-09-24"
-        }
-      ],
-      "questions": [
-        {
-          "n": 55,
-          "state": "closed",
-          "text": "how much headroom is there under the peak? 1.34x with the 8-token microkernel: built, 1.17-1.23x on the matmul, prefill 1.19-1.30x"
-        },
-        {
-          "n": 59,
-          "state": "open",
-          "text": "FMA in the definition? (Marcello's decision) On this Zen 4 the FMA peak equals mul+add; the 8-token flow with FMA goes 1.19x"
-        },
-        {
-          "n": 10,
-          "state": "open",
-          "text": "do more lanes (32 or 64) unblock the sum chain on one thread?"
-        }
-      ],
-      "files": [
-        "tests/bench_peak.c"
-      ],
-      "commands": [
-        "sh tools/bench_native.sh bench_peak",
-        "make bench"
-      ],
-      "depends": [
-        "kernel"
-      ]
-    },
-    {
       "id": "m3-attn",
-      "milestone": "M3",
+      "milestone": "R1",
       "title": "The decode's attention on the GPU",
       "state": "done",
       "what": "The slowest piece of the long-context decode, the attention, runs on the GPU with the same bits as the CPU: every operation rounded like the definition, no fusions. The driver opens while the program is running: whoever has no GPU does not notice. A laptop puts the GPU to sleep between layers: a single thread group keeps it awake.",
@@ -1152,81 +942,8 @@
       ]
     },
     {
-      "id": "m3-dense",
-      "milestone": "M3",
-      "title": "Dense weights on the GPU",
-      "state": "next",
-      "what": "The matrices every token reads in full (attention and output head, about 395 MB a token) in VRAM, next to the KV. The Q8_0 matrix-vector product on the GPU gives the same bits as the CPU.",
-      "numbers": [
-        {
-          "v": "Q8_0 exact product at 97% of VRAM bandwidth; a token's dense weights 2.4 ms against ~7.7 on the CPU",
-          "d": "2026-09-24"
-        },
-        {
-          "v": "model: 1.64x at 2048, 1.92x at 4000 together with the attention",
-          "d": "2026-09-24"
-        },
-        {
-          "v": "after: exact integer Q4 on the GPU as a draft, checked exact by the engine. Q4_K picks Q8_0's token in 88.7 / 94.7 / 90.6% of cases (prose, code, italian): below the hoped-for 95%, but a 9-row verify pass reads only 3.52x a token's experts, so ~2x fewer bytes a token",
-          "d": "2026-09-24"
-        }
-      ],
-      "questions": [],
-      "files": [
-        "tests/bench_gpu_q8.c"
-      ],
-      "commands": [
-        "build/tests/bench_gpu_q8.exe check"
-      ],
-      "depends": [
-        "m3-attn"
-      ]
-    },
-    {
-      "id": "m3-experts",
-      "milestone": "M3",
-      "title": "Experts in VRAM",
-      "state": "open",
-      "what": "The GPU as a loadable module, not a dependency: whoever does not have one does not notice. The hottest experts in VRAM, the rest in RAM and on disk, with a single plan deciding what goes where.",
-      "numbers": [
-        {
-          "v": "model: with the experts fitting in VRAM ~4x at 2048 (9.3 ms a token against 36.8)",
-          "d": "2026-09-24"
-        }
-      ],
-      "questions": [
-        {
-          "state": "open",
-          "text": "an exact exp with float32 only for the GPU (the prefill wants billions of them, and doubles there run at 1/64)"
-        }
-      ],
-      "files": [],
-      "commands": [],
-      "depends": [
-        "m3-dense",
-        "m1-first-prompt-cost",
-        "m2-kquant"
-      ]
-    },
-    {
-      "id": "m4-v4",
-      "milestone": "M4",
-      "title": "DeepSeek V4 Flash",
-      "state": "open",
-      "what": "A second family of models, to prove the engine is not tailored to OLMoE. It has different attention and routing.",
-      "numbers": [],
-      "questions": [],
-      "files": [
-        "docs/DeepSeek_V41_Tech_Report.md"
-      ],
-      "commands": [],
-      "depends": [
-        "m3-experts"
-      ]
-    },
-    {
       "id": "m5-spec",
-      "milestone": "M5",
+      "milestone": "R1",
       "title": "Speculative decoding",
       "state": "done",
       "what": "Guessing several tokens at once by reusing pieces of the prompt, and checking them all together. The same tokens as before, only faster when the text repeats -- as it does in code.",
@@ -1348,8 +1065,196 @@
       ]
     },
     {
+      "id": "r1-profiles",
+      "milestone": "R1",
+      "title": "The three machines and the theoretical limit",
+      "state": "next",
+      "what": "Every number of the rung measured on three machines, the two weaker ones emulated on this PC: below average (4 threads, AVX2 only, 8 GB, no GPU), average (8 threads, 16 GB, no dedicated GPU), this PC. Each machine's limit is its RAM's bandwidth divided by the bytes read a token; the engine is pushed toward it. On 8 GB the Q8_0 model (7 GB) needs its experts from disk.",
+      "numbers": [],
+      "questions": [],
+      "files": [],
+      "commands": [
+        "sh tools/decode_context.sh change-short <binary-before>"
+      ],
+      "depends": [
+        "m1-plan",
+        "genome"
+      ]
+    },
+    {
+      "id": "m1-decode-fixed-cost",
+      "milestone": "R1",
+      "title": "Generation's fixed cost",
+      "state": "open",
+      "what": "Under budget the first tokens after the prompt cost more: about one second, once, at 25% of the model in RAM. With the model fully in RAM it does not happen, so it is not the engine warming up: it is the expert store settling after the prompt. We know where it is, not yet exactly what it is.",
+      "numbers": [
+        {
+          "v": "resident: 34.64 tok/s at 200 tokens, 33.48 at 1000 -- no fixed cost",
+          "d": "2026-09-21"
+        },
+        {
+          "v": "50%: 29.21 -> 30.79 (~0.35 s fixed); 25%: 26.53 -> 29.84 (~0.84 s)",
+          "d": "2026-09-21"
+        },
+        {
+          "v": "the extra misses of the first tokens explain ~115 ms out of 840",
+          "d": "2026-09-21"
+        }
+      ],
+      "questions": [
+        {
+          "n": 46,
+          "state": "open",
+          "text": "where does the rest of the fixed cost go: a per-zone profile of the first 64 tokens"
+        }
+      ],
+      "files": [],
+      "commands": [
+        "make profile SCENARIOS=bench/scenarios-olmoe-1b-7b.json"
+      ],
+      "depends": [
+        "m1-measurements"
+      ]
+    },
+    {
+      "id": "m5-server",
+      "milestone": "R1",
+      "title": "Server",
+      "state": "open",
+      "what": "A process that stays up and answers several requests. It fits together with the store surviving the session: it is the same problem seen from another angle.",
+      "numbers": [],
+      "questions": [],
+      "files": [],
+      "commands": [],
+      "depends": [
+        "m1-first-prompt-cost"
+      ]
+    },
+    {
+      "id": "r2-arch",
+      "milestone": "R2",
+      "title": "Qwen3-MoE exact on a tiny model",
+      "state": "open",
+      "what": "The architecture's new pieces (GQA 32/4, 128 experts with 8 used, a norm per head) against transformers on random weights, the same way OLMoE's tiny oracle began.",
+      "numbers": [],
+      "questions": [],
+      "files": [],
+      "commands": [],
+      "depends": [
+        "r1-profiles"
+      ]
+    },
+    {
+      "id": "r2-tokenizer",
+      "milestone": "R2",
+      "title": "Qwen's tokenizer and template",
+      "state": "open",
+      "what": "The tokenizer.json and the chat template, each against its reference.",
+      "numbers": [],
+      "questions": [],
+      "files": [],
+      "commands": [],
+      "depends": [
+        "r2-arch"
+      ]
+    },
+    {
+      "id": "m2-kquant",
+      "milestone": "R2",
+      "title": "Fewer bytes a weight: Q2_K, IQ2",
+      "state": "open",
+      "what": "Left: Q2_K and IQ2_XXS, the fewest bytes a weight, for the weaker machines (Q4_K and Q6_K done, Q4_K_M runs). Formats that hold the weights in fewer bytes (Q4_K, Q6_K, Q2_K, IQ2_XXS): less disk and less RAM, a lever that adds to all of M1. Done on 09/24: Q4_K and Q6_K in the engine, exact against their dequantized weights (identical to the bit to gguf-py, the real models cut to 2 layers against transformers in make check). Q4_K has our own AVX-512 kernel (a sub-block's 16 values computed once); Q6_K unpacks a block's 256 quants once and then runs like Q8_0. With Q6_K, Q4_K_M runs, the file people download. The real models in Q4_K and Q4_K_M are made from our own Q8_0, with no download. Measured again: in the prefill decoding the weights does not matter, loading the activations does, so no row dequantized once per block (dropped) and instead two weight rows per load (kept). On 09/25 the Q4_K decode at 4 threads reached llama.cpp (scales in vector, two rows per call). Next: the two rows also on AVX2. Two threads per core (SMT) in the decode: measured on 09/25, not worth it at the width the engine uses.",
+      "numbers": [
+        {
+          "v": "swiglu and the down projection's prep in the same call (P4 of question 83): prompt 1.0087x, decode even, same bits; the prep alone costs 0.70 microseconds per 2048 row",
+          "d": "2026-09-27"
+        },
+        {
+          "v": "the prep once per row (question 83): q, k and v from a single prep, gate and up from the token rows through a map, no copy; prompt 1.058x, 3-row verify pass 1.026x, decode 1.025x with P4 (arms with no period), same bits",
+          "d": "2026-09-27"
+        },
+        {
+          "v": "Q4_K decode at 4 threads even with llama.cpp (50.4 against 50.2 tok/s, 1.25x over before), same bits; the prefill at 4 threads stays behind (theirs 1.6x)",
+          "d": "2026-09-25"
+        },
+        {
+          "v": "real model in Q4_K_M: decode 0.93x the Q4_K (45 against 48 tok/s at 16 threads), prefill equal; llama.cpp on the same file 1.09x in decode",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "Q6_K on AVX2 remeasured: 0.85x the Q8_0 (the first series, 0.74-0.80x, was noise)",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "Q6_K kernel against Q8_0 per element: AVX-512 0.85x (0.89-1.00x on four tokens), AVX2 0.74-0.80x",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "oracle on the 2-layer cut in Q4_K_M (Q6_K and Q4_K together): 32/32 tokens, logits within 2e-4",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "Q6_K seen red under 14 mutations out of 14",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "real model in Q4_K: decode 1.5x the Q8_0 (45.8 against 30.1 tok/s at 16 threads), prefill equal",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "Q4_K kernel against Q8_0 per element: AVX-512 0.84-0.90x, AVX2 0.53-0.63x",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "the same table on AVX2: even on the row, -3.5% on four tokens at a time: rejected",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "oracle on the 2-layer cut in Q4_K: 32/32 tokens, logits within 1.9e-4",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "llama.cpp on the same Q4_K: decode 1.07x ours at 16 threads, prefill 2.1x (8-bit activations)",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "experts in Q4 would halve the prompt's disk (3.3 GiB instead of 6.5)",
+          "d": "2026-09-21"
+        },
+        {
+          "v": "exact Q4_K: fixed-point 32-bit input per 256-block, exact integer sums, one rounding; the decode even with the float kernel after sequencing its dot to two rows (0.937x the float when hot)",
+          "d": "2026-09-27"
+        }
+      ],
+      "questions": [
+        {
+          "n": 83,
+          "state": "open",
+          "text": "half a prep per token, or less (Marcello): P1, P2 and P4 done; gate and up in one call remain, the calls' tails, and last the prep's bit arithmetic"
+        }
+      ],
+      "files": [
+        "src/kernels/kernels.c",
+        "src/kernels/kernels_x86.c",
+        "tools/check_dequant.py",
+        "tools/quantize_q4k.sh",
+        "tools/mutate_q6k.sh",
+        "tools/bench_kernels.sh",
+        "tools/mutate_row2.sh"
+      ],
+      "commands": [
+        "sh tools/bench_kernels.sh",
+        "sh tools/race_q4k.sh 5 m",
+        "sh tools/quantize_q4k.sh m",
+        "AB_INPROC_PROMPT=8 sh tools/ab_inproc.sh build/trochilus.exe prep 4"
+      ],
+      "depends": [
+        "m1-layer-order"
+      ]
+    },
+    {
       "id": "m5-kv-disk",
-      "milestone": "M5",
+      "milestone": "R2",
       "title": "KV checkpoint on disk",
       "state": "open",
       "what": "Saving the context memory of a file already read, so reopening it does not cost a whole new prompt. It is the biggest lever for anyone always working on the same files.",
@@ -1369,22 +1274,170 @@
       ]
     },
     {
-      "id": "m5-server",
-      "milestone": "M5",
-      "title": "Server",
+      "id": "r2-model",
+      "milestone": "R2",
+      "title": "The real model on the three machines",
       "state": "open",
-      "what": "A process that stays up and answers several requests. It fits together with the store surviving the session: it is the same problem seen from another angle.",
+      "what": "The ~17 GB download announced first; then the five phases on the three machines, coding prompts.",
       "numbers": [],
       "questions": [],
       "files": [],
       "commands": [],
       "depends": [
-        "m1-first-prompt-cost"
+        "r2-arch",
+        "r2-tokenizer"
+      ]
+    },
+    {
+      "id": "m1-file-reorder",
+      "milestone": "R3",
+      "title": "File reorder by co-activation",
+      "state": "open",
+      "what": "Rewriting the GGUF putting close together the experts that light up together (mbolt's idea, MIT). On our disk and with our large experts it is worth little: their own README says the gain fades above 4 MB per chunk, and ours are 6.4.",
+      "numbers": [
+        {
+          "v": "co-activation exists and grows with depth: at layers 8-15, 17-21% of pairs light up together more than double the baseline case; an expert's 3 most frequent companions make up 18-28% of its paired activations (baseline: 4.8%)",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "ceiling <= 1.15x here (from our own disk bench), against the 2.23x they claim on their own reads",
+          "d": "2026-09-21"
+        }
+      ],
+      "questions": [],
+      "files": [],
+      "commands": [
+        "make bench-disk",
+        "tools/.venv/Scripts/python.exe tools/route_union_report.py build/route/*.bin"
+      ],
+      "depends": [
+        "m1-measurements"
+      ]
+    },
+    {
+      "id": "m3-dense",
+      "milestone": "R3",
+      "title": "Dense weights on the GPU",
+      "state": "open",
+      "what": "The matrices every token reads in full (attention and output head, about 395 MB a token) in VRAM, next to the KV. The Q8_0 matrix-vector product on the GPU gives the same bits as the CPU.",
+      "numbers": [
+        {
+          "v": "Q8_0 exact product at 97% of VRAM bandwidth; a token's dense weights 2.4 ms against ~7.7 on the CPU",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "model: 1.64x at 2048, 1.92x at 4000 together with the attention",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "after: exact integer Q4 on the GPU as a draft, checked exact by the engine. Q4_K picks Q8_0's token in 88.7 / 94.7 / 90.6% of cases (prose, code, italian): below the hoped-for 95%, but a 9-row verify pass reads only 3.52x a token's experts, so ~2x fewer bytes a token",
+          "d": "2026-09-24"
+        }
+      ],
+      "questions": [],
+      "files": [
+        "tests/bench_gpu_q8.c"
+      ],
+      "commands": [
+        "build/tests/bench_gpu_q8.exe check"
+      ],
+      "depends": [
+        "m3-attn"
+      ]
+    },
+    {
+      "id": "m3-experts",
+      "milestone": "R3",
+      "title": "Experts in VRAM",
+      "state": "open",
+      "what": "The GPU as a loadable module, not a dependency: whoever does not have one does not notice. The hottest experts in VRAM, the rest in RAM and on disk, with a single plan deciding what goes where.",
+      "numbers": [
+        {
+          "v": "model: with the experts fitting in VRAM ~4x at 2048 (9.3 ms a token against 36.8)",
+          "d": "2026-09-24"
+        }
+      ],
+      "questions": [
+        {
+          "state": "open",
+          "text": "an exact exp with float32 only for the GPU (the prefill wants billions of them, and doubles there run at 1/64)"
+        }
+      ],
+      "files": [],
+      "commands": [],
+      "depends": [
+        "m3-dense",
+        "m1-first-prompt-cost",
+        "m2-kquant"
+      ]
+    },
+    {
+      "id": "m4-v4",
+      "milestone": "R4",
+      "title": "DeepSeek V4 Flash",
+      "state": "open",
+      "what": "A second family of models, to prove the engine is not tailored to OLMoE. It has different attention and routing.",
+      "numbers": [],
+      "questions": [],
+      "files": [
+        "docs/DeepSeek_V41_Tech_Report.md"
+      ],
+      "commands": [],
+      "depends": [
+        "m3-experts"
+      ]
+    },
+    {
+      "id": "m2-assembly",
+      "milestone": "X",
+      "title": "Assembly lab",
+      "state": "open",
+      "what": "Rewriting the hottest kernels in assembly, one at a time. It stays only if the test finds it identical to the C one and the bench finds it faster; the C stays as the fallback for the other CPUs.",
+      "numbers": [
+        {
+          "v": "the 8-token microkernel did not need assembly: in C with gcc intrinsics it keeps everything in registers; the matmul now at 61% of the no-FMA peak (102 of 166), the kernel at 87% of its ideal flow",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "the prefill's matmul does 49-53% of the no-FMA peak on one core (87 of 166.5 GFLOP/s); the same instruction flow in assembly with 8 tokens per weight instead of 4 reaches 119.4: 1.34x (prefill estimated 1.15-1.25x)",
+          "d": "2026-09-24"
+        },
+        {
+          "v": "on Zen 4 the order of independent instructions is worth 20%: mul and add alternated one by one 139 GFLOP/s, grouped 167",
+          "d": "2026-09-24"
+        }
+      ],
+      "questions": [
+        {
+          "n": 55,
+          "state": "closed",
+          "text": "how much headroom is there under the peak? 1.34x with the 8-token microkernel: built, 1.17-1.23x on the matmul, prefill 1.19-1.30x"
+        },
+        {
+          "n": 59,
+          "state": "open",
+          "text": "FMA in the definition? (Marcello's decision) On this Zen 4 the FMA peak equals mul+add; the 8-token flow with FMA goes 1.19x"
+        },
+        {
+          "n": 10,
+          "state": "open",
+          "text": "do more lanes (32 or 64) unblock the sum chain on one thread?"
+        }
+      ],
+      "files": [
+        "tests/bench_peak.c"
+      ],
+      "commands": [
+        "sh tools/bench_native.sh bench_peak",
+        "make bench"
+      ],
+      "depends": [
+        "kernel"
       ]
     },
     {
       "id": "m6-vulkan",
-      "milestone": "M6",
+      "milestone": "X",
       "title": "Vulkan and Metal",
       "state": "open",
       "what": "The GPUs that are not NVIDIA: AMD, Intel, integrated, and Macs. Always as modules, always with the same tokens as the CPU.",
@@ -1394,6 +1447,20 @@
       "commands": [],
       "depends": [
         "m3-experts"
+      ]
+    },
+    {
+      "id": "x-team",
+      "milestone": "X",
+      "title": "A team of small models",
+      "state": "open",
+      "what": "Question 86: can three diverse 1-3B models match one ~7B, at fewer bytes read a token? Placed after rung 2: then the engine runs two families exactly, and a 1-3B model is what a below-average machine holds.",
+      "numbers": [],
+      "questions": [],
+      "files": [],
+      "commands": [],
+      "depends": [
+        "r2-model"
       ]
     }
   ]

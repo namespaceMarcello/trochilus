@@ -6,6 +6,7 @@ Each check names the lesson it enforces. Exit 1 on any failure.
   python tools/lint.py            run every check
 """
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -547,6 +548,31 @@ def check_status_json():
         fail(258, f"docs/status.json: {msg}")
 
 
+def rung_problems(d):
+    """The ladder (docs/ARCHITECTURE.md §The roadmap): at most one rung R1.. in progress, and a next block only there."""
+    rungs = [m for m in d["milestones"] if m["id"][:1] == "R" and m["id"] != "R0"]
+    live = [m["id"] for m in rungs if m["state"] == "in-progress"]
+    problems = [f"rungs in progress together: {', '.join(live)}"] if len(live) > 1 else []
+    problems += [f"block {b['id']} is next in {b['milestone']}, a rung not in progress" for b in d["blocks"]
+                 if b["state"] == "next" and b["milestone"] not in live]
+    return problems
+
+
+def check_one_rung():
+    """One rung at a time (Marcello, 2026-10-02): milestones by technology were all in progress at once (#262)."""
+    def sample(r2="open", nxt="R1"):
+        return {"milestones": [{"id": "R0", "state": "done"}, {"id": "R1", "state": "in-progress"},
+                               {"id": "R2", "state": r2}, {"id": "X", "state": "open"}],
+                "blocks": [{"id": "a", "milestone": nxt, "state": "next"}]}
+    for n, (d, want) in enumerate([(sample(), 0), (sample(r2="in-progress"), 1), (sample(nxt="X"), 1)], 1):
+        if len(rung_problems(d)) != want:
+            failures.append(f"[ladder] the check is broken: sample {n}")
+            return
+    d = json.loads((ROOT / "docs" / "status.json").read_text(encoding="utf-8"))
+    for p in rung_problems(d):
+        fail("262", f"docs/status.json: {p}")
+
+
 # Every piece against colibri and ds4 (Marcello, 2026-10-02): docs/UPSTREAM.md keeps one row a piece of
 # docs/ORIGINS.md §Every piece, with a verdict a project; better is offered to them, worse is studied and adopted.
 VERDICTS = ("not raced", "better", "worse", "level", "n/a")
@@ -615,7 +641,7 @@ def main():
                   check_type_table, check_tests_no_tmpfile, check_hot_zones, check_global_state,
                   check_makefile_recipes_ascii, check_shell_scripts_whole, check_scripts_clean_up,
                   check_no_failure_into_tee, check_struct_calloc, check_expf_table, check_readme_numbers,
-                  check_english, check_status_json, check_upstream_verdicts):
+                  check_english, check_status_json, check_one_rung, check_upstream_verdicts):
         check()
     for f in failures:
         print(f)

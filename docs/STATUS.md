@@ -4,6 +4,10 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
 
 ## Decisions
 
+- 2026-10-02 — **The roadmap is a ladder of models, for the machines most people own** (Marcello): R1 OLMoE,
+  R2 Qwen3-Coder-30B, R3 a MoE larger than RAM, R4 DeepSeek V4; each through five phases (exact, studied, at
+  the theoretical limit on three machines, usable, raced) before the next; one rung in progress (lint). The
+  old milestones by technology map into the rungs (ARCHITECTURE §The roadmap, LESSONS #262).
 - 2026-10-02 — **Every piece against colibri and ds4, and the verdict acts** (Marcello): worse, their way
   adopted; better, ours offered (PR ready, opened after his yes). `docs/UPSTREAM.md` §Our pieces against
   colibri and ds4, checked by the lint; today 1 of 14 raced (level).
@@ -326,18 +330,14 @@ experts balanced at the tail (1.04-1.08×); exp in a vector (prefill 1.05×). Cl
   16 mutations. **10-02, pretouch**: level (1.0027 +- 0.0022), attn_norm +54 us unchanged (#259): out.
   **10-02, piece 4**: q, k, v and gate, up one call each, the weights' items one flat range
   (`tr_matmul_q4x_prepared_n`): the decode **1.0054 +- 0.0007**, the same bits (MEASUREMENTS §Piece 4, #260-#261).
-- **next, one piece at a time** (the thinker's order for the decode, `build/prep/predictions.txt`): the serial
-  steps as messages (question 85: the add and the mix inside the calls that make their rows, normed and the prepared
-  row in buffers the workers have not read, measured first without hints; then the hints again); the pool's messages
-  (release stores, `shutdown` off `remaining`'s line); last the prep's bit arithmetic. The
-  README's numbers raced again after them (Marcello approves the README first). Then the post-it's rest: the dense at
-  3 rows (xt(3)'s block end batched across its tokens), AVX2's own xt, the row price at 2048 and 4000 positions,
-  #229, questions 79, 80, the gate in C, `--spec` by default (Marcello). Then: the GPU A/B at a free machine with no
-  writes; the engine's deletion series of a W16 item; AVX2's W16 tile; `dot_row2` is dead code (remove it with
-  `tools/mutate_row2.sh`'s lines); `tests/bench_q4k_genome.c` sequences a kernel that is gone; the race of whole
-  binaries with copies and a rotated order (#243), and its disturbed rounds named (#244). Queued: questions 74
-  (**does the GPU count?**) and 76; Q6_K's panel; tile-block stealing; question 68; M3's dense weights on the GPU.
-  **For Marcello, 59 and 60**. 61 after M4.
+- **next: the ladder** (ARCHITECTURE §The roadmap, status.json R1-R4): **R1, OLMoE to the end**; its next block,
+  the three machines and their theoretical limit (below average and average emulated: `-t 4`/`-t 8`,
+  `TR_CPU_MAX=avx2`, `TR_GPU=0`, an expert budget within 8/16 GB). Then R1's first prompt's cost, generation's fixed
+  cost, the review, the server; the races with llama.cpp, colibri and ds4 together at R1's close. The decode's
+  speed backlog (R1 phase 3 where the weak machines need it): question 85's serial steps as messages; the pool's
+  messages; the prep's bit arithmetic; the dense at 3 rows, AVX2's own xt, #229, questions 79-80, the gate in C,
+  `--spec` by default; the GPU A/B at a free machine; W16's deletion series and AVX2 tile; `dot_row2` dead code;
+  the race of whole binaries (#243-#244); questions 68, 74, 76; **for Marcello, 59 and 60**.
 
 **2026-09-24**: the gate 428 → 238 s; **M2: Q4_K and Q6_K** exact. **Tests** (09-24/25): `mutate_auto.py`
 lists the mutants no check runs (gcov); open: `threads.c`'s 22 (speed, not bits), `platform.c`'s Windows

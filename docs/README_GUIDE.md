@@ -25,7 +25,7 @@ What the three references share, in the order that serves a reader who has never
    with the proof (the test, the count, the check in the gate).
 7. **Get started**: clone, build, run, in one code block (llama.cpp's "Quick start", ds4's "Start
    Here").
-8. **Status**: one line, the milestones table, the honest list of what is missing.
+8. **Status**: one line, the aim and the rungs table (ARCHITECTURE §The roadmap), the honest list of what is missing.
 9. **How it is built**: the AI disclosure (ds4 has one: say it plainly), the method in two lines, the
    documents table.
 10. **Acknowledgements**: what we read and what we took, with the licenses.
