@@ -1133,9 +1133,19 @@
         {
           "v": "the eviction told what is coming, replayed on the real routes: the unreachable best (Belady) needs 4-16 tokens of the future (Q8_0 on 8 GB: 33.75 expert misses a token today, 28.68 knowing the next token, 23.09 knowing 4, 18.35 knowing 16 = Belady); the next layer's router as a hint gives 0.3%, the text's own repeats see only 1-2 tokens, three rules from the past and quotas a layer lose or tie. Today's rule is the best that needs no future: closed",
           "d": "2026-10-04"
+        },
+        {
+          "v": "reading experts ahead on the 8 GB machine, modelled on the real routes before any code: the next layer's router reading its experts during this layer's compute gives 1.066x (Q4_K), because one layer's compute (2.2 ms) is a third of one expert's read (7.1 ms); computing a layer's experts already in RAM while its missing one is read gives 1.084x (Q4_K) and 1.038x (Q8_0) with no byte more; both 1.129x",
+          "d": "2026-10-04"
         }
       ],
-      "questions": [],
+      "questions": [
+        {
+          "n": 90,
+          "state": "open",
+          "text": "a decode layer's experts computed as their bytes arrive (the resident ones while an I/O thread reads the misses): does the engine keep the model's 1.084x (Q4_K) and 1.038x (Q8_0) on the 8 GB machine"
+        }
+      ],
       "files": [
         "tools/machines.sh",
         "src/models/olmoe.c (TR_MEM_TOTAL_MIB)",
@@ -1154,7 +1164,8 @@
         "MACHINES_COUNTS=1 MACHINES_LIST=\"weak weakhot\" sh tools/machines.sh <binary> 1 q8",
         "tools/.venv/Scripts/python.exe tools/evict_replay.py <trace> --slots 290 --see 16,64,256",
         "sh tools/machines.sh table build/machines",
-        "MACHINES_ARGS=\"-c 4096\" MACHINES_COUNTS=1 MACHINES_LIST=\"weak weakold\" MACHINES_BIN_weakold=<before> sh tools/machines.sh <binary> 1 q4k q8"
+        "MACHINES_ARGS=\"-c 4096\" MACHINES_COUNTS=1 MACHINES_LIST=\"weak weakold\" MACHINES_BIN_weakold=<before> sh tools/machines.sh <binary> 1 q4k q8",
+        "tools/.venv/Scripts/python.exe tools/evict_replay.py <trace> --slots 615 --compute-ms 34.8 --prefetch 4,8,12 --arrive 0,1"
       ],
       "depends": [
         "m1-plan",

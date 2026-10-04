@@ -1748,3 +1748,14 @@ a layer lose or tie: the store's `heat` stays, closed. `tools/evict_replay.py --
 H calls, heat beyond) stays as the instrument; its `--check` case (16 cases) seen red under two mutations.
 Try: `tools/.venv/Scripts/python.exe tools/evict_replay.py build/evict/Q8_0.trace --slots 290 --see 16,64,256`;
 `tools/.venv/Scripts/python.exe tools/evict_replay.py --check`.
+
+### 2026-10-04 — The routes as time: the read ahead replayed, the arrival order found
+The 8 GB machine's decode time replayed on one disk queue before anything is built (MEASUREMENTS §The routes as
+time; LESSONS #309-#313; question 90): `tools/evict_replay.py --prefetch` (replay_time) reads the next layer's
+experts ahead (the router's top k, `pred_in`/`pred_out`, or the true ones), in chunks a demand read can pass,
+dropped when the next router does not name them, and `--arrive 1` computes a layer's experts as their bytes arrive.
+The window limits the read ahead (the true next call 1.122x on Q4_K, the router's top 8 1.066x at +14% bytes);
+the arrival order alone 1.084x (Q4_K) and 1.038x (Q8_0) with no byte more. The tool's `--check` now counts its
+cases (33) and fails if a written check never ran (LESSONS #309); 11 hand-computed cases, nine mutations red.
+Try: `tools/.venv/Scripts/python.exe tools/evict_replay.py build/evict/Q4_K.trace --slots 615 --compute-ms 34.8
+--prefetch 4,8,12 --arrive 0,1 --src in,oracle`; `tools/.venv/Scripts/python.exe tools/evict_replay.py --check`.

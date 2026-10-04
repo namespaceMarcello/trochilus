@@ -338,18 +338,18 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
   its disk's time for its bytes (+2-3% bytes), the same tokens. **10-03 evening, the prompt's routings
   told to the store** (MEASUREMENTS, same name; #287-#289): a pass adds each unit its tokens' routings scaled to 64:
   the weak decode **Q4_K 8.00 -> 15.50, Q8_0 1.91 -> 2.38 tok/s**, the same tokens.
-  **10-03 night, the KV grown from the store's room** (MEASUREMENTS, same name; #290-#291): the plan no longer sets
-  the KV aside; the store gives the KV its slots as it is written (`tr_experts_set_slots`).
-  A chat's plan on weak: Q8_0 131 -> 278 slots, disk a token 375.9 ->
-  193.7 MiB; Q4_K 314 -> 591, 87.4 -> 16.3; raced, a chat's decode **Q8_0 1.22 -> 2.29, Q4_K 4.55 -> 14.77 tok/s**.
-  **10-04, offered to colibri** (UPSTREAM row 7; #293-#294): `kv_room_fit` in the fork (`perf/olmoe-kv-room`), its
-  coldest slots freed as the KV grows; on colibri's own engine (5 GB container) 16 -> 26 slots a layer, misses -37%,
-  a request **1.19x**, the logits byte-identical (less than ours: its page cache fills the room). **colibri #1873**,
-  waiting for its review. **10-04 evening, the eviction told the future** (MEASUREMENTS, same name; #304-#307):
-  the next layer's router as a hint 0.3% fewer misses; Belady needs 4-16 tokens ahead (`evict_replay.py --see`);
-  heat is the best rule without the future: closed.
-  **Next** (R1 phase 3, the 8 GB machine): its decode's bytes, not its victims (a miss as one request, the prompt's
-  last 2-3%, this PC at half budget); then the integrated GPU (r1-igpu:
+  **10-03 night, the KV grown from the store's room** (MEASUREMENTS, same name; #290-#291): the store gives the KV
+  its slots as it is written; a chat's decode on weak **Q8_0 1.22 -> 2.29, Q4_K 4.55 -> 14.77 tok/s**.
+  **10-04, offered to colibri** (UPSTREAM row 7; #293-#294): `kv_room_fit` (fork branch `perf/olmoe-kv-room`), on
+  colibri's engine a request **1.19x**, the logits byte-identical: **colibri #1873**, waiting for its review.
+  **10-04 evening, the eviction told the future** (#304-#307): the next layer's router as a hint 0.3% fewer misses;
+  Belady needs 4-16 tokens ahead; heat stays: closed. **10-04 night, the routes as time** (MEASUREMENTS, same name;
+  #309-#313; replayed, `evict_replay.py --prefetch`): the window, not the prediction, is the limit
+  (the true next call read ahead 1.12x of a 1.82x bound, the router's top 8 1.066 at +14% bytes); a layer's experts
+  computed as their bytes arrive **1.084 Q4_K, 1.038 Q8_0** with no byte more; both 1.129.
+  **Next** (R1 phase 3, the 8 GB machine): **question 90, the arrival order built and raced** (the router's read
+  ahead after, only if the race keeps the model's word); then a miss as one request, the prompt's last 2-3%, this PC
+  at half budget; then the integrated GPU (r1-igpu:
   Vulkan; q. 87-88); then R1's first prompt's cost, generation's fixed cost, the review, the server; the races
   with llama.cpp, colibri and ds4 together at R1's close. The decode's
   speed backlog (R1 phase 3 where the weak machines need it): question 85's serial steps as messages; the pool's

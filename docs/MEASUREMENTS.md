@@ -208,6 +208,7 @@ decides | — | — |
 | 87 | **The dedicated and the integrated GPU together** (Marcello, 2026-10-03; a machine with both, like this PC, RTX 4070 + Radeon 610M, and many 16 GB laptops): today the engine takes the dedicated one and leaves the integrated idle. Could the integrated take the work the dedicated cannot hold, or that would travel to it (it reads the RAM in place: the experts the VRAM has no room for, a layer's prompt while the dedicated takes the decode), the same bits on both? | after R1 phase 3 has the integrated GPU (Vulkan): the bytes each one reads a token and its share of the time, one GPU against both, on a machine with both; the prediction first | a laptop's two GPUs are two engines, and one of them sits idle today |
 | 88 | **What the integrated GPU gives on a real machine** (Marcello, 2026-10-03): **until real PCs are available, every number of the integrated GPU is an estimate**, and is written as one (Iris Xe or Radeon 680M ~2-3.4 TFLOPS against ~0.4 of four AVX2 cores: a prompt 3-5x; the UHD of the cheapest machines ~0.2-0.4, about the CPU). This PC's Radeon 610M (2 compute units) checks the bits, not the speed | `tools/machines.sh` on a real 8 or 16 GB laptop with an integrated GPU: the prompt and the decode with and without it, the same tokens | the emulation gives fewer cores and less memory, never another GPU: the integrated machines' prompt limits stay unmeasured until then |
 | 89 | **A MoE larger than RAM: its experts at the disk's limit, the VRAM as their cache** (Marcello, 2026-10-04; rung R3, **not before R2 closes**): Qwen3.8-Flash-Next FP8, 185 GB, 48 layers x 512 experts of 4.9 MB, 10 a token a layer. On this 8 GB-GPU, 31 GB laptop colibri decodes it at 0.75-1.01 tok/s and is disk-bound: it reads the experts buffered at 0.6 GB/s, queue depth ~1.5, against 2.1-3.0 GB/s O_DIRECT on the same drive (LESSONS #297); its VRAM gives more as expert cache than as trunk compute (#296; §Qwen3.8-Flash-Next FP8 on colibri's Vulkan tier). How close to the drive's limit can our store read 4.9 MB experts, and how many misses a token does the VRAM save as a cache tier under the RAM's? | the drive's ceiling for 4.9 MB reads at depth 1-16 (`make bench-disk`); a routing trace of the real model replayed through RAM + VRAM slots (`tools/evict_replay.py`); then the engine on the real model, the same tokens, against colibri on this machine | colibri used 0.6 of the drive's 2-3 GB/s: on a disk-bound decode that is up to 3.5-5x before any compute (an estimate); the VRAM holds ~5% of the experts (1248 of 24576), the RAM ~9% |
+| 90 | **A decode layer's experts as their bytes arrive** (R1 phase 3, the 8 GB machine; 2026-10-04): today a layer's misses are read on the calling thread, then its experts computed. Computing the resident ones while an I/O thread reads the misses, then the late ones, hides a miss under its own layer (§The routes as time: the model 1.084 Q4_K, 1.038 Q8_0, the same bytes); the next layer's router reading ahead adds 4% on Q4_K at +11% bytes. Does the engine keep the model's word, and what do the extra pool regions cost? | the expert stages split (resident, then late) with the store's reads on an I/O thread, the same bits (`make check`); counted (`MACHINES_COUNTS=1`), then raced on the 8 GB machine (`sh tools/machines.sh <binary> 5 q4k q8`) | Q4_K 1.06-1.08, Q8_0 1.03-1.04 (the model less two or three region ends a layer with a miss) |
 Reference machine: Ryzen 9 7940HX (Zen 4, 16 core / 32 thread, AVX-512 VNNI/BF16), 31 GB
 RAM (2×16 GB DDR5-5200), NVMe Micron 1 TB, GPU RTX 4070 Laptop 8 GB and Radeon 610M (not used
 until M3/M6), Windows 11, MinGW-w64 gcc 15.2 `-O2`. Laptop on power, other programs open
@@ -5977,3 +5978,53 @@ whose `heat` and `opt` the ad hoc script reproduces to the hundredth). Traces bu
   machine's decode is in its bytes (a unit's size, the disk's request) and its slots, not in the choice of victim.
   `tools/evict_replay.py --see H` stays as the instrument for R2-R3's stores (question 89: how far ahead a VRAM
   tier's policy must see).
+
+## The routes as time (2026-10-04)
+
+R1 phase 3, the 8 GB machine, after the victim closed: **its decode's bytes and time, not its misses**. Its Q4_K decode
+is about half disk (MEASUREMENTS §q128's race: 34.8 ms of compute a token, the rest the disk at 500 MB/s), Q8_0 92%
+disk (33.3 ms of compute). The engine reads a layer's misses on the calling thread after its router, then computes
+its experts (src/models/olmoe.c olmoe_refresh_experts); nothing is read ahead in decode. **Replayed only, nothing
+built** (`tools/evict_replay.py --prefetch`, replay_time: `heat`'s store and one disk queue in time; build/evict's
+traces, code.txt 321 + 256 tokens, Q4_K at 615 slots, Q8_0 at 290; a unit 3.54 MB = 7.08 ms, 6.68 MB = 13.37 ms; a
+layer's compute 1/16 of the token's 95%, a quarter of it before the router, 5% after the last layer, the output
+head; predictions written before each run in build/routes_time/predictions.txt). The read ahead: at layer L's
+router, layer L+1's router on L's FFN input (`pred_in`, top k) names units; the ones not resident are queued, each
+taking a slot, and read while the disk is free in chunks; a demand read waits only for the chunk in flight; at
+L+1's router a queued unit it names finishes first, one it does not name is dropped (a half-read one frees its
+slot). The arrival order (`--arrive 1`): a layer's experts computed as their bytes arrive, the resident ones first
+while a miss is read.
+
+| a decode token (gain against today's serial) | Q4_K ms | gain | MiB | Q8_0 ms | gain | MiB |
+|---|---|---|---|---|---|---|
+| today: the misses, then the experts | 76.96 | 1 | 20.1 | 484.46 | 1 | 215.1 |
+| **the experts as their bytes arrive** (no prediction) | **71.00** | **1.084** | 20.1 | **466.94** | **1.038** | 215.1 |
+| `pred_in` top 4 / 8 / 12 ahead, chunks of 512 KiB | 74.98 / 72.22 / 71.75 | 1.026 / 1.066 / 1.073 | 20.4 / 22.9 / 27.5 | 474.21 / 469.99 / 473.49 | 1.022 / 1.031 / 1.023 | 216-224 |
+| **both: arrival order + `pred_in` top 8** | **68.15** | **1.129** | 22.4 | 464.35 | 1.043 | 219.0 |
+| the true next call ahead (any next-layer predictor's ceiling) | 68.62 | 1.122 | 20.2 | 462.89 | 1.047 | 216.7 |
+| arrival order + the true next call | 65.30 | 1.179 | 20.2 | 459.97 | 1.053 | 216.7 |
+| full overlap (max of compute and disk, a bound) | 42.2 | 1.82 | | 451.2 | 1.074 | |
+
+Without the head's 5% (every ms of compute inside a layer) the same table gives 1-2% more to every read ahead.
+Sensitivity (no head): chunks of 2 MiB lose 1.5-5.6% against 512 KiB on Q4_K at k 8-16 (a chunk is 4.2 ms, the window
+2.2); whole units lose: Q4_K 0.997 / 0.959 / 0.934 at k 8 / 12 / 16, Q8_0 0.965 / 0.944 / 0.933; `pred_out` (known
+only after the layer: the window is the next layer's attention) at best 1.016 (Q4_K k 8) and 1.004 (Q8_0).
+
+- **The window is the limit, not the prediction**: a Q4_K unit reads in 7.1 ms, a layer computes in 2.2; even the true
+  next call read ahead hides one layer's compute where the next layer misses: 1.12x of a 1.82x bound. The router's
+  top 8 already takes half of that ceiling (1.066), at +14% bytes; top 12 +37% bytes for 1%.
+- **A layer's own resident experts are the larger window**: computing the 7 resident experts while the eighth is read
+  gives 1.084 on Q4_K and 1.038 on Q8_0 with no prediction and no byte more, more than the router's read ahead
+  alone; both together 1.129 (Q4_K), the oracle's level.
+- **A wrong read ahead costs its victim more than its time**: chunks of 512 KiB waste 2-7 MiB a token on Q4_K, but
+  a wrong unit read whole stays and has evicted a resident one; with a shorter window (the head's 5% moved out of
+  the layers) fewer wrong units finish and k 12 gains more (1.054 -> 1.073).
+- Predictions (build/routes_time/predictions.txt): the serial model to the hundredth, in; the oracle Q4_K +10-15%,
+  Q8_0 +5-7%, in; `pred_in` Q4_K -3..+5% best k 4, **out** (better: 1.059-1.066 at k 8); 2 MiB chunks, in; whole
+  units Q4_K -10..-30%, out (milder, -4%); bytes Q4_K +10-30% at k 12, out (+37-47%); the arrival order alone
+  Q4_K +7-10%, Q8_0 +3-5%, in; with `pred_in` k 8 Q4_K +12-16%, in, Q8_0 +5-6%, out (+4.3%); with the oracle
+  Q4_K +18-22% and Q8_0 1.06-1.07, out (just under: 1.179, 1.053).
+- **Next (question 90)**: the arrival order built first (the same bytes, no prediction: the engine's expert stages
+  over the resident experts while an I/O thread reads the misses, then over the late ones), raced on the 8 GB
+  machine against the model's 1.084 / 1.038; the router's read ahead after, on top, only if the race keeps the
+  model's word.
