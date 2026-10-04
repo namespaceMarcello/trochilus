@@ -1393,7 +1393,9 @@ static void test_tiers_match_scalar(void) {
                "scalar (%s)\n", K->tier, g_q4x_prep_cmp, g_q4x_dot2_cmp, g_q4x_xt_cmp[2], g_q4x_xt_cmp[3], g_q4x_panel_cmp,
                g_q4x_tile_cmp,
                K->q4x_prep == S->q4x_prep ? "the scalar kernels by rows"
-                                          : K->q4x_panel != NULL ? "W16 panel and tiles" : "its own kernels by rows");
+                                          : K->q4x_panel == NULL ? "its own kernels by rows"
+                                          : K->q4x_tile_max == 3 ? "AVX2's W16 panel in two halves, tiles of 3"
+                                                                 : "W16 panel and tiles");
         /* the tier's x8 kernels were compared, if it has any */
         int has_x8 = 0;
         for (int type = 0; type < TR_TYPE_COUNT; type++) has_x8 |= K->dot_row2_x8[type] != NULL;
@@ -2255,8 +2257,11 @@ static void pms_q4x_prep(const float *x, int64_t n, void *xq) {
     atomic_fetch_add(&g_pms_preps, 1);
     g_pms_real->q4x_prep(x, n, xq);
 }
+static atomic_long g_pms_tile_wide, g_pms_tile_full; /* tiles wider than the tier's q4x_tile_max, and as wide */
 static void pms_q4x_tile(const void *panel, const void *const *xq, int64_t n, int T, float *y, int64_t y_stride) {
     atomic_fetch_add(&g_pms_tiles, 1);
+    if (T > g_pms_real->q4x_tile_max) atomic_fetch_add(&g_pms_tile_wide, 1);
+    if (T == g_pms_real->q4x_tile_max) atomic_fetch_add(&g_pms_tile_full, 1);
     g_pms_real->q4x_tile(panel, xq, n, T, y, y_stride);
 }
 static void pms_q4x_dot2(const void *row0, const void *row1, const void *xq, int64_t n, float *out) {
@@ -2687,6 +2692,79 @@ static void test_short_pass_q4k(void) {
     TR_CHECK(calls > 0);
 }
 
+/* The prompt's Q4_K tiles at each tier's own width (q4x_tile_max: AVX2 3, its 4 spills; docs/LESSONS.md #280). Branch:
+ * groups of 4 and 8 input rows on the panel road, where widths 3 and 4 cut differently (4: one tile and two; 3: two
+ * and three, 2 + 2 and 2 + 3 + 3); the tiles counted exactly for one 16-row item a group, none wider than the
+ * tier's width and some as wide, at 1 and 7 threads, the outputs tr_matmul_grouped's byte for byte. */
+static void test_tile_width_q4k(void) {
+    static const char *const tiers[] = {"scalar", "avx2", "avx512"};
+    enum { G = 2, C = 256, R = 16 };
+    static const int64_t offsets[G + 1] = {0, 4, 12};
+    static const int threads[2] = {1, 7};
+    static tr_kernels counting;
+    const size_t rb = tr_row_bytes(TR_TYPE_Q4_K, C), ybytes = (size_t)offsets[G] * R * sizeof(float);
+    unsigned char *wd = (unsigned char *)malloc((size_t)G * R * rb);
+    float *x = (float *)malloc((size_t)offsets[G] * C * sizeof(float));
+    float *ref = (float *)malloc(ybytes), *y = (float *)malloc(ybytes);
+    TR_CHECK(wd != NULL && x != NULL && ref != NULL && y != NULL);
+    if (wd == NULL || x == NULL || ref == NULL || y == NULL) {
+        free(wd);
+        free(x);
+        free(ref);
+        free(y);
+        return;
+    }
+    unsigned seed = 2026u;
+    fill_q4_k(wd, G * R * (C / 256), &seed, 0);
+    for (int64_t i = 0; i < offsets[G] * C; i++) x[i] = rand_float(&seed);
+    tr_mat w[G];
+    for (int g = 0; g < G; g++) {
+        w[g].type = TR_TYPE_Q4_K;
+        w[g].rows = R;
+        w[g].cols = C;
+        w[g].data = wd + (size_t)g * R * rb;
+    }
+    tr_matmul_grouped(NULL, w, offsets, G, x, ref);
+    long compared = 0;
+    for (size_t ti = 0; ti < sizeof tiers / sizeof tiers[0]; ti++) {
+        const tr_kernels *K = tr_kernels_tier(tiers[ti]);
+        if (K == NULL || K->q4x_tile == NULL) continue;
+        const int W = K->q4x_tile_max;
+        TR_CHECK(W == 3 || W == 4);
+        g_pms_real = K;
+        counting = *K;
+        counting.q4x_tile = pms_q4x_tile;
+        tr_kernels_set_active(&counting);
+        tr_pm_scratch s;
+        TR_CHECK(tr_pm_scratch_init(&s, 16, G, offsets[G], C, offsets[G] * C) == 0);
+        for (int pi = 0; pi < 2; pi++) {
+            tr_pool *pool = tr_pool_create(threads[pi]);
+            TR_CHECK(pool != NULL);
+            if (pool == NULL) continue;
+            memset(y, 0x7F, ybytes);
+            atomic_store(&g_pms_tiles, 0);
+            atomic_store(&g_pms_tile_wide, 0);
+            atomic_store(&g_pms_tile_full, 0);
+            tr_matmul_grouped_s(pool, w, offsets, G, x, y, &s);
+            TR_CHECK(memcmp(y, ref, ybytes) == 0);
+            TR_CHECK_EQ_INT(atomic_load(&g_pms_tiles), W == 3 ? 2 + 3 : 1 + 2);
+            TR_CHECK_EQ_INT(atomic_load(&g_pms_tile_wide), 0);
+            TR_CHECK(atomic_load(&g_pms_tile_full) > 0);
+            compared++;
+            tr_pool_destroy(pool);
+        }
+        tr_pm_scratch_free(&s);
+        tr_kernels_set_active(NULL);
+        printf("  tile width on tier %-8s Q4_K groups of 4 and 8 in tiles of at most %d, counted exactly at 1 and 7 threads\n",
+               K->tier, W);
+    }
+    TR_CHECK(compared > 0);
+    free(wd);
+    free(x);
+    free(ref);
+    free(y);
+}
+
 /* ---- tr_f32_to_bf16_exact: the top halves when every value fits, nothing when one does not ---------------------- */
 static void test_f32_to_bf16_exact(void) {
     enum { N = 37 };
@@ -2724,9 +2802,42 @@ static void test_f32_to_bf16_exact(void) {
     TR_CHECK(memcmp(back, copy, sizeof back) == 0);
 }
 
+/* The prep's exponent arithmetic from the bits (kernels_internal.h tr_pow2, tr_pow2f, tr_q4x_shift) against the C
+ * library's ldexp and frexpf, the definition it replaces: every power of two a double and a float hold as a normal,
+ * and the shift of every exponent field of a finite float with five mantissas each (none, one bit, all bits, two in
+ * between), the subnormals among them. Branches: the normal field, the subnormal's bit length and the step down
+ * past TR_Q4X_XMAX, each counted. */
+static void test_pow2_bits(void) {
+    for (int n = -1022; n <= 1023; n++) TR_CHECK(tr_pow2(n) == ldexp(1.0, n));
+    for (int n = -126; n <= 127; n++) TR_CHECK(tr_pow2f(n) == ldexpf(1.0f, n));
+    const uint32_t mans[5] = {0u, 1u, 0x7fffffu, 0x400001u, 0x12345u};
+    int normal = 0, subnormal = 0, stepped = 0;
+    for (uint32_t field = 0; field <= 254; field++) {
+        for (int k = 0; k < 5; k++) {
+            uint32_t b = field << 23 | mans[k];
+            float m;
+            memcpy(&m, &b, sizeof m);
+            if (m == 0.0f) continue;
+            int e;
+            (void)frexpf(m, &e);
+            int want = 31 - e;
+            if (ldexp((double)m, want) > TR_Q4X_XMAX) {
+                want--;
+                stepped++;
+            }
+            TR_CHECK(tr_q4x_shift(m) == want);
+            if (field == 0) subnormal++;
+            else normal++;
+        }
+    }
+    TR_CHECK(tr_q4x_shift(0.0f) == 0);
+    TR_CHECK(normal > 0 && subnormal > 0 && stepped > 0 && stepped < normal + subnormal);
+}
+
 int main(void) {
     tr_kernels_init();
 
+    test_pow2_bits();
     test_edges();
     test_f32_to_bf16_exact();
     test_half_to_float();
@@ -2756,6 +2867,7 @@ int main(void) {
     test_matmul_grouped_s();
     test_short_pass();
     test_short_pass_q4k();
+    test_tile_width_q4k();
 
     TR_TEST_EXIT();
 }

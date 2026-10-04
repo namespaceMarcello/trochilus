@@ -116,8 +116,8 @@ static void test_table(void) {
             printf("  tier %s: dot_row_xt of Q8_0 is scalar's or missing\n", K->tier);
             missing++;
         }
-        /* Q4_K's integer road: every tier prepares and pairs with its own kernels; AVX-512 with the byte
-         * permutes, VNNI and DQ has its W16 panel and tiles too (elsewhere the road goes by rows) */
+        /* Q4_K's integer road: every tier prepares and pairs with its own kernels and has a W16 panel and tiles of
+         * its own: AVX-512's where the CPU has the byte permutes, VNNI and DQ, AVX2's (two halves) elsewhere */
         const tr_cpu_info *ci = tr_cpu();
         const int w16 = strcmp(K->tier, "avx512") == 0 && ci->avx512bw && ci->avx512vl && ci->avx512dq &&
                         ci->avx512vnni && ci->avx512vbmi && ci->f16c;
@@ -126,9 +126,9 @@ static void test_table(void) {
             printf("  tier %s: q4x_prep, q4x_dot2 or q4x_dot_xt is scalar's or missing\n", K->tier);
             missing++;
         }
-        if (w16 && (K->q4x_panel == NULL || K->q4x_panel == S->q4x_panel || K->q4x_tile == NULL ||
-                    K->q4x_tile == S->q4x_tile)) {
-            printf("  tier %s: the W16 panel or tile is missing or scalar's\n", K->tier);
+        if (K->q4x_panel == NULL || K->q4x_panel == S->q4x_panel || K->q4x_tile == NULL || K->q4x_tile == S->q4x_tile ||
+            K->q4x_tile_max != (w16 ? TR_Q4X_TILE_MAX : 3)) {
+            printf("  tier %s: the W16 panel or tile is missing or scalar's, or its tile width is not its own\n", K->tier);
             missing++;
         }
         TR_CHECK(strcmp(K->tier, tiers[t]) == 0); /* asked for one tier, handed another */
@@ -137,7 +137,7 @@ static void test_table(void) {
         if (missing == 0)
             printf("  tier %-8s every hot entry is its own: dot and axpy with their x4, dot_row and dot_row_x4 of %d "
                    "weight types, Q4_K's q4x %s\n",
-                   K->tier, types, w16 ? "with the W16 panel and tiles" : "by rows");
+                   K->tier, types, w16 ? "with AVX-512's W16 panel and tiles of 4" : "with AVX2's W16 panel and tiles of 3");
     }
 
     /* a tier exists exactly when the CPU (capped by TR_CPU_MAX) has it, and tr_kernels_init takes
@@ -258,6 +258,7 @@ static void counted_pm_tile(const float *panel, const float *xil, int64_t n, int
 /* Q4_K's integer road (kernels.h q4x_*): the prepared rows, the pairs (two products a call), the runs of the
  * short passes' pairs (2 T products a call) and the tiles' products */
 static atomic_ullong n_q4x_prep, n_q4x_dot2, n_q4x_xt, n_q4x_products;
+static atomic_ullong n_q4x_tile_wide, n_q4x_tile_full; /* tiles wider than the tier's q4x_tile_max, and as wide */
 static void counted_q4x_prep(const float *x, int64_t n, void *xq) {
     atomic_fetch_add(&n_q4x_prep, 1);
     g_real->q4x_prep(x, n, xq);
@@ -274,6 +275,8 @@ static void counted_q4x_dot_xt(const void *row0, const void *row1, const void *c
 }
 static void counted_q4x_tile(const void *panel, const void *const *xq, int64_t n, int T, float *y, int64_t y_stride) {
     atomic_fetch_add(&n_q4x_products, (unsigned long long)(TR_PM_ROWS * T));
+    if (T > g_real->q4x_tile_max) atomic_fetch_add(&n_q4x_tile_wide, 1);
+    if (T == g_real->q4x_tile_max) atomic_fetch_add(&n_q4x_tile_full, 1);
     g_real->q4x_tile(panel, xq, n, T, y, y_stride);
 }
 
@@ -373,6 +376,8 @@ static void test_engine(const char *argv0, tr_type type, const char *name, long 
     atomic_store(&n_q4x_dot2, 0);
     atomic_store(&n_q4x_xt, 0);
     atomic_store(&n_q4x_products, 0);
+    atomic_store(&n_q4x_tile_wide, 0);
+    atomic_store(&n_q4x_tile_full, 0);
     atomic_store(&n_pm_products, 0);
     for (int i = 0; i < TR_TYPE_COUNT; i++) {
         atomic_store(&n_row[i], 0);
@@ -463,6 +468,9 @@ static void test_engine(const char *argv0, tr_type type, const char *name, long 
             TR_CHECK(atomic_load(&n_q4x_dot2) > 0);
             TR_CHECK(atomic_load(&n_q4x_xt) > 0);
             if (g_real->q4x_panel != NULL && g_real->q4x_tile != NULL) TR_CHECK(atomic_load(&n_q4x_products) > 0);
+            /* the planner gives each tier's tile its own widest T and never more (AVX2's 3: its 4 spills) */
+            TR_CHECK_EQ_INT((long long)atomic_load(&n_q4x_tile_wide), 0);
+            if (g_real->q4x_tile != NULL) TR_CHECK(atomic_load(&n_q4x_tile_full) > 0);
             TR_CHECK_EQ_INT(atomic_load(&n_row[type]), 0); /* nothing left to the definition from the floats */
             printf("  q4_k  model: %llu rows prepared, %llu pairs, %llu runs of 2-3 rows, %llu run and tile products\n",
                    (unsigned long long)atomic_load(&n_q4x_prep), (unsigned long long)atomic_load(&n_q4x_dot2),

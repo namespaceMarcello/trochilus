@@ -32,6 +32,10 @@
  *                                       shapes), the other threads bringing their regions' first X KiB in
  *                                       while they wait (tr_pool_hint, T0 and T2) or not, raced step set by
  *                                       step set.
+ *   bench_q4x --prompt [--runs N]       the prompt's road on one core hot (docs/MEASUREMENTS.md §AVX2's own Q4_K
+ *                                       tile): dot2 a token, the panel alone, the tile alone at T = 1..4, then a
+ *                                       token's cost at groups of 4, 8, 40 and 320 rows, tiles of 4 and of the
+ *                                       tier's q4x_tile_max.
  * Medians of N runs, the lines alternated run by run, spread (max - min) / median. Every way's outputs are
  * compared with scalar's dot_row (L1) or with dot2's (RAM) before timing; a mismatch fails the run. The active
  * tier's kernels; run natively on a still machine (tools/measure_guard.lib). */
@@ -866,8 +870,101 @@ static int idle_lines(const tr_kernels *K, int P, int runs, const char *wl, cons
     return r;
 }
 
+/* ---- the prompt's road on one core: the panel and the tile apart ------------------------------------------- */
+
+/* A prompt's group of G input rows runs an item's panel once and ceil(G / 4) tiles; by rows it is G x 8 calls of
+ * dot2 (the tiers without a panel). Hot (16 rows of 2048, L1 and L2): dot2 a token (8 calls), the panel alone, the
+ * tile alone at T = 1..4; then the cost a token at G = 4, 8, 40 and 320 by the panel road and by rows. */
+static int prompt_lines(const tr_kernels *K, int runs, double run_ms) {
+    enum { N_LINES = 2 + TR_Q4X_TILE_MAX };
+    static unsigned char rows[ROWS * (NMAX / 256) * TR_Q4_K_BLOCK_BYTES];
+    static unsigned char xq[TR_Q4X_TILE_MAX * (NMAX / 256) * 1152] __attribute__((aligned(64)));
+    static unsigned char panel[NMAX / 256 * 9728] __attribute__((aligned(64)));
+    static float x[TR_Q4X_TILE_MAX][NMAX];
+    if (K->q4x_panel == NULL || K->q4x_tile == NULL) {
+        printf("bench_q4x --prompt: tier %s has no panel road\n", K->tier);
+        return 0;
+    }
+    const int64_t n = NMAX;
+    const size_t rb = tr_row_bytes(TR_TYPE_Q4_K, n), xb = tr_q4x_bytes(n);
+    fill_q4_k(rows, ROWS * NMAX / 256);
+    const void *xp[TR_Q4X_TILE_MAX];
+    for (int t = 0; t < TR_Q4X_TILE_MAX; t++) {
+        for (int i = 0; i < NMAX; i++) x[t][i] = (float)rnd() * 0x1p-30f - 1.0f;
+        K->q4x_prep(x[t], n, xq + (size_t)t * xb);
+        xp[t] = xq + (size_t)t * xb;
+    }
+    /* exactness: every tile's outputs against dot2's, dot2's against scalar's dot_row */
+    const tr_kernels *S = tr_kernels_tier("scalar");
+    float yd[ROWS * TR_Q4X_TILE_MAX], yt[ROWS * TR_Q4X_TILE_MAX];
+    long checked = 0;
+    int bad = 0;
+    for (int t = 0; t < TR_Q4X_TILE_MAX; t++)
+        for (int r = 0; r < ROWS; r += 2) K->q4x_dot2(rows + (size_t)r * rb, rows + (size_t)(r + 1) * rb, xp[t], n, yd + t * ROWS + r);
+    for (int t = 0; t < TR_Q4X_TILE_MAX; t++)
+        for (int r = 0; r < ROWS; r++) {
+            const float want = S->dot_row[TR_TYPE_Q4_K](rows + (size_t)r * rb, x[t], n);
+            bad |= memcmp(&want, &yd[t * ROWS + r], sizeof want) != 0;
+            checked++;
+        }
+    K->q4x_panel(rows, rb, n, panel, NULL);
+    for (int T = 1; T <= TR_Q4X_TILE_MAX; T++) {
+        K->q4x_tile(panel, xp, n, T, yt, ROWS);
+        bad |= memcmp(yt, yd, sizeof(float) * (size_t)(ROWS * T)) != 0;
+        checked += ROWS * T;
+    }
+    if (bad) {
+        printf("bench_q4x --prompt: exactness check failed\n");
+        return 1;
+    }
+    printf("# the prompt's road, one core hot, 16 rows of %lld: %ld outputs equal scalar's dot_row bit for bit\n",
+           (long long)n, checked);
+    /* lines: 0 dot2 a token, 1 the panel, 2.. the tile at T = 1..4; ns a call */
+    long calls[N_LINES];
+    double ns[N_LINES][MAX_RUNS];
+    for (int pass = -1; pass < runs; pass++)
+        for (int l = 0; l < N_LINES; l++) {
+            const long c = pass < 0 ? 200 : calls[l];
+            double t0 = tr_time_sec();
+            for (long i = 0; i < c; i++) {
+                if (l == 0)
+                    for (int r = 0; r < ROWS; r += 2)
+                        K->q4x_dot2(rows + (size_t)r * rb, rows + (size_t)(r + 1) * rb, xp[0], n, yd + r);
+                else if (l == 1) K->q4x_panel(rows, rb, n, panel, NULL);
+                else K->q4x_tile(panel, xp, n, l - 1, yt, ROWS);
+            }
+            const double v = (tr_time_sec() - t0) * 1e9 / (double)c;
+            if (pass < 0) calls[l] = (long)(run_ms * 1e6 / v) + 1;
+            else ns[l][pass] = v;
+        }
+    g_sink = yd[0] + yt[0];
+    double med[N_LINES], spread[N_LINES];
+    for (int l = 0; l < N_LINES; l++) med[l] = median_spread(ns[l], runs, &spread[l]);
+    const double macs = (double)ROWS * (double)n;
+    printf("%-14s %12s %8s %14s\n", "line", "ns a call", "spread", "GMAC/s a token");
+    printf("%-14s %12.0f %7.1f%% %14.2f\n", "dot2 a token", med[0], 100 * spread[0], macs / med[0]);
+    printf("%-14s %12.0f %7.1f%%\n", "panel", med[1], 100 * spread[1]);
+    for (int T = 1; T <= TR_Q4X_TILE_MAX; T++)
+        printf("tile T=%-7d %12.0f %7.1f%% %14.2f\n", T, med[1 + T], 100 * spread[1 + T], macs * T / med[1 + T]);
+    static const int G[] = {4, 8, 40, 320};
+    printf("# a token at G rows a group: the panel over G, then ceil(G / W) tiles cut evenly as the planner cuts them, "
+           "at W = 4 and at the tier's width %d, against dot2\n", K->q4x_tile_max);
+    for (int g = 0; g < 4; g++) {
+        double road[2];
+        for (int k = 0; k < 2; k++) {
+            const int W = k ? K->q4x_tile_max : TR_Q4X_TILE_MAX, nt = (G[g] + W - 1) / W;
+            double sum = med[1];
+            for (int i = 0; i < nt; i++) sum += med[1 + (i + 1) * G[g] / nt - i * G[g] / nt];
+            road[k] = sum / G[g];
+        }
+        printf("G=%-4d panel road %8.0f ns a token at W 4, %8.0f at W %d; by rows %8.0f: %.2fx\n", G[g], road[0], road[1],
+               K->q4x_tile_max, med[0], med[0] / road[1]);
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
-    int runs = 11, ram = 0, mib = 1024, ends = 0, idle = 0;
+    int runs = 11, ram = 0, mib = 1024, ends = 0, idle = 0, prompt = 0;
     const char *wl = NULL, *xl = NULL, *kl = NULL;
     double run_ms = 5;
     for (int i = 1; i < argc; i++) {
@@ -880,8 +977,9 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--w") == 0 && i + 1 < argc) wl = argv[++i];
         else if (strcmp(argv[i], "--x") == 0 && i + 1 < argc) xl = argv[++i];
         else if (strcmp(argv[i], "--kinds") == 0 && i + 1 < argc) kl = argv[++i];
+        else if (strcmp(argv[i], "--prompt") == 0) prompt = 1;
         else {
-            fprintf(stderr, "usage: bench_q4x [--runs N] [--ms M] [--ram P] [--mib M] [--ends P] [--idle P [--w us,..] "
+            fprintf(stderr, "usage: bench_q4x [--runs N] [--ms M] [--prompt] [--ram P] [--mib M] [--ends P] [--idle P [--w us,..] "
                             "[--x KiB,..] [--kinds spin,l2,ram]]\n");
             return 2;
         }
@@ -899,6 +997,12 @@ int main(int argc, char **argv) {
     if (ram > 0) return ram_lines(K, ram, runs, mib);
     if (ends > 0) return ends_lines(K, ends, runs);
     if (idle > 0) return idle_lines(K, idle, runs, wl, xl, kl);
+    if (prompt) {
+        tr_pool *pp = tr_pool_create(1);
+        const int rp = prompt_lines(K, runs, run_ms);
+        tr_pool_destroy(pp);
+        return rp;
+    }
     tr_pool *pool = tr_pool_create(1); /* pins this thread to the first slot */
     const int r = l1_lines(K, runs, run_ms) | prep_line(K, runs, run_ms);
     tr_pool_destroy(pool);

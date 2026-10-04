@@ -1588,3 +1588,153 @@ Check: `tools/.venv/Scripts/python.exe tools/lint.py`.
   and template, the real model, a team of small models); README's status table; STATUS's decision and next.
 - `tools/lint.py` `check_one_rung`: one rung in progress, a next block only there (LESSONS #262).
 Check: `tools/.venv/Scripts/python.exe tools/lint.py`; `tools/.venv/Scripts/python.exe tools/status_html.py`.
+
+### 2026-10-02 — The disk at its limit: one request a part for a layer's experts
+Question 41 answered (docs/MEASUREMENTS.md §The disk at its limit): the disk's speed is the request's
+size (1.9 GB/s at 2 MiB, 3.5 at 64 MiB), not the order or the readers; BitLocker costs +3.8 processors at
+3.5 GB/s. `tests/bench_disk.c` gains `--seq`, `--handles`, `--scatter`. `tr_file_preadv` (platform.h: one
+ReadFileScatter or preadv into many pieces). The expert store's runs (`cfg.readv`, experts.h): a layer's
+consecutive experts in one request a part at load, ahead and on demand, the page two neighbours share
+copied after; `tr_experts_touch` faults the slots' pages over the pool first; `stats.requests`, printed on
+the `experts:` line. `TR_EXPERT_RUNS=0` and `TR_EXPERT_TOUCH=0` turn them off for the race. Tests:
+test_experts `runs` (load, split, demand, ahead, failure, fallback), test_base preadv (buffered, direct,
+past the end), seen red by 7 new mutations in tools/mutate_experts.sh (22 of 22) and a reversed-pieces
+mutation natively and in Linux; `tools/lint.py` checks every mutation text still applies. Try:
+`TR_BAR=0 build/trochilus run -m <Q8_0.gguf> -f bench/prompts/code.txt -n 8` (the `experts:` line: read
+at load in ~2.0 s, 96 requests; with `TR_EXPERT_RUNS=0`, ~4.1 s, 3072).
+
+### 2026-10-02 — The disk race; the touch timed; the exponent from its bits; every mutation script checked
+The store's runs and touch raced arm by arm (`tools/disk_race.sh`: old, runs, new and an A/A, a process each,
+median of 8, the same tokens in every run; MEASUREMENTS §The disk at its limit): a resident load's read 2.015x,
+its whole run 1.576x, a first prompt under half budget 1.564x at 321 tokens and 1.090x at 2048, the 8 GB machine
+emulated 1.350x and 1.029x. `tools/ab_modes.sh` reads the `experts:` line's read time (read_s), the touch's
+(touch_s) and the requests; the line prints `slots touched in X s` (stats.touch_sec). The Q4_K prep's `ldexp`,
+`ldexpf` and `frexpf` replaced by `tr_pow2`, `tr_pow2f` and the float's bits (kernels_internal.h), the same bits:
+test_kernels `pow2_bits` against the C library on every exponent, seen red by three mutations (now in
+tools/mutate_q4x.sh); the lint refuses those calls in a hot zone. The lint's mutation check reads every
+`tools/mutate_*.sh` (double and single quotes, a file through a variable, "@@" newlines, a script's one file),
+and the stale texts it found were rewritten on today's code. `make BUILD=<dir> FRESH=1`: a build-id from the
+clock, a hash Smart App Control has not seen (the same code in a new folder links to the same bytes, LESSONS
+#251). UPSTREAM and ORIGINS row 7: colibri's one read an expert raced as a request pattern.
+`tr_file_preadv_n` (platform.h): up to 4 scattered requests, on a direct Windows file all in flight before
+the first is waited for (the bench: +7.6% at 68 MiB with two); the store's readv takes a run's three parts in
+one call (test_experts counts one call a run, test_base three requests buffered and direct, three mutations
+in tools/mutate_experts.sh). Not yet raced. The hook `.claude/hooks/time-from-date.cjs` refuses a typed
+date and hour written into build/prep/predictions.txt (LESSONS #267).
+Try: `sh tools/disk_race.sh build/<dir>/trochilus.exe 8 res` (~5 min); `TR_BAR=0 build/trochilus run -m
+<Q8_0.gguf> -f bench/prompts/code.txt -n 8` (the `experts:` line: read at load ~2.0 s, slots touched in ~0.1 s,
+96 requests).
+
+### 2026-10-03 — Three requests in flight, raced and kept
+A run's three parts read in one `tr_file_preadv_n` call (built 10-02 night) raced against one call a part, the new
+switch `TR_EXPERT_INFLIGHT=0` (olmoe.c, its own reader): a resident load's read 2.03 -> 1.95 s (1.041x, 3.5 GB/s),
+the whole run 1.022x; a first 321-token prompt at half budget, read 1.026x, run 1.017x (the prompt 2.82 -> 2.76 s).
+The same tokens in all 54 runs; kept. `tools/disk_race.sh` takes `DISK_RACE_ARMS=inflight` (new, serial, aa). The
+Windows `tr_file_preadv_n` natively green (build/q110), and its hand mutation (every request's page list over the
+first's) green too: Windows takes the list at the call, an equivalent mutant (LESSONS #268). `make check` green
+(294 s).
+Try: `DISK_RACE_ARMS=inflight DISK_RACE_OUT=build/<dir> sh tools/disk_race.sh build/<dir>/trochilus.exe 8 res`
+(~5 min); `TR_EXPERT_INFLIGHT=0 TR_BAR=0 build/trochilus run -m <Q8_0.gguf> -f bench/prompts/code.txt -n 8`
+(the `experts:` line's read at load ~2.03 s against ~1.95 without the switch).
+
+### 2026-10-03 — R1's three machines, first measured
+`tools/machines.sh` runs the same prompt and generation on the below-average machine (4 threads, AVX2, 8 GB, no
+GPU) and the average one (8 threads, 16 GB), both emulated, and on this PC; it sets each decode against its
+theoretical limit (the RAM's bandwidth over the bytes a token reads, plus the disk's bytes). `TR_MEM_TOTAL_MIB`
+(olmoe.c, measurement only) lets the automatic plan see the emulated machine's total RAM (its reserve is a tenth of
+it); `tests/test_stream.c` sees it (1 TiB: partial where the real total loads resident; red with the override
+removed). Found: on 8 GB the Q8_0's store keeps 83 units of the 128 a token uses and the LRU hits nothing (2.14
+tok/s, 816 MiB a token from disk); the average machine draws more than its RAM gives (103-108% of its limit). Fixed:
+`tools/ab_modes.sh` died on a zero median (test branch `zero`). `make check` green.
+Try: `sh tools/machines.sh build/<dir>/trochilus.exe 8 q4k` (~10 min), then `sh tools/machines.sh table build/machines`.
+
+### 2026-10-03 — Four machines, the integrated GPU into R1
+Marcello: nearly every PC has an integrated GPU. The roadmap's machines are four (ARCHITECTURE §The roadmap): 8 GB
+and 16 GB with an integrated GPU sharing the RAM, 16 GB with a small dedicated one too, this PC. The integrated GPU
+(Vulkan, a module like CUDA, the weights read in place) is R1's block `r1-igpu`, after the 8 GB machine's two
+brakes; Metal stays off the ladder. Written: the two GPUs together (MEASUREMENTS question 87), and that every
+number of an integrated GPU is an estimate until real PCs are available (question 88). `tools/machines.sh` runs
+the fourth machine (`avgd`: the average one with the GPU on).
+Try: `sh tools/machines.sh build/<dir>/trochilus.exe 8 q4k` (five arms now: weak, avg, avgd, pc, aa).
+
+### 2026-10-03 — The 8 GB machine: its disk, the plan on the run's positions, ds4's eviction; races that count first
+R1 phase 3 on the below-average machine. Its disk emulated: `TR_EXPERT_DISK_MBPS` (the expert store's reads at that
+rate, one disk for both threads; measurement only), and `tools/machines.sh` sets each machine's limit at its RAM's
+nominal bandwidth and at its practical ceiling (this PC decodes at 98-99% of its measured 56.3 GB/s). The plan now
+sets aside the session's own bytes at the positions the run will hold (`tr_model_load_plan`, olmoe.c
+`session_bytes`; generate and run pass prompt + -n + the draft), not a 4096-position F32 KV and a flat 512 MiB:
+on 8 GB the Q8_0's store holds 290 units instead of 83, the Q4_K's 615 instead of 224. The eviction, replayed first
+on a route trace (`tools/evict_replay.py`, eight policies, Belady's ceiling), is now ds4's (hotness halved every 16
+tokens; `TR_EXPERT_EVICT=lru` for the LRU): the LRU hit nothing under one token's units. Raced on the 8 GB machine
+with a SATA-class disk against the engine of 10-03: the decode **0.57 -> 1.70 tok/s (Q8_0), 2.52 -> 8.02 (Q4_K)**,
+the same tokens in every run. `tests/bench_disk_misses.c` reads a decode's misses the way ours, colibri, ds4 and
+llama.cpp do, and a prompt's runs with 1-4 in flight. The races: `MACHINES_COUNTS=1` (counts, no marker),
+`AB_STOP` (a race stops once steady), `measure_runnable` (a held binary's copy a byte longer). Tests: test_experts
+branches `hot` and `disk` (13 mutations red), test_stream's plan and default eviction (3), test_ab_modes `stop` and
+`nostop`. `make check` green.
+Try: `MACHINES_COUNTS=1 MACHINES_LIST="weak weakhot" sh tools/machines.sh build/<dir>/trochilus.exe 1 q8` (~1 min);
+`MACHINES_LIST="weak aa" MACHINES_N=32 sh tools/machines.sh build/<dir>/trochilus.exe 5 q4k` (~10 min).
+
+### 2026-10-03 — AVX2's own Q4_K tile: the 8 GB machine's prompt 1.7x
+AVX2 had no W16 panel: a prompt's Q4_K groups went by rows, every weight decoded once a token. Now
+`avx2_q4x_panel` writes the W16 panel in scalar's bytes (16 rows transposed 8 x 8, the row terms by vpmaddwd) and
+`q4x_tile2_t` runs AVX-512's exact arithmetic in two halves of 8 rows (vpmaddwd + vpaddd for vpdpwssd, a blend for
+vpsraq, the 1.5 2^52 constant for vcvtqq2pd); the avx512 tier without VBMI takes them too. Each tier now names its
+widest tile (`q4x_tile_max`: AVX2 3, its T = 4 spills; the plan's room for tiles of 3). Raced on the 8 GB machine
+(two races, each against the binary before, the same tokens in all 68 runs): the Q4_K prompt **20.6 -> 35.1 tok/s**,
+with every expert in RAM 36.4 -> 137.9; the decode unchanged. `bench_q4x --prompt` (the panel and the tile apart,
+a token's cost by group size) and `tests/bench_q4x_genome.c` (the tile with one piece removed at a time) measure it;
+`machines.sh` has a `weakrold` arm. Tests: test_kernels' panel and tiles on avx2 and the new tile-width branch (groups
+of 4 and 8 counted), test_tier_used pins each tier's panel and width and counts tiles wider than it; 11 new mutations
+in `tools/mutate_q4x.sh` (`MUTATE_ONLY=` runs a subset), all red. `make check` green.
+Try: `TR_CPU_MAX=avx2 sh tools/bench_q4x.sh 15 --prompt`; `MACHINES_LIST="weakrold weakr aa"
+MACHINES_BIN_weakrold=<before> MACHINES_N=32 sh tools/machines.sh <binary> 5 q4k` (~5 min).
+
+### 2026-10-03 — A pass reads the next layer ahead: the 8 GB machine's prompt 1.21-1.29x
+The task was a second run in flight; on the 8 GB machine it gives nothing (its disk is one queue), and its one-pass
+prompt read every layer on demand with the compute never overlapped. Now `forward_pass` reads the next layer ahead
+once a layer named more than half its experts (`tr_experts_prefetch_n`, requests of at most 8 MiB a part,
+`TR_AHEAD_RUN_KIB`), and `tr_experts_prefetch_cancel` drops, before the next layer acquires, every unit of it still
+queued that it does not name; the layer-major prompt keeps its rule and long runs. The read ahead queues a layer under
+one lock and one wake (the I/O thread used to read the first unit alone, #284), and returns once the I/O thread has
+taken its first run (#286: the disk starts before the compute holds the cores). Raced on the 8 GB machine against the
+binary before (the same tokens in all 24 runs): the prompt **Q4_K 35.26 -> 45.49 tok/s, Q8_0 20.29 -> 24.55**, at
+97-98% of its disk's time for its bytes, the decode unchanged. Tests: test_prefetch's pass, cancel, major_kept,
+fail_pass and lru branches, test_experts' hot case (ds4's eviction never takes a slot in flight); `mutate_prefetch.sh`
+gets a dry pass and 12 new mutations: 39 red, 3 green and named (#283); the lint names a mutation text found twice where a script wants it once
+(#283); `machines.sh`'s counts keep the emulated disk and print `dropped` (#285). `make check` green.
+Try: `MACHINES_LIST="weak weakold" MACHINES_BIN_weakold=<before> MACHINES_N=32 sh tools/machines.sh <binary> 5 q4k`
+(~5 min); `MACHINES_COUNTS=1` for the counts.
+
+### 2026-10-03 — The prompt's routings told to the store: the 8 GB machine's decode 1.94x (Q4_K)
+The first decode tokens after a prompt missed 12.7 units a token against 7.8 later: a prompt's pass named each unit
+once and the store added 1 a call, so the decode began on the prompt's last layers. ds4 adds a prefill's every token
+row (read for the verdict: our "ds4's eviction" of 10-03 had only its decode half, #289). Now a call adds each unit
+its tokens' routings scaled to at most 64 tokens (`tr_experts_acquire_counts`, `TR_EXPERTS_HOT_PROMPT`; the counts
+come from the routing's own sort, `olmoe_refresh_experts`), replayed first on 7 traces (`tools/evict_replay.py`'s
+`once`, `ds4` and `heat`: the first 32 tokens 37% fewer misses than ours, 7% fewer than ds4's whole counts). On the 8
+GB machine, disk a decode token 42.9 -> 14.0 MiB (Q4_K), 233.8 -> 184.9 (Q8_0); the decode **Q4_K 8.00 -> 15.50, Q8_0 1.91 -> 2.38
+tok/s**, the prompts level, the same tokens. Tests: test_experts' `hot` with counts and `prompt`, test_prefetch's
+`heat` (`hot_extra`), the replay's two hand cases; 7 mutations red; test_prefetch's misses equality now under the
+LRU (#287). `make check` green.
+Try: `MACHINES_COUNTS=1 MACHINES_LIST="weak weakold" MACHINES_BIN_weakold=<before> MACHINES_N=32 sh tools/machines.sh
+<binary> 1 q4k q8` (the counts); `tools/.venv/Scripts/python.exe tools/evict_replay.py build/evict/Q4_K.trace --slots
+615` (the replay).
+
+### 2026-10-03 — The KV grown from the store's room
+A chat (and serve) plans the default context, and the plan set aside its whole KV at load (4096 positions F32, 1 GiB)
+for a conversation that had written none of it: on the 8 GB machine the store kept 131 Q8_0 slots where a run keeps
+290. Now the plan leaves the KV out and gives the store and the sessions' KV pages one room (olmoe.c `kv_room`): before
+each pass the session takes the pages its positions reach (`kv_hold`), and the store gives back a slot for each slot's
+bytes (`tr_experts_set_slots`: the coldest units go, the ones above the new count move below it with their bytes and
+recency, the pages go back to the system through `tr_pages_release`; the slab is now `tr_pages_alloc`). A freed session
+gives its KV back and the store takes its slots again; a context whose KV would leave the store under its minimum is
+refused by name, so chat's halving still finds one that fits. None of colibri, ds4 or llama.cpp does it (ORIGINS row 7).
+Counted on weak with a chat's plan (`-c 4096`): Q8_0 131 -> 278 slots, disk a decode token 375.9 -> 193.7 MiB; Q4_K
+314 -> 591, 87.4 -> 16.3; a run's own positions level; every bit the same. Raced (2026-10-04, median of 3): a chat's
+decode Q8_0 1.22 -> 2.29 tok/s, Q4_K 4.55 -> 14.77, the Q8_0 prompt 20.55 -> 24.59, the same tokens; `make check`
+green. Tests: test_experts' `slots`, test_stream's `kv_room`, test_base's `pages`; 17 mutations red
+(`tools/mutate_experts.sh` set_slots and pages, `tools/mutate_stream.sh` kv). `tools/machines.sh` takes `MACHINES_ARGS`.
+Try: `MACHINES_ARGS="-c 4096" MACHINES_COUNTS=1 MACHINES_LIST="weak weakold" MACHINES_BIN_weakold=<before> MACHINES_N=32
+sh tools/machines.sh <binary> 1 q4k q8`; a chat: `build/trochilus chat -m <Q8_0.gguf>` under `TR_MEM_TOTAL_MIB=8192
+TR_MEM_AVAILABLE_MIB=4608`, the slots in the `experts:` line of `--profile` runs.

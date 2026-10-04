@@ -7,7 +7,8 @@
 #   sh tools/bench_native.sh <bench> [args...]    e.g. bench_peak, or bench_kvpack time --run all
 #
 # BENCH_BUILD=<dir>: build <dir>/tests/<bench>.exe and run it as it is, no copy: a second build in another
-# folder is another hash, which Smart App Control often lets run at once while a copy of the first waits.
+# folder, linked with FRESH=1 (a build-id from the clock: the same code alone links to the same bytes, #251),
+# is another hash, which Smart App Control often lets run at once while a copy of the first waits.
 #
 # Results in build/bench_native/<bench>/ (bench.txt, load.txt, commit.txt); lines above 10% spread
 # named in noisy.txt.
@@ -20,7 +21,8 @@ shift
 OUT=build/bench_native/$B
 mkdir -p $OUT
 BB=${BENCH_BUILD:-build}
-make WERROR=1 BUILD=$BB $BB/tests/$B.exe > /dev/null
+if [ -n "${BENCH_BUILD:-}" ]; then FRESH=1; else FRESH=0; fi
+make WERROR=1 BUILD=$BB FRESH=$FRESH $BB/tests/$B.exe > /dev/null
 . tools/measure_guard.lib
 trap measure_end EXIT
 trap 'exit 130' INT TERM

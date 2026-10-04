@@ -1,7 +1,7 @@
 {
   "project": "Trochilus",
   "subtitle": "AI for the machines most people own: one model at a time, to the end, exact and at the theoretical limit on three machines",
-  "updated": "2026-10-02",
+  "updated": "2026-10-03",
   "states": {
     "done": "finished and proven: green tests in make check",
     "in-progress": "we are working on it now",
@@ -647,8 +647,8 @@
           "d": "2026-09-21"
         },
         {
-          "v": "real disk: 1.33-1.37 GB/s, as the bench says",
-          "d": "2026-09-21"
+          "v": "the disk at its limit: 1.9 GB/s at 2 MiB requests, 3.5 at 64 MiB (the request's size is the lever, not the order or the readers); BitLocker takes 3.8 more processors at 3.5 GB/s",
+          "d": "2026-10-02"
         }
       ],
       "questions": [],
@@ -773,7 +773,7 @@
       "milestone": "R1",
       "title": "The first prompt's cost",
       "state": "in-progress",
-      "what": "Under budget every startup rereads the model from disk. `trochilus serve` keeps the engine on (threads, model, expert store) between commands, and `run`, `chat`, `generate` run inside it on their own when it is up, with the same output to the byte. Measured: with the model fully in RAM the first prompt goes from 12.8 to 7.8 seconds, the load disappears. At half budget almost nothing (13.0 -> 12.0 s): every prompt rewrites the store from scratch, so there the lever is what to drop during the prompt. While the model loads a rainbow water bar shows (variant A). Next: reading while you type (question 48).",
+      "what": "Under budget every startup rereads the model from disk. `trochilus serve` keeps the engine on (threads, model, expert store) between commands, and `run`, `chat`, `generate` run inside it on their own when it is up, with the same output to the byte. Measured: with the model fully in RAM the first prompt goes from 12.8 to 7.8 seconds, the load disappears. At half budget almost nothing (13.0 -> 12.0 s): every prompt rewrites the store from scratch, so there the lever is what to drop during the prompt. While the model loads a rainbow water bar shows (variant A). The disk at its limit: a layer's consecutive experts are read in one request a part (96 requests for the whole model instead of 3072), into slot pages faulted beforehand over the pool. Next: reading while you type (question 48).",
       "numbers": [
         {
           "v": "with the server, model fully in RAM: first prompt 12.79 -> 7.81 s (removing the 4.98 s of loading)",
@@ -790,6 +790,18 @@
         {
           "v": "the bar: 63 mutations out of 63 caught by the tests",
           "d": "2026-09-23"
+        },
+        {
+          "v": "the expert reads at the disk's limit, model fully in RAM: the experts' read at load 4.07 -> 2.02 s (2.015x), the whole run 5.49 -> 3.48 s (1.576x)",
+          "d": "2026-10-02"
+        },
+        {
+          "v": "half budget, a first prompt: 321 tokens 4.39 -> 2.81 s (1.564x), 2048 tokens 1.090x; the 8 GB machine emulated 1.350x and 1.029x (its long prompt is compute)",
+          "d": "2026-10-02"
+        },
+        {
+          "v": "a run's three parts read in flight together instead of one after another: the read at load 2.03 -> 1.95 s (1.041x, 3.5 GB/s), the half-budget 321-token prompt's reads 1.026x (2.82 -> 2.76 s); the same tokens in all 54 runs. Less on the smaller requests, against the prediction",
+          "d": "2026-10-03"
         }
       ],
       "questions": [
@@ -812,12 +824,15 @@
       "files": [
         "src/app/serve.c",
         "tests/test_serve.c",
-        "tools/serve_first_prompt.sh"
+        "tools/serve_first_prompt.sh",
+        "src/memory/experts.c",
+        "tools/disk_race.sh"
       ],
       "commands": [
         "build/trochilus serve -m <gguf>",
         "build/trochilus serve --status",
-        "sh tools/serve_first_prompt.sh"
+        "sh tools/serve_first_prompt.sh",
+        "sh tools/disk_race.sh <binary> 8"
       ],
       "depends": [
         "m1-measurements"
@@ -828,7 +843,7 @@
       "milestone": "R1",
       "title": "Disk and compute together",
       "state": "done",
-      "what": "Before, the engine read, then computed, then read again: disk and cores waited on each other in turn. Now, in the long prompt, a separate thread reads the next layer's experts from disk while the cores compute the current one. Same numbers to the byte: only when the data arrives changes. Half the disk wait is still to be understood, and the short prompt (up to 512 tokens) still does not read ahead.",
+      "what": "Before, the engine read, then computed, then read again: disk and cores waited on each other in turn. Now, in the long prompt, a separate thread reads the next layer's experts from disk while the cores compute the current one. Same numbers to the byte: only when the data arrives changes. Since 10-03 a short prompt (one pass, up to 512 tokens) reads ahead too, in short requests, and what the next layer does not ask is dropped before it is read.",
       "numbers": [
         {
           "v": "prompt 2048 at half budget: 11.45 -> 9.39 s (1.22x), the computed ceiling was 1.61x",
@@ -841,6 +856,10 @@
         {
           "v": "70 MiB read extra out of 6 273 (1.1%)",
           "d": "2026-09-23"
+        },
+        {
+          "v": "one pass of 321 tokens on the 8 GB machine: 1.29x (Q4_K), 1.21x (Q8_0); 43-58 units dropped unread",
+          "d": "2026-10-03"
         }
       ],
       "questions": [
@@ -851,7 +870,7 @@
         }
       ],
       "files": [
-        "src/memory/experts.c (tr_experts_prefetch)",
+        "src/memory/experts.c (tr_experts_prefetch, _n, _cancel)",
         "src/base/threads.c (thread e monitor)",
         "tests/test_prefetch.c"
       ],
@@ -1068,17 +1087,94 @@
       "id": "r1-profiles",
       "milestone": "R1",
       "title": "The three machines and the theoretical limit",
-      "state": "next",
-      "what": "Every number of the rung measured on three machines, the two weaker ones emulated on this PC: below average (4 threads, AVX2 only, 8 GB, no GPU), average (8 threads, 16 GB, no dedicated GPU), this PC. Each machine's limit is its RAM's bandwidth divided by the bytes read a token; the engine is pushed toward it. On 8 GB the Q8_0 model (7 GB) needs its experts from disk.",
-      "numbers": [],
+      "state": "in-progress",
+      "what": "Every number of the rung measured on four machines, the weaker ones emulated on this PC: below average (4 threads, AVX2 only, 8 GB, an integrated GPU), average (8 threads, 16 GB, an integrated GPU only), average with a small dedicated GPU, this PC. The emulation gives fewer cores and less memory, never another GPU: an integrated GPU's numbers stay estimates until real PCs are available. Each machine's limit is its RAM's bandwidth divided by the bytes read a token; the engine is pushed toward it. On 8 GB the Q8_0 model (7 GB) needs its experts from disk. Measured on 10-03: the average machine and this PC are at their RAM's limit; the weak one was not. Its two brakes went the same night: the memory set aside for the run's own tokens instead of 4096, and ds4's rule for which expert leaves the RAM (replayed on the real routes before it was built): 3x its decode, with its disk emulated at a SATA-class 0.5 GB/s. The same day AVX2 got a Q4_K tile of its own (the weights decoded once for a group of tokens, in exact integers): the weak machine's Q4_K prompt 1.7x, its cores' 3.8x. Then its prompt waited for the disk 73% of its time: a second read in flight gives its one-queue disk nothing, but a prompt that fits one pass now reads each next layer while this one computes and drops what that layer does not ask: the prompt 1.21-1.29x, at 97-98% of the time its disk needs for its bytes. Then its first tokens after a prompt: the experts the prompt chose most now stay in RAM (ds4 counts a prompt's choices; ours had counted each expert once): its generation 8.00 -> 15.50 tok/s (Q4_K), 1.91 -> 2.38 (Q8_0). Left on it: chat's memory, a better eviction.",
+      "numbers": [
+        {
+          "v": "the same prompt and 64 tokens on the three machines, the same tokens on all of them: Q4_K generates 6.8 / 69.5 / 72.7 tok/s (weak / average / this PC), Q8_0 2.1 / 40.8 / 41.4; the average machine draws 103-108% of what its RAM gives, this PC 55-56 GB/s (its practical ceiling), the weak one 58-66% of its limit",
+          "d": "2026-10-03"
+        },
+        {
+          "v": "on 8 GB the Q8_0 keeps 83 experts in RAM, fewer than the 128 a token uses: the least-recently-used rule then finds none of them (0 hits in 9010), 816 MiB a token from disk",
+          "d": "2026-10-03"
+        },
+        {
+          "v": "this PC decodes at 98-99% of what its RAM gives in practice (56.3 GB/s measured, 68% of the nominal 83)",
+          "d": "2026-10-03"
+        },
+        {
+          "v": "the eviction replayed on the real routes before it was built: with 83 experts in RAM the least-recently-used rule hits 0 of the 128 a token uses, keeping the first layers 10, ds4's rule 47, the unreachable best 65",
+          "d": "2026-10-03"
+        },
+        {
+          "v": "on the 8 GB machine with its disk emulated (0.5 GB/s): the memory planned on the run's own tokens (Q8_0: 290 experts in RAM instead of 83) and ds4's rule take generation from 0.57 to 1.70 tok/s (Q8_0) and from 2.52 to 8.02 (Q4_K), the same tokens in every run",
+          "d": "2026-10-03"
+        },
+        {
+          "v": "AVX2's own Q4_K tile (the W16 panel in two halves, tiles of 3: a tile of 4 runs out of registers): the 8 GB machine's Q4_K prompt 20.6 -> 35.1 tok/s with its disk, 36.4 -> 137.9 with every expert in RAM; two races, each against the binary before, the same tokens in all 68 runs; the decode unchanged",
+          "d": "2026-10-03"
+        },
+        {
+          "v": "a one-pass prompt reads the next layer ahead in short requests and drops the unasked: the 8 GB machine's prompt Q4_K 35.3 -> 45.5 tok/s, Q8_0 20.3 -> 24.6, 2-3% more bytes, at 97-98% of its disk's time for them; the same tokens in all 24 runs, the decode unchanged",
+          "d": "2026-10-03"
+        },
+        {
+          "v": "the prompt's routings told to the eviction (scaled to 64 tokens; ds4 adds them whole, ours of 10-03 added 1 a pass): on the 8 GB machine disk a decode token 42.9 -> 14.0 MiB (Q4_K), 233.8 -> 184.9 (Q8_0); generation 8.00 -> 15.50 tok/s (Q4_K), 1.91 -> 2.38 (Q8_0), the same tokens",
+          "d": "2026-10-03"
+        },
+        {
+          "v": "a chat's memory for its whole context (4096 tokens, 1 GiB) no longer set aside at load: the experts hold it and hand it to the conversation a page at a time as it is written, which none of colibri, ds4 or llama.cpp does; on the 8 GB machine a chat keeps 278 Q8_0 experts instead of 131 and reads 194 MiB a token from disk instead of 376 (Q4_K 591 instead of 314, 16 instead of 87), and generates 2.29 tok/s instead of 1.22 (Q4_K 14.77 instead of 4.55), the same tokens",
+          "d": "2026-10-04"
+        },
+        {
+          "v": "the same idea offered to colibri, built in its fork and raced on its own engine (OLMoE int8, a 5 GB container): 26 experts a layer instead of 16, 37% fewer expert reads, a request 1.19x faster, the logits byte-identical; less than ours because colibri reads through the system's file cache, which already used part of that room; opened as colibri's pull request #1873 on 2026-10-04, waiting for its review",
+          "d": "2026-10-04"
+        }
+      ],
       "questions": [],
-      "files": [],
+      "files": [
+        "tools/machines.sh",
+        "src/models/olmoe.c (TR_MEM_TOTAL_MIB)",
+        "tests/test_stream.c (mem_available)",
+        "src/memory/experts.c (TR_EXPERTS_EVICT_HOT, the emulated disk)",
+        "src/models/olmoe.c (session_bytes, the plan)",
+        "tools/evict_replay.py",
+        "tests/bench_disk_misses.c",
+        "tests/bench_q4x_genome.c",
+        "src/memory/experts.c (tr_experts_set_slots)",
+        "src/models/olmoe.c (kv_room, kv_hold)",
+        "src/base/platform.c (tr_pages_*)"
+      ],
       "commands": [
-        "sh tools/decode_context.sh change-short <binary-before>"
+        "sh tools/machines.sh <binary> 8 q4k q8",
+        "MACHINES_COUNTS=1 MACHINES_LIST=\"weak weakhot\" sh tools/machines.sh <binary> 1 q8",
+        "tools/.venv/Scripts/python.exe tools/evict_replay.py <trace>",
+        "sh tools/machines.sh table build/machines",
+        "MACHINES_ARGS=\"-c 4096\" MACHINES_COUNTS=1 MACHINES_LIST=\"weak weakold\" MACHINES_BIN_weakold=<before> sh tools/machines.sh <binary> 1 q4k q8"
       ],
       "depends": [
         "m1-plan",
         "genome"
+      ]
+    },
+    {
+      "id": "r1-igpu",
+      "milestone": "R1",
+      "title": "The integrated GPU",
+      "state": "open",
+      "what": "Nearly every PC has a GPU inside its processor (Intel Iris Xe or UHD, AMD Radeon), sharing its RAM. It adds little to generation, which waits on the RAM or the disk, but the prompt is compute, and there it could give 3-5x on the 8 and 16 GB machines. Through Vulkan, loaded as a module like CUDA, the weights read where they already are (no copy: they share the RAM), the same bits as the CPU, and the CPU wherever a GPU cannot give them. After the 8 GB machine's two brakes, removed on 10-03 (3x its decode). Until real PCs are available, its numbers are estimates (question 88): this PC's Radeon 610M checks the bits, not the speed.",
+      "numbers": [],
+      "questions": [
+        {
+          "n": 88,
+          "state": "open",
+          "text": "what the integrated GPU gives on a real 8 or 16 GB laptop: until one is available, every number is an estimate"
+        }
+      ],
+      "files": [],
+      "commands": [],
+      "depends": [
+        "r1-profiles"
       ]
     },
     {
@@ -1438,15 +1534,22 @@
     {
       "id": "m6-vulkan",
       "milestone": "X",
-      "title": "Vulkan and Metal",
+      "title": "Metal, and two GPUs together",
       "state": "open",
-      "what": "The GPUs that are not NVIDIA: AMD, Intel, integrated, and Macs. Always as modules, always with the same tokens as the CPU.",
+      "what": "The Macs (Metal), always as a module, always with the same tokens as the CPU; and a machine with a dedicated and an integrated GPU using both (question 87): today the engine takes the dedicated one and leaves the integrated idle. The integrated GPU alone moved to R1 (the roadmap of 2026-10-03).",
       "numbers": [],
-      "questions": [],
+      "questions": [
+        {
+          "n": 87,
+          "state": "open",
+          "text": "the dedicated and the integrated GPU together: can the integrated take the work the dedicated cannot hold, reading the RAM in place, with the same bits?"
+        }
+      ],
       "files": [],
       "commands": [],
       "depends": [
-        "m3-experts"
+        "m3-experts",
+        "r1-igpu"
       ]
     },
     {

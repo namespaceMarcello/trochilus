@@ -6,9 +6,11 @@
 #   MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src trochilus-dev:local sh tools/mutate_q4x.sh
 #
 # One line per mutation, three checks: kernels (tests/test_kernels on the best tier: the W16 panel and
-# tiles), novbmi (the same under TR_CPU_MAX=avx512-novbmi: AVX2's kernels by rows) and tier (test_tier_used:
+# tiles), novbmi (the same under TR_CPU_MAX=avx512-novbmi: AVX2's kernels, by rows and its own W16 panel and tiles of
+# 3) and tier (test_tier_used:
 # the table's entries, every product through them). "no mutation" must be all green, every other line must
 # have at least one RED. The copy is built once and each mutation rebuilds only its file. About 15 minutes.
+# MUTATE_ONLY=<text>: only the mutations whose name holds it (and "no mutation").
 set -e
 # The body is one function, called on the last line (docs/LESSONS.md #69).
 main() {
@@ -47,6 +49,9 @@ run() {
     echo "$NAME: applies"
     return 0
   fi
+  if [ -n "${MUTATE_ONLY:-}" ] && [ "$NAME" != "no mutation" ]; then
+    case "$NAME" in *"$MUTATE_ONLY"*) ;; *) return 0 ;; esac
+  fi
   RES=""
   if make -j8 BUILD=b CC=gcc b/tests/test_kernels b/tests/test_tier_used > /tmp/mutq-build.log 2>&1; then
     if timeout 900 ./b/tests/test_kernels > /tmp/mutq-k.log 2>&1; then RES="$RES kernels=green"; else RES="$RES kernels=RED"; fi
@@ -67,7 +72,9 @@ run "no mutation" $C "static void k_q4x_prep(" "static void k_q4x_prep("
 # the scalar definition
 run "scalar prep: X truncated, not rounded" $C "const int32_t X = bad ? 0 : (int32_t)(((double)x[k] * f + magic) - magic);" \
   "const int32_t X = bad ? 0 : (int32_t)((double)x[k] * f);"
-run "shift: never one step down" $I "if (ldexp((double)m, sh) > TR_Q4X_XMAX) sh--;" "(void)0;"
+run "shift: never one step down" $I "if ((double)m * tr_pow2(sh) > TR_Q4X_XMAX) sh--;" "(void)0;"
+run "shift: a subnormal's exponent one too low" $I "e = len - 149;" "e = len - 150;"
+run "pow2: the exponent's bias one short" $I "uint64_t b = (uint64_t)(n + 1023) << 52;" "uint64_t b = (uint64_t)(n + 1022) << 52;"
 run "digits: the quotient truncated" $I "const int64_t q = x >= 0 ? (x + b / 2) / b : -((-x + b / 2) / b);" "const int64_t q = x / b;"
 run "block: the mins of the mirrored sub-block" $C "M += (int64_t)m[j] * (int64_t)v->bf[8 * s + j];" \
   "M += (int64_t)m[7 - j] * (int64_t)v->bf[8 * s + j];"
@@ -153,7 +160,7 @@ run "avx512 xt: the kernel of 3 in the slot of 2" $X "{NULL, NULL, avx512_q4x_do
   "{NULL, NULL, avx512_q4x_dot_xt_3, avx512_q4x_dot_xt_3}"
 run "avx512 xt: the kernel of 2 in the slot of 3" $X "{NULL, NULL, avx512_q4x_dot_xt_2, avx512_q4x_dot_xt_3}" \
   "{NULL, NULL, avx512_q4x_dot_xt_2, avx512_q4x_dot_xt_2}"
-# AVX2 (by rows; the avx512 tier's under the novbmi cap)
+# AVX2 (by rows and its W16 panel in two halves; the avx512 tier's under the novbmi cap)
 run "avx2 prep: the second factor dropped (blocks past 2^-96)" $X \
   "_mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(x + k), fa), fb)" "_mm256_mul_ps(_mm256_loadu_ps(x + k), fa)"
 run "avx2 dot2: digit 0 of the second 16 columns from the first" $X "(const __m256i *)(const void *)(v0 + 64 * c + 16 * i)" \
@@ -163,6 +170,29 @@ run "avx2 dot2: the value fused (the cancelling mins)" $X \
   "fma((double)tr_half_to_float(hd), (double)(t0 + (int64_t)TR_Q4X_BASE * t1),@@                               -((double)tr_half_to_float(hm) * (double)M));"
 run "avx2 dot2: the sums from -0.0 (the signed zero)" $X "double y[2] = {0.0, 0.0};@@    for (int64_t s = 0;" \
   "double y[2] = {-0.0, -0.0};@@    for (int64_t s = 0;"
+run "avx2 panel: the bias on the odd rows" $X \
+  "_mm256_setr_epi32(INT32_MIN, 0, INT32_MIN, 0, INT32_MIN, 0, INT32_MIN, 0)" \
+  "_mm256_setr_epi32(0, INT32_MIN, 0, INT32_MIN, 0, INT32_MIN, 0, INT32_MIN)"
+run "avx2 panel: the transpose's row pair 1 with its halves swapped" $X "r[1] = _mm256_permute2x128_si256(s1, s5, 0x20);" \
+  "r[1] = _mm256_permute2x128_si256(s1, s5, 0x02);"
+run "avx2 panel: the row term without the second 16 columns" $X \
+  "_mm256_add_epi32(_mm256_madd_epi16(l0[u], h0[u]), _mm256_madd_epi16(l1[u], h1[u]))" "_mm256_madd_epi16(l0[u], h0[u])"
+run "avx2 tile: the odd row's dword not sign-extended" $X \
+  "return _mm256_blend_epi32(_mm256_srli_epi64(a, 32), _mm256_srai_epi32(a, 31), 0xAA);" "return _mm256_srli_epi64(a, 32);"
+run "avx2 tile: int64 to f64 by 2^52 (the negatives wrong)" $X \
+  "_mm256_set1_epi64x(0x4338000000000000ll))),@@                         _mm256_set1_pd(6755399441055744.0));" \
+  "_mm256_set1_epi64x(0x4330000000000000ll))),@@                         _mm256_set1_pd(4503599627370496.0));"
+run "avx2 tile: digit 1's f2 from the high column" $X \
+  "const __m256i f2b = _mm256_add_epi16(wh, _mm256_set1_epi32(q4x_ld32(v[t].v1 + k0 + 2 * u)));" \
+  "const __m256i f2b = _mm256_add_epi16(wh, _mm256_set1_epi32(q4x_ld32(v[t].v1 + k0 + 32 + 2 * u)));"
+run "avx2 tile: the second half with the first half's constants" $X \
+  "const double *cst = (const double *)(const void *)sb + 4 * hh;@@            __m256i ae[TR_Q4X_TILE_MAX][2]" \
+  "const double *cst = (const double *)(const void *)sb;@@            __m256i ae[TR_Q4X_TILE_MAX][2]"
+run "avx2 tile: the outputs' even and odd rows swapped" $X "_mm_storeu_ps(yt, _mm_unpacklo_ps(e, o));" \
+  "_mm_storeu_ps(yt, _mm_unpacklo_ps(o, e));"
+run "table: the avx2 tiles of 4 (they spill)" $X "g_avx2.q4x_tile_max = 3;" "g_avx2.q4x_tile_max = 4;"
+run "driver: the plan's tiles of 4 whatever the tier" $C "c->min_rows, k->q4x_tile_max," "c->min_rows, TR_Q4X_TILE_MAX,"
+run "table: the avx2 panel road left out" $X "g_avx2.q4x_panel = avx2_q4x_panel;" "(void)avx2_q4x_panel;"
 run "table: the W16 panel left out" $X "g_avx512.q4x_panel = avx512_q4x_panel;" "(void)avx512_q4x_panel;"
 run "table: the avx512 xt left scalar's" $X "g_avx512.q4x_dot_xt = avx512_q4x_dot_xt;" "(void)avx512_q4x_dot_xt;"
 # the prep once a row (docs/MEASUREMENTS.md §The prep once a row): the rows read in place, a grouped row through the map

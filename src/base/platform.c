@@ -35,7 +35,9 @@
 #  include <sched.h>
 #  include <time.h>
 #  include <unistd.h>
+#  include <sys/mman.h>
 #  include <sys/stat.h>
+#  include <sys/uio.h>
 #  if defined(__APPLE__)
 #    include <mach/mach.h>
 #    include <mach/mach_host.h>
@@ -219,12 +221,134 @@ int tr_file_pread(const tr_file *f, void *buf, size_t n, uint64_t offset) {
     return 0;
 }
 
+size_t tr_file_preadv_scratch(size_t n) {
+    return (n / TR_FILE_DIRECT_ALIGN + 1) * sizeof(FILE_SEGMENT_ELEMENT);
+}
+
+size_t tr_file_preadv_n_scratch(size_t total, int n) {
+    return (total / TR_FILE_DIRECT_ALIGN + (size_t)n) * sizeof(FILE_SEGMENT_ELEMENT);
+}
+
+/* One direct request of tr_file_preadv_n: issued (its pages listed in seg, then ReadFileScatter),
+ * finished later. in_flight 0: nothing to wait for, rc is its result. */
+typedef struct {
+    OVERLAPPED ov;
+    size_t total;
+    uint64_t offset;
+    int in_flight, rc;
+} preadv_op;
+
+static void preadv_issue(const tr_file *f, const tr_readv_req *r, FILE_SEGMENT_ELEMENT *seg, preadv_op *op) {
+    size_t pages = 0;
+    for (int i = 0; i < r->cnt; i++)
+        for (size_t at = 0; at < r->iov[i].n; at += TR_FILE_DIRECT_ALIGN)
+            seg[pages++].Buffer = PtrToPtr64((unsigned char *)r->iov[i].base + at);
+    seg[pages].Buffer = NULL;
+    op->total = pages * TR_FILE_DIRECT_ALIGN;
+    op->offset = r->offset;
+    op->in_flight = 0;
+    op->rc = 0;
+    if (op->total == 0) return;
+    if (op->total > 0x7FFFF000u) {
+        op->rc = -1;
+        return;
+    }
+    memset(&op->ov, 0, sizeof op->ov);
+    op->ov.Offset = (DWORD)(r->offset & 0xFFFFFFFFu);
+    op->ov.OffsetHigh = (DWORD)(r->offset >> 32);
+    op->ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (op->ov.hEvent == NULL) {
+        op->rc = -1;
+        return;
+    }
+    BOOL ok = ReadFileScatter(f->handle, seg, (DWORD)op->total, NULL, &op->ov);
+    DWORD gle = ok ? 0 : GetLastError();
+    if (ok || gle == ERROR_IO_PENDING) {
+        op->in_flight = 1;
+        return;
+    }
+    CloseHandle(op->ov.hEvent);
+    op->rc = gle == ERROR_HANDLE_EOF ? 0 : -1; /* wholly past the real end: as tr_file_pread */
+}
+
+static int preadv_finish(const tr_file *f, preadv_op *op) {
+    if (!op->in_flight) return op->rc;
+    DWORD got = 0;
+    BOOL ok = GetOverlappedResult(f->handle, &op->ov, &got, TRUE);
+    DWORD gle = ok ? 0 : GetLastError();
+    CloseHandle(op->ov.hEvent);
+    if (!ok) return gle == ERROR_HANDLE_EOF ? 0 : -1;
+    if (got == op->total) return 0;
+    /* short: only the file's real end may stop it, as for tr_file_pread on a direct handle */
+    int64_t size = tr_file_size(f);
+    return size >= 0 && op->offset + got >= (uint64_t)size ? 0 : -1;
+}
+
+int tr_file_preadv_n(const tr_file *f, const tr_readv_req *req, int n, void *scratch) {
+    if (n < 1 || n > TR_FILE_PREADV_MAX) return -1;
+    if (!f->direct) { /* ReadFileScatter wants an unbuffered handle: a read a piece, a request after another */
+        for (int k = 0; k < n; k++) {
+            uint64_t offset = req[k].offset;
+            for (int i = 0; i < req[k].cnt; i++) {
+                if (tr_file_pread(f, req[k].iov[i].base, req[k].iov[i].n, offset) != 0) return -1;
+                offset += req[k].iov[i].n;
+            }
+        }
+        return 0;
+    }
+    /* every request in flight before the first is waited for; each one's pages listed after the last's */
+    preadv_op op[TR_FILE_PREADV_MAX];
+    FILE_SEGMENT_ELEMENT *seg = (FILE_SEGMENT_ELEMENT *)scratch;
+    for (int k = 0; k < n; k++) {
+        preadv_issue(f, &req[k], seg, &op[k]);
+        seg += op[k].total / TR_FILE_DIRECT_ALIGN + 1;
+    }
+    int rc = 0;
+    for (int k = 0; k < n; k++)
+        if (preadv_finish(f, &op[k]) != 0) rc = -1;
+    return rc;
+}
+
+int tr_file_preadv(const tr_file *f, const tr_iov *iov, int cnt, uint64_t offset, void *scratch) {
+    tr_readv_req r = {iov, cnt, offset};
+    return tr_file_preadv_n(f, &r, 1, scratch);
+}
+
 void *tr_alloc_aligned(size_t n, size_t align) {
     return _aligned_malloc(n, align);
 }
 
 void tr_free_aligned(void *p) {
     _aligned_free(p);
+}
+
+static size_t page_size(void) {
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return si.dwPageSize > 0 ? (size_t)si.dwPageSize : 4096;
+}
+
+void *tr_pages_alloc(size_t n) {
+    return n > 0 ? VirtualAlloc(NULL, n, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) : NULL;
+}
+
+void tr_pages_free(void *p, size_t n) {
+    (void)n;
+    if (p != NULL) VirtualFree(p, 0, MEM_RELEASE);
+}
+
+int tr_pages_release(void *p, size_t n) {
+    size_t pg = page_size();
+    uintptr_t lo = ((uintptr_t)p + pg - 1) / pg * pg, hi = ((uintptr_t)p + n) / pg * pg;
+    if (hi <= lo) return 0;
+    return VirtualFree((void *)lo, (SIZE_T)(hi - lo), MEM_DECOMMIT) ? 0 : -1;
+}
+
+int tr_pages_commit(void *p, size_t n) {
+    size_t pg = page_size();
+    uintptr_t lo = (uintptr_t)p / pg * pg, hi = ((uintptr_t)p + n + pg - 1) / pg * pg;
+    if (hi <= lo) return 0;
+    return VirtualAlloc((void *)lo, (SIZE_T)(hi - lo), MEM_COMMIT, PAGE_READWRITE) != NULL ? 0 : -1;
 }
 
 double tr_time_sec(void) {
@@ -237,6 +361,26 @@ double tr_time_sec(void) {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     return (double)now.QuadPart / (double)freq.QuadPart;
+}
+
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#  define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+void tr_wait_until(double t) {
+    double left = t - tr_time_sec() - 0.001;
+    if (left > 0) {
+        /* Sleep's tick is 1-15.6 ms; a high-resolution timer (Windows 10 1803+) wakes within ~0.5 */
+        HANDLE h = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        LARGE_INTEGER due;
+        due.QuadPart = -(LONGLONG)(left * 1e7); /* relative, in 100 ns */
+        if (h != NULL && SetWaitableTimer(h, &due, 0, NULL, NULL, FALSE))
+            WaitForSingleObject(h, INFINITE);
+        else if (left > 0.016)
+            Sleep((DWORD)((left - 0.016) * 1000.0));
+        if (h != NULL) CloseHandle(h);
+    }
+    while (tr_time_sec() < t) YieldProcessor();
 }
 
 int tr_thread_pin(unsigned group, const unsigned short *lcpus, int n, tr_affinity *prev) {
@@ -373,6 +517,63 @@ int tr_file_pread(const tr_file *f, void *buf, size_t n, uint64_t offset) {
     return 0;
 }
 
+size_t tr_file_preadv_scratch(size_t n) {
+    (void)n;
+    return 0;
+}
+
+int tr_file_preadv(const tr_file *f, const tr_iov *iov, int cnt, uint64_t offset, void *scratch) {
+    (void)scratch;
+    enum { BATCH = 64 }; /* pieces handed to one preadv; IOV_MAX is at least 1024 */
+    int i = 0;
+    size_t done = 0; /* bytes of iov[i] already read */
+    while (i < cnt) {
+        if (iov[i].n == done) {
+            i++, done = 0;
+            continue;
+        }
+        struct iovec v[BATCH];
+        int k = 0;
+        for (int j = i; j < cnt && k < BATCH; j++, k++) {
+            v[k].iov_base = (unsigned char *)iov[j].base + (j == i ? done : 0);
+            v[k].iov_len = iov[j].n - (j == i ? done : 0);
+        }
+        ssize_t got = preadv(f->fd, v, k, (off_t)offset);
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        /* the real end, as tr_file_pread: an error on a buffered file, not on a direct one */
+        if (got == 0) return f->direct ? 0 : -1;
+        if (f->direct && (size_t)got % TR_FILE_DIRECT_ALIGN != 0) return 0;
+        offset += (uint64_t)got;
+        for (size_t left = (size_t)got; left > 0;) {
+            size_t room = iov[i].n - done;
+            if (left < room) {
+                done += left;
+                left = 0;
+            } else {
+                left -= room;
+                i++, done = 0;
+            }
+        }
+    }
+    return 0;
+}
+
+size_t tr_file_preadv_n_scratch(size_t total, int n) {
+    (void)total, (void)n;
+    return 0;
+}
+
+/* one after the other: a preadv waits for its bytes, and nothing here puts two in flight */
+int tr_file_preadv_n(const tr_file *f, const tr_readv_req *req, int n, void *scratch) {
+    if (n < 1 || n > TR_FILE_PREADV_MAX) return -1;
+    for (int k = 0; k < n; k++)
+        if (tr_file_preadv(f, req[k].iov, req[k].cnt, req[k].offset, scratch) != 0) return -1;
+    return 0;
+}
+
 void *tr_alloc_aligned(size_t n, size_t align) {
     void *p = NULL;
     if (posix_memalign(&p, align, n) != 0) return NULL;
@@ -383,10 +584,56 @@ void tr_free_aligned(void *p) {
     free(p);
 }
 
+static size_t page_size(void) {
+    long pg = sysconf(_SC_PAGESIZE);
+    return pg > 0 ? (size_t)pg : 4096;
+}
+
+void *tr_pages_alloc(size_t n) {
+    if (n == 0) return NULL;
+    void *p = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return p == MAP_FAILED ? NULL : p;
+}
+
+void tr_pages_free(void *p, size_t n) {
+    if (p != NULL) munmap(p, n);
+}
+
+int tr_pages_release(void *p, size_t n) {
+    size_t pg = page_size();
+    uintptr_t lo = ((uintptr_t)p + pg - 1) / pg * pg, hi = ((uintptr_t)p + n) / pg * pg;
+    if (hi <= lo) return 0;
+#if defined(__APPLE__)
+    /* macOS keeps MADV_DONTNEED's pages; MADV_FREE hands them to the system */
+    return madvise((void *)lo, hi - lo, MADV_FREE) == 0 ? 0 : -1;
+#else
+    return madvise((void *)lo, hi - lo, MADV_DONTNEED) == 0 ? 0 : -1;
+#endif
+}
+
+int tr_pages_commit(void *p, size_t n) {
+    (void)p;
+    (void)n;
+    return 0;
+}
+
 double tr_time_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+void tr_wait_until(double t) {
+    for (;;) {
+        double left = t - tr_time_sec() - 0.001;
+        if (left <= 0) break;
+        struct timespec ts;
+        ts.tv_sec = (time_t)left;
+        ts.tv_nsec = (long)((left - (double)ts.tv_sec) * 1e9);
+        nanosleep(&ts, NULL); /* a signal cuts it short: the loop sleeps the rest */
+    }
+    while (tr_time_sec() < t) {
+    }
 }
 
 #if defined(__linux__)

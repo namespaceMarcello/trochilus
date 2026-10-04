@@ -6,7 +6,17 @@
  * (and as big as three, as if an expert's matrices were stored together), at random aligned
  * positions of a big file, with 1, 2, 4, 8 and 16 readers at once.
  *
- *   bench_disk <big file> [--block <bytes>] [--runs N]
+ *   bench_disk <big file> [--block <bytes>] [--runs N] [--seq] [--handles] [--scatter <bytes>]
+ *
+ *   --seq      a run's blocks one after another from a random aligned start, claimed in file order by
+ *              whichever reader is free: one stream with `readers` requests in flight, as a reader of
+ *              a whole layer's experts would issue them (question 41: the request's size or the order?)
+ *   --handles  the direct file opened once per reader instead of once for all: does something
+ *              serialize the requests of one handle?
+ *   --scatter  each direct block read by one request into pieces of <bytes> (a multiple of 4096) placed
+ *              a page apart, as one read of a whole GGUF tensor landing in the store's slots would:
+ *              ReadFileScatter on Windows (one element per page), preadv elsewhere; checked byte for
+ *              byte against a plain read before any number
  *
  *   direct   the file opened so that the system keeps no copy (FILE_FLAG_NO_BUFFERING, O_DIRECT,
  *            F_NOCACHE): what the disk itself gives, every time, also the first
@@ -22,6 +32,7 @@
 #if defined(__linux__) && !defined(_GNU_SOURCE)
 #define _GNU_SOURCE /* O_DIRECT */
 #endif
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,58 +46,73 @@
 #else
 #  include <errno.h>
 #  include <fcntl.h>
+#  include <sys/uio.h>
 #  include <unistd.h>
 #endif
 
-enum { MAX_READERS = 16, MAX_BLOCKS = 256, ALIGN = 4096, MAX_RUNS = 15 };
+enum { MAX_READERS = 16, MAX_BLOCKS = 256, ALIGN = 4096, MAX_RUNS = 15, MAX_PIECES = 1024 };
 #define RUN_BYTES (128u << 20) /* a run reads about this much */
 #define TIME_LIMIT_SEC 50.0
 
 /* ---- a file the system keeps no copy of ---- */
 typedef struct {
+    int n_handles; /* 1, or MAX_READERS with --handles: reader i reads through handle i % n_handles */
 #if defined(_WIN32)
-    HANDLE h;
+    HANDLE h[MAX_READERS];
     HANDLE ev[MAX_READERS]; /* one event per reader: a read waits on its own */
+    FILE_SEGMENT_ELEMENT *seg[MAX_READERS]; /* --scatter: one element per page, and the closing NULL */
 #else
-    int fd;
+    int fd[MAX_READERS];
 #endif
 } raw_file;
 
-static int raw_open(raw_file *f, const char *path) {
+static int raw_open(raw_file *f, const char *path, int n_handles) {
+    f->n_handles = n_handles;
 #if defined(_WIN32)
     wchar_t wpath[1024];
     if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 1024) == 0) return -1;
-    f->h = CreateFileW(wpath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
-                       FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, NULL);
-    if (f->h == INVALID_HANDLE_VALUE) return -1;
+    for (int i = 0; i < n_handles; i++) {
+        f->h[i] = CreateFileW(wpath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                              FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, NULL);
+        if (f->h[i] == INVALID_HANDLE_VALUE) return -1;
+    }
     for (int i = 0; i < MAX_READERS; i++) {
         f->ev[i] = CreateEventW(NULL, TRUE, FALSE, NULL);
         if (f->ev[i] == NULL) return -1;
     }
     return 0;
-#elif defined(__APPLE__)
-    f->fd = open(path, O_RDONLY);
-    if (f->fd < 0) return -1;
-    return fcntl(f->fd, F_NOCACHE, 1) == -1 ? -1 : 0;
 #else
-    f->fd = open(path, O_RDONLY | O_DIRECT);
-    return f->fd < 0 ? -1 : 0;
+    for (int i = 0; i < n_handles; i++) {
+#  if defined(__APPLE__)
+        f->fd[i] = open(path, O_RDONLY);
+        if (f->fd[i] < 0 || fcntl(f->fd[i], F_NOCACHE, 1) == -1) return -1;
+#  else
+        f->fd[i] = open(path, O_RDONLY | O_DIRECT);
+        if (f->fd[i] < 0) return -1;
+#  endif
+    }
+    return 0;
 #endif
 }
 
 static void raw_close(raw_file *f) {
 #if defined(_WIN32)
-    for (int i = 0; i < MAX_READERS; i++)
+    for (int i = 0; i < MAX_READERS; i++) {
         if (f->ev[i] != NULL) CloseHandle(f->ev[i]);
-    if (f->h != INVALID_HANDLE_VALUE) CloseHandle(f->h);
+        free(f->seg[i]);
+    }
+    for (int i = 0; i < f->n_handles; i++)
+        if (f->h[i] != NULL && f->h[i] != INVALID_HANDLE_VALUE) CloseHandle(f->h[i]);
 #else
-    if (f->fd >= 0) close(f->fd);
+    for (int i = 0; i < f->n_handles; i++)
+        if (f->fd[i] > 0) close(f->fd[i]);
 #endif
 }
 
 /* n and offset multiples of ALIGN, buf aligned to ALIGN */
 static int raw_read(raw_file *f, int reader, void *buf, size_t n, uint64_t offset) {
 #if defined(_WIN32)
+    HANDLE h = f->h[reader % f->n_handles];
     unsigned char *p = (unsigned char *)buf;
     while (n > 0) {
         OVERLAPPED ov;
@@ -95,9 +121,9 @@ static int raw_read(raw_file *f, int reader, void *buf, size_t n, uint64_t offse
         ov.OffsetHigh = (DWORD)(offset >> 32);
         ov.hEvent = f->ev[reader];
         DWORD got = 0;
-        if (!ReadFile(f->h, p, (DWORD)n, &got, &ov)) {
+        if (!ReadFile(h, p, (DWORD)n, &got, &ov)) {
             if (GetLastError() != ERROR_IO_PENDING) return -1;
-            if (!GetOverlappedResult(f->h, &ov, &got, TRUE)) return -1;
+            if (!GetOverlappedResult(h, &ov, &got, TRUE)) return -1;
         }
         if (got == 0 || got % ALIGN != 0) return -1;
         p += got;
@@ -106,10 +132,10 @@ static int raw_read(raw_file *f, int reader, void *buf, size_t n, uint64_t offse
     }
     return 0;
 #else
-    (void)reader;
+    int fd = f->fd[reader % f->n_handles];
     unsigned char *p = (unsigned char *)buf;
     while (n > 0) {
-        ssize_t got = pread(f->fd, p, n, (off_t)offset);
+        ssize_t got = pread(fd, p, n, (off_t)offset);
         if (got < 0 && errno == EINTR) continue;
         if (got <= 0) return -1;
         p += got;
@@ -117,6 +143,49 @@ static int raw_read(raw_file *f, int reader, void *buf, size_t n, uint64_t offse
         n -= (size_t)got;
     }
     return 0;
+#endif
+}
+
+/* --scatter: piece j of a block lands at buf + j * (piece + ALIGN), one page of gap between pieces */
+static size_t scatter_bytes(size_t n, size_t piece) {
+    return (n + piece - 1) / piece * (piece + ALIGN);
+}
+
+static unsigned char *scatter_at(void *buf, size_t piece, size_t at) {
+    return (unsigned char *)buf + at / piece * (piece + ALIGN) + at % piece;
+}
+
+/* the whole block in one request, its pieces apart: n, offset and piece multiples of ALIGN */
+static int raw_read_scatter(raw_file *f, int reader, void *buf, size_t n, uint64_t offset, size_t piece) {
+#if defined(_WIN32)
+    HANDLE h = f->h[reader % f->n_handles];
+    FILE_SEGMENT_ELEMENT *seg = f->seg[reader];
+    size_t pages = n / ALIGN;
+    for (size_t i = 0; i < pages; i++) seg[i].Buffer = PtrToPtr64(scatter_at(buf, piece, i * ALIGN));
+    seg[pages].Buffer = NULL;
+    OVERLAPPED ov;
+    memset(&ov, 0, sizeof ov);
+    ov.Offset = (DWORD)(offset & 0xFFFFFFFFu);
+    ov.OffsetHigh = (DWORD)(offset >> 32);
+    ov.hEvent = f->ev[reader];
+    DWORD got = 0;
+    if (!ReadFileScatter(h, seg, (DWORD)n, NULL, &ov)) {
+        if (GetLastError() != ERROR_IO_PENDING) return -1;
+    }
+    if (!GetOverlappedResult(h, &ov, &got, TRUE)) return -1;
+    return got == n ? 0 : -1;
+#else
+    int fd = f->fd[reader % f->n_handles];
+    struct iovec iov[MAX_PIECES];
+    int cnt = 0;
+    for (size_t at = 0; at < n; at += piece, cnt++) {
+        iov[cnt].iov_base = scatter_at(buf, piece, at);
+        iov[cnt].iov_len = n - at < piece ? n - at : piece;
+    }
+    ssize_t got;
+    do got = preadv(fd, iov, cnt, (off_t)offset);
+    while (got < 0 && errno == EINTR);
+    return got == (ssize_t)n ? 0 : -1;
 #endif
 }
 
@@ -214,21 +283,46 @@ typedef struct {
     void *buf[MAX_READERS];
     uint64_t *sums; /* first + last 8 bytes of every block: the bytes really arrived */
     int failed;
+    _Atomic int64_t next; /* --seq: the next block in file order, claimed by whichever reader is free */
+    int64_t n_blocks;
+    size_t piece; /* --scatter on the direct reads, or 0 */
 } run_ctx;
+
+static void read_one(run_ctx *c, int64_t i, int worker) {
+    int scatter = c->raw != NULL && c->piece > 0;
+    int rc = scatter          ? raw_read_scatter(c->raw, worker, c->buf[worker], c->block, c->offs[i], c->piece)
+             : c->raw != NULL ? raw_read(c->raw, worker, c->buf[worker], c->block, c->offs[i])
+                              : tr_file_pread(c->file, c->buf[worker], c->block, c->offs[i]);
+    if (rc != 0) {
+        c->failed = 1;
+        return;
+    }
+    uint64_t a, b;
+    memcpy(&a, c->buf[worker], 8);
+    memcpy(&b, scatter ? scatter_at(c->buf[worker], c->piece, c->block - 8)
+                       : (const unsigned char *)c->buf[worker] + c->block - 8, 8);
+    c->sums[i] = a + b;
+}
 
 static void read_body(void *ctx_, int64_t begin, int64_t end, int worker) {
     run_ctx *c = (run_ctx *)ctx_;
-    for (int64_t i = begin; i < end; i++) {
-        int rc = c->raw != NULL ? raw_read(c->raw, worker, c->buf[worker], c->block, c->offs[i])
-                                : tr_file_pread(c->file, c->buf[worker], c->block, c->offs[i]);
-        if (rc != 0) {
-            c->failed = 1;
-            continue;
-        }
-        uint64_t a, b;
-        memcpy(&a, c->buf[worker], 8);
-        memcpy(&b, (const unsigned char *)c->buf[worker] + c->block - 8, 8);
-        c->sums[i] = a + b;
+    for (int64_t i = begin; i < end; i++) read_one(c, i, worker);
+}
+
+/* --seq: called with one index per reader; each claims blocks in file order until none is left */
+static void claim_body(void *ctx_, int64_t begin, int64_t end, int worker) {
+    run_ctx *c = (run_ctx *)ctx_;
+    (void)begin, (void)end;
+    for (int64_t i; (i = atomic_fetch_add(&c->next, 1)) < c->n_blocks;) read_one(c, i, worker);
+}
+
+/* one run's reads: random blocks split in contiguous chunks, or (--seq) one stream claimed in order */
+static void run_reads(tr_pool *pool, run_ctx *c, int readers, int seq) {
+    if (seq) {
+        atomic_store(&c->next, 0);
+        tr_parallel_for(pool, readers, 1, claim_body, c);
+    } else {
+        tr_parallel_for(pool, c->n_blocks, 1, read_body, c);
     }
 }
 
@@ -246,6 +340,13 @@ static void pick_offsets(uint64_t *offs, int n, uint64_t file_size, size_t block
     }
 }
 
+static void pick_offsets_seq(uint64_t *offs, int n, uint64_t file_size, size_t block) {
+    uint64_t slots = (file_size - (uint64_t)n * block) / ALIGN;
+    uint64_t r = ((uint64_t)rng() << 24) ^ rng();
+    uint64_t start = (r % slots) * ALIGN;
+    for (int i = 0; i < n; i++) offs[i] = start + (uint64_t)i * block;
+}
+
 static int cmp_double(const void *a, const void *b) {
     double x = *(const double *)a, y = *(const double *)b;
     return x < y ? -1 : x > y;
@@ -260,7 +361,7 @@ static void print_line(const char *what, size_t block, int readers, int n_blocks
     double med = (n % 2) ? sec[n / 2] : 0.5 * (sec[n / 2 - 1] + sec[n / 2]);
     double mb = (double)block * n_blocks / 1e6;
     /* the fastest run has the smallest time: min MB/s comes from sec[n - 1] */
-    printf("%-14s block %8zu  readers %2d: median %8.1f MB/s (%6.2f ms a block)  min %8.1f  max %8.1f  spread %5.1f%%  n=%d\n",
+    printf("%-18s block %9zu  readers %2d: median %8.1f MB/s (%6.2f ms a block)  min %8.1f  max %8.1f  spread %5.1f%%  n=%d\n",
            what, block, readers, mb / med, med / n_blocks * 1e3, mb / sec[n - 1], mb / sec[0],
            (sec[n - 1] - sec[0]) / med * 100.0, n);
 }
@@ -269,17 +370,24 @@ int main(int argc, char **argv) {
     const char *path = NULL;
     /* one Q8_0 expert matrix of OLMoE-1B-7B (1024 x 2048 weights, 34 bytes per 32), and three */
     size_t blocks[2] = {2228224, 3 * 2228224};
-    int n_sizes = 2, runs = 5, bad = 0;
+    int n_sizes = 2, runs = 5, bad = 0, seq = 0, n_handles = 1;
+    size_t piece = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--block") == 0 && i + 1 < argc) {
             blocks[0] = ((size_t)atoll(argv[++i]) + ALIGN - 1) / ALIGN * ALIGN;
             n_sizes = 1;
         } else if (strcmp(argv[i], "--runs") == 0 && i + 1 < argc) runs = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--seq") == 0) seq = 1;
+        else if (strcmp(argv[i], "--handles") == 0) n_handles = MAX_READERS;
+        else if (strcmp(argv[i], "--scatter") == 0 && i + 1 < argc) piece = (size_t)atoll(argv[++i]);
         else if (path == NULL && argv[i][0] != '-') path = argv[i];
         else bad = 1;
     }
-    if (bad || path == NULL || runs < 1 || runs > MAX_RUNS || blocks[0] < ALIGN) {
-        fprintf(stderr, "usage: bench_disk <big file> [--block <bytes>] [--runs N]  (N <= %d)\n", MAX_RUNS);
+    if (bad || path == NULL || runs < 1 || runs > MAX_RUNS || blocks[0] < ALIGN || piece % ALIGN != 0 ||
+        (piece > 0 && blocks[n_sizes - 1] / piece >= MAX_PIECES)) {
+        fprintf(stderr, "usage: bench_disk <big file> [--block <bytes>] [--runs N] [--seq] [--handles] "
+                        "[--scatter <bytes, a multiple of %d, under %d pieces a block>]  (N <= %d)\n",
+                ALIGN, MAX_PIECES, MAX_RUNS);
         return 2;
     }
 
@@ -292,24 +400,57 @@ int main(int argc, char **argv) {
     uint64_t size = (uint64_t)tr_file_size(file);
     raw_file raw;
     memset(&raw, 0, sizeof raw);
-    if (size < 64u * blocks[n_sizes - 1] || raw_open(&raw, path) != 0) {
-        fprintf(stderr, "bench_disk: '%s' is too small (64 blocks wanted) or cannot be opened without the system's cache\n", path);
+    if (size < 32u * blocks[n_sizes - 1] || raw_open(&raw, path, n_handles) != 0) {
+        fprintf(stderr, "bench_disk: '%s' is too small (32 blocks wanted) or cannot be opened without the system's cache\n", path);
         return 1;
     }
-    printf("file: %s, %.2f GiB\n", path, (double)size / (1u << 30));
+    printf("file: %s, %.2f GiB; %s order, %d handle%s, %s\n", path, (double)size / (1u << 30),
+           seq ? "file" : "random", n_handles, n_handles > 1 ? "s (one per reader)" : "",
+           piece > 0 ? "the direct blocks scattered" : "the direct blocks into one buffer");
 
     static uint64_t offs[MAX_BLOCKS], sums[MAX_BLOCKS], sums_cached[MAX_BLOCKS];
     static const int readers[] = {1, 2, 4, 8, 16};
     run_ctx c;
     memset(&c, 0, sizeof c);
+    size_t buf_bytes = piece > 0 ? scatter_bytes(blocks[n_sizes - 1], piece) : blocks[n_sizes - 1];
     for (int i = 0; i < MAX_READERS; i++) {
-        c.buf[i] = tr_alloc_aligned(blocks[n_sizes - 1], ALIGN);
+        c.buf[i] = tr_alloc_aligned(buf_bytes, ALIGN);
+#if defined(_WIN32)
+        if (piece > 0) raw.seg[i] = malloc((blocks[n_sizes - 1] / ALIGN + 1) * sizeof(FILE_SEGMENT_ELEMENT));
+        if (piece > 0 && raw.seg[i] == NULL) c.buf[i] = NULL;
+#endif
         if (c.buf[i] == NULL) {
             fprintf(stderr, "bench_disk: out of memory\n");
             return 1;
         }
     }
     t_start = tr_time_sec();
+
+    /* --scatter: every byte of a scattered block where a plain read puts it, or nothing to measure */
+    if (piece > 0) {
+        int same = 1;
+        for (int k = 0; k < 4 && same; k++) {
+            for (int si = 0; si < n_sizes && same; si++) {
+                size_t n = blocks[si];
+                pick_offsets(offs, 1, size, n);
+                if (raw_read_scatter(&raw, 0, c.buf[0], n, offs[0], piece) != 0 ||
+                    raw_read(&raw, 1, c.buf[1], n, offs[0]) != 0) {
+                    same = 0;
+                    break;
+                }
+                for (size_t at = 0; at < n; at += piece) {
+                    size_t len = n - at < piece ? n - at : piece;
+                    if (memcmp(scatter_at(c.buf[0], piece, at), (unsigned char *)c.buf[1] + at, len) != 0) same = 0;
+                }
+            }
+        }
+        if (!same) {
+            fprintf(stderr, "bench_disk: a scattered read differs from a plain read, or failed\n");
+            return 1;
+        }
+        printf("scattered and plain direct reads agree on every byte of 4 blocks a size, pieces of %zu\n", piece);
+        c.piece = piece;
+    }
 
     /* the same bytes from the two readers, or nothing to measure */
     {
@@ -345,14 +486,14 @@ int main(int argc, char **argv) {
             if (pool == NULL) break;
             double sec[MAX_RUNS];
             int n = 0;
-            c.raw = &raw, c.file = NULL, c.sums = sums;
+            c.raw = &raw, c.file = NULL, c.sums = sums, c.n_blocks = n_blocks;
             for (int r = -1; r < runs && !(stopped = out_of_time()); r++) {
-                pick_offsets(offs, n_blocks, size, c.block); /* new positions every run */
+                (seq ? pick_offsets_seq : pick_offsets)(offs, n_blocks, size, c.block); /* new positions every run */
                 double t0 = tr_time_sec();
-                tr_parallel_for(pool, n_blocks, 1, read_body, &c);
+                run_reads(pool, &c, readers[qi], seq);
                 if (r >= 0) sec[n++] = tr_time_sec() - t0;
             }
-            print_line("direct", c.block, readers[qi], n_blocks, sec, n);
+            print_line(seq ? "direct seq" : "direct", c.block, readers[qi], n_blocks, sec, n);
             tr_pool_destroy(pool);
         }
     }
@@ -367,18 +508,18 @@ int main(int argc, char **argv) {
         if (pool == NULL) break;
         double first[MAX_RUNS], again[MAX_RUNS];
         int n = 0;
-        c.raw = NULL, c.file = file, c.sums = sums;
+        c.raw = NULL, c.file = file, c.sums = sums, c.n_blocks = n_blocks;
         for (int r = 0; r < runs && !(stopped = out_of_time()); r++) {
-            pick_offsets(offs, n_blocks, size, c.block);
+            (seq ? pick_offsets_seq : pick_offsets)(offs, n_blocks, size, c.block);
             double t0 = tr_time_sec();
-            tr_parallel_for(pool, n_blocks, 1, read_body, &c);
+            run_reads(pool, &c, 8, seq);
             double t1 = tr_time_sec();
-            tr_parallel_for(pool, n_blocks, 1, read_body, &c);
+            run_reads(pool, &c, 8, seq);
             again[n] = tr_time_sec() - t1;
             first[n++] = t1 - t0;
         }
-        print_line("cached first", c.block, 8, n_blocks, first, n);
-        print_line("cached again", c.block, 8, n_blocks, again, n);
+        print_line(seq ? "cached first seq" : "cached first", c.block, 8, n_blocks, first, n);
+        print_line(seq ? "cached again seq" : "cached again", c.block, 8, n_blocks, again, n);
         tr_pool_destroy(pool);
     }
     if (stopped) printf("stopped at the %.0f s limit: the lines above are what fitted\n", TIME_LIMIT_SEC);

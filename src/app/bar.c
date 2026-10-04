@@ -356,16 +356,22 @@ void tr_bar_close(tr_bar *b) {
 #endif
 }
 
-tr_model *tr_bar_load_with(tr_bar *b, const char *path, tr_pool *pool, uint64_t expert_budget, char *err,
-                           size_t err_len) {
+tr_model *tr_bar_load_plan_with(tr_bar *b, const char *path, tr_pool *pool, uint64_t expert_budget, int64_t plan_ctx,
+                                char *err, size_t err_len) {
     tr_progress progress = {tr_bar_progress, b};
-    tr_model *m = tr_model_load_progress(path, pool, expert_budget, b->on ? &progress : NULL, err, err_len);
+    tr_model *m = tr_model_load_plan(path, pool, expert_budget, plan_ctx, b->on ? &progress : NULL, err, err_len);
     tr_bar_close(b);
     return m;
 }
 
-tr_model *tr_bar_load(const char *path, tr_pool *pool, uint64_t expert_budget, char *err, size_t err_len) {
+tr_model *tr_bar_load_with(tr_bar *b, const char *path, tr_pool *pool, uint64_t expert_budget, char *err,
+                           size_t err_len) {
+    return tr_bar_load_plan_with(b, path, pool, expert_budget, 0, err, err_len);
+}
+
+tr_model *tr_bar_load(const char *path, tr_pool *pool, uint64_t expert_budget, int64_t plan_ctx, char *err,
+                      size_t err_len) {
     tr_bar b;
     tr_bar_init_stderr(&b);
-    return tr_bar_load_with(&b, path, pool, expert_budget, err, err_len);
+    return tr_bar_load_plan_with(&b, path, pool, expert_budget, plan_ctx, err, err_len);
 }

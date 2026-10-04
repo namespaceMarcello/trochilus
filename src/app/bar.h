@@ -134,7 +134,11 @@ void tr_bar_close(tr_bar *b);
  * tr_bar_close(b) whatever the outcome. */
 tr_model *tr_bar_load_with(tr_bar *b, const char *path, tr_pool *pool, uint64_t expert_budget, char *err,
                            size_t err_len);
-/* The same with tr_bar_init_stderr: what the commands load through (src/app/serve.c app_model). */
-tr_model *tr_bar_load(const char *path, tr_pool *pool, uint64_t expert_budget, char *err, size_t err_len);
+/* The same, the plan made for a session of plan_ctx positions (src/models/model.h tr_model_load_plan). */
+tr_model *tr_bar_load_plan_with(tr_bar *b, const char *path, tr_pool *pool, uint64_t expert_budget, int64_t plan_ctx,
+                                char *err, size_t err_len);
+/* That with tr_bar_init_stderr: what the commands load through (src/app/serve.c app_model). */
+tr_model *tr_bar_load(const char *path, tr_pool *pool, uint64_t expert_budget, int64_t plan_ctx, char *err,
+                      size_t err_len);
 
 #endif

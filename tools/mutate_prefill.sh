@@ -73,13 +73,17 @@ K=src/kernels/kernels.c
 X=src/kernels/kernels_x86.c
 O=src/models/olmoe.c
 run "no mutation" $K "last_n_pos" "last_n_pos"
-run "group: a query sees one position too many" $K "int64_t n_pos = first_n_pos + j, end = t1 < n_pos ? t1 : n_pos, t = t0;
-            for (; t + TR_ATTN_X <= end; t += TR_ATTN_X) {" "int64_t n_pos = first_n_pos + j + 1, end = t1 < n_pos ? t1 : n_pos, t = t0;
-            for (; t + TR_ATTN_X <= end; t += TR_ATTN_X) {"
+run "group: a query sees one position too many" $K "attn_dots(k, q + j * q_stride, keys, t0, t1 < first_n_pos + j ? t1 : first_n_pos + j, head_dim, scale," "attn_dots(k, q + j * q_stride, keys, t0, t1 < first_n_pos + j + 1 ? t1 : first_n_pos + j + 1, head_dim, scale,"
 run "group: the first query of a block starts one late" $K "int64_t j0 = t0 + 1 > first_n_pos ? t0 + 1 - first_n_pos : 0; /* the first query that sees t0 */" "int64_t j0 = t0 + 1 > first_n_pos ? t0 + 2 - first_n_pos : 0;"
 run "group: the softmax of a row one position short" $K "tr_softmax(scores + j * score_stride, first_n_pos + j);" "tr_softmax(scores + j * score_stride, first_n_pos + j - (j > 0));"
-run "group: the blocks of values overlap by one position" $K "            for (; t < end; t++) k->axpy_f32(oj, values + t * head_dim, row[t], head_dim);" "            for (; t < end; t++) k->axpy_f32(oj, values + t * head_dim, row[t], head_dim);
-            if (t1 < n_pos && t1 < last_n_pos) k->axpy_f32(oj, values + t1 * head_dim, row[t1], head_dim);"
+run "group: the blocks of values overlap by one position" $K "        for (; j < n_q; j++)
+            attn_values(k, out + j * out_stride, values, t0, t1 < first_n_pos + j ? t1 : first_n_pos + j, head_dim,
+                        scores + j * score_stride);" "        for (; j < n_q; j++) {
+            attn_values(k, out + j * out_stride, values, t0, t1 < first_n_pos + j ? t1 : first_n_pos + j, head_dim,
+                        scores + j * score_stride);
+            if (t1 < first_n_pos + j && t1 < last_n_pos)
+                k->axpy_f32(out + j * out_stride, values + t1 * head_dim, scores[j * score_stride + t1], head_dim);
+        }"
 run "group: scores not scaled in the x4 path" $K "for (int x = 0; x < TR_ATTN_X; x++) row[t + x] = row[t + x] * scale;" "for (int x = 1; x < TR_ATTN_X; x++) row[t + x] = row[t + x] * scale;"
 run "x4 avx512: the third key is the second" $X "acc2 = _mm512_add_ps(acc2, _mm512_mul_ps(av, _mm512_loadu_ps(b2 + k)));" "acc2 = _mm512_add_ps(acc2, _mm512_mul_ps(av, _mm512_loadu_ps(b1 + k)));"
 run "x4 avx512: the tail of the last value is dropped" $X "v = _mm512_add_ps(v, _mm512_mul_ps(a3, _mm512_maskz_loadu_ps(m, x3 + k)));" "v = _mm512_add_ps(v, _mm512_mul_ps(a3, _mm512_maskz_loadu_ps(m, x2 + k)));"

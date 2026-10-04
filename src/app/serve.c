@@ -142,8 +142,11 @@ static tr_model *with_gpu(tr_model *m) {
     return m;
 }
 
-tr_model *app_model(const char *path, tr_pool *pool, uint64_t expert_budget, char *err, size_t err_len) {
-    if (!g_serve.serving) return with_gpu(tr_bar_load(path, pool, expert_budget, err, err_len));
+tr_model *app_model(const char *path, tr_pool *pool, uint64_t expert_budget, int64_t plan_ctx, char *err,
+                    size_t err_len) {
+    if (!g_serve.serving) return with_gpu(tr_bar_load(path, pool, expert_budget, plan_ctx, err, err_len));
+    /* a server keeps one model for every request: its plan is for the default context, whatever this
+     * request's own needs (tr_model_load_plan with 0) */
     char full[4096], stamp[64], key[sizeof g_serve.key];
     full_path(path, full, sizeof full);
     file_stamp(path, stamp, sizeof stamp);
@@ -157,7 +160,7 @@ tr_model *app_model(const char *path, tr_pool *pool, uint64_t expert_budget, cha
             tr_bar_init(&b, 0, NULL, NULL, NULL, NULL);
             g_serve.model = with_gpu(tr_bar_load_with(&b, path, pool, expert_budget, err, err_len));
         } else {
-            g_serve.model = with_gpu(tr_bar_load(path, pool, expert_budget, err, err_len));
+            g_serve.model = with_gpu(tr_bar_load(path, pool, expert_budget, 0, err, err_len));
         }
         if (g_serve.model == NULL) return NULL;
         snprintf(g_serve.key, sizeof g_serve.key, "%s", key);
@@ -190,6 +193,7 @@ int app_expert_stats(const tr_model *model, tr_experts_stats *out) {
         out->read_sec -= g_serve.base.read_sec;
         out->prefetched -= g_serve.base.prefetched;
         out->prefetch_wait_sec -= g_serve.base.prefetch_wait_sec;
+        out->cancelled -= g_serve.base.cancelled;
     }
     return 0;
 }
@@ -927,7 +931,7 @@ int serve_run(const serve_config *cfg, serve_command_fn dispatch) {
     int rc = 0;
     if (cfg->model_path != NULL) {
         tr_pool *pool = app_pool(cfg->n_threads);
-        tr_model *model = pool != NULL ? app_model(cfg->model_path, pool, cfg->expert_budget, err, sizeof err) : NULL;
+        tr_model *model = pool != NULL ? app_model(cfg->model_path, pool, cfg->expert_budget, 0, err, sizeof err) : NULL;
         if (model == NULL) {
             fprintf(stderr, "serve: %s\n", pool == NULL ? "could not create thread pool" : err);
             rc = 1;

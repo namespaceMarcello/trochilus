@@ -43,8 +43,16 @@
  *   mem_available TR_MEM_AVAILABLE_MIB (Step D) too small refuses with the minimum named in MiB;
  *                a value placed inside the window a bigger synthetic model opens between "not
  *                enough to be fully resident" and "not enough to run at all" forces the plan's
- *                partial branch on a real load, logits still identical to a forced-resident one
- *   progress     tr_model_load_progress (model.h tr_progress) at a resident budget: total ==
+ *                partial branch on a real load, logits still identical to a forced-resident one;
+ *                TR_MEM_TOTAL_MIB (tools/machines.sh) of 1 TiB places the window at its tenth's
+ *                reserve, partial where the real total would load resident; tr_model_load_plan in
+ *                the window: a session of 4 positions leaves no fewer slots than the default
+ *                context and one of 1024 fewer only by its working memory (the KV is not set
+ *                aside), the 4-position store's logits the resident's; kv_room: a 1024-position
+ *                session's passes give the store's slots to the KV's pages as they are written
+ *                (floor or ceil of their bytes in slots), the logits a resident's, every slot
+ *                taken again at free, a context too long for the room refused by name
+ *   progress    tr_model_load_progress (model.h tr_progress) at a resident budget: total ==
  *                the file's dense + expert tensor bytes, one report per dense tensor and per
  *                expert unit, done strictly growing and ending on total; at the smallest store
  *                (really partial): total == dense bytes only, one report per dense tensor
@@ -65,6 +73,7 @@
 #include "../src/models/model.h"
 #include "../src/models/model_internal.h"
 #include "../src/memory/experts.h"
+#include "../src/kv/kv.h"
 
 /* NULL clears the variable; portable enough for a test (both platforms declare stdlib's
  * putenv-family functions differently, so each gets its own call rather than one shared one). */
@@ -363,8 +372,9 @@ static void test_budget_gate(const char *argv0) {
 
 typedef struct {
     tr_experts_read_fn real;
+    tr_experts_readv_fn realv;
     void *real_ctx;
-    int64_t calls, fail_at; /* 1-based; 0 never fails */
+    int64_t calls, fail_at; /* 1-based over both doors' calls; 0 never fails */
 } fail_reader_ctx;
 
 static int fail_reader(void *ctx, void *buf, size_t n, uint64_t offset) {
@@ -374,8 +384,18 @@ static int fail_reader(void *ctx, void *buf, size_t n, uint64_t offset) {
     return f->real(f->real_ctx, buf, n, offset);
 }
 
-/* How many real reads a fresh min-store model consumes evaluating tokens[0..n) (3 per miss,
- * src/memory/experts.c): deterministic, since the file and the store's starting state are always
+/* a run's requests, counted one by one as the store counts them: the call fails when one of them is the one */
+static int fail_readerv(void *ctx, const tr_readv_req *req, int n, void *scratch) {
+    fail_reader_ctx *f = (fail_reader_ctx *)ctx;
+    int fail = 0;
+    for (int k = 0; k < n; k++)
+        if (++f->calls == f->fail_at) fail = 1;
+    if (fail) return -1;
+    return f->realv(f->real_ctx, req, n, scratch);
+}
+
+/* How many real reads a fresh min-store model consumes evaluating tokens[0..n) (the store's
+ * requests: 3 a lone miss, 3 a run; src/memory/experts.c): deterministic, since the file and the store's starting state are always
  * the same, so this is exactly the read count the same pass will reproduce later. */
 static int64_t count_reads(const char *path, int64_t n_batch, const int32_t *tokens, int64_t n) {
     tr_model *m = load_budget(path, NULL, UINT64_MAX);
@@ -385,7 +405,7 @@ static int64_t count_reads(const char *path, int64_t n_batch, const int32_t *tok
     if (s != NULL && tr_session_eval(s, tokens, n) == 0) {
         tr_experts_stats st;
         tr_model_expert_stats(m, &st);
-        reads = (int64_t)st.misses * TR_EXPERT_PARTS;
+        reads = (int64_t)st.requests; /* both doors' calls: a run is one a part */
     }
     if (s != NULL) tr_session_free(s);
     tr_model_free(m);
@@ -425,16 +445,16 @@ static void test_failure(const char *argv0) {
                 TR_CHECK(ex != NULL);
                 fail_reader_ctx frc = {0};
                 if (ex != NULL) {
-                    tr_experts_get_reader(ex, &frc.real, &frc.real_ctx);
+                    tr_experts_get_reader(ex, &frc.real, &frc.realv, &frc.real_ctx);
                     frc.fail_at = 1;
-                    tr_experts_set_reader(ex, fail_reader, &frc);
+                    tr_experts_set_reader(ex, fail_reader, frc.realv != NULL ? fail_readerv : NULL, &frc);
                 }
 
                 TR_CHECK(tr_session_eval(s, tokens, 1) == -1);
                 TR_CHECK_EQ_INT(tr_session_pos(s), 0);
                 checked++;
 
-                if (ex != NULL) tr_experts_set_reader(ex, frc.real, frc.real_ctx);
+                if (ex != NULL) tr_experts_set_reader(ex, frc.real, frc.realv, frc.real_ctx);
                 TR_CHECK(tr_session_eval(s, tokens, 1) == 0);
                 TR_CHECK(memcmp(tr_session_logits(s), ref[0], sizeof ref[0]) == 0);
                 checked++;
@@ -459,16 +479,16 @@ static void test_failure(const char *argv0) {
                 TR_CHECK(ex != NULL);
                 fail_reader_ctx frc = {0};
                 if (ex != NULL) {
-                    tr_experts_get_reader(ex, &frc.real, &frc.real_ctx);
+                    tr_experts_get_reader(ex, &frc.real, &frc.realv, &frc.real_ctx);
                     frc.fail_at = reads1 + 1; /* the first read of the second pass */
-                    tr_experts_set_reader(ex, fail_reader, &frc);
+                    tr_experts_set_reader(ex, fail_reader, frc.realv != NULL ? fail_readerv : NULL, &frc);
                 }
 
                 TR_CHECK(tr_session_eval(s, tokens, N_PROMPT) == -1);
                 TR_CHECK_EQ_INT(tr_session_pos(s), 0); /* the whole eval, not just the failed pass */
                 checked++;
 
-                if (ex != NULL) tr_experts_set_reader(ex, frc.real, frc.real_ctx);
+                if (ex != NULL) tr_experts_set_reader(ex, frc.real, frc.realv, frc.real_ctx);
                 TR_CHECK(tr_session_eval(s, tokens, N_PROMPT) == 0);
                 TR_CHECK(memcmp(tr_session_logits(s), ref[N_PROMPT - 1], sizeof ref[0]) == 0);
                 checked++;
@@ -511,16 +531,16 @@ static void test_failure(const char *argv0) {
                 tr_experts *ex = tr_model_experts(m);
                 fail_reader_ctx frc = {0};
                 if (ex != NULL) {
-                    tr_experts_get_reader(ex, &frc.real, &frc.real_ctx);
+                    tr_experts_get_reader(ex, &frc.real, &frc.realv, &frc.real_ctx);
                     frc.fail_at = reads + 1; /* the first read of the second pass */
-                    tr_experts_set_reader(ex, fail_reader, &frc);
+                    tr_experts_set_reader(ex, fail_reader, frc.realv != NULL ? fail_readerv : NULL, &frc);
                 }
                 TR_CHECK(tr_session_eval(s, tokens + 1, N_PROMPT - 1) == -1);
                 TR_CHECK_EQ_INT(tr_session_pos(s), 1);
                 const float *kept = tr_session_logits(s);
                 TR_CHECK(kept != NULL && memcmp(kept, ref[0], sizeof ref[0]) == 0);
                 checked++;
-                if (ex != NULL) tr_experts_set_reader(ex, frc.real, frc.real_ctx);
+                if (ex != NULL) tr_experts_set_reader(ex, frc.real, frc.realv, frc.real_ctx);
                 tr_session_free(s);
             }
             tr_model_free(m);
@@ -713,8 +733,9 @@ static void test_direct(const char *argv0) {
 /* ---- mem_available: TR_MEM_AVAILABLE_MIB (docs/ARCHITECTURE.md Esperti M1, Step D) ---- */
 
 /* Big enough that its expert weights alone (F32, not Q8_0: at this size Q8_0's per-byte cost in
- * synth_olmoe.h would dominate the test) clear the automatic plan's fixed 512 MiB session floor
- * (model.c tr_expert_budget_plan, olmoe.c session_allowance) with room to spare: only then does a
+ * synth_olmoe.h would dominate the test) clear 512 MiB, the margin the window below keeps (the plan's
+ * flat session floor until 2026-10-03; now the session's own bytes, olmoe.c session_bytes), with room
+ * to spare: only then does a
  * window of RAM exist that is enough to run partially but not enough to be fully resident, for
  * TR_MEM_AVAILABLE_MIB to force. n_layers = 32, n_expert = 8: min_slots (8 + 2 = 10) is a small
  * fraction (~3.9%) of n_units (256), which is what keeps that window open (the window's width is
@@ -777,9 +798,10 @@ static void test_mem_available(const char *argv0) {
     }
 
     /* the window: [reserve + dense + 512 MiB + min_bytes, reserve + dense + resident_bytes).
-     * session_allowance is >= the flat 512 MiB (plus a KV allowance too small to matter at this
-     * context length), so this slightly overshoots the true lower edge -- always inward, never
-     * past the upper one. reserve depends on the real machine's total RAM (tr_mem_guard's own
+     * session_allowance is the session's own bytes (olmoe.c session_bytes: a few MiB at this context
+     * length), so the window's middle leaves the store (512 MiB + min + resident) / 2 minus them: more
+     * than the minimum and less than resident, since resident > 512 MiB + min (BIG_* sized for it).
+     * reserve depends on the real machine's total RAM (tr_mem_guard's own
      * rule, model.c tr_mem_guard / tr_expert_budget_plan), read here only to place the value the
      * plan will see; the guard downstream still checks the real available RAM (Step D). */
     uint64_t mib = 1024 * 1024, gib = 1024 * mib, two_gib = 2 * gib, floor_512mib = 512 * mib;
@@ -822,6 +844,185 @@ static void test_mem_available(const char *argv0) {
             }
         }
     }
+
+    /* TR_MEM_TOTAL_MIB: the plan's reserve is a tenth of the total it names. 1 TiB: a reserve of ~102 GiB,
+     * so the window placed with it loads partial, where the real total (any machine under ~1000 GiB)
+     * would leave the same available resident: only the override's branch passes */
+    int total_seen = 0;
+    if (dense_bytes > 0 && resident_bytes > floor_512mib + min_bytes) {
+        uint64_t reserve = 1024 * gib / 10;
+        uint64_t lo_mib = (reserve + dense_bytes + floor_512mib + min_bytes) / mib + 1;
+        uint64_t hi_mib = (reserve + dense_bytes + resident_bytes) / mib;
+        TR_CHECK(hi_mib > lo_mib);
+        if (hi_mib > lo_mib) {
+            char avail[32];
+            snprintf(avail, sizeof avail, "%llu", (unsigned long long)((lo_mib + hi_mib) / 2));
+            set_env("TR_MEM_AVAILABLE_MIB", avail);
+            set_env("TR_MEM_TOTAL_MIB", "1048576");
+            tr_model *m = load_budget(path, NULL, 0); /* automatic */
+            TR_CHECK(m != NULL);
+            if (m != NULL) {
+                tr_experts_stats st;
+                TR_CHECK(tr_model_expert_stats(m, &st) == 0);
+                uint64_t slab_bytes = (uint64_t)st.n_slots * st.slot_bytes;
+                TR_CHECK(slab_bytes > min_bytes);
+                TR_CHECK(slab_bytes < resident_bytes); /* the emulated total's reserve, not the real one's */
+                printf("  test_mem_available: TR_MEM_TOTAL_MIB 1 TiB, available %s MiB: %.1f MiB of slots\n", avail,
+                       (double)slab_bytes / mib);
+                tr_model_free(m);
+                total_seen++;
+            }
+            set_env("TR_MEM_TOTAL_MIB", NULL);
+        }
+    }
+    TR_CHECK(total_seen > 0);
+
+    /* tr_model_load_plan: the plan sets aside the session of plan_ctx positions, not the default context's
+     * (64 here, the model's trained length). At the same available RAM a 4-position session leaves the
+     * experts more slots and a 1024-position one fewer, and the 4-position store's logits are the
+     * resident's to the bit */
+    int plan_seen = 0, kv_room_seen = 0;
+    if (dense_bytes > 0 && resident_bytes > floor_512mib + min_bytes) {
+        tr_meminfo mi;
+        TR_CHECK(tr_mem_info(&mi) == 0);
+        uint64_t reserve = mi.total_bytes / 10;
+        if (reserve < two_gib) reserve = two_gib;
+        uint64_t lo_mib = (reserve + dense_bytes + floor_512mib + min_bytes) / mib + 1;
+        uint64_t hi_mib = (reserve + dense_bytes + resident_bytes) / mib;
+        if (mi.total_bytes > 0 && hi_mib > lo_mib) {
+            char avail[32];
+            snprintf(avail, sizeof avail, "%llu", (unsigned long long)((lo_mib + hi_mib) / 2));
+            set_env("TR_MEM_AVAILABLE_MIB", avail);
+            static const int64_t plans[3] = {4, 0, 1024};
+            int64_t slots[3] = {0, 0, 0};
+            uint64_t slot_bytes = 0;
+            int same = 0;
+            for (int k = 0; k < 3; k++) {
+                char err[256];
+                tr_model *m = tr_model_load_plan(path, NULL, 0, plans[k], NULL, err, sizeof err);
+                TR_CHECK(m != NULL);
+                if (m == NULL) continue;
+                tr_experts_stats st;
+                TR_CHECK(tr_model_expert_stats(m, &st) == 0);
+                slots[k] = st.n_slots;
+                slot_bytes = st.slot_bytes;
+                TR_CHECK_EQ_INT(st.evict, TR_EXPERTS_EVICT_HOT); /* ds4's eviction, the default */
+                if (k == 0) {
+                    tr_session *s = tr_session_create(m, plans[0], 0, err, sizeof err);
+                    TR_CHECK(s != NULL);
+                    if (s != NULL) {
+                        TR_CHECK(tr_session_eval_rows(s, tokens, N_TOK, N_TOK) == 0);
+                        same = 1;
+                        for (int i = 0; i < N_TOK; i++)
+                            same &= memcmp(tr_session_logits_back(s, N_TOK - 1 - i), ref[i], sizeof ref[i]) == 0;
+                        TR_CHECK(same);
+                        tr_session_free(s);
+                    }
+                }
+                tr_model_free(m);
+            }
+            printf("  test_mem_available: plans of 4, the default and 1024 positions: %lld, %lld, %lld slots\n",
+                   (long long)slots[0], (long long)slots[1], (long long)slots[2]);
+            /* from 64 positions to 1024 the KV takes this many slots more; the plan no longer sets it aside (the
+             * store gives its slots back as the KV grows, kv_room below): only the working memory differs */
+            uint64_t kv_more = tr_kv_bytes(BIG_LAYERS, BIG_HEAD_KV, BIG_EMBD / BIG_HEAD, 1024) -
+                               tr_kv_bytes(BIG_LAYERS, BIG_HEAD_KV, BIG_EMBD / BIG_HEAD, BIG_CTX);
+            int64_t kv_slots = slot_bytes > 0 ? (int64_t)(kv_more / slot_bytes) : 0;
+            TR_CHECK(kv_slots > 2);
+            TR_CHECK(slots[0] >= slots[1] && slots[1] >= slots[2]);
+            TR_CHECK(slots[1] - slots[2] < kv_slots);
+            if (same && slots[0] >= slots[1] && kv_slots > 2 && slots[1] - slots[2] < kv_slots) plan_seen++;
+            /* TR_EXPERT_EVICT=lru: the LRU, for the measurement that compares them */
+            set_env("TR_EXPERT_EVICT", "lru");
+            char err[256];
+            tr_model *m = tr_model_load_plan(path, NULL, 0, 4, NULL, err, sizeof err);
+            TR_CHECK(m != NULL);
+            if (m != NULL) {
+                tr_experts_stats st;
+                TR_CHECK(tr_model_expert_stats(m, &st) == 0);
+                TR_CHECK_EQ_INT(st.evict, TR_EXPERTS_EVICT_LRU);
+                tr_model_free(m);
+            }
+            set_env("TR_EXPERT_EVICT", NULL);
+
+            /* kv_room: the KV's pages from the store's room (olmoe.c kv_hold). A session of 1024 positions written
+             * 32 at a time: after each pass the store has given back the slots of the KV's pages so far (floor or
+             * ceil of them: the room is the slots made and less than one more), never one taken again, the
+             * logits a resident store's to the bit; freed, every slot taken again. A context whose KV would
+             * leave the store under its minimum is refused, named */
+            enum { KV_CHUNK = 32, KV_CHUNKS = 8, KV_CTX = 1024 };
+            int32_t kv_toks[KV_CHUNK * KV_CHUNKS];
+            for (int i = 0; i < KV_CHUNK * KV_CHUNKS; i++) kv_toks[i] = prompt_token(i);
+            static float kv_ref[KV_CHUNKS][BIG_VOCAB];
+            int have_ref = 0;
+            tr_model *r = load_budget(path, NULL, HUGE_BUDGET);
+            if (r != NULL) {
+                tr_session *s = tr_session_create(r, KV_CTX, 0, err, sizeof err);
+                TR_CHECK(s != NULL);
+                if (s != NULL) {
+                    have_ref = 1;
+                    for (int c = 0; c < KV_CHUNKS; c++) {
+                        have_ref &= tr_session_eval_rows(s, kv_toks + c * KV_CHUNK, KV_CHUNK, 1) == 0;
+                        memcpy(kv_ref[c], tr_session_logits_back(s, 0), sizeof kv_ref[c]);
+                    }
+                    tr_session_free(s);
+                }
+                tr_experts_stats st;
+                TR_CHECK(tr_model_expert_stats(r, &st) == 0);
+                TR_CHECK_EQ_INT(st.slots_given, 0); /* a forced budget shares no room */
+                tr_model_free(r);
+            }
+            TR_CHECK(have_ref);
+            tr_model *km = tr_model_load_plan(path, NULL, 0, KV_CTX, NULL, err, sizeof err);
+            TR_CHECK(km != NULL);
+            if (km != NULL && have_ref) {
+                tr_experts_stats st0, st;
+                TR_CHECK(tr_model_expert_stats(km, &st0) == 0);
+                TR_CHECK(st0.n_slots_made < st0.n_units && st0.n_slots == st0.n_slots_made);
+                tr_session *s = tr_session_create(km, KV_CTX, 0, err, sizeof err);
+                TR_CHECK(s != NULL);
+                int same_kv = 1, given_ok = 1, falling = 1;
+                memset(&st, 0, sizeof st);
+                if (s != NULL) {
+                    int64_t last = st0.n_slots;
+                    for (int c = 0; c < KV_CHUNKS; c++) {
+                        TR_CHECK(tr_session_eval_rows(s, kv_toks + c * KV_CHUNK, KV_CHUNK, 1) == 0);
+                        same_kv &= memcmp(tr_session_logits_back(s, 0), kv_ref[c], sizeof kv_ref[c]) == 0;
+                        TR_CHECK(tr_model_expert_stats(km, &st) == 0);
+                        uint64_t held = tr_kv_bytes(BIG_LAYERS, BIG_HEAD_KV, BIG_EMBD / BIG_HEAD,
+                                                    (int64_t)(c + 1) * KV_CHUNK);
+                        uint64_t given = (uint64_t)(st.n_slots_made - st.n_slots);
+                        given_ok &= given >= held / st.slot_bytes && given <= (held + st.slot_bytes - 1) / st.slot_bytes;
+                        falling &= st.n_slots <= last && st.slots_taken == 0;
+                        last = st.n_slots;
+                    }
+                    TR_CHECK(same_kv);
+                    TR_CHECK(given_ok);
+                    TR_CHECK(falling);
+                    TR_CHECK(st.slots_given >= 2);
+                    printf("  test_mem_available: kv_room, %lld slots made, %llu given to 256 positions' KV, %llu "
+                           "units moved\n",
+                           (long long)st.n_slots_made, (unsigned long long)st.slots_given,
+                           (unsigned long long)st.moved);
+                    tr_session_free(s);
+                }
+                tr_experts_stats st1;
+                TR_CHECK(tr_model_expert_stats(km, &st1) == 0);
+                TR_CHECK_EQ_INT(st1.n_slots, st1.n_slots_made); /* freed: every slot taken again */
+                TR_CHECK_EQ_INT(st1.slots_taken, st1.slots_given);
+                tr_session *big = tr_session_create(km, (int64_t)1 << 24, 0, err, sizeof err);
+                int refused = big == NULL && strstr(err, "context of") != NULL;
+                TR_CHECK(refused);
+                if (big != NULL) tr_session_free(big);
+                if (same_kv && given_ok && falling && st.slots_given >= 2 && st1.n_slots == st1.n_slots_made &&
+                    refused)
+                    kv_room_seen++;
+            }
+            if (km != NULL) tr_model_free(km);
+        }
+    }
+    TR_CHECK(plan_seen > 0);
+    TR_CHECK(kv_room_seen > 0);
 
     set_env("TR_MEM_AVAILABLE_MIB", NULL);
     TR_CHECK(checked > 0);

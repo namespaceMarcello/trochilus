@@ -25,6 +25,9 @@
 # runs of two machines (docs/LESSONS.md #73: another session started its containers again
 # seven minutes into a measurement). Example: AB_GUARD='sh tools/machine_still.sh 3.0 600 2';
 # the measuring scripts set it with measure_machine (tools/measure_guard.lib).
+#
+# AB_STOP=<pct> (and AB_MIN, default 3): <rounds> becomes the most; the comparison stops at the first round
+# after which every mode's timed phases have spread at most pct% over the rounds kept (see the loop's end).
 set -e
 # The body is one function, called on the last line: the shell parses all of it before it runs
 # any, so editing this file while it runs cannot change a run under way (docs/LESSONS.md #69).
@@ -70,13 +73,20 @@ while [ "$R" -le "$ROUNDS" ]; do
       sed -n "s/^prompt: [0-9]* tokens in .* (\([0-9.]*\) tok.s)/$LABEL prefill $R \1/p;
               s/^generate: .* in .* (\([0-9.]*\) tok.s)/$LABEL decode $R \1/p;
               s/^threads: [0-9]* prompt, \([0-9]*\) decode.*/$LABEL width $R \1/p")
-    # the store's three counters come from one line, so awk (a second s/// would work on what the
-    # first one already rewrote); "MiB)," of the resident form is not the field "MiB"
+    # the store's counters come from one line, so awk (a second s/// would work on what the
+    # first one already rewrote); "MiB)," of the resident form is not the field "MiB". "read_s":
+    # the store's own read time (resident: "read at load in X s"; streaming: "MiB read in X s"),
+    # "touch_s": its slots' pages faulted before the reads, "requests": the reads it issued
+    # (docs/MEASUREMENTS.md §The disk at its limit)
     EXPERTS=$(printf '%s\n' "$ERR" | awk -v l="$LABEL" -v r="$R" '
       /^experts: / { for (i = 2; i <= NF; i++) {
           if ($i == "hits,")   print l, "hits", r, $(i - 1)
           if ($i == "misses,") print l, "misses", r, $(i - 1)
           if ($i == "MiB")     print l, "mib", r, $(i - 1)
+          if ($i == "in" && ($(i - 1) == "load" || ($(i - 1) == "read" && $(i - 2) == "MiB")))
+                               print l, "read_s", r, $(i + 1)
+          if ($i == "in" && $(i - 1) == "touched") print l, "touch_s", r, $(i + 1)
+          if ($i == "requests") print l, "requests", r, $(i - 1)
       } }')
     [ -z "$EXPERTS" ] || LINES="$LINES
 $EXPERTS"
@@ -94,6 +104,17 @@ $WALL"
     I=$((I + 1))
   done
   R=$((R + 1))
+  # AB_STOP=<pct>: stop once every mode's timed phases (prefill, decode, wall_ms) spread no more than pct% over
+  # the rounds kept (round 0 out), from AB_MIN kept rounds on (default 3): arms that steady gain nothing from more
+  # rounds (the 8 GB machine's races of 2026-10-03: 0.0-1.7%, five rounds where three said the same)
+  if [ -n "${AB_STOP:-}" ] && [ "$R" -gt "${AB_MIN:-3}" ] && awk -v s="$AB_STOP" '
+      $3 > 0 && ($2 == "prefill" || $2 == "decode" || $2 == "wall_ms") {
+        k = $1 " " $2; if (!(k in lo) || $4 + 0 < lo[k]) lo[k] = $4 + 0; if (!(k in hi) || $4 + 0 > hi[k]) hi[k] = $4 + 0
+        sum[k] += $4; n[k]++ }
+      END { for (k in n) if (sum[k] <= 0 || (hi[k] - lo[k]) / (sum[k] / n[k]) * 100 > s) exit 1; exit 0 }' "$OUT"; then
+    echo "ab_modes: stopped after round $((R - 1)) of $ROUNDS: every mode's timed phases within ${AB_STOP}%" >&2
+    break
+  fi
 done
 echo
 echo "medians (round 0 dropped as warm-up; ratio to the first mode, phase by phase)"
@@ -107,10 +128,11 @@ awk -v first="$FIRST" '
       med[k] = (n % 2) ? a[(n + 1) / 2] : (a[n / 2] + a[n / 2 + 1]) / 2; lo[k] = a[1]; hi[k] = a[n]; cnt[k] = n
     }
     for (q = 1; q <= n_keys; q++) {
+      # a median of 0 (the store hit nothing, docs/LESSONS.md #270) prints its spread and ratio as 0
       k = order[q]; split(k, part, " "); base = part[1] " " first
       printf "%-8s %-14s median %8.2f  min %8.2f  max %8.2f  spread %5.1f%%  n=%d  vs %s %.3fx\n",
-             part[1], part[2], med[k], lo[k], hi[k], (hi[k] - lo[k]) / med[k] * 100, cnt[k], first,
-             (base in med) ? med[k] / med[base] : 0
+             part[1], part[2], med[k], lo[k], hi[k], med[k] != 0 ? (hi[k] - lo[k]) / med[k] * 100 : 0, cnt[k], first,
+             (base in med) && med[base] != 0 ? med[k] / med[base] : 0
     }
   }' "$OUT" | sort
 rm -f "$OUT"

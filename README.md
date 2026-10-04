@@ -25,8 +25,9 @@ an NVIDIA GPU when one is there — without a CUDA toolkit. And it gives the **s
 - **The decode's attention on an NVIDIA GPU**, loaded at runtime (hand-written PTX through the
   driver) with the CPU's bits: the logits of 600 positions and the tokens after a 4000-token prompt
   are the CPU's byte for byte. Without a GPU nothing changes.
-- **Experts from disk** under a RAM budget: a slot store with an O(1) LRU, unbuffered reads, the
-  prompt read layer by layer, the next layer's experts read while this one computes.
+- **Experts from disk** under a RAM budget planned on the run's own tokens: a slot store that gives
+  up the coolest expert (ds4's rule), unbuffered reads, a layer's consecutive experts in one request a
+  part, the prompt read layer by layer, the next layer's experts read while this one computes.
 - **Speculative decoding** (`--spec`): drafts taken from the text already in the context, several
   tokens verified in one pass that loads each weight row from memory once for all of them (a pass
   of three tokens costs 1.7 times a pass of one).
@@ -57,7 +58,34 @@ and the optimizations that did not pay are in [`docs/MEASUREMENTS.md`](docs/MEAS
 
 Under a RAM budget the model is not read twice: with a partial expert budget a 2048-token prompt runs
 1.89x faster reading 6 273 MiB instead of 22 880, and 1.22x more with the disk reading the next layer
-while the cores compute this one.
+while the cores compute this one. And the disk runs at its limit, 3.4 GB/s from this laptop's encrypted
+drive: a layer's consecutive experts go in one request a part (96 requests for the whole model instead of
+3072) into pages faulted beforehand by the engine's threads. With Q8_0 whole in RAM, the run from start to end (the
+load, a 321-token prompt, 8 tokens) takes 3.48 s instead of 5.49; with half the experts in RAM, that first
+prompt takes 2.81 s instead of 4.39 (2026-10-02, median of 8, the same tokens). A run's three parts then
+went in flight together: the resident read 2.03 -> 1.95 s (3.5 GB/s), that first prompt 2.82 -> 2.76 s
+(2026-10-03, median of 8, the same tokens).
+
+On an 8 GB laptop the Q8_0's experts do not fit, and its disk is slower. Emulated here (4 cores, AVX2, the
+memory Windows leaves free on 8 GB, the experts read at a SATA-class 0.5 GB/s), the memory planned on the
+run's own tokens (290 experts in RAM instead of 83) and ds4's rule for which expert leaves take its generation
+from 0.57 to 1.70 tok/s, and the Q4_K's from 2.52 to 8.02, the same tokens (2026-10-03, median of 5): the rule
+was replayed on the model's real routes before it was written, and picked over ours, colibri's and the page
+cache's. Its prompt was half computation: AVX2 now has a Q4_K tile of its own (each weight decoded once for a group
+of tokens, in the same exact integers), and the Q4_K prompt goes from 20.6 to 35.1 tok/s there, from 36.4 to 137.9
+on its four cores with every expert in RAM, the same tokens (2026-10-03, median of 5). Then it waited for the disk:
+a prompt that fits one pass now reads each next layer while this one computes, in short requests, and drops what
+that layer does not ask before it is read: the Q4_K prompt goes from 35.3 to 45.5 tok/s, the Q8_0's from 20.3 to
+24.6, at 97-98% of the time its disk needs for those bytes, the same tokens (2026-10-03, median of 5 and of 3).
+After a prompt the experts it chose most now stay in RAM (the prompt's routings tell the rule, as ds4's does, scaled
+to 64 tokens): its generation goes from 8.00 to 15.50 tok/s (Q4_K) and from 1.91 to 2.38 (Q8_0), the same
+tokens (2026-10-03, median of 3, stopped steady). A chat does not know how long it will be, so it used to set
+aside the memory of its whole context (4096 tokens, 1 GiB) at load; now the experts hold that memory and hand it
+to the conversation a page at a time as it is written, which none of colibri, ds4 or llama.cpp does: on the 8 GB
+machine a chat keeps 278 Q8_0 experts in RAM instead of 131 and reads 193.7 MiB a token from disk instead of
+375.9 (Q4_K: 591 instead of 314, 16.3 MiB instead of 87.4): its generation goes from 1.22 to 2.29 tok/s
+(Q8_0) and from 4.55 to 14.77 (Q4_K), its Q8_0 prompt from 20.55 to 24.59, the same tokens (2026-10-04, median of
+3, stopped steady).
 
 ## How it keeps up, bit for bit
 
@@ -128,7 +156,7 @@ to the end — exact, studied piece by piece, at the theoretical limit of three 
 | Rung | Model | State |
 |---|---|---|
 | R0 | the exact engine: GGUF, CPU kernels for every tier, tokenizer, chat | **done** |
-| R1 | OLMoE-1B-7B, to the end | exact; Q4_K, Q6_K, Q4_K_M; experts from disk under a RAM budget; the GPU's decode attention; speculation from the context, `serve`; the two weaker machines next |
+| R1 | OLMoE-1B-7B, to the end | exact; Q4_K, Q6_K, Q4_K_M; experts from disk under a RAM budget; the GPU's decode attention; speculation from the context, `serve`; the three machines measured (2026-10-03): an average one (8 cores, 16 GB) generates Q4_K at 69.9 tok/s, at its RAM's limit, this PC at 97-99% of what its RAM gives in practice, an 8 GB one with a SATA-class disk 15.50 tok/s from disk (2.52 before its memory was planned on the run, 8.00 before the prompt's routings told its eviction), its prompt 45.5 tok/s (20.6 before AVX2's own Q4_K tile, 35.3 before it read the next layer ahead) |
 | R2 | Qwen3-Coder-30B-A3B, a coding model: on 16 GB its experts come from disk; 2-bit formats | — |
 | R3 | a MoE larger than this laptop's RAM | — |
 | R4 | DeepSeek V4 Flash, hundreds of gigabytes, on the same laptop | — |

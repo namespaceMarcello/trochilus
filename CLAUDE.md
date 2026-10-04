@@ -42,14 +42,16 @@ took the Q4_K decode level with llama.cpp, MEASUREMENTS §The Q4_K decode dot se
 4. **bring the data before it is needed** (prefetch, early reads), every idea timed alone in cache,
    then from RAM, then in the engine, then in the race (#181);
 5. **prove the result did not move**: bit for bit against scalar, and mutations the tests must see.
-The prediction is written before the run; the report to Marcello follows the same five steps.
+The prediction is written before the run; the report to Marcello follows the same five steps. **A race is the
+last step** (Marcello, 10-03): count first (`MACHINES_COUNTS=1`), a checked model next (`tools/evict_replay.py`),
+race the winner at the prediction's horizon (#277), stop once steady (`AB_STOP`), never wait for Smart App
+Control (`measure_runnable`); meanwhile, whatever needs no machine (#278).
 
 ---
 
 ## How to work
 
-- At every session start, without being asked: read `build/prompt-next.md`
-  (the task Marcello left for this session: do it), then `docs/STATUS.md`.
+- At every session start, without being asked: read `build/prompt-next.md` (the task Marcello left: do it), then `docs/STATUS.md`.
 - When a piece of work ends, without being asked: write the next session's prompt in
   `build/prompt-next.md` (what to read, the state, the task, how to measure it, how to report),
   so Marcello can `/clear` and start again.
@@ -195,5 +197,4 @@ Before delivering: `make check` green. On Windows correctness runs in Docker
 
 ## Maintenance
 
-When a document is born in `docs/`, add its row to the table. What happened goes in
-`docs/STATUS.md`, not here.
+When a document is born in `docs/`, add its row to the table. What happened goes in `docs/STATUS.md`, not here.

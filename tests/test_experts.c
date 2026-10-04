@@ -48,6 +48,19 @@
  *                reads beside reads ahead, no slot overwritten mid-read; (fail) a failed read
  *                ahead leaves only that unit absent, reported once by the wait, read on demand
  *                afterwards, and an acquire asking for it is -1; (free) freed with reads in flight
+ *   hot          TR_EXPERTS_EVICT_HOT (ds4's policy): the store against a plain reference after every
+ *                call of a random sequence (halvings included; a third of the calls a prompt's pass
+ *                through tr_experts_acquire_counts, some of more tokens than TR_EXPERTS_HOT_PROMPT),
+ *                apart from the LRU's; a run's several victims in one call, every unit exact in a
+ *                slot of its own; and (prompt) the unit a pass's tokens chose most kept into the decode
+ *   slots        tr_experts_set_slots: 14 -> 10 slots under HOT drops the four coolest and moves the four
+ *                units above 10 below it, bytes exact; under the LRU the four least recent go and a moved
+ *                unit keeps its recency (the next miss evicts the least recent left, not it); clamped to
+ *                the minimum and to the slots made, the same count a no-op; taken back free and filled;
+ *                reads ahead in flight taken in before any slot moves
+ *   disk         the emulated disk (cfg.disk_bytes_per_sec): a layer on demand and a load in runs take
+ *                at least their bytes at the rate, and not twice that; the I/O thread and the calling
+ *                thread reading at once share one disk (their bytes one after the other)
  *
  * Every test above align_reuse runs twice, at read_align 1 (buffered, today's layout) and
  * TR_FILE_DIRECT_ALIGN (direct, Step B): same contents, same LRU behaviour, same counters either
@@ -946,7 +959,7 @@ static int layer_ok(const tr_experts *x, int64_t layer, uint64_t align) {
 }
 
 static int g_pf_start, g_pf_basic, g_pf_victims, g_pf_wait, g_pf_fail, g_pf_fail_acquire, g_pf_concurrent,
-    g_pf_free_in_flight;
+    g_pf_free_in_flight, g_pf_hot, g_pf_cancel;
 
 static void test_prefetch(uint64_t align) {
     uint64_t slot_bytes = tr_experts_slot_bytes(&PART_BYTES_TABLE[0][0], N_LAYERS, align);
@@ -1081,6 +1094,64 @@ static void test_prefetch(uint64_t align) {
     if (rc == -1) g_pf_fail_acquire++;
     tr_experts_free(x);
 
+    /* hot: concurrent again under ds4's eviction. Layer 1 read ahead (never named: hotness 0) while
+     * layer 2 is read on demand: the coolest units are layer 1's in flight, and none may be a victim;
+     * layer 0's (hotness 1) go instead, and every unit left in RAM is exact */
+    cfg.evict = TR_EXPERTS_EVICT_HOT;
+    x = tr_experts_create(&cfg, err, sizeof err);
+    TR_CHECK(x != NULL && tr_experts_prefetch_start(x) == 0);
+    if (x != NULL) {
+        TR_CHECK(tr_experts_acquire(x, 0, ALL_EXPERTS, N_EXPERT) == 0);
+        f.delay = 0.002;
+        TR_CHECK_EQ_INT(tr_experts_prefetch(x, 1, 0), N_EXPERT);
+        TR_CHECK(tr_experts_acquire(x, 2, ALL_EXPERTS, N_EXPERT) == 0);
+        TR_CHECK(tr_experts_prefetch_wait(x) == 0);
+        f.delay = 0.0;
+        int exact = layer_ok(x, 2, align);
+        for (int64_t e = 0; e < N_EXPERT; e++) exact &= unit_absent(x, 1, e) || unit_ok(x, 1, e, align);
+        TR_CHECK(exact);
+        int layer1_whole = 1; /* nothing of layer 1 was evicted: it was all in flight */
+        for (int64_t e = 0; e < N_EXPERT; e++) layer1_whole &= unit_ok(x, 1, e, align);
+        TR_CHECK(layer1_whole);
+        if (exact && layer1_whole) g_pf_hot++;
+        tr_experts_free(x);
+    }
+    cfg.evict = TR_EXPERTS_EVICT_LRU;
+
+    /* cancel: layer 1 queued ahead (slow reads, one unit a read: no runs here), then layer 2 while the
+     * I/O thread is still reading layer 1: the second call returns only once the thread has taken
+     * layer 2's first unit, so a cancel naming only layer 2's last unit drops the N_EXPERT - 2 between
+     * them unread (absent, slots free, never counted as read) while the first, in flight, and the last
+     * land; the dropped ones are then read on demand, exact. A read ahead that returned at once would
+     * find layer 2's first still queued behind layer 1 and drop it too: N_EXPERT - 1 */
+    x = tr_experts_create(&cfg, err, sizeof err);
+    TR_CHECK(x != NULL && tr_experts_prefetch_start(x) == 0);
+    if (x != NULL) {
+        TR_CHECK(tr_experts_acquire(x, 0, ALL_EXPERTS, N_EXPERT) == 0);
+        f.delay = 0.01;
+        int64_t last_one[1] = {N_EXPERT - 1};
+        int64_t q1 = tr_experts_prefetch(x, 1, 0);
+        int64_t q = tr_experts_prefetch(x, 2, 1);
+        int64_t dropped = tr_experts_prefetch_cancel(x, 2, last_one, 1);
+        TR_CHECK_EQ_INT(q1, N_EXPERT);
+        TR_CHECK_EQ_INT(q, N_EXPERT);
+        TR_CHECK_EQ_INT(dropped, N_EXPERT - 2);
+        TR_CHECK(tr_experts_prefetch_wait(x) == 0);
+        f.delay = 0.0;
+        tr_experts_stats cs;
+        tr_experts_get_stats(x, &cs);
+        TR_CHECK_EQ_INT(cs.cancelled, N_EXPERT - 2);
+        TR_CHECK_EQ_INT(cs.prefetched, N_EXPERT + 2);
+        int landed = layer_ok(x, 1, align) && unit_ok(x, 2, 0, align) && unit_ok(x, 2, N_EXPERT - 1, align);
+        int absent = 1;
+        for (int64_t e = 1; e < N_EXPERT - 1; e++) absent &= unit_absent(x, 2, e);
+        TR_CHECK(landed && absent);
+        TR_CHECK(tr_experts_acquire(x, 2, ALL_EXPERTS, N_EXPERT) == 0);
+        TR_CHECK(layer_ok(x, 2, align));
+        if (dropped == N_EXPERT - 2 && landed && absent && cs.cancelled == N_EXPERT - 2) g_pf_cancel++;
+        tr_experts_free(x);
+    }
+
     /* freed with reads in flight: the I/O thread finishes and is joined, nothing leaks (ASan) */
     x = tr_experts_create(&cfg, err, sizeof err);
     TR_CHECK(x != NULL);
@@ -1094,9 +1165,747 @@ static void test_prefetch(uint64_t align) {
     }
 }
 
+/* ---- runs (cfg.readv): a layer's consecutive experts in one request a part, each unit's pages
+ * scattered into its own slot and the page two neighbours share copied after ---- */
+
+/* The fake file again, with a scattered door: fake_file first, so fake_read takes the same ctx. */
+typedef struct {
+    fake_file f;
+    int64_t calls, max_pieces, fail_at, bad_align;
+    int64_t batches, batch_not_parts; /* readv calls, and those with other than a run's three requests */
+    uint64_t bytes;
+} fake_run_file;
+
+/* calls counts the requests, as the store's stats do: fail_at names the request that fails, and the
+ * others of its call still land (tr_file_preadv_n waits for every request it issued) */
+static int fake_readv(void *ctx, const tr_readv_req *req, int n, void *scratch) {
+    fake_run_file *r = (fake_run_file *)ctx;
+    (void)scratch;
+    r->batches++;
+    if (n != TR_EXPERT_PARTS) r->batch_not_parts++;
+    int failed = 0;
+    for (int k = 0; k < n; k++) {
+        r->calls++;
+        if (r->fail_at == r->calls) {
+            failed = 1;
+            continue;
+        }
+        const tr_iov *iov = req[k].iov;
+        int cnt = req[k].cnt;
+        uint64_t offset = req[k].offset;
+        if (cnt > r->max_pieces) r->max_pieces = cnt;
+        uint64_t a = r->f.align_check, o = offset;
+        if (a > 1 && offset % a != 0) r->bad_align++;
+        for (int i = 0; i < cnt; i++) {
+            if (a > 1 && ((uintptr_t)iov[i].base % a != 0 || iov[i].n % a != 0)) r->bad_align++;
+            unsigned char *dst = (unsigned char *)iov[i].base;
+            for (size_t j = 0; j < iov[i].n; j++) dst[j] = pattern_byte(o + j);
+            o += iov[i].n;
+        }
+        r->bytes += o - offset;
+    }
+    return failed ? -1 : 0;
+}
+
+/* Parts of at least a page: layer 0 and 2 unaligned (sizes and offsets: every neighbour shares a
+ * page on a direct store), layer 1 all aligned (none does: the copy is skipped). */
+enum { RN_LAYERS = 3, RN_EXPERT = 6, RN_USED = 2 };
+static const size_t RN_PART[RN_LAYERS][TR_EXPERT_PARTS] = {
+    {3 * 4096 + 100, 2 * 4096 + 3000, 4096 + 5},
+    {2 * 4096, 4096, 3 * 4096},
+    {3 * 4096 + 100, 2 * 4096 + 3000, 4096 + 5},
+};
+static uint64_t rn_offset[RN_LAYERS * TR_EXPERT_PARTS];
+static const int64_t RN_ALL[RN_EXPERT] = {0, 1, 2, 3, 4, 5};
+
+static void rn_build_offsets(void) {
+    uint64_t off = 3 * 4096 + 123;
+    for (int64_t layer = 0; layer < RN_LAYERS; layer++)
+        for (int p = 0; p < TR_EXPERT_PARTS; p++) {
+            if (layer == 1) off = (off + 4095) / 4096 * 4096;
+            if (layer == 2 && p == 0) off += 777; /* another residue than layer 0's */
+            rn_offset[layer * TR_EXPERT_PARTS + p] = off;
+            off += RN_PART[layer][p] * (uint64_t)RN_EXPERT + 4096 + 13;
+        }
+}
+
+static tr_experts_config rn_cfg(uint64_t slots, fake_run_file *r, uint64_t align, uint64_t run_bytes) {
+    tr_experts_config cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.n_layers = RN_LAYERS;
+    cfg.n_expert = RN_EXPERT;
+    cfg.n_used = RN_USED;
+    cfg.part_bytes = &RN_PART[0][0];
+    cfg.part_offset = rn_offset;
+    cfg.budget_bytes = slots * tr_experts_slot_bytes(&RN_PART[0][0], RN_LAYERS, align);
+    cfg.read = fake_read;
+    cfg.readv = fake_readv;
+    cfg.read_ctx = r;
+    cfg.read_align = align;
+    cfg.run_bytes = run_bytes;
+    return cfg;
+}
+
+static int rn_unit_ok(const tr_experts *x, int64_t layer, int64_t e) {
+    for (int p = 0; p < TR_EXPERT_PARTS; p++) {
+        const unsigned char *got = (const unsigned char *)tr_experts_part(x, layer, e, p);
+        if (got == NULL) return 0;
+        uint64_t base = rn_offset[layer * TR_EXPERT_PARTS + p] + RN_PART[layer][p] * (uint64_t)e;
+        for (size_t i = 0; i < RN_PART[layer][p]; i++)
+            if (got[i] != pattern_byte(base + i)) return 0;
+    }
+    return 1;
+}
+
+static int rn_layer_ok(const tr_experts *x, int64_t layer) {
+    for (int64_t e = 0; e < RN_EXPERT; e++)
+        if (!rn_unit_ok(x, layer, e)) return 0;
+    return 1;
+}
+
+/* Bytes of one request of the run (layer, part, e0 .. e0 + k - 1): its units' aligned ranges end to end. */
+static uint64_t rn_request_bytes(int64_t layer, int p, int64_t e0, int64_t k, uint64_t align) {
+    uint64_t pb = RN_PART[layer][p], first = rn_offset[layer * TR_EXPERT_PARTS + p] + pb * (uint64_t)e0;
+    return (first + pb * (uint64_t)k + align - 1) / align * align - first / align * align;
+}
+
+static int64_t g_rn_shared, g_rn_unshared, g_rn_split, g_rn_demand, g_rn_ahead, g_rn_fail, g_rn_fallback;
+
+static void test_runs(uint64_t align) {
+    char err[256];
+
+    /* the branch the copy serves, by construction: neighbours sharing a page, and not */
+    for (int64_t layer = 0; layer < RN_LAYERS && align > 1; layer++)
+        for (int p = 0; p < TR_EXPERT_PARTS; p++)
+            for (int64_t e = 0; e + 1 < RN_EXPERT; e++) {
+                uint64_t off = rn_offset[layer * TR_EXPERT_PARTS + p] + RN_PART[layer][p] * (uint64_t)e;
+                uint64_t hi = (off + RN_PART[layer][p] + align - 1) / align * align;
+                uint64_t next_lo = (off + RN_PART[layer][p]) / align * align;
+                if (hi > next_lo) g_rn_shared++;
+                else g_rn_unshared++;
+            }
+
+    /* (load) resident, one request a part a layer: every unit exact, the reader one at a time never called */
+    {
+        fake_run_file r;
+        memset(&r, 0, sizeof r);
+        r.f.align_check = align;
+        tr_experts_config cfg = rn_cfg(RN_LAYERS * RN_EXPERT, &r, align, 0);
+        tr_experts *x = tr_experts_create(&cfg, err, sizeof err);
+        TR_CHECK(x != NULL);
+        if (x != NULL) {
+            tr_experts_touch(x, NULL); /* before any read: contents untouched by it */
+            TR_CHECK(tr_experts_load_all(x, NULL, NULL) == 0);
+            TR_CHECK_EQ_INT(r.calls, RN_LAYERS * TR_EXPERT_PARTS);
+            /* a run's three parts handed over in one call, so the disk has them in flight together */
+            TR_CHECK_EQ_INT(r.batches, RN_LAYERS);
+            TR_CHECK_EQ_INT(r.batch_not_parts, 0);
+            TR_CHECK_EQ_INT(r.f.n_calls, 0);
+            TR_CHECK_EQ_INT(r.max_pieces, RN_EXPERT);
+            uint64_t want = 0;
+            for (int64_t layer = 0; layer < RN_LAYERS; layer++)
+                for (int p = 0; p < TR_EXPERT_PARTS; p++) want += rn_request_bytes(layer, p, 0, RN_EXPERT, align);
+            TR_CHECK_EQ_INT(r.bytes, want);
+            tr_experts_stats st;
+            tr_experts_get_stats(x, &st);
+            TR_CHECK_EQ_INT(st.requests, RN_LAYERS * TR_EXPERT_PARTS);
+            TR_CHECK_EQ_INT(st.bytes_read, want);
+            TR_CHECK_EQ_INT(st.misses, RN_LAYERS * RN_EXPERT);
+            for (int64_t layer = 0; layer < RN_LAYERS; layer++) TR_CHECK(rn_layer_ok(x, layer));
+            tr_experts_touch(x, NULL); /* after: still the same bytes */
+            for (int64_t layer = 0; layer < RN_LAYERS; layer++) TR_CHECK(rn_layer_ok(x, layer));
+            tr_experts_free(x);
+        }
+    }
+
+    /* (split) a run longer than a request carries: 6 experts at 2 a request, in equal requests */
+    {
+        fake_run_file r;
+        memset(&r, 0, sizeof r);
+        r.f.align_check = align;
+        tr_experts_config cfg = rn_cfg(RN_LAYERS * RN_EXPERT, &r, align, (uint64_t)(2.5 * (3 * 4096 + 100)));
+        tr_experts *x = tr_experts_create(&cfg, err, sizeof err);
+        TR_CHECK(x != NULL);
+        if (x != NULL) {
+            TR_CHECK(tr_experts_load_all(x, NULL, NULL) == 0);
+            TR_CHECK_EQ_INT(r.calls, RN_LAYERS * TR_EXPERT_PARTS * 3);
+            TR_CHECK_EQ_INT(r.max_pieces, 2);
+            for (int64_t layer = 0; layer < RN_LAYERS; layer++) TR_CHECK(rn_layer_ok(x, layer));
+            g_rn_split++;
+            tr_experts_free(x);
+        }
+    }
+
+    /* (demand) the smallest store: a layer given in id order is one run; ids out of order are read
+     * one at a time; two consecutive missing ones are a run again */
+    {
+        fake_run_file r;
+        memset(&r, 0, sizeof r);
+        r.f.align_check = align;
+        tr_experts_config cfg = rn_cfg(RN_EXPERT + RN_USED, &r, align, 0);
+        tr_experts *x = tr_experts_create(&cfg, err, sizeof err);
+        TR_CHECK(x != NULL);
+        if (x != NULL) {
+            TR_CHECK(tr_experts_acquire(x, 0, RN_ALL, RN_EXPERT) == 0);
+            TR_CHECK_EQ_INT(r.calls, TR_EXPERT_PARTS);
+            TR_CHECK(rn_layer_ok(x, 0));
+            int64_t scattered[3] = {5, 0, 2};
+            TR_CHECK(tr_experts_acquire(x, 1, scattered, 3) == 0);
+            TR_CHECK_EQ_INT(r.calls, TR_EXPERT_PARTS);
+            TR_CHECK_EQ_INT(r.f.n_calls, 3 * TR_EXPERT_PARTS);
+            int64_t pair[2] = {3, 4};
+            TR_CHECK(tr_experts_acquire(x, 1, pair, 2) == 0);
+            TR_CHECK_EQ_INT(r.calls, 2 * TR_EXPERT_PARTS);
+            for (int i = 0; i < 3; i++) TR_CHECK(rn_unit_ok(x, 1, scattered[i]));
+            TR_CHECK(rn_unit_ok(x, 1, 3) && rn_unit_ok(x, 1, 4));
+            tr_experts_stats st;
+            tr_experts_get_stats(x, &st);
+            TR_CHECK_EQ_INT(st.requests, 2 * TR_EXPERT_PARTS + 3 * TR_EXPERT_PARTS);
+            TR_CHECK_EQ_INT(r.bad_align + r.f.bad_align, 0);
+            g_rn_demand++;
+
+            /* (fail) the second request of a run fails: the run's units absent, the store consistent */
+            r.fail_at = r.calls + 2;
+            TR_CHECK(tr_experts_acquire(x, 2, RN_ALL, RN_EXPERT) == -1);
+            for (int64_t e = 0; e < RN_EXPERT; e++) TR_CHECK(unit_absent(x, 2, e));
+            TR_CHECK(tr_experts_acquire(x, 2, RN_ALL, RN_EXPERT) == 0);
+            TR_CHECK(rn_layer_ok(x, 2));
+            g_rn_fail++;
+            tr_experts_free(x);
+        }
+    }
+
+    /* (ahead) the I/O thread takes a layer queued in id order as one run; a failed run's units are
+     * absent after the wait and read on demand afterwards */
+    {
+        fake_run_file r;
+        memset(&r, 0, sizeof r);
+        r.f.align_check = align;
+        tr_experts_config cfg = rn_cfg(2 * RN_EXPERT + RN_USED, &r, align, 0);
+        tr_experts *x = tr_experts_create(&cfg, err, sizeof err);
+        TR_CHECK(x != NULL);
+        if (x != NULL) {
+            TR_CHECK(tr_experts_prefetch_start(x) == 0);
+            TR_CHECK(tr_experts_acquire(x, 0, RN_ALL, RN_EXPERT) == 0);
+            int64_t before = r.calls;
+            TR_CHECK_EQ_INT(tr_experts_prefetch(x, 1, 0), RN_EXPERT);
+            TR_CHECK(tr_experts_prefetch_wait(x) == 0);
+            TR_CHECK_EQ_INT(r.calls - before, TR_EXPERT_PARTS);
+            TR_CHECK(tr_experts_acquire(x, 1, RN_ALL, RN_EXPERT) == 0);
+            TR_CHECK(rn_layer_ok(x, 1));
+            tr_experts_stats st;
+            tr_experts_get_stats(x, &st);
+            TR_CHECK_EQ_INT(st.prefetched, RN_EXPERT);
+            TR_CHECK_EQ_INT(st.requests, 2 * TR_EXPERT_PARTS);
+            g_rn_ahead++;
+
+            r.fail_at = r.calls + 1;
+            TR_CHECK_EQ_INT(tr_experts_prefetch(x, 2, 1), RN_EXPERT);
+            TR_CHECK(tr_experts_prefetch_wait(x) == -1);
+            for (int64_t e = 0; e < RN_EXPERT; e++) TR_CHECK(unit_absent(x, 2, e));
+            TR_CHECK(tr_experts_acquire(x, 2, RN_ALL, RN_EXPERT) == 0);
+            TR_CHECK(rn_layer_ok(x, 2));
+            TR_CHECK_EQ_INT(r.bad_align + r.f.bad_align, 0);
+            g_rn_fail++;
+            tr_experts_free(x);
+        }
+    }
+
+    /* (fallback) a direct store whose parts are under a page: no runs, every part one read */
+    if (align > 1) {
+        fake_run_file r;
+        memset(&r, 0, sizeof r);
+        r.f.align_check = align;
+        tr_experts_config cfg = mk_cfg((uint64_t)MIN_SLOTS * tr_experts_slot_bytes(&PART_BYTES_TABLE[0][0], N_LAYERS, align),
+                                       fake_read, &r, align);
+        cfg.readv = fake_readv;
+        tr_experts *x = tr_experts_create(&cfg, err, sizeof err);
+        TR_CHECK(x != NULL);
+        if (x != NULL) {
+            TR_CHECK(tr_experts_acquire(x, 1, ALL_EXPERTS, N_EXPERT) == 0);
+            TR_CHECK_EQ_INT(r.calls, 0);
+            TR_CHECK_EQ_INT(r.f.n_calls, N_EXPERT * TR_EXPERT_PARTS);
+            for (int64_t e = 0; e < N_EXPERT; e++) TR_CHECK(unit_ok(x, 1, e, align));
+            g_rn_fallback++;
+            tr_experts_free(x);
+        }
+    }
+}
+
+/* ---- hot: TR_EXPERTS_EVICT_HOT, ds4's streaming cache, against a plain reference ---- */
+
+enum { HOT_PERIOD = 23 };
+
+typedef struct {
+    ref_model lru;           /* the recency order and the counters, as the LRU's reference keeps them */
+    uint32_t hot[N_UNITS2];
+    int64_t calls;
+} ref_hot_model;
+
+/* The policy in its definition: every unit a call names +1, or with counts its tokens' routings scaled to
+ * at most TR_EXPERTS_HOT_PROMPT tokens, rounded to the nearest (half up), at least 1 (after this call's
+ * halving, every HOT_PERIOD calls); a miss takes a free slot, else the resident unit of the lowest hotness
+ * not named by this call, the least recent among equals. */
+static int ref_hot_acquire(ref_hot_model *h, int64_t layer, const int64_t *ids, const int64_t *counts,
+                           int64_t n_tok, int64_t n) {
+    ref_model *r = &h->lru;
+    if (layer < 0 || layer >= N_LAYERS2 || n < 1 || n > N_EXPERT2) return -1;
+    for (int64_t i = 0; i < n; i++) {
+        if (ids[i] < 0 || ids[i] >= N_EXPERT2) return -1;
+        for (int64_t j = 0; j < i; j++)
+            if (ids[j] == ids[i]) return -1;
+    }
+    if (++h->calls % HOT_PERIOD == 0)
+        for (int64_t u = 0; u < N_UNITS2; u++) h->hot[u] >>= 1;
+    for (int64_t i = 0; i < n; i++) {
+        int64_t add = 1;
+        if (counts != NULL && n_tok <= TR_EXPERTS_HOT_PROMPT) add = counts[i];
+        if (counts != NULL && n_tok > TR_EXPERTS_HOT_PROMPT) {
+            int64_t num = counts[i] * TR_EXPERTS_HOT_PROMPT; /* num / n_tok, up when the rest is half or more */
+            add = num / n_tok + (2 * (num % n_tok) >= n_tok);
+            if (add < 1) add = 1;
+        }
+        h->hot[layer * N_EXPERT2 + ids[i]] += (uint32_t)add;
+    }
+    for (int64_t i = 0; i < n; i++) {
+        int64_t unit = layer * N_EXPERT2 + ids[i];
+        if (r->pos[unit] != -1) {
+            ref_move_front(r, r->pos[unit]);
+            r->hits++;
+        }
+    }
+    for (int64_t i = 0; i < n; i++) {
+        int64_t unit = layer * N_EXPERT2 + ids[i];
+        if (r->pos[unit] != -1) continue;
+        if (r->count < r->n_slots) {
+            r->count++;
+        } else {
+            int64_t best = -1;
+            for (int64_t k = r->count - 1; k >= 0; k--) {
+                int64_t u = r->list[k], named = 0;
+                for (int64_t j = 0; j < n && !named; j++) named = layer * N_EXPERT2 + ids[j] == u;
+                if (named) continue;
+                if (best == -1 || h->hot[u] < h->hot[r->list[best]]) best = k;
+            }
+            r->pos[r->list[best]] = -1;
+            r->evictions++;
+            memmove(&r->list[best], &r->list[best + 1], (size_t)(r->count - 1 - best) * sizeof(int64_t));
+        }
+        memmove(&r->list[1], &r->list[0], (size_t)(r->count - 1) * sizeof(int64_t));
+        r->list[0] = unit;
+        for (int64_t k = 0; k < r->count; k++) r->pos[r->list[k]] = (int32_t)k;
+        r->misses++;
+    }
+    return 0;
+}
+
+static int64_t g_hot_diff, g_hot_apart, g_hot_runs, g_hot_own, g_hot_resident, g_hot_scaled, g_hot_prompt;
+
+/* diff:  the store under EVICT_HOT against ref_hot_acquire, the o1 shape and sequence: the same presence
+ *        and counters after every call, with halvings every HOT_PERIOD calls; and the LRU's reference on
+ *        the same calls hits differently (the policy is not the LRU under another name);
+ * runs:  a layer's missing experts read as a run under EVICT_HOT (several victims in one call): every
+ *        unit exact, each in a slot of its own (a run's earlier picks are not taken again);
+ * own:   the call's own units are the coolest in the store (layer 0 made hot first), and still never its
+ *        victims: the call ends with all of them present;
+ * prompt: a pass of 320 tokens names layer 0's experts, 300 of them chose expert 0, the others 2-5 each;
+ *        the next layer's misses evict layer 0's coolest, and expert 0 is still present after them (ds4's
+ *        +1 leaves all at 1 and evicts the least recent, layer 0's first ids, 0 among them). */
+static void test_hot(uint64_t align) {
+    char err[256];
+    {
+        fake_file f = mk_fake(align);
+        uint64_t slot_bytes = tr_experts_slot_bytes(&PART_BYTES_TABLE[0][0], N_LAYERS, align);
+        tr_experts_config cfg = mk_cfg((uint64_t)(N_EXPERT + N_USED) * slot_bytes, fake_read, &f, align);
+        cfg.evict = TR_EXPERTS_EVICT_HOT;
+        tr_experts *x = tr_experts_create(&cfg, err, sizeof err);
+        TR_CHECK(x != NULL);
+        if (x != NULL) {
+            for (int k = 0; k < 5; k++) TR_CHECK(tr_experts_acquire(x, 0, ALL_EXPERTS, N_EXPERT) == 0);
+            static const int64_t two[2] = {0, 1}, three[3] = {0, 1, 2};
+            TR_CHECK(tr_experts_acquire(x, 1, two, 2) == 0);   /* the 2 free slots: hotness 1 each */
+            TR_CHECK(tr_experts_acquire(x, 1, three, 3) == 0); /* 0 and 1 at 2, layer 0 at 5: 2 needs a victim */
+            int all = unit_ok(x, 1, 0, align) && unit_ok(x, 1, 1, align) && unit_ok(x, 1, 2, align);
+            TR_CHECK(all);
+            tr_experts_stats st;
+            tr_experts_get_stats(x, &st);
+            TR_CHECK_EQ_INT(st.evictions, 1);
+            if (all && st.evictions == 1) g_hot_own++;
+            tr_experts_free(x);
+        }
+    }
+    {
+        build_part_bytes2();
+        build_part_offsets2();
+        fake_file f = mk_fake(align);
+        int64_t n_slots2 = 600;
+        tr_experts_config cfg;
+        memset(&cfg, 0, sizeof cfg);
+        cfg.n_layers = N_LAYERS2;
+        cfg.n_expert = N_EXPERT2;
+        cfg.n_used = N_USED2;
+        cfg.part_bytes = part_bytes_table2;
+        cfg.part_offset = part_offset_table2;
+        cfg.budget_bytes = (uint64_t)n_slots2 * tr_experts_slot_bytes(part_bytes_table2, N_LAYERS2, align);
+        cfg.read = fake_read;
+        cfg.read_ctx = &f;
+        cfg.read_align = align;
+        cfg.evict = TR_EXPERTS_EVICT_HOT;
+        cfg.hot_period = HOT_PERIOD;
+        tr_experts *x = tr_experts_create(&cfg, err, sizeof err);
+        TR_CHECK(x != NULL);
+        static ref_hot_model ref;
+        static ref_model lru;
+        memset(&ref, 0, sizeof ref);
+        ref_init(&ref.lru, n_slots2);
+        ref_init(&lru, n_slots2);
+        rng_state = 0xC0FFEEu;
+        int64_t pool[N_EXPERT2], counts[N_EXPERT2], mismatches = 0, checked = 0, scaled = 0;
+        for (int it = 0; it < O1_ITERS && x != NULL; it++) {
+            for (int64_t i = 0; i < N_EXPERT2; i++) pool[i] = i;
+            int64_t n = 1 + (int64_t)(rng_next() % 8);
+            if (rng_next() % 20 == 0) n = N_EXPERT2;
+            /* fewer layers than the o1 test: units come back, so hotness has something to tell */
+            int64_t layer = (int64_t)(rng_next() % 6);
+            shuffle_prefix(pool, N_EXPERT2, n);
+            /* a third of the calls a prompt's pass: 1-300 tokens, each id chosen by 1..n_tok of them */
+            int64_t n_tok = 1 + (int64_t)(rng_next() % 300);
+            int with_counts = rng_next() % 3 == 0;
+            for (int64_t i = 0; i < n; i++) counts[i] = 1 + (int64_t)(rng_next() % (uint64_t)n_tok);
+            if (with_counts && n_tok > TR_EXPERTS_HOT_PROMPT) scaled++;
+            int rc = with_counts ? tr_experts_acquire_counts(x, layer, pool, counts, n_tok, n)
+                                 : tr_experts_acquire(x, layer, pool, n);
+            if (rc != ref_hot_acquire(&ref, layer, pool, with_counts ? counts : NULL, n_tok, n)) mismatches++;
+            ref_acquire(&lru, layer, pool, n);
+            tr_experts_stats st;
+            tr_experts_get_stats(x, &st);
+            if (st.hits != ref.lru.hits || st.misses != ref.lru.misses || st.evictions != ref.lru.evictions)
+                mismatches++;
+            for (int64_t u = 0; u < N_UNITS2; u++)
+                if ((tr_experts_part(x, u / N_EXPERT2, u % N_EXPERT2, 0) != NULL) != (ref.lru.pos[u] != -1)) {
+                    mismatches++;
+                    break;
+                }
+            checked++;
+        }
+        TR_CHECK_EQ_INT(mismatches, 0);
+        TR_CHECK_EQ_INT(checked, O1_ITERS);
+        TR_CHECK(ref.lru.hits != lru.hits);
+        TR_CHECK(scaled > 0);
+        if (mismatches == 0 && checked == O1_ITERS) g_hot_diff++;
+        if (mismatches == 0 && scaled > 0) g_hot_scaled++;
+        if (ref.lru.hits != lru.hits) g_hot_apart++;
+        tr_experts_free(x);
+    }
+    {
+        /* resident: tr_experts_load_all runs before any acquire (call_seq 0), its runs' picks included */
+        fake_run_file r;
+        memset(&r, 0, sizeof r);
+        r.f.align_check = align;
+        tr_experts_config cfg = rn_cfg(RN_LAYERS * RN_EXPERT, &r, align, 0);
+        cfg.evict = TR_EXPERTS_EVICT_HOT;
+        tr_experts *x = tr_experts_create(&cfg, err, sizeof err);
+        TR_CHECK(x != NULL);
+        if (x != NULL) {
+            int ok = tr_experts_load_all(x, NULL, NULL) == 0;
+            for (int64_t layer = 0; layer < RN_LAYERS && ok; layer++) ok &= rn_layer_ok(x, layer);
+            TR_CHECK(ok);
+            if (ok) g_hot_resident++;
+            tr_experts_free(x);
+        }
+    }
+    {
+        fake_run_file r;
+        memset(&r, 0, sizeof r);
+        r.f.align_check = align;
+        tr_experts_config cfg = rn_cfg(RN_EXPERT + RN_USED + 2, &r, align, 0);
+        cfg.evict = TR_EXPERTS_EVICT_HOT;
+        tr_experts *x = tr_experts_create(&cfg, err, sizeof err);
+        TR_CHECK(x != NULL);
+        if (x != NULL) {
+            int ok = 1;
+            static const int64_t all[RN_EXPERT] = {0, 1, 2, 3, 4, 5};
+            for (int round = 0; round < 2; round++)
+                for (int64_t layer = 0; layer < RN_LAYERS; layer++) {
+                    TR_CHECK(tr_experts_acquire(x, layer, all, RN_EXPERT) == 0);
+                    ok &= rn_layer_ok(x, layer);
+                }
+            TR_CHECK(ok);
+            TR_CHECK(r.batches > 0); /* the runs' door ran: several victims in one call */
+            if (ok && r.batches > 0) g_hot_runs++;
+            tr_experts_free(x);
+        }
+    }
+    {
+        fake_file f = mk_fake(align);
+        uint64_t slot_bytes = tr_experts_slot_bytes(&PART_BYTES_TABLE[0][0], N_LAYERS, align);
+        tr_experts_config cfg = mk_cfg((uint64_t)(N_EXPERT + N_USED) * slot_bytes, fake_read, &f, align);
+        cfg.evict = TR_EXPERTS_EVICT_HOT;
+        tr_experts *x = tr_experts_create(&cfg, err, sizeof err);
+        TR_CHECK(x != NULL);
+        if (x != NULL) {
+            int64_t counts[N_EXPERT];
+            for (int64_t e = 0; e < N_EXPERT; e++) counts[e] = e == 0 ? 300 : 1 + e;
+            TR_CHECK(tr_experts_acquire_counts(x, 0, ALL_EXPERTS, counts, 320, N_EXPERT) == 0);
+            /* the next layer's N_EXPERT units fill the N_USED free slots, then evict N_EXPERT - N_USED of layer 0 */
+            TR_CHECK(tr_experts_acquire(x, 1, ALL_EXPERTS, N_EXPERT) == 0);
+            int kept = tr_experts_part(x, 0, 0, 0) != NULL && unit_ok(x, 0, 0, align);
+            TR_CHECK(kept);
+            if (kept) g_hot_prompt++;
+            tr_experts_free(x);
+        }
+    }
+}
+
+/* ---- the emulated disk (cfg.disk_bytes_per_sec, TR_EXPERT_DISK_MBPS): a slower disk for measurements ---- */
+
+static int64_t g_disk_rate, g_disk_runs, g_disk_shared;
+
+/* Bytes the reader moves for one layer read on demand into a fresh store, no disk emulated. */
+static double disk_layer_bytes(uint64_t align, int64_t layer) {
+    shared_file f;
+    shared_init(&f, align);
+    char err[256];
+    uint64_t slot_bytes = tr_experts_slot_bytes(&PART_BYTES_TABLE[0][0], N_LAYERS, align);
+    tr_experts_config cfg = mk_cfg((uint64_t)PREFETCH_SLOTS * slot_bytes, shared_read, &f, align);
+    tr_experts *x = tr_experts_create(&cfg, err, sizeof err);
+    TR_CHECK(x != NULL);
+    if (x == NULL) return 0.0;
+    TR_CHECK(tr_experts_acquire(x, layer, ALL_EXPERTS, N_EXPERT) == 0);
+    tr_experts_free(x);
+    return (double)atomic_load(&f.bytes);
+}
+
+/* rate:   a layer read on demand, one request a part, takes at least its bytes at the rate (the wall and
+ *         the store's read time) and not much more (a timer, not a 15.6 ms tick a request);
+ * runs:   a resident load in runs (three requests in flight a call): the same, on the runs' door;
+ * shared: a layer read ahead by the I/O thread while the calling thread reads another on demand: the
+ *         two layers' bytes at the rate one after the other (one disk), where two clocks would overlap
+ *         them and finish in about the larger one's time. */
+/* ---- slots: tr_experts_set_slots, the slots in use fewer and more (a session's KV grows into them) ---- */
+
+static int64_t g_sl_hot, g_sl_lru, g_sl_clamp, g_sl_back, g_sl_pending;
+
+/* 14 slots filled in one known order: layer 0 three times (slots 0-5), layer 1's experts 0 and 1 (slots 6-7),
+ * layer 2 (slots 8-13): every slot holds a unit, the last two calls' units the most recent */
+static tr_experts *slots_filled(tr_experts_config *cfg) {
+    char err[256];
+    tr_experts *x = tr_experts_create(cfg, err, sizeof err);
+    TR_CHECK(x != NULL);
+    if (x == NULL) return NULL;
+    static const int64_t two[2] = {0, 1};
+    for (int k = 0; k < 3; k++) TR_CHECK(tr_experts_acquire(x, 0, ALL_EXPERTS, N_EXPERT) == 0);
+    TR_CHECK(tr_experts_acquire(x, 1, two, 2) == 0);
+    TR_CHECK(tr_experts_acquire(x, 2, ALL_EXPERTS, N_EXPERT) == 0);
+    return x;
+}
+
+static void test_slots(uint64_t align) {
+    uint64_t slot_bytes = tr_experts_slot_bytes(&PART_BYTES_TABLE[0][0], N_LAYERS, align);
+    tr_experts_stats st;
+    /* HOT: 14 -> 10 drops the four coolest, layer 1's two (hotness 1, older) then layer 2's experts 0 and 1
+     * (hotness 1, the least recent of their call); layer 0 (hotness 3) stays where it is, and layer 2's
+     * experts 2-5, in slots 10-13, move below 10 with their bytes */
+    {
+        fake_file f = mk_fake(align);
+        tr_experts_config cfg = mk_cfg(14 * slot_bytes, fake_read, &f, align);
+        cfg.evict = TR_EXPERTS_EVICT_HOT;
+        tr_experts *x = slots_filled(&cfg);
+        if (x != NULL) {
+            TR_CHECK_EQ_INT(tr_experts_set_slots(x, 10), 10);
+            tr_experts_get_stats(x, &st);
+            int kept = 1, gone = unit_absent(x, 1, 0) && unit_absent(x, 1, 1) && unit_absent(x, 2, 0) &&
+                                 unit_absent(x, 2, 1);
+            for (int64_t e = 0; e < N_EXPERT; e++) kept &= unit_ok(x, 0, e, align);
+            for (int64_t e = 2; e < N_EXPERT; e++) kept &= unit_ok(x, 2, e, align);
+            TR_CHECK(kept && gone);
+            TR_CHECK_EQ_INT(st.n_slots, 10);
+            TR_CHECK_EQ_INT(st.n_slots_made, 14);
+            TR_CHECK_EQ_INT(st.slots_given, 4);
+            TR_CHECK_EQ_INT(st.moved, 4);
+            TR_CHECK_EQ_INT(st.evictions, 4);
+            /* the store goes on in 10 slots: a whole layer read in, every unit exact */
+            uint64_t calls = (uint64_t)f.n_calls;
+            TR_CHECK(tr_experts_acquire(x, 1, ALL_EXPERTS, N_EXPERT) == 0);
+            TR_CHECK((uint64_t)f.n_calls > calls);
+            int layer1 = 1;
+            for (int64_t e = 0; e < N_EXPERT; e++) layer1 &= unit_ok(x, 1, e, align);
+            TR_CHECK(layer1);
+            if (kept && gone && st.moved == 4 && st.slots_given == 4 && layer1) g_sl_hot++;
+
+            /* clamped: never under the minimum, never over the slots made; the same count changes nothing */
+            TR_CHECK_EQ_INT(tr_experts_set_slots(x, 3), MIN_SLOTS);
+            TR_CHECK_EQ_INT(tr_experts_set_slots(x, MIN_SLOTS), MIN_SLOTS);
+            tr_experts_get_stats(x, &st);
+            TR_CHECK_EQ_INT(st.slots_given, 14 - MIN_SLOTS);
+            int clamp_ok = st.n_slots == MIN_SLOTS && st.slots_given == 14 - MIN_SLOTS;
+            /* back: the slots taken again free, and filled as before */
+            TR_CHECK_EQ_INT(tr_experts_set_slots(x, 100), 14);
+            tr_experts_get_stats(x, &st);
+            TR_CHECK_EQ_INT(st.slots_taken, 14 - MIN_SLOTS);
+            uint64_t ev = st.evictions;
+            TR_CHECK(tr_experts_acquire(x, 0, ALL_EXPERTS, N_EXPERT) == 0);
+            TR_CHECK(tr_experts_acquire(x, 2, ALL_EXPERTS, N_EXPERT) == 0);
+            tr_experts_get_stats(x, &st);
+            int all = 1;
+            for (int64_t e = 0; e < N_EXPERT; e++) all &= unit_ok(x, 0, e, align) && unit_ok(x, 2, e, align);
+            TR_CHECK(all);
+            /* 14 slots, MIN_SLOTS of them held: the 6 taken back free first, so two layers of 12 units need
+             * at most 12 - 6 victims */
+            TR_CHECK(st.evictions - ev <= 6);
+            if (clamp_ok && all) g_sl_clamp++;
+            if (all && st.slots_taken == 14 - MIN_SLOTS) g_sl_back++;
+            tr_experts_free(x);
+        }
+    }
+    /* LRU: 14 -> 10 drops the four least recent, layer 0's experts 0-3; layer 2's 2-5 move into their slots
+     * and keep their recency: the next miss evicts layer 0's expert 4, the least recent left, not a moved unit */
+    {
+        fake_file f = mk_fake(align);
+        tr_experts_config cfg = mk_cfg(14 * slot_bytes, fake_read, &f, align);
+        tr_experts *x = slots_filled(&cfg);
+        if (x != NULL) {
+            TR_CHECK_EQ_INT(tr_experts_set_slots(x, 10), 10);
+            int gone = 1, kept = unit_ok(x, 0, 4, align) && unit_ok(x, 0, 5, align) && unit_ok(x, 1, 0, align) &&
+                                 unit_ok(x, 1, 1, align);
+            for (int64_t e = 0; e < 4; e++) gone &= unit_absent(x, 0, e);
+            for (int64_t e = 0; e < N_EXPERT; e++) kept &= unit_ok(x, 2, e, align);
+            TR_CHECK(kept && gone);
+            static const int64_t one[1] = {2};
+            TR_CHECK(tr_experts_acquire(x, 1, one, 1) == 0);
+            int next = unit_absent(x, 0, 4) && unit_ok(x, 0, 5, align) && unit_ok(x, 1, 2, align);
+            for (int64_t e = 2; e < N_EXPERT; e++) next &= unit_ok(x, 2, e, align);
+            TR_CHECK(next);
+            tr_experts_get_stats(x, &st);
+            TR_CHECK_EQ_INT(st.moved, 4);
+            if (kept && gone && next && st.moved == 4) g_sl_lru++;
+            tr_experts_free(x);
+        }
+    }
+    /* reads ahead still in flight are taken in before any slot moves: layer 1 queued on a slow reader, then
+     * 14 -> 10 at once */
+    {
+        shared_file f;
+        shared_init(&f, align);
+        f.delay = 0.002;
+        char err[256];
+        tr_experts_config cfg = mk_cfg((uint64_t)PREFETCH_SLOTS * slot_bytes, shared_read, &f, align);
+        tr_experts *x = tr_experts_create(&cfg, err, sizeof err);
+        TR_CHECK(x != NULL);
+        if (x != NULL) {
+            TR_CHECK(tr_experts_prefetch_start(x) == 0);
+            TR_CHECK(tr_experts_acquire(x, 0, ALL_EXPERTS, N_EXPERT) == 0);
+            TR_CHECK_EQ_INT(tr_experts_prefetch(x, 1, 0), N_EXPERT);
+            TR_CHECK_EQ_INT(tr_experts_set_slots(x, 10), 10);
+            tr_experts_get_stats(x, &st);
+            TR_CHECK_EQ_INT(st.prefetched, N_EXPERT); /* all taken in by set_slots, none by an acquire */
+            int present = 0, exact = 1;
+            for (int64_t l = 0; l < 2; l++)
+                for (int64_t e = 0; e < N_EXPERT; e++) {
+                    if (unit_absent(x, l, e)) continue;
+                    present++;
+                    exact &= unit_ok(x, l, e, align);
+                }
+            TR_CHECK_EQ_INT(present, 10);
+            TR_CHECK(exact);
+            TR_CHECK(tr_experts_prefetch_wait(x) == 0);
+            if (st.prefetched == N_EXPERT && present == 10 && exact) g_sl_pending++;
+            tr_experts_free(x);
+        }
+    }
+}
+
+static void test_disk_emulated(uint64_t align) {
+    char err[256];
+    uint64_t slot_bytes = tr_experts_slot_bytes(&PART_BYTES_TABLE[0][0], N_LAYERS, align);
+    double rate = disk_layer_bytes(align, 1) / 0.04; /* layer 1 in 40 ms */
+    TR_CHECK(rate > 0);
+    if (!(rate > 0)) return;
+
+    /* rate */
+    {
+        shared_file f;
+        shared_init(&f, align);
+        tr_experts_config cfg = mk_cfg((uint64_t)PREFETCH_SLOTS * slot_bytes, shared_read, &f, align);
+        cfg.disk_bytes_per_sec = rate;
+        tr_experts *x = tr_experts_create(&cfg, err, sizeof err);
+        TR_CHECK(x != NULL);
+        if (x != NULL) {
+            double t0 = tr_time_sec();
+            TR_CHECK(tr_experts_acquire(x, 1, ALL_EXPERTS, N_EXPERT) == 0);
+            double wall = tr_time_sec() - t0;
+            double want = (double)atomic_load(&f.bytes) / rate;
+            tr_experts_stats st;
+            tr_experts_get_stats(x, &st);
+            TR_CHECK(layer_ok(x, 1, align));
+            TR_CHECK(st.disk_bytes_per_sec == rate);
+            TR_CHECK(want > 0.039 && want < 0.041);
+            TR_CHECK(wall >= want * 0.999);
+            TR_CHECK(st.read_sec >= want * 0.999);
+            TR_CHECK(wall < 2 * want + 0.05);
+            if (layer_ok(x, 1, align) && wall >= want * 0.999 && wall < 2 * want + 0.05) g_disk_rate++;
+            tr_experts_free(x);
+        }
+    }
+
+    /* runs */
+    {
+        fake_run_file r;
+        memset(&r, 0, sizeof r);
+        r.f.align_check = align;
+        tr_experts_config cfg = rn_cfg(RN_LAYERS * RN_EXPERT, &r, align, 0);
+        cfg.disk_bytes_per_sec = rate;
+        tr_experts *x = tr_experts_create(&cfg, err, sizeof err);
+        TR_CHECK(x != NULL);
+        if (x != NULL) {
+            double t0 = tr_time_sec();
+            TR_CHECK(tr_experts_load_all(x, NULL, NULL) == 0);
+            double wall = tr_time_sec() - t0;
+            tr_experts_stats st;
+            tr_experts_get_stats(x, &st);
+            double want = (double)st.bytes_read / rate;
+            TR_CHECK_EQ_INT(r.batches, RN_LAYERS); /* the runs' door, not the one a part */
+            TR_CHECK(rn_layer_ok(x, 0) && rn_layer_ok(x, 1) && rn_layer_ok(x, 2));
+            TR_CHECK(want > 0.0);
+            TR_CHECK(wall >= want * 0.999);
+            TR_CHECK(st.read_sec >= want * 0.999);
+            if (r.batches == RN_LAYERS && want > 0.0 && wall >= want * 0.999) g_disk_runs++;
+            tr_experts_free(x);
+        }
+    }
+
+    /* shared */
+    {
+        shared_file f;
+        shared_init(&f, align);
+        tr_experts_config cfg = mk_cfg((uint64_t)PREFETCH_SLOTS * slot_bytes, shared_read, &f, align);
+        cfg.disk_bytes_per_sec = rate;
+        tr_experts *x = tr_experts_create(&cfg, err, sizeof err);
+        TR_CHECK(x != NULL);
+        if (x == NULL) return;
+        TR_CHECK(tr_experts_prefetch_start(x) == 0);
+        TR_CHECK(tr_experts_acquire(x, 0, ALL_EXPERTS, N_EXPERT) == 0);
+        long long b0 = atomic_load(&f.bytes);
+        double t0 = tr_time_sec();
+        int64_t queued = tr_experts_prefetch(x, 1, 0); /* the I/O thread reads layer 1 ... */
+        TR_CHECK(tr_experts_acquire(x, 2, ALL_EXPERTS, N_EXPERT) == 0); /* ... while this one reads layer 2 */
+        TR_CHECK(tr_experts_prefetch_wait(x) == 0);
+        double wall = tr_time_sec() - t0;
+        double want = (double)(atomic_load(&f.bytes) - b0) / rate;
+        TR_CHECK_EQ_INT(queued, N_EXPERT);
+        TR_CHECK(want > 0.06); /* both layers: 40 ms and at least 30 more */
+        TR_CHECK(wall >= want * 0.999);
+        TR_CHECK(tr_experts_acquire(x, 1, ALL_EXPERTS, N_EXPERT) == 0);
+        TR_CHECK(layer_ok(x, 1, align));
+        if (queued == N_EXPERT && want > 0.06 && wall >= want * 0.999) g_disk_shared++;
+        tr_experts_free(x);
+    }
+}
+
 int main(void) {
     t_test_thread = 1;
     build_part_offsets();
+    rn_build_offsets();
 
     static const uint64_t aligns[] = {1, TR_FILE_DIRECT_ALIGN};
     for (size_t i = 0; i < sizeof aligns / sizeof aligns[0]; i++) {
@@ -1111,8 +1920,34 @@ int main(void) {
         test_o1_evidence(align);
         test_few_layers(align);
         test_prefetch(align);
+        test_runs(align);
+        test_disk_emulated(align);
+        test_hot(align);
+        test_slots(align);
     }
     test_align_reuse();
+    TR_CHECK(g_sl_hot > 0);
+    TR_CHECK(g_sl_lru > 0);
+    TR_CHECK(g_sl_clamp > 0);
+    TR_CHECK(g_sl_back > 0);
+    TR_CHECK(g_sl_pending > 0);
+    TR_CHECK(g_hot_diff > 0);
+    TR_CHECK(g_hot_scaled > 0);
+    TR_CHECK(g_hot_prompt > 0);
+    TR_CHECK(g_hot_apart > 0);
+    TR_CHECK(g_hot_runs > 0);
+    TR_CHECK(g_hot_own > 0);
+    TR_CHECK(g_hot_resident > 0);
+    TR_CHECK(g_disk_rate > 0);
+    TR_CHECK(g_disk_runs > 0);
+    TR_CHECK(g_disk_shared > 0);
+    TR_CHECK(g_rn_shared > 0);
+    TR_CHECK(g_rn_unshared > 0);
+    TR_CHECK(g_rn_split > 0);
+    TR_CHECK(g_rn_demand > 0);
+    TR_CHECK(g_rn_ahead > 0);
+    TR_CHECK(g_rn_fail > 0);
+    TR_CHECK(g_rn_fallback > 0);
     TR_CHECK(g_pf_start > 0);
     TR_CHECK(g_pf_basic > 0);
     TR_CHECK(g_pf_victims > 0);
@@ -1120,7 +1955,7 @@ int main(void) {
     TR_CHECK(g_pf_concurrent > 0);
     TR_CHECK(g_pf_fail > 0);
     TR_CHECK(g_pf_fail_acquire > 0);
-    TR_CHECK(g_pf_free_in_flight > 0);
+    TR_CHECK(g_pf_free_in_flight > 0); TR_CHECK(g_pf_hot > 0); TR_CHECK(g_pf_cancel > 0);
 
     TR_TEST_EXIT();
 }

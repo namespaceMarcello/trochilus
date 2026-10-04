@@ -11,6 +11,9 @@
 #   crashed       a mode that prints its prompt line, then exits 1: ab_modes stops, rc 1
 #   measured      modes that print a prompt line: rc 0, a prefill median per mode
 #   measured+wall the same with AB_WALL=1: rc 0, a wall_ms median per mode as well
+#   zero          a field whose median is 0 (the store's hits): rc 0, its median and every other one printed
+#   stop          AB_STOP on steady modes: stops after AB_MIN kept rounds, rc 0
+#   nostop        AB_STOP with a mode 40% apart run to run: every round runs
 # A counter per branch fails the test if a branch was never reached.
 # The body is one function, called on the last line (docs/LESSONS.md #69).
 main() {
@@ -23,7 +26,7 @@ finish() { cleanup_children; rm -rf "$T"; }
 trap finish EXIT
 trap 'exit 130' INT TERM
 FAIL=0
-N_FAILED=0 N_FAILED_WALL=0 N_CRASHED=0 N_MEASURED=0 N_MEASURED_WALL=0
+N_FAILED=0 N_FAILED_WALL=0 N_CRASHED=0 N_MEASURED=0 N_MEASURED_WALL=0 N_ZERO=0 N_STOP=0 N_NOSTOP=0
 fail() { echo "test_ab_modes: FAILED: $*"; FAIL=1; }
 
 GOOD="echo 'prompt: 8 tokens in 0.1 s (80.0 tok/s)' >&2"
@@ -76,11 +79,47 @@ else
   cat "$T/measured-wall.txt"
 fi
 
-for n in N_FAILED N_FAILED_WALL N_CRASHED N_MEASURED N_MEASURED_WALL; do
+# zero: a field whose median is 0 (the store's hits on a budget below one token's experts, docs/LESSONS.md #270)
+# must print its median and every field after it; it once divided by zero and the summary stopped there
+ZA="$GOOD; echo 'experts: 8 of 64 units in RAM (1 MiB, direct), 0 hits, 5 misses, 3 MiB read in 0.5 s' >&2"
+ZB="$GOOD; echo 'experts: 8 of 64 units in RAM (1 MiB, direct), 2 hits, 3 misses, 2 MiB read in 0.4 s' >&2"
+RC=0
+sh "$AB" 1 "a=$ZA" "b=$ZB" > "$T/zero.txt" 2>&1 || RC=$?
+if [ "$RC" = 0 ] && [ "$(grep -c ' median ' "$T/zero.txt")" = 10 ] && grep -q '^hits  *a  *median  *0[.]00 ' "$T/zero.txt"; then
+  N_ZERO=$((N_ZERO + 1))
+else
+  fail "zero: rc $RC (0 wanted), or not 10 medians (prefill, hits, misses, mib, read_s of two modes), or no hits median 0"
+  cat "$T/zero.txt"
+fi
+
+# stop: AB_STOP=5 AB_MIN=2 on modes that print the same speed every time: the comparison stops after round 2
+# of 9 (three runs a mode: rounds 0, 1, 2), rc 0, its medians printed
+RC=0
+AB_STOP=5 AB_MIN=2 sh "$AB" 9 "a=$GOOD" "b=$GOOD" > "$T/stop.txt" 2>&1 || RC=$?
+if [ "$RC" = 0 ] && grep -q 'stopped after round 2 of 9' "$T/stop.txt" && [ "$(grep -c '^a prefill ' "$T/stop.txt")" = 3 ]; then
+  N_STOP=$((N_STOP + 1))
+else
+  fail "stop: rc $RC (0 wanted), or not stopped after round 2, or not three runs of a"
+  cat "$T/stop.txt"
+fi
+
+# nostop: one mode's speed jumps 80 <-> 120 run by run, 40% apart: AB_STOP=5 never holds, all 4 rounds run
+echo 0 > "$T/c"
+NOISY="n=\$(cat '$T/c'); echo \$((n + 1)) > '$T/c'; if [ \$((n % 2)) = 0 ]; then echo 'prompt: 8 tokens in 0.1 s (80.0 tok/s)' >&2; else echo 'prompt: 8 tokens in 0.1 s (120.0 tok/s)' >&2; fi"
+RC=0
+AB_STOP=5 AB_MIN=2 sh "$AB" 4 "a=$GOOD" "b=$NOISY" > "$T/nostop.txt" 2>&1 || RC=$?
+if [ "$RC" = 0 ] && ! grep -q 'stopped after' "$T/nostop.txt" && [ "$(grep -c '^b prefill ' "$T/nostop.txt")" = 5 ]; then
+  N_NOSTOP=$((N_NOSTOP + 1))
+else
+  fail "nostop: rc $RC (0 wanted), or stopped early on a noisy mode, or not five runs of b"
+  cat "$T/nostop.txt"
+fi
+
+for n in N_FAILED N_FAILED_WALL N_CRASHED N_MEASURED N_MEASURED_WALL N_ZERO N_STOP N_NOSTOP; do
   eval "v=\$$n"
   [ "$v" -gt 0 ] || fail "branch $n never reached"
 done
 [ "$FAIL" = 0 ] || exit 1
-echo "test_ab_modes: 5 branches, all passed"
+echo "test_ab_modes: 8 branches, all passed"
 }
 main "$@"; exit

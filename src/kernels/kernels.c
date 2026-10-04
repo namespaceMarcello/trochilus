@@ -209,10 +209,10 @@ static void k_q4x_prep(const float *x, int64_t n, void *xq) {
             else if (a > m) m = a;
         }
         const int sh = bad ? 0 : tr_q4x_shift(m);
-        v.scale[s] = bad ? (double)NAN : ldexp(1.0, -sh);
+        v.scale[s] = bad ? (double)NAN : tr_pow2(-sh);
         /* x 2^sh is exact in double, and adding and taking away 1.5 2^52 rounds it to the nearest integer,
          * ties to even (|x 2^sh| <= TR_Q4X_XMAX < 2^51) */
-        const double f = bad ? 0.0 : ldexp(1.0, sh), magic = 6755399441055744.0;
+        const double f = bad ? 0.0 : tr_pow2(sh), magic = 6755399441055744.0;
         for (int j = 0; j < 8; j++) {
             int64_t b = 0;
             for (int i = 0; i < 32; i++) {
@@ -521,6 +521,7 @@ static void build_scalar_table(tr_kernels *k) {
     k->q4x_dot_xt = k_q4x_dot_xt;
     k->q4x_panel = k_q4x_panel;
     k->q4x_tile = k_q4x_tile;
+    k->q4x_tile_max = TR_Q4X_TILE_MAX;
     k->dequant_row[TR_TYPE_F32] = k_dequant_f32;
     k->dequant_row[TR_TYPE_F16] = k_dequant_f16;
     k->dequant_row[TR_TYPE_BF16] = k_dequant_bf16;
@@ -753,6 +754,8 @@ void tr_matmul_grouped(tr_pool *pool, const tr_mat *w, const int64_t *offsets, i
  * own, whatever the thread: the same y at every thread count. */
 #define PM_CHUNK 256
 #define PM_MIN_ROWS 4
+/* the narrowest tile_max a road plans with (AVX2's Q4_K tiles of 3): the plan's room for tiles */
+#define PM_ROOM_TILE 3
 
 /* the plan's tables inside s->plan */
 typedef struct {
@@ -766,7 +769,7 @@ typedef struct {
 } pm_plan;
 
 static int64_t pm_max_chunks(const tr_pm_scratch *s) { return s->max_groups + s->max_tokens / PM_CHUNK + 1; }
-static int64_t pm_max_tiles(const tr_pm_scratch *s) { return s->max_tokens / PM_MIN_ROWS + pm_max_chunks(s) + 1; }
+static int64_t pm_max_tiles(const tr_pm_scratch *s) { return s->max_tokens / PM_ROOM_TILE + pm_max_chunks(s) + 1; }
 
 static pm_plan pm_plan_of(const tr_pm_scratch *s) {
     pm_plan p;
@@ -847,8 +850,8 @@ static void pm_rows_by_dot(const pm_ctx *c, int64_t g, int64_t r0, int64_t p_beg
 /* The plan of both roads, cut evenly (piece i of L in n: [i*L/n, (i+1)*L/n)): a group of min_rows input rows
  * or more in chunks of at most PM_CHUNK, each in tiles of at most tile_max; a smaller group in one chunk with no
  * tiles. Items are (group, TR_PM_ROWS weight rows, chunk); every worker's panel is forgotten. The tiles fit the
- * plan's room (pm_max_tiles: max_tokens / PM_MIN_ROWS + the chunks) while tile_max >= PM_MIN_ROWS: a chunk of
- * len holds ceil(len / tile_max) <= len / PM_MIN_ROWS + 1 tiles. Returns the items; *n_tiles the tiles. */
+ * plan's room (pm_max_tiles: max_tokens / PM_ROOM_TILE + the chunks) while tile_max >= PM_ROOM_TILE: a chunk of
+ * len holds ceil(len / tile_max) <= len / PM_ROOM_TILE + 1 tiles. Returns the items; *n_tiles the tiles. */
 static int64_t pm_plan_build(pm_plan *pl, const int64_t *offsets, int64_t n_groups, int64_t rows, int64_t min_rows,
                              int64_t tile_max, int n_workers, int64_t *n_tiles) {
     int64_t n_items = 0, n_chunks = 0, nt_all = 0;
@@ -1138,10 +1141,10 @@ static void q4x_run(tr_pool *pool, q4x_ctx *c, const tr_mat *w, const int64_t *o
     c->row_bytes = tr_row_bytes(TR_TYPE_Q4_K, c->cols);
     c->xq_row = tr_q4x_bytes(c->cols);
     c->min_rows = k->q4x_dot_xt != NULL ? Q4X_MIN_TILE_ROWS : Q4X_MIN_TILE_ROWS_DOT2;
-    /* tiles of at most TR_Q4X_TILE_MAX (4: within the plan's room, ceil(len / 4) tiles a chunk); a group under
-     * min_rows is one chunk, so an item holds its 2-3 input rows on one thread */
+    /* tiles of at most the tier's q4x_tile_max (3 or 4: within the plan's room, ceil(len / 3) tiles a chunk at
+     * most); a group under min_rows is one chunk, so an item holds its 2-3 input rows on one thread */
     int64_t n_tiles;
-    const int64_t n_items = pm_plan_build(&c->plan, offsets, n_groups, c->rows, c->min_rows, TR_Q4X_TILE_MAX,
+    const int64_t n_items = pm_plan_build(&c->plan, offsets, n_groups, c->rows, c->min_rows, k->q4x_tile_max,
                                           s->n_workers, &n_tiles);
     (void)n_tiles;
     TR_TRACE_NOTE(matmul_used_bytes(offsets, n_groups, c->rows, c->row_bytes) * (uint64_t)c->n_w, c->rows, c->cols,

@@ -23,6 +23,17 @@
             "statusMessage": "Checking for backslashes in shell writes..."
           }
         ]
+      },
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"C:/Users/marce/Desktop/trochilus/.claude/hooks/time-from-date.cjs\"",
+            "timeout": 10,
+            "statusMessage": "Checking that a prediction's time comes from date..."
+          }
+        ]
       }
     ]
   }

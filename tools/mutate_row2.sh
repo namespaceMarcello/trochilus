@@ -1,8 +1,8 @@
 #!/bin/sh
 # mutate_row2.sh — do the tests see a wrong two-row kernel (dot_row2_x4 and dot_row2_x8: two weight
 # rows against the same four or eight input rows, AVX-512), a wrong lane tree in SIMD, a wrong use
-# of them in tr_matmul, or a wrong SIMD Q6_K scale? And the decode's Q4_K: the one-row kernel's
-# vector scales and the pair of rows against one token (dot_row2) with its roads in tr_matmul
+# of them in tr_matmul, or a wrong SIMD Q6_K scale? And the decode's Q4_K: the scales' byte mask
+# and the pair of rows against one token (dot_row2) with its roads in tr_matmul
 # (question 66). A test
 # never seen red proves nothing (docs/LESSONS.md #43): each mutation is applied to a copy of the
 # tree, the copy is built and the checks that should notice are run: test_kernels (every tier's
@@ -58,8 +58,6 @@ run "every type: row 1's fourth input row times row 0's weights" $K \
   "b3 = _mm512_add_ps(b3, _mm512_mul_ps(u, v_));" "b3 = _mm512_add_ps(b3, _mm512_mul_ps(w, v_));"
 run "q8_0: row 1's first two sums swapped" $K \
   "TR_ROW2_OUT(out, a0, a1, a2, a3, b0, b1, b2, b3);" "TR_ROW2_OUT(out, a0, a1, a2, a3, b1, b0, b2, b3);"
-run "q4_k: row 1's high nibbles look up row 0's values" $K \
-  "_mm512_permutexvar_ps(_mm512_srli_epi32(q10, 4), vhi1)" "_mm512_permutexvar_ps(_mm512_srli_epi32(q10, 4), vhi0)"
 run "q6_k: row 1's quants unpacked from row 0" $K "avx2_q6_k_unpack(k1, q1);" "avx2_q6_k_unpack(k0, q1);"
 run "q6_k scales, avx512: one byte late" $K \
   "avx512_i8_to_ps(blk + TR_Q6_K_SCALES_OFFSET)" "avx512_i8_to_ps(blk + TR_Q6_K_SCALES_OFFSET + 1)"
@@ -85,31 +83,18 @@ run "x4 out: row 0's first two sums swapped" $K \
   "h_ = avx512_pair_sums(avx512_pair_sums(avx512_pair_sums(a0, a1)" "h_ = avx512_pair_sums(avx512_pair_sums(avx512_pair_sums(a1, a0)"
 run "lane tree: lanes 12 and 14 paired the other way" $K \
   "_mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14," "_mm512_setr_epi32(0, 2, 4, 6, 8, 10, 14, 12,"
-run "x8 q4_k: row 1's high nibbles look up row 0's values" $K \
-  "_mm512_permutexvar_ps(_mm512_srli_epi32(q10, 4), vhi1)" "_mm512_permutexvar_ps(_mm512_srli_epi32(q10, 4), vhi0)" 2
 run "x8 q6_k: row 1's quants unpacked from row 0" $K "avx2_q6_k_unpack(k1, q1);" "avx2_q6_k_unpack(k0, q1);" 2
-run "table: avx512 q4_k x8 kernel left out" $K \
-  "g_avx512.dot_row2_x8[TR_TYPE_Q4_K] = avx512_dot_row2_x8_q4_k;" "(void)avx512_dot_row2_x8_q4_k;"
 run "matmul x8: row 1's sums stored over row 0's" $M \
   "c->y[(q + j) * c->rows + r + 1] = out[TR_DOT_TOKENS_WIDE + j];" "c->y[(q + j) * c->rows + r] = out[TR_DOT_TOKENS_WIDE + j];"
 run "matmul: the x8 road never taken" $M "if (c->dot_row2_x8 != NULL) {" "if (c->dot_row2_x8 != NULL && c->rows < 0) {"
 run "matmul x8: a whole group of eight left to x4" $M \
   "for (; q + TR_DOT_TOKENS_WIDE <= b_end; q += TR_DOT_TOKENS_WIDE) {" "for (; q + TR_DOT_TOKENS_WIDE < b_end; q += TR_DOT_TOKENS_WIDE) {"
-# the decode's Q4_K (question 66): the one-row kernel's vector scales, one block ahead, and the pair
-# of rows against one token (dot_row2) with its roads in tr_matmul
+# the decode's Q4_K (question 66): the scales' byte mask, and the pair of rows against one token (dot_row2)
+# with its roads in tr_matmul. The float Q4_K kernels (x8, one row, pair) are gone, replaced by the integer
+# road (kernels.h q4x_*): their mutations went with them, the integer road's are in mutate_q4x.sh. The mask's
+# text is now in three of its kernels; the first, the W16 panel's header decode, is the one mutated
 run "q4_k scales in a vector: min 4 masked to 3 bits" $K \
   "63, 63, 63, 63, 15, 15, 15, 15, 63, 63, 63, 63, 15, 15, 15, 15" "63, 63, 63, 63, 15, 15, 15, 15, 63, 63, 63, 63, 7, 15, 15, 15"
-run "q4_k one row: the next block's scales over this block's" $K "sm[(b + 1) & 1]" "sm[b & 1]"
-run "q4_k one row: the high table takes the low min" $K "_mm512_set1_ps(s[9 + 2 * c])" "_mm512_set1_ps(s[8 + 2 * c])"
-run "pair q4_k: row 1's first low table is row 0's" $K "_mm512_permutexvar_ps(b0v, lo1)" "_mm512_permutexvar_ps(b0v, lo0)"
-run "pair q4_k: row 1's high table takes its low min" $K "_mm512_set1_ps(d[9 + 2 * c])" "_mm512_set1_ps(d[8 + 2 * c])"
-run "pair q4_k: row 1's scales read from row 0" $K \
-  "avx512_q4_k_scales_store(p1 + (size_t)b * TR_Q4_K_BLOCK_BYTES, s1[b - b0]);" \
-  "avx512_q4_k_scales_store(p0 + (size_t)b * TR_Q4_K_BLOCK_BYTES, s1[b - b0]);"
-run "pair q4_k: the last span one block short" $K \
-  "int64_t b1 = b0 + TR_Q4_K_SPAN < nb ? b0 + TR_Q4_K_SPAN : nb;" "int64_t b1 = b0 + TR_Q4_K_SPAN < nb ? b0 + TR_Q4_K_SPAN : nb - 1;"
-run "table: avx512 q4_k pair left out" $K \
-  "g_avx512.dot_row2[TR_TYPE_Q4_K] = avx512_dot_row2_q4_k;" "(void)avx512_dot_row2_q4_k;"
 run "matmul rows: the pair stored one row late" $M "xp, c->cols, yp + r);" "xp, c->cols, yp + r + 1);"
 run "matmul tiled: the pair's second result is its first" $M \
   "c->y[q * c->rows + r + 1] = out[1];" "c->y[q * c->rows + r + 1] = out[0];"

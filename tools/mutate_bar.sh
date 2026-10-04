@@ -177,7 +177,7 @@ run "a bar that is off draws" bar $B "b->on = on && clock != NULL && write != NU
 run "the load asks for no progress" bar $B "b->on ? &progress : NULL" "NULL"
 run "the load does not close the bar" bar $B "    tr_bar_close(b);
     return m;" "    return m;"
-run "the load opens no file" bar $B "tr_model_load_progress(path, pool" "tr_model_load_progress(\"\", pool"
+run "the load opens no file" bar $B "tr_model_load_plan(path, pool" "tr_model_load_plan(\"\", pool"
 
 # the core's report (model.h tr_progress)
 run "read_vec does not report" core $O "    progress_add(lp, t->n_bytes);
@@ -191,19 +191,17 @@ run "the experts counted at a partial load" core $O "        if (resident)
             for (int64_t i = 0;"
 run "the experts left out of the total" core $O "lp.total = dense_bytes + experts_at_load;" "lp.total = dense_bytes;"
 run "a unit reported with no bytes" core $O "progress_add((load_progress *)ctx, unit_bytes);" "progress_add((load_progress *)ctx, 0);"
-run "the total fixed only after the experts" core $O "        lp.total = dense_bytes + experts_at_load;
-        /* resident: fill every slot now, so forward_pass's acquire calls are hits from the very
-         * first token and the reader is never called again (one path afterwards either way). */
-        if (resident && tr_experts_load_all(m->experts, progress_unit, &lp) != 0) {
+run "the total fixed only after the experts" core $O "        if (resident && tr_experts_load_all(m->experts, progress_unit, &lp) != 0) {
             snprintf(err, err_len, \"failed reading the experts at load\");
             goto fail;
-        }" "        /* resident: fill every slot now */
+        }" "        const uint64_t total_now = lp.total;
+        lp.total = 0;
         if (resident && tr_experts_load_all(m->experts, progress_unit, &lp) != 0) {
             snprintf(err, err_len, \"failed reading the experts at load\");
             goto fail;
         }
-        lp.total = dense_bytes + experts_at_load;"
-run "no report per unit" core $X "            if (on_unit != NULL) on_unit(ctx, unit_bytes);
+        lp.total = total_now;"
+run "no report per unit" core $X "            for (int64_t e = 0; e < k && on_unit != NULL; e++) on_unit(ctx, unit_bytes);
 " ""
 run "a unit reported without its down part" core $X "for (int p = 0; p < TR_EXPERT_PARTS; p++)
             unit_bytes +=" "for (int p = 0; p < 2; p++)
@@ -219,8 +217,8 @@ run "a missing router is not an error" core $O \
 run "a missing matrix names no tensor" core $O "snprintf(err, err_len, \"missing tensor '%s'\", name);
         return -1;" "snprintf(err, err_len, \"missing tensor\");
         return -1;"
-run "model.c drops the progress" core src/models/model.c "vt->load(path, g, pool, expert_budget, progress, err, err_len)" \
-  "vt->load(path, g, pool, expert_budget, NULL, err, err_len)"
+run "model.c drops the progress" core src/models/model.c "plan_ctx > 0 ? plan_ctx : 0, progress, err, err_len)" \
+  "plan_ctx > 0 ? plan_ctx : 0, NULL, err, err_len)"
 
 echo "$CAUGHT of $TOTAL red"
 [ "$BASELINE_OK" = 1 ] || { echo "the unmutated baseline was not green on every test"; exit 1; }

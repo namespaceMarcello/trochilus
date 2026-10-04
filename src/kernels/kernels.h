@@ -171,13 +171,16 @@ typedef struct {
      *   64-byte aligned); next, when not NULL, is the TR_PM_ROWS rows the caller builds after these (the
      *   same row_bytes and n), which a tier may bring toward its caches while it builds (never read);
      * q4x_tile: the panel against T prepared rows xq[0], ..., xq[T - 1], T from 1 to TR_Q4X_TILE_MAX:
-     *   y[t * y_stride + r] = the panel's row r against input row t. */
+     *   y[t * y_stride + r] = the panel's row r against input row t;
+     * q4x_tile_max: the widest tile the planner gives q4x_tile, 3 or 4 (AVX2's T = 4 spills: docs/MEASUREMENTS.md
+     *   §AVX2's own Q4_K tile). */
     void (*q4x_prep)(const float *x, int64_t n, void *xq);
     void (*q4x_dot2)(const void *row0, const void *row1, const void *xq, int64_t n, float *out);
     void (*q4x_dot_xt)(const void *row0, const void *row1, const void *const *xq, int64_t n, int T, float *y,
                        int64_t y_stride);
     void (*q4x_panel)(const void *rows, size_t row_bytes, int64_t n, void *panel, const void *next);
     void (*q4x_tile)(const void *panel, const void *const *xq, int64_t n, int T, float *y, int64_t y_stride);
+    int q4x_tile_max;
     /* decode one row of n elements to f32 */
     void (*dequant_row[TR_TYPE_COUNT])(const void *row, float *out, int64_t n);
     /* y[i] = tr_expf(x[i]) for i < n, element-wise; y may be x (in place). The exponential of the

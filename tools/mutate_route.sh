@@ -50,7 +50,7 @@ run "pred_out uses layer L's own ffn_norm, not layer L+1's" $M \
   "for (int64_t i = 0; i < rec; i++) tr_rmsnorm(tr->normed + i * n_embd, next->ffn_norm, n_embd, m->rms_eps);" \
   "for (int64_t i = 0; i < rec; i++) tr_rmsnorm(tr->normed + i * n_embd, m->layers[L].ffn_norm, n_embd, m->rms_eps);"
 run "pred_out taken from the FFN input instead of the output" $M \
-  "memcpy(tr->normed, s->x, (size_t)rec * n_embd * sizeof(float));" \
+  "memcpy(tr->normed, x, (size_t)rec * n_embd * sizeof(float));" \
   "memcpy(tr->normed, s->normed, (size_t)rec * n_embd * sizeof(float));"
 run "chosen recorded with the wrong token index inside a batch" $M \
   "int64_t id = s->sel_id[i * n_used + slot];" \

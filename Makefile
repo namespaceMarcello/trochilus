@@ -41,6 +41,12 @@ EXE     := .exe
 # no link timestamp in the PE header: the same code links to the same bytes, so Smart App Control
 # keeps its verdict on a rebuilt binary instead of blocking a new hash (docs/LESSONS.md #12, #103)
 LDLIBS  := -Wl,--no-insert-timestamp $(EXTRA_LDFLAGS)
+# FRESH=1: a build-id from the clock, so this link is a hash nobody has seen. The same code in a new
+# folder links to the same bytes, and waits for the verdict the first one is waiting for (#251)
+ifeq ($(FRESH),1)
+# an even count of hex digits: with 19 (the clock in ns) ld aborts or leaves a file Windows cannot run
+LDLIBS  += -Wl,--build-id=0x$(shell printf %020d $$(date +%s%N))
+endif
 PY      ?= tools/.venv/Scripts/python.exe
 else
 EXE     :=
@@ -59,7 +65,7 @@ ATTN_BIN := $(BUILD)/tests/bench_attn$(EXE)
 EXPF_BIN := $(BUILD)/tests/bench_expf$(EXE)
 DISK_BIN := $(BUILD)/tests/bench_disk$(EXE)
 # premise benches of 2026-09-24 (docs/MEASUREMENTS.md): built by the gate so they do not rot, run by hand
-RESEARCH_BIN := $(foreach b,bench_gpu_attn bench_gpu_q8 bench_attn_bw bench_kvpack bench_expf32 bench_peak bench_q4k_genome bench_q4x,$(BUILD)/tests/$(b)$(EXE))
+RESEARCH_BIN := $(foreach b,bench_gpu_attn bench_gpu_q8 bench_attn_bw bench_kvpack bench_expf32 bench_peak bench_q4k_genome bench_q4x bench_q4x_genome bench_disk_misses,$(BUILD)/tests/$(b)$(EXE))
 
 .PHONY: all attn-probe test check-gcc check-clang check-asan check-tsan check-tiny check-real check-cut oracle tier-check oracle-tokenizer chat-check oracle-real spec-check bench bench-mem bench-attn bench-expf bench-disk lint profile check check-linux clean-machine clean platform-guard quick
 all: $(BUILD)/trochilus$(EXE)
@@ -189,6 +195,7 @@ profile: $(BUILD)/trochilus$(EXE)
 lint:
 	$(PY) tools/lint.py
 	$(PY) tools/route_trace_report.py --check
+	$(PY) tools/evict_replay.py --check
 	$(PY) tools/check_measurements.py
 
 # Tiny OLMoE: transformers reference -> GGUF -> engine, greedy tokens must match exactly.

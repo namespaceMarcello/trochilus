@@ -153,6 +153,31 @@ static int cmd_inspect(int argc, char **argv) {
 
 /* ---- generate / logits: shared helpers ------------------------------------ */
 
+/* The ids a --tokens list holds, counted before it is parsed (a comma more is an id more): an upper
+ * bound for a malformed one, which parse_tokens refuses afterwards. 0 for NULL. */
+static int64_t count_ids(const char *s) {
+    if (s == NULL) return 0;
+    int64_t n = 1;
+    for (; *s != '\0'; s++) n += *s == ',';
+    return n;
+}
+
+/* The positions a run holds: its prompt, the tokens it generates and a draft's (--spec), the plan's
+ * session (tr_model_load_plan). 0 (the default context) when -n is too large to mean a length. */
+static int64_t plan_positions(int64_t n_prompt, int64_t n_gen, int64_t n_draft) {
+    const int64_t big = (int64_t)1 << 40;
+    if (n_prompt < 0 || n_gen < 0 || n_prompt >= big || n_gen >= big) return 0;
+    return n_prompt + n_gen + n_draft;
+}
+
+/* The session's context: -c when given; else the positions the run holds, while they fit the model's
+ * trained length; else 0, the default (the run then stops where the context ends, as before). */
+static int64_t session_positions(const tr_model *model, int64_t n_ctx, int64_t need) {
+    if (n_ctx > 0) return n_ctx;
+    const tr_model_info *info = tr_model_get_info(model);
+    return need > 0 && need <= info->n_ctx_train ? need : 0;
+}
+
 /* Parses a comma-separated list of ids, e.g. "3,11,29", into a malloc'd array. An id outside
  * 0..INT32_MAX is an error, not a cast: 4294967297 was id 1 on Linux (tests/test_cli.c). */
 static int parse_tokens(const char *s, int32_t **out, int64_t *out_n) {
@@ -360,8 +385,9 @@ static void print_experts(const tr_model *model) {
     double mib = 1024.0 * 1024.0;
     const char *how = st.direct ? "direct" : "buffered";
     if (st.n_slots == st.n_units) {
-        fprintf(stderr, "experts: %lld of %lld units in RAM (%.0f MiB, %s)\n", (long long)st.n_units,
-                (long long)st.n_units, (double)st.n_slots * (double)st.slot_bytes / mib, how);
+        fprintf(stderr, "experts: %lld of %lld units in RAM (%.0f MiB, %s), read at load in %.2f s",
+                (long long)st.n_units, (long long)st.n_units, (double)st.n_slots * (double)st.slot_bytes / mib, how,
+                st.read_sec);
     } else {
         fprintf(stderr,
                 "experts: %lld of %lld units in RAM (%.0f MiB, %s), %llu hits, %llu misses, %.0f MiB read in %.2f s",
@@ -373,8 +399,18 @@ static void print_experts(const tr_model *model) {
         if (st.prefetched > 0)
             fprintf(stderr, ", %llu of them read ahead, %.2f s waited", (unsigned long long)st.prefetched,
                     st.prefetch_wait_sec);
-        fprintf(stderr, "\n");
+        /* queued ahead and dropped unread: the next layer's call did not name them (a pass's read ahead) */
+        if (st.cancelled > 0) fprintf(stderr, ", %llu dropped unread", (unsigned long long)st.cancelled);
+        /* slots whose pages went to the KV as the positions advanced (olmoe.c kv_hold), of the ones made */
+        if (st.slots_given > 0)
+            fprintf(stderr, ", %llu of %lld slots given to the KV (%llu units moved)",
+                    (unsigned long long)st.slots_given, (long long)st.n_slots_made, (unsigned long long)st.moved);
     }
+    /* the slots' pages faulted before the reads (tr_experts_touch), when it ran; the requests last */
+    if (st.touch_sec > 0.0) fprintf(stderr, ", slots touched in %.3f s", st.touch_sec);
+    /* a slower disk emulated (TR_EXPERT_DISK_MBPS): named, so no number of it reads as this disk's */
+    if (st.disk_bytes_per_sec > 0.0) fprintf(stderr, ", disk emulated at %.0f MB/s", st.disk_bytes_per_sec / 1e6);
+    fprintf(stderr, ", %llu requests\n", (unsigned long long)st.requests);
 }
 
 /* After the speed lines: how many threads each phase ran on, and who chose the decode's. A
@@ -522,16 +558,19 @@ static int cmd_generate(int argc, char **argv) {
         fprintf(stderr, "generate: could not create thread pool\n");
         return 1;
     }
-    tr_model *model = app_model(model_path, pool, expert_budget, err, sizeof err);
+    /* the positions this run holds: the prompt, the tokens to generate and a draft's (--spec), so the expert
+     * budget's plan sets aside this session and not the default context's (tr_model_load_plan) */
+    int64_t need = plan_positions(n_prompt_synth >= 0 ? n_prompt_synth : count_ids(tokens_str), n_gen, n_draft);
+    tr_model *model = app_model(model_path, pool, expert_budget, n_ctx > 0 ? n_ctx : need, err, sizeof err);
     if (model == NULL) {
         fprintf(stderr, "error: %s\n", err);
         app_release(NULL, pool);
         return 1;
     }
     tr_model_set_decode_threads(model, (int)decode_threads);
-    /* -c: KV cache size in tokens, 0 = model default. A small context keeps the cache and
-     * the memory guard small when profiling a real model. */
-    tr_session *sess = tr_session_create(model, n_ctx, n_batch, err, sizeof err);
+    /* -c: KV cache size in tokens; without it, the positions the run holds (the default context when they
+     * pass the model's trained length). A small context keeps the cache and the memory guard small. */
+    tr_session *sess = tr_session_create(model, session_positions(model, n_ctx, need), n_batch, err, sizeof err);
     if (sess == NULL) {
         fprintf(stderr, "error: %s\n", err);
         app_release(model, pool);
@@ -801,7 +840,7 @@ static int cmd_logits(int argc, char **argv) {
         free(tokens);
         return 1;
     }
-    tr_model *model = app_model(model_path, pool, expert_budget, err, sizeof err);
+    tr_model *model = app_model(model_path, pool, expert_budget, 0, err, sizeof err);
     if (model == NULL) {
         fprintf(stderr, "error: %s\n", err);
         free(tokens);
@@ -1112,8 +1151,10 @@ static int cmd_run(int argc, char **argv) {
         fprintf(stderr, "run: could not create thread pool\n");
         goto done;
     }
-    if ((model = app_model(model_path, pool, expert_budget, err, sizeof err)) == NULL ||
-        (sess = tr_session_create(model, n_ctx, n_batch, err, sizeof err)) == NULL) {
+    /* the positions this run holds (cmd_generate): the prompt, -n and a draft's */
+    int64_t need = plan_positions((int64_t)n_prompt, n_max, n_draft);
+    if ((model = app_model(model_path, pool, expert_budget, n_ctx > 0 ? n_ctx : need, err, sizeof err)) == NULL ||
+        (sess = tr_session_create(model, session_positions(model, n_ctx, need), n_batch, err, sizeof err)) == NULL) {
         fprintf(stderr, "error: %s\n", err);
         goto done;
     }
@@ -1377,7 +1418,7 @@ static int cmd_chat(int argc, char **argv) {
         fprintf(stderr, "chat: could not create thread pool\n");
         goto done;
     }
-    if ((model = app_model(model_path, pool, expert_budget, err, sizeof err)) == NULL) {
+    if ((model = app_model(model_path, pool, expert_budget, 0, err, sizeof err)) == NULL) {
         fprintf(stderr, "error: %s\n", err);
         goto done;
     }

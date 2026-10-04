@@ -136,6 +136,9 @@ HOT_RULES = [
     ("math to put in a table", re.compile(r"\b(pow|powf|cos|cosf|sin|sinf|tan|tanf|log|logf|log2|log10)\s*\(")),
     # the library's exponential: 30 ns a call with MinGW, and other bits with glibc (docs/MEASUREMENTS.md question 37)
     ("the C library's exponential (use tr_expf)", re.compile(r"\b(expf|exp|exp2f|exp2|expm1f|expm1)\s*\(")),
+    # a power of two or an exponent is two lines of bits; the library's call is what we can do ourselves (10-02)
+    ("the C library's exponent arithmetic (use tr_pow2, the bits)",
+     re.compile(r"\b(ldexp|ldexpf|frexp|frexpf|scalbn|scalbnf|scalbln|scalblnf|ilogb|ilogbf)\s*\(")),
 ]
 HOT_BEGIN, HOT_END = "/* hot: begin */", "/* hot: end */"
 
@@ -196,6 +199,8 @@ def check_hot_zones():
         (f"{b}\nvoid f(void) {{ y = expf(x); }}\n{e}\n", 1),
         (f"{b}\nvoid f(void) {{ y = exp((double)x); }}\n{e}\n", 1),
         (f"{b}\nvoid f(void) {{ y = tr_expf(x); }}\n{e}\n", 0),
+        (f"{b}\nvoid f(void) {{ y = ldexp(1.0, n); }}\n{e}\n", 1),
+        (f"{b}\nvoid f(void) {{ y = tr_pow2(n); }}\n{e}\n", 0),
         (f"{b}\nvoid f(void) {{ }}\n", 1),
         ("void f(void) { }\n", 1),
     ]
@@ -636,12 +641,114 @@ def check_upstream_verdicts():
         failures.append(f"[upstream, docs/UPSTREAM.md {VERDICTS_HEADING[3:]}] {p}")
 
 
+# Every tools/mutate_*.sh with `run "name" ... <file> "text" "replacement"` lines: a text the code no longer
+# has stops the script at that line, and nothing ran it for days (LESSONS #264: mutate_experts.sh; 10-02 again,
+# mutate_q4x.sh's shift step after ldexp left). The file is the first word that names one of the repository
+# (after the script's VAR=path lines: $VAR, $VAR/name), or the one file a script always mutates (below).
+MUTATION_IMPLICIT = {"tools/mutate_gpu.sh": "src/backend/gpu_attn.c", "tools/mutate_marker.sh": "tools/measure_guard.lib"}
+
+
+def shell_words(s, i):
+    """The words of the shell command that starts at s[i], to the newline that ends it: double quotes (a
+    backslash before " $ ` \\ or a newline), single quotes, a backslash, a backslash-newline joining lines."""
+    words, cur, have = [], [], False
+    while i < len(s) and s[i] != "\n":
+        c = s[i]
+        if c == "\\" and i + 1 < len(s):
+            if s[i + 1] != "\n":
+                cur.append(s[i + 1])
+                have = True
+            i += 2
+        elif c == '"':
+            i, have = i + 1, True
+            while i < len(s) and s[i] != '"':
+                if s[i] == "\\" and i + 1 < len(s) and s[i + 1] in '"$`\\\n':
+                    if s[i + 1] != "\n":
+                        cur.append(s[i + 1])
+                    i += 2
+                else:
+                    cur.append(s[i])
+                    i += 1
+            i += 1
+        elif c == "'":
+            j = s.find("'", i + 1)
+            j = len(s) if j < 0 else j
+            cur.append(s[i + 1:j])
+            i, have = j + 1, True
+        elif c in " \t":
+            if have:
+                words.append("".join(cur))
+                cur, have = [], False
+            i += 1
+        else:
+            cur.append(c)
+            have = True
+            i += 1
+    if have:
+        words.append("".join(cur))
+    return words
+
+
+def stale_mutations(script, read_source, is_file, implicit=None):
+    """Names of the mutations whose text is not in their file (or with no file found): read_source(path) gives a
+    file's text, is_file(path) whether the repository has it, implicit the file every mutation of the script edits.
+    A script that applies a text only when it is there exactly once (`count(old) != 1`) also names a text found
+    more than once (LESSONS #283: a second copy of a line stopped mutate_prefetch.sh at its eleventh mutation)."""
+    once = "count(old) != 1" in script
+    names = dict(re.findall(r"^([A-Z][A-Z0-9_]*)=([^\s$`'\"]+)$", script, re.M))
+    resolve = lambda w: re.sub(r"\$\{?([A-Z][A-Z0-9_]*)\}?", lambda m: names.get(m.group(1), m.group(0)), w)
+    stale = []
+    for m in re.finditer(r'^run "', script, re.M):
+        words = shell_words(script, m.start() + 4)
+        name, path, text = words[0], implicit, None
+        if implicit is not None:
+            text = words[1] if len(words) > 1 else None
+        else:
+            for k in range(1, len(words) - 1):
+                if ("/" in words[k] or "$" in words[k]) and is_file(resolve(words[k])):
+                    path, text = resolve(words[k]), words[k + 1]
+                    break
+        if text is not None and '"@@" in a mutation\'s text stands for a newline' in script:
+            text = text.replace("@@", "\n")
+        if path is None or text is None:
+            stale.append(name + " (no file)")
+        elif text not in read_source(path):
+            stale.append(name)
+        elif once and read_source(path).count(text) > 1:
+            stale.append(f"{name} (found {read_source(path).count(text)} times)")
+    return stale
+
+
+def check_mutations_apply():
+    """Every mutation's text is still in its file, in every mutation script."""
+    script = ('E=a.c\nrun "one" $E \\\n  "x = 1;" \\\n  "x = 2;"\nrun "two" core $E \'y = "1";\' "y = 3;"\n'
+              'run "three" "$E" "z = \\"\\$k\\";" "z = 0;"\nrun "four" b.c "w;" "v;"\n')
+    for src, want in (('x = 1; y = "1"; z = "$k";', 1), ("x = 1;", 3), ("", 4)):
+        got = stale_mutations(script, lambda path: src, lambda path: path == "a.c")
+        if len(got) != want or "four (no file)" not in got:
+            failures.append(f"[mutations] the check is broken: '{src}' gives {got}, not {want} stale")
+            return
+    once = 'E=a.c\nif s.count(old) != 1:\nrun "one" $E "x = 1;" "x = 2;"\n'
+    for src, want in (("x = 1;", []), ("x = 1; x = 1;", ["one (found 2 times)"])):
+        got = stale_mutations(once, lambda path: src, lambda path: path == "a.c")
+        if got != want:
+            failures.append(f"[mutations] the once check is broken: '{src}' gives {got}, not {want}")
+            return
+    scripts = sorted(p for p in (ROOT / "tools").glob("mutate_*.sh"))
+    for p in scripts:
+        rel = p.relative_to(ROOT).as_posix()
+        script = p.read_text(encoding="utf-8")
+        for name in stale_mutations(script, lambda f: (ROOT / f).read_text(encoding="utf-8"),
+                                    lambda f: (ROOT / f).is_file(), MUTATION_IMPLICIT.get(rel)):
+            failures.append(f"[mutations, {rel}] '{name}': its text is no longer in the source")
+
+
 def main():
     for check in (check_docs_control_chars, check_line_endings, check_doc_limits, check_no_future_dates, check_lessons_table,
                   check_type_table, check_tests_no_tmpfile, check_hot_zones, check_global_state,
                   check_makefile_recipes_ascii, check_shell_scripts_whole, check_scripts_clean_up,
                   check_no_failure_into_tee, check_struct_calloc, check_expf_table, check_readme_numbers,
-                  check_english, check_status_json, check_one_rung, check_upstream_verdicts):
+                  check_english, check_status_json, check_one_rung, check_upstream_verdicts, check_mutations_apply):
         check()
     for f in failures:
         print(f)

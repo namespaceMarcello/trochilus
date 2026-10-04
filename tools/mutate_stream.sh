@@ -79,12 +79,11 @@ run "gate and up offsets swapped at load" $O \
         part_bytes_tbl[L * TR_EXPERT_PARTS + 1] = (size_t)m->n_ff * tr_row_bytes(t->type, m->n_embd);
         part_offset_tbl[L * TR_EXPERT_PARTS + 0] = t->offset;"
 run "acquire only asks for the first non-empty expert" $O \
-  "    int64_t n_ids = 0;
-    for (int64_t e = 0; e < n_expert; e++)
-        if (s->offsets[e + 1] > s->offsets[e]) s->acquire_ids[n_ids++] = e;" \
-  "    int64_t n_ids = 0;
-    for (int64_t e = 0; e < n_expert; e++)
-        if (s->offsets[e + 1] > s->offsets[e]) { s->acquire_ids[n_ids++] = e; break; }"
+  "            s->acquire_ids[n_ids++] = e;
+        }" \
+  "            s->acquire_ids[n_ids++] = e;
+            break;
+        }"
 run "pos is not restored after a failed pass" $O \
   "        if (forward_pass(m, s, tokens + off, len, off + len == n ? n_logits : 0) != 0) {
             s->pos = pos0;
@@ -94,7 +93,38 @@ run "pos is not restored after a failed pass" $O \
             return -1;
         }"
 run "forward_pass ignores acquire's return value" $O \
-  "        if (olmoe_refresh_experts(m, s, L) != 0) return -1;" \
-  "        olmoe_refresh_experts(m, s, L);"
+  "    if (olmoe_refresh_experts(m, s, L, n_tok) != 0) return -1;" \
+  "    olmoe_refresh_experts(m, s, L, n_tok);"
+run "plan: the session's positions ignored (the default context's always)" $O \
+  "        int64_t ctx_plan = session_ctx(m, plan_ctx);" \
+  "        int64_t ctx_plan = session_ctx(m, 0);"
+run "eviction: the LRU by default" $O \
+  "        ecfg.evict = evict != NULL && strcmp(evict, \"lru\") == 0 ? TR_EXPERTS_EVICT_LRU : TR_EXPERTS_EVICT_HOT;" \
+  "        ecfg.evict = evict != NULL && strcmp(evict, \"hot\") == 0 ? TR_EXPERTS_EVICT_HOT : TR_EXPERTS_EVICT_LRU;"
+run "session guard: the KV left out of the session's bytes" $O \
+  "    return kv_bytes + scratch_bytes + x_all_bytes;" \
+  "    return scratch_bytes + x_all_bytes + 0 * kv_bytes;"
+# the KV grown from the store's room (test_mem_available kv_room)
+run "plan: the KV set aside again" $O \
+  "                                     tr_kv_bytes(m->n_layers, m->n_head_kv, m->head_dim, ctx_plan);" \
+  "                                     0 * tr_kv_bytes(m->n_layers, m->n_head_kv, m->head_dim, ctx_plan);"
+run "kv room: a partial plan shares none" $O \
+  "            if (budget < resident_bytes) m->kv_room = budget; /* partial: every byte the plan left */" \
+  "            if (0) m->kv_room = budget;"
+run "kv_hold: never called before a pass" $O \
+  "    kv_hold(m, s, s->pos + n);" \
+  "    if (0) kv_hold(m, s, s->pos + n);"
+run "store_fit: the KV held not taken off the room" $O \
+  "    uint64_t room = m->kv_held < m->kv_room ? m->kv_room - m->kv_held : 0;" \
+  "    uint64_t room = m->kv_room;"
+run "session free: its KV not given back to the room" $O \
+  "    s->m->kv_held -= s->kv_held; /* its pages back to the system: the store takes their slots again */" \
+  "    (void)0;"
+run "session free: the slots not taken again" $O \
+  "    store_fit(s->m);" \
+  "    (void)s->m;"
+run "session guard: the room's check off" $O \
+  "        if (m->kv_held + kv_full + least > m->kv_room) {" \
+  "        if (0) {"
 }
 main "$@"; exit

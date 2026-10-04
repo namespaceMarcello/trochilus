@@ -74,6 +74,13 @@ typedef struct {
  * tr_model_load_budget). */
 tr_model *tr_model_load_progress(const char *path, tr_pool *pool, uint64_t expert_budget, const tr_progress *progress,
                                  char *err, size_t err_len);
+/* tr_model_load_progress for a session of plan_ctx positions: the automatic plan (expert_budget 0)
+ * sets aside that session's KV and working memory, exactly as tr_session_create(model, plan_ctx, 0)
+ * will allocate them, before the experts take the rest. 0: the model's default context
+ * (min(n_ctx_train, 4096)), the plan of tr_model_load_progress. A session of more positions than its
+ * plan still runs where memory allows (tr_session_create's own guard). */
+tr_model *tr_model_load_plan(const char *path, tr_pool *pool, uint64_t expert_budget, int64_t plan_ctx,
+                             const tr_progress *progress, char *err, size_t err_len);
 void tr_model_free(tr_model *m);
 const tr_model_info *tr_model_get_info(const tr_model *m);
 /* Snapshot of the shared expert store's counters (src/memory/experts.h); -1 if this model's
@@ -255,9 +262,10 @@ typedef struct {
     /* takes ownership of g, also on failure; expert_budget: see tr_model_load_budget. path: the
      * same file g was opened from, kept only so an architecture with a shared expert store can
      * open a second, unbuffered handle on it (docs/ARCHITECTURE.md Esperti M1, Step C) -- not
-     * retained beyond this call. progress: see tr_progress, may be NULL, not retained either. */
-    void *(*load)(const char *path, tr_gguf *g, tr_pool *pool, uint64_t expert_budget, const tr_progress *progress,
-                  char *err, size_t err_len);
+     * retained beyond this call. progress: see tr_progress, may be NULL, not retained either.
+     * plan_ctx: see tr_model_load_plan. */
+    void *(*load)(const char *path, tr_gguf *g, tr_pool *pool, uint64_t expert_budget, int64_t plan_ctx,
+                  const tr_progress *progress, char *err, size_t err_len);
     void (*free)(void *model);
     const tr_model_info *(*info)(const void *model);
     int (*expert_stats)(const void *model, tr_experts_stats *out); /* -1: no store */

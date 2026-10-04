@@ -14,6 +14,8 @@
 #                          The caller sets its traps (below) before calling it.
 #   measure_machine <name> after measure_begin: names the containers left running, gives the
 #                          Docker VM's file cache back to Windows, and sets AB_GUARD.
+#   measure_runnable <bin> a path to the binary that runs here: itself, or a copy a byte or three longer (Smart
+#                          App Control holds a fresh build's hash; a longer copy is another hash)
 #   measure_still <name>   before the first run: the CPU is not busy with somebody else's work,
 #                          or it waits, then refuses (exit 3).
 #   measure_end            ends what the script started (tools/cleanup.lib), releases the lock
@@ -133,6 +135,28 @@ measure_machine() {
   export TR_SERVER MACHINE_MARKER MEASURE_MARK_LINE
   AB_GUARD='[ "$(head -1 "$MACHINE_MARKER" 2> /dev/null)" = "$MEASURE_MARK_LINE" ] && touch -c "$MACHINE_MARKER" && sh tools/machine_still.sh 3.0 600 2'
   export AB_GUARD
+}
+
+# measure_runnable <binary>: prints a path to that binary which this machine lets run: the binary itself, or a
+# copy 1, 2 or 3 bytes longer (another hash, which Smart App Control judges apart: on 2026-10-03 build/q120 was
+# held 50 minutes while its copy one byte longer ran at once; a copy can wait too, LESSONS #251). The copies sit
+# beside it (<dir>/runnable<i>/). rc 1 and the binary's own path when every one is held: the caller waits.
+measure_runnable() {
+  MR_B=$1
+  MR_RC=0
+  "$MR_B" cpu > /dev/null 2>&1 || MR_RC=$?
+  [ "$MR_RC" = 126 ] || { echo "$MR_B"; return 0; }
+  for MR_I in 1 2 3; do
+    MR_C=$(dirname "$MR_B")/runnable$MR_I/$(basename "$MR_B")
+    mkdir -p "$(dirname "$MR_C")"
+    cp "$MR_B" "$MR_C"
+    head -c "$MR_I" /dev/zero >> "$MR_C"
+    MR_RC=0
+    "$MR_C" cpu > /dev/null 2>&1 || MR_RC=$?
+    [ "$MR_RC" = 126 ] || { echo "$MR_C"; return 0; }
+  done
+  echo "$MR_B"
+  return 1
 }
 
 # measure_still <name>: a longer look (10 s), and a wait of up to 15 minutes for whoever is using

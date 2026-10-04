@@ -140,14 +140,41 @@ static inline tr_q4x_view tr_q4x_view_of(const void *xq, int64_t n) {
     return v;
 }
 
+/* 2^n from its bits, what ldexp(1.0, n) gives without the C library: a double for |n| <= 1022, a float for
+ * |n| <= 126 (the prep's shifts stay within -99..179, and a float's within -99..127) */
+static inline double tr_pow2(int n) {
+    uint64_t b = (uint64_t)(n + 1023) << 52;
+    double d;
+    memcpy(&d, &b, sizeof d);
+    return d;
+}
+
+static inline float tr_pow2f(int n) {
+    uint32_t b = (uint32_t)(n + 127) << 23;
+    float f;
+    memcpy(&f, &b, sizeof f);
+    return f;
+}
+
 /* the shift of a block whose largest |x| is m (finite): the largest sh with m 2^sh <= TR_Q4X_XMAX, 0 for 0.
- * m 2^(31 - e) lies in [2^30, 2^31) and TR_Q4X_XMAX in between: one step down at most. */
+ * e is frexpf's exponent (m = f 2^e, f in [0.5, 1)), read from the bits: the exponent field less 126, or for a
+ * subnormal (mantissa M, m = M 2^-149) M's bit length less 149. m 2^(31 - e) lies in [2^30, 2^31) and
+ * TR_Q4X_XMAX in between: one step down at most; the product is exact (a power of two, in double's range). */
 static inline int tr_q4x_shift(float m) {
     if (m == 0.0f) return 0;
-    int e;
-    (void)frexpf(m, &e);
+    uint32_t b;
+    memcpy(&b, &m, sizeof b);
+    int field = (int)((b >> 23) & 0xffu), e;
+    if (field != 0) {
+        e = field - 126;
+    } else {
+        uint32_t man = b & 0x7fffffu;
+        int len = 0;
+        while (man >> len) len++;
+        e = len - 149;
+    }
     int sh = 31 - e;
-    if (ldexp((double)m, sh) > TR_Q4X_XMAX) sh--;
+    if ((double)m * tr_pow2(sh) > TR_Q4X_XMAX) sh--;
     return sh;
 }
 

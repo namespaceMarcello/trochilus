@@ -159,7 +159,7 @@ decides | — | — |
 | 38 | Grouped attention with **GQA** past 4096 tokens (Qwen3-Coder: 32 query heads over 4 key heads): a group today is 16 tokens of **one** query head; the 8 heads that share keys and values could sit in the same group and read them only once. And at 16-32 thousand tokens a head's keys and values (16-32 MB) fit in no cache: there the repeated read, which at 4000 ranges from 1% to 21-39% of the zone depending on the run, becomes the bulk | `make bench-attn` with the new model's shapes and `--heads`/`--group`; prefill at 8, 16, 32 thousand tokens once the model exists | coding uses long contexts; at 4000 a group of 4, 16 or 64 performs the same, beyond that is not known |
 | 39 | **Closed as "no" on 2026-09-19 (Marcello)**: 1.01-1.04× estimated sits at the noise threshold, for about 200 lines in the project's most delicate piece; the scalar has already taken almost everything. ~~`tr_expf` in SIMD, yes or no~~ (numbers in §`tr_expf` point 7). After the scalar, in the prefill at 512 / 2048 / 4000, the attention's softmax remains at about 9 / 130 / 610 ms and `expert_act` at 25 / 108 / 218 ms. Estimate with an AVX-512 exponential at 1.0-1.3 ns per element: prefill **1.01× / 1.03× / 1.04×**, decode +1-2%; cost about 200 lines, the delicate piece (table gather, mask for lanes that fail the test, bit identity with the scalar proven on every float for every tier) | a sketch in the bench (`tests/bench_expf.c`) would give the real per-element cost before deciding; then an `exp` entry in the kernel table, `make bench-expf` per tier, `prefill_context.sh change` | the scalar has taken almost everything: at 4000 tokens the estimated gain is close to a good session's threshold (3%) |
 | 40 | ~~Are Windows's and Linux's **RoPE tables** the same entry by entry?~~ **Yes**, measured on 2026-09-19 (`sh tools/platform_bits.sh`, §`tr_expf` point 5): over 4096 positions × 64 pairs the two libraries' `cos` and `sin` **in double** differ in 0.83-0.85% of entries (2175 and 2216 of 262 144: glibc and MinGW round the double's last digit differently), `pow` never (64 of 64 correctly rounded on both), and **none** of the 524 288 entries in float differ: rounding to float absorbs the difference. With `tr_expf` the engine therefore gives **the same bytes on both platforms** up to OLMoE's training context | — | — |
-| 41 | **Why does the disk give 1.5 GB/s, a third of its card's spec (Micron 2400, 4.5 GB/s)?** Three hypotheses: Windows's volume encryption (read with `manage-bde -status C:` as administrator), QLC with no DRAM on sparse reads, the synchronous 2 MiB request (try larger, overlapped requests). Worth three times M1's tokens per second with the cache at 50%. **2026-09-20: the volume is encrypted** (`manage-bde`: BitLocker ON, XTS-AES 128, so in software). It is not proven to be the cause, nor the only one: during reads the System process goes from 0.79 to 0.94 processors (`tools/background_load.ps1`, `build/disk/run3.txt`), no core is saturated, so if the limit is there it is latency, not compute. The real test needs an unencrypted volume on the same disk, and **encryption is not removed for a measurement**: Windows 11 PCs ship encrypted from the factory, so ~1.5 GB/s **is** the target, and M1's automatic plan measures the disk it finds | `bench_disk --block` at 16 and 64 MiB; more requests in flight per reader; the same bench on an external disk or an unencrypted partition, if one turns up | after the first M1 run: the exact path first, then the bandwidth |
+| 41 | **Why does the disk give 1.5 GB/s, a third of its card's spec (Micron 2400, 4.5 GB/s)?** **Answered 2026-10-02 (§The disk at its limit)**: the request's size: 1.9 GB/s at 2.125 MiB, **3.5 at 64 MiB** (78% of the spec), flat past it; the order, the requests in flight and the handles do not move it; one request scattered into the slots runs level; the decryption costs the System process +0.8 logical processors at 2 GB/s, +3.8 at 3.5. The engine's lever: a layer's experts in three requests (the GGUF's tensors are already in a row). Three hypotheses: Windows's volume encryption (read with `manage-bde -status C:` as administrator), QLC with no DRAM on sparse reads, the synchronous 2 MiB request (try larger, overlapped requests). Worth three times M1's tokens per second with the cache at 50%. **2026-09-20: the volume is encrypted** (`manage-bde`: BitLocker ON, XTS-AES 128, so in software). It is not proven to be the cause, nor the only one: during reads the System process goes from 0.79 to 0.94 processors (`tools/background_load.ps1`, `build/disk/run3.txt`), no core is saturated, so if the limit is there it is latency, not compute. The real test needs an unencrypted volume on the same disk, and **encryption is not removed for a measurement**: Windows 11 PCs ship encrypted from the factory, so ~1.5 GB/s **is** the target, and M1's automatic plan measures the disk it finds | `bench_disk --block` at 16 and 64 MiB; more requests in flight per reader; the same bench on an external disk or an unencrypted partition, if one turns up | after the first M1 run: the exact path first, then the bandwidth |
 | 43 | **From what disk speed up does prefetching pay off, and with how many candidates?** The time model says: at 1.5 GB/s no (k=8 neutral, k=12 −40%), at 4.3 GB/s k=8 gives 11-15% (§M1 point 6) — model, not measured: one disk, one read at a time — and the decode by now has little to hide: far from the prompt it misses by 0.03-0.14 units per token (§M1 measured: what experts really cost from disk), so if prefetching helps it is in the **prompt** | with M1 running: `--expert-budget` at 50%, prefetching off and with k=8, on this disk and on a fast one (or on the file in the system cache, which gives 12-26 GB/s); threshold in the automatic plan | after the first M1 |
 | 42 | **How is the first layer predicted?** Prediction with the next layer's router takes 92-95% everywhere except at layer 0 (75-80%, question 13) | from the trace: layer 0's experts chosen equal per token (do they depend almost only on the embedding?); alternatively layer 0 always stays in RAM (64 experts = 408 MiB, 6% of the model) | M1's project |
 | 44 | ~~Is the model's behavior on code a small, deterministic graph?~~ **No, in all four senses** (Marcello, 2026-09-20; closed on the night of 2026-09-20 with the five texts of the functional proof). From the trace at hand (OLMoE-1B-7B, `code-1000`, 1204 tokens; one-off computation on the trace, not yet in the report): **small, no**: 1012 of 1024 units used, 89% already after 100 tokens; the top 25% used covers 68% of activations, the top 50% 88%, the top 75% 97%; usage entropy 5.1 of 6 bits per layer. **Static, no**: a cross-layer co-occurrence graph learned on the first 900 tokens guesses 53.7% of the next layer's experts on the following 300 (frequency alone: 40.3%; the router on the live state: 82-86%); no whole path repeats (0 of 1204), the single set of 8 does (32%); 3.6 of 8 experts shared with the previous token (chance: 1.0), which is what the LRU exploits. Consistent with the usage pin that loses against the LRU (question 14) and with the balancing loss MoEs are trained with. Limits: one general-purpose model, one prompt, one language | missing, with the thresholds written **beforehand**: (1) token ids in the trace → same token, same experts? (the "table" version of the hypothesis, plausible at layer 0); (2) 4-6 traces (different files and languages, and control prose) → does the overlap of hot units code-to-code exceed code-to-prose?; (3) the margin between the 8th and 9th expert (probability in the trace); (4) the proof that decides, functional and not about routing: **masking** the experts outside the top X% used and measuring equal tokens and KL against the whole model on code never seen (measurement-only mode) **Thresholds written before measuring (2026-09-20, Marcello's yes)**: *small* = the top 25% of units covers ≥ 99% of activations on code; *code graph* = the overlap (Jaccard) of the hottest 25% between two code traces exceeds that between code and prose by ≥ 0.20; *table* = same token id → same set of experts at layer 0 in ≥ 95% of repeats (the other layers are reported); *functional* = with 50% of the units masked (the least used, on **another** code file) the greedy token matches in ≥ 99% of positions and the average KL is ≤ 1e-2 on code never seen (the project's yardstick for a non-exact mode: llama.cpp sits at 9e-3). A missed threshold falsifies that part of the hypothesis for OLMoE-1B-7B; to say it "of models" needs at least a second model | **Answer (§Is code behavior a small, deterministic graph?)**: small no, table no, static no, functional no (already on the mask's own text: 93.9% of tokens with 50% off); one **region of code** yes (Jaccard 0.68-0.77 between C, Python and shell, 0.07-0.09 with English prose), and usage orders the experts 13-50 times better than chance **inside code** and not at all outside it (on English prose the usage mask performs like a random one). Functional proof on five texts out of five: with 50% off the token matches in 93.9 / 92.8 / 86.0 / 81.4% (mask's own text, other C, Python, shell). A second model remains |
@@ -205,6 +205,8 @@ decides | — | — |
 | 85 | The serial steps as messages (LESSONS #255): the idle workers' hints gain the next call up to the serial step's length in the bench (0.85-0.96 W) and nothing in the engine, where the step after each hint reads the rows the workers wrote (attn_out, h3) and stores over lines they share (normed, the prepared row). If the steps stop touching the workers' lines (the add and the mix inside the calls that make their rows, normed and the prepared row in buffers the workers have not read since), do the serial steps get faster by themselves, and do the hints then pay? Step 1 raced 2026-10-02, `pretouch` (the calling thread's own next lines asked before each hint): level (1.0027 +- 0.0022), attn_norm's +54 us a pass unchanged, so a step does not pay its own lines' latency but a share of the core or the fabric under the flood (§The idle workers) | the steps' zones with `TR_POOL_HINT=2` against 0 in one process (`idle`), then each step's lines moved | the serial zones are ~260 us a token (1.7%); the hints' gross gain 150-190 us |
 | 86 | A team of small models (Marcello, 2026-10-01; placed 2026-10-02 after rung 2, block x-team: then two families run exactly, and a 1-3B model is what a below-average machine holds): can three diverse 1-3B models (different families: Qwen, Llama, Mistral...) match or beat one ~7B, and at fewer bytes read a token? Three forms: a vote on the whole answer (any tokenizer); a token-level vote (shared tokenizer: mean or product of probabilities, or the most confident model speaks); the cascade, where the cheapest model runs first and the others wake only when it is unsure (entropy). Prior art, all outside inference engines: Product of Experts (Hinton 2002), self-consistency (2022), LLM-Blender (2023), FrugalGPT (2023) and RouteLLM (2024) cascades on whole answers, Mixture-of-Agents (2024), Branch-Train-MiX (2024), mergekit-moe, DeePEn and UniTE (2024); not seen: an exact token-level team inside an engine, counted in bytes a token. Three traps found in a review by Claude Opus 5.5 at medium effort (2026-10-01; the top-1 minus top-2 gate came from DeepSeek): (1) a model woken at token t lacks tokens 0..t-1 in its KV, so the output is wrong, not just slow: it must catch up with a prefill of the skipped tokens on waking, and that catch-up cost decides whether the cascade pays; (2) the mean of logits and the product of probabilities pick the same token (logits are defined up to a constant), so the real fusion modes are the mean of probabilities after softmax, the product of probabilities, and the most confident model (top-1 minus top-2 margin, a better gate than entropy alone: a model sure and wrong wakes nobody); (3) a shared tokenizer is checked by a hash of the whole token list, not by vocab size, and n_ctx is the minimum over the models. A fusion defined as a fixed sequence of operations can be exact against a Python oracle | Python first (`tools/.venv`, transformers, no C): GSM8K (math) and MMLU (knowledge) subsets, the team against the single ~7B; accuracy and bytes read a token for each form; the prediction written before the run; the RAM guard (one model loaded at a time if the sum does not fit) | a capability nobody offers (an exact team that wakes only when needed); a zero is written and closed |
 
+| 87 | **The dedicated and the integrated GPU together** (Marcello, 2026-10-03; a machine with both, like this PC, RTX 4070 + Radeon 610M, and many 16 GB laptops): today the engine takes the dedicated one and leaves the integrated idle. Could the integrated take the work the dedicated cannot hold, or that would travel to it (it reads the RAM in place: the experts the VRAM has no room for, a layer's prompt while the dedicated takes the decode), the same bits on both? | after R1 phase 3 has the integrated GPU (Vulkan): the bytes each one reads a token and its share of the time, one GPU against both, on a machine with both; the prediction first | a laptop's two GPUs are two engines, and one of them sits idle today |
+| 88 | **What the integrated GPU gives on a real machine** (Marcello, 2026-10-03): **until real PCs are available, every number of the integrated GPU is an estimate**, and is written as one (Iris Xe or Radeon 680M ~2-3.4 TFLOPS against ~0.4 of four AVX2 cores: a prompt 3-5x; the UHD of the cheapest machines ~0.2-0.4, about the CPU). This PC's Radeon 610M (2 compute units) checks the bits, not the speed | `tools/machines.sh` on a real 8 or 16 GB laptop with an integrated GPU: the prompt and the decode with and without it, the same tokens | the emulation gives fewer cores and less memory, never another GPU: the integrated machines' prompt limits stay unmeasured until then |
 Reference machine: Ryzen 9 7940HX (Zen 4, 16 core / 32 thread, AVX-512 VNNI/BF16), 31 GB
 RAM (2×16 GB DDR5-5200), NVMe Micron 1 TB, GPU RTX 4070 Laptop 8 GB and Radeon 610M (not used
 until M3/M6), Windows 11, MinGW-w64 gcc 15.2 `-O2`. Laptop on power, other programs open
@@ -5287,6 +5289,446 @@ up always on Q4_K's road. Every output is the same `q4x_dot2` or tile on the sam
   fusion, question 85's messages); q, k, v merged at load (one stream of rows, ik's `-mqkv`), the layout question 84
   priced at 1.0-1.75% of a dense call.
 
+## The disk at its limit: the request's size, and BitLocker's processors (2026-10-02)
+
+Question 41 reopened (Marcello: "is there something better than the GGUF? measure every possibility, to the max").
+`tests/bench_disk.c`, native, by `tools/bench_native.sh` (marker, still machine, load declared: 1.30-1.95 busy except
+the one line marked), the Q8_0 file (6.85 GiB, BitLocker XTS-AES-128 in software), direct reads
+(`FILE_FLAG_NO_BUFFERING`), median of 5 runs, files in `build/disk41/`. New switches: `--seq` (a run's blocks in file
+order, claimed by whichever reader is free: one stream, `readers` requests in flight), `--handles` (one handle per
+reader), `--scatter <bytes>` (one request whose pieces land a page apart, `ReadFileScatter`; checked byte for byte
+against a plain read). Predictions in `build/prep/predictions.txt`, written before each run.
+
+| request | 1 reader | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| 2.125 MiB random (one expert matrix: the engine today) | 1.85 GB/s | 1.95 | 1.95 | 1.94 | 1.92 |
+| 2.125 MiB in file order (`--seq`; 2.6-2.8 busy) | 1.88 | 1.98 | 1.89 | 1.93 | 1.96 |
+| 2.125 MiB random, one handle a reader | 1.76 | 1.87 | 1.86 | 1.81 | 1.86 |
+| 6.375 MiB random (an expert's three matrices) | 2.35 | 2.52 | 2.53 | 2.46 | 2.39 |
+| 16 MiB random | 2.53 | 2.70 | 3.00 | 2.94 | 3.15 |
+| 64 MiB random | 3.11 | 3.36 | **3.49** | 3.42 | 3.42 |
+| 64 MiB in file order | 3.20 | 3.43 | **3.59** | 3.53 | 3.38 |
+| 64 MiB random, one handle a reader | 3.04 | 3.39 | 3.46 | 3.50 | 3.51 |
+| 64 MiB in file order, scattered in 2.125 MiB pieces | 3.11 | 3.45 | **3.48** | 3.42 | 3.43 |
+| 96 MiB random | 3.35 | 3.58 | 3.50 | 3.52 | 3.48 |
+
+- **The request's size is the only lever**: 1.9 GB/s at 2.125 MiB, 3.5 at 64 MiB (1.8x), flat past 64 MiB. Neither
+  the order (`--seq` = random), nor more requests in flight (1-16 readers within ~10%), nor one handle a reader moves
+  it. A fit: each request ~0.5 ms that others in flight do not overlap, plus its bytes at ~3.4 GB/s. 3.5 GB/s is 78%
+  of the card's 4.5 GB/s spec. The 09-20 numbers (1.40-1.51 at 2.125 MiB) were lower by a third: same file, same
+  bench; the sessions differ (load, the drive's state), so only same-session ratios are compared.
+- **One request can land in the store's slots**: a 64 MiB read scattered in 2.125 MiB pieces a page apart runs level
+  with a plain one (3.48 against 3.59 in file order, within the spread), every byte where a plain read puts it. The
+  GGUF already stores each layer's experts as three tensors of 64 x 2.125 MiB in a row (136 MiB each): **a layer can
+  be read in three requests without a format of our own**, where the engine issues 192 today.
+- **BitLocker's processors** (`tools/background_load.ps1` during a sustained read; at rest the System process holds
+  0.71-0.81): at 64 MiB and 3.5 GB/s **4.47 logical processors** (+3.8); at 2.125 MiB and 2.0 GB/s 1.48 (+0.8). The
+  decryption runs in the System process, and the large requests that reach the bandwidth cost 2.7x more processors a
+  byte (1.07 against 0.39 a GB/s). On a 4-core machine a read at full speed would take the whole CPU: the engine's
+  read ahead competes with its own compute on an encrypted volume, and the plan has to count it.
+- The file is not the cause: 116 extents, runs of ~100 MiB on average (`fsutil file queryExtents`).
+- Not measured, and why: IoRing (a request's own call costs 2.5 us, LESSONS #94: nothing to remove at this size); an
+  unencrypted volume (not removed for a measurement, question 41: Windows 11 ships encrypted, 3.5 GB/s is the
+  target); the system cache's first read (`cached first seq` 6.5 GB/s is pages the system already held; the store
+  reads direct by design).
+- **What it gives**: the first prompt under budget reads the whole model (question 45: 4.44 s of disk in 6.11 s at
+  512 tokens, half budget, 09-21). At 3.5 GB/s instead of 1.9-2.0 the disk part shrinks ~1.75x. The decode's misses
+  (0.03-0.6 a token) gain at most an expert's three matrices in one request (2.5 against 1.9 GB/s), and only with a
+  format of our own: not worth one now.
+- **Built** (same evening, 10-02): `tr_file_preadv`, the store's runs (`cfg.readv`: a layer's consecutive experts one
+  request a part, at most 96 MiB, at load, ahead and on demand) and `tr_experts_touch` (the slots' pages faulted
+  over the pool before any read: inside a direct request each fresh page's first fault is the disk's time).
+- **The guarded race** (`sh tools/disk_race.sh build/q107b/trochilus.exe 8`, `build/disk_race/`): Q8_0, `TR_GPU=0`,
+  8 tokens, four arms a process each, rounds rotating, median of 8 (round 0 dropped), the native guards (load 2.09 ->
+  1.28 busy, 0.72-0.79 the System process). **old** = `TR_EXPERT_RUNS=0 TR_EXPERT_TOUCH=0` (every part one request),
+  **runs** = runs, no touch, **new** = both (the default), aa = new again. The same tokens in all 36 runs of every
+  scenario. Prompt times from its tok/s; "whole" is the process, start to end (load included).
+
+| scenario | what | old | runs | new | old/new | A/A |
+|---|---|---|---|---|---|---|
+| resident, 321 tokens, 8 threads | the experts' read at load | 4.07 s (3072 requests) | 2.58 (96) | **2.02** (96) | **2.015x** | 1.000 |
+| | whole run | 5.49 s | 4.11 | **3.48** | **1.576x** | 1.011 |
+| half budget (3264 MiB), 321 tokens (one pass, reads on demand) | prompt | 4.39 s (3531 requests) | 3.12 (918) | **2.81** | **1.564x** | 1.001 |
+| | whole run | 5.73 s | 4.48 | 4.18 | 1.371x | 0.999 |
+| half budget, 2048 tokens (layer-major, the I/O thread reads ahead) | prompt | 7.18 s (3507 requests) | 6.68 (762) | **6.59** | **1.090x** | 1.003 |
+| | whole run | 8.40 s | 7.89 | 7.83 | 1.073x | 0.998 |
+| the 8 GB machine (`-t 4`, `TR_CPU_MAX=avx2`, half budget), 321 tokens | prompt | 6.59 s | 5.32 | **4.88** | **1.350x** | 0.986 |
+| | whole run | 7.92 s | 6.69 | 6.27 | 1.263x | 1.009 |
+| the 8 GB machine, 2048 tokens | prompt | 20.75 s | 20.45 | 20.17 | 1.029x | 0.997 |
+| | whole run | 21.94 s | 21.72 | 21.43 | 1.024x | 1.002 |
+
+- **Read**: the runs give 1.58x on a resident load's read and the touch 1.28x more (2.0x together, 3.4 GB/s: the
+  disk's one-request ceiling); a first prompt under budget that reads on demand gains 1.35-1.56x. **The touch costs
+  a sixth of what it saves**: 0.093 s for the resident 6540 MiB (0.091-0.094, 8 runs, `build/disk_race_touch`),
+  0.047 s for half (0.045-0.050), predicted 0.2-0.5 s: fell; the read takes 0.55 s less (the wall's 0.63 is inside
+  the runs arm's 3.7% spread). The second session gave every ratio again within 1.2%, the same tokens in 40 runs. Where the I/O thread reads ahead (2048 tokens) the disk was already mostly
+  behind the compute: 1.03-1.09x. **The 8 GB machine's long prompt is compute** (101 tok/s at 4 threads AVX2 against
+  311 at 8 threads AVX-512; the disk, 2.77 s of reads, hidden): that is its phase 3. Not emulated: its own disk, and
+  BitLocker's 3.8 processors at full speed (above) that a 4-core machine would take from its compute.
+- **Two requests in flight, the premise** (`bench_disk --block 71303168 --seq --scatter 2228224`: a run of 32
+  experts' parts, the engine's own request, `build/bench_native/bench_disk/`, load 1.20-1.24 busy): 1 in flight
+  3269 MB/s, 2 3516 (+7.6%), 4 3525, 16 3535 (predicted +4-8%: in). The engine's resident read with one in flight
+  is already 3.41 GB/s (6540 MiB in 2.01 s), so at load the room is ~3%; the on-demand runs of a one-pass prompt
+  (918 requests of ~8 MiB, 2.8 GB/s) have more (the bench's 6.375 MiB: +8% at 2 readers).
+- **Built** (10-02 night): `tr_file_preadv_n` (platform.h: up to 4 scattered requests, on a direct Windows file
+  all issued before the first is waited for; elsewhere one after another), and the store's readv takes a run's
+  three parts in one call, so they are in flight together at load, ahead and on demand.
+- **Raced** (2026-10-03, `DISK_RACE_ARMS=inflight sh tools/disk_race.sh build/q115/trochilus.exe 8 res half321`,
+  build/disk_inflight; arms new, serial = `TR_EXPERT_INFLIGHT=0` one call a part, aa; load 1.37-1.40 busy, 0.68-0.75
+  of it the System process). Prediction (build/prep/predictions.txt, 00:09): res read serial/new 1.02-1.05, wall
+  1.01-1.03; half321 read 1.05-1.08, wall 1.02-1.05.
+
+  | scenario | read_s new | serial | serial/new | wall ms new | serial | serial/new | aa (read, wall) |
+  |---|---|---|---|---|---|---|---|
+  | res (6528 MiB, 96 requests) | 1.95 | 2.03 | **1.041** | 3419.5 | 3496 | **1.022** | 1.005, 0.997 |
+  | half321 (7503 MiB, 918 requests) | 2.73 | 2.79 | **1.026** | 4098.5 | 4168 | **1.017** | 1.006, 1.000 |
+
+  res inside the prediction; half321 below it: the guess "smaller runs, in flight helps more" fell (8.2 MiB a
+  request gains less than ~68 MiB, LESSONS #269). The prompt there 114.0 -> 116.5 tok/s (321 tokens in 2.82 ->
+  2.76 s). The same tokens in all 27 runs of each scenario. **Kept** (both above 1.01, A/A inside 1%).
+  The hand mutation of the page lists (every request's list over the first's) stays green: Windows takes the list
+  at the call (LESSONS #268).
+
+## The three machines, first measured (2026-10-03)
+
+R1's block `r1-profiles` (docs/ARCHITECTURE.md §The roadmap): `sh tools/machines.sh build/q119/trochilus.exe 8 q4k
+q8` (build/machines; load 1.2-1.4 busy, 0.65-0.75 of it the System process). The same 321-token prompt
+(bench/prompts/code.txt) and 64 generated tokens on: **weak** (`-t 4`, `TR_CPU_MAX=avx2`, `TR_GPU=0`, the plan
+seeing 8 GiB with 4.5 free: `TR_MEM_TOTAL_MIB=8192 TR_MEM_AVAILABLE_MIB=4608`, the new switch: the plan's reserve is
+a tenth of the total, and the real 31 GiB gave 3.1 GiB where an 8 GB machine has 2, so the Q4_K was refused),
+**avg** (`-t 8`, `TR_GPU=0`, 16 GiB with 11 free), **pc** (as it is). Medians of 8; the bytes a token from one
+profiled run a machine; the limit = the RAM's nominal bandwidth (21 / 51 / 83 GB/s) over the RAM bytes a token, plus
+the disk's bytes at 3.5 GB/s. The prediction (build/prep/predictions.txt, after a 1-round smoke on q4k): q8 weak
+3-4 tok/s with ~300 MiB a token from disk, prompt 15-25 tok/s; avg 40-45 tok/s at ~100% of its limit; pc 42-48.
+
+| model | machine | experts in RAM | prompt tok/s | decode tok/s | RAM MiB/token | disk MiB/token | GB/s drawn | limit tok/s | of limit |
+|---|---|---|---|---|---|---|---|---|---|
+| Q4_K | weak | 224/1024, 759 MiB | 32.8 | 6.76 | 723.5 | 166.3 | 5.1 | 11.6 | 58% |
+| Q4_K | avg | all, 3468 MiB | 442.2 | 69.48 | 723.5 | 0 | 52.7 | 67.2 | **103%** |
+| Q4_K | pc | all | 652.5 | 72.73 | 723.5 | 0 | 55.2 | 109.4 | 66% |
+| Q8_0 | weak | **83/1024, 530 MiB** | 65.9 | **2.14** | 1284.6 | **816.0** | 2.9 | 3.2 | 66% |
+| Q8_0 | avg | all, 6540 MiB | 398.0 | 40.84 | 1284.6 | 0 | 55.0 | 37.9 | **108%** |
+| Q8_0 | pc | all | 562.5 | 41.39 | 1284.6 | 0 | 55.8 | 61.6 | 67% |
+
+The same tokens in all 78 runs, on the three machines (another tier, other thread counts, the GPU or not: the same
+bits). What the numbers say:
+- **avg** draws more than an average machine's RAM gives (103-108%): there it is the RAM's, at its limit if it
+  draws its whole bandwidth (not provable here: this PC's RAM is faster).
+- **pc** draws 55-56 GB/s, 66-67% of the nominal 83; the practical ceiling of this RAM, measured again the same
+  day (`build/tests/bench_mem.exe ram`): 56.3 GB/s sequential at 8 threads: the engine is at 98-99% of it (#273). The engine settles on 8 decode threads on Q4_K, 4 on Q8_0.
+- **weak, Q8_0: 0 hits in 9010 accesses** (the prediction said ~300 MiB a token from disk: 816). The plan keeps 83
+  units, fewer than the 128 a token uses (8 experts x 16 layers), and an LRU over a cycle longer than itself evicts
+  every unit just before it is wanted again: 57 439 MiB read for 385 tokens (LESSONS #271). Keeping the first layers
+  and evicting the most recent (STATUS M1 item 2, the eviction during a sweep) would hit ~83/128 of a token.
+- **weak's budget is eaten by the session allowance**: the plan sets aside a 4096-token F32 KV (1 GiB) plus 512 MiB
+  before the experts; the run uses ~400 positions (100 MiB). On 8 GB that is 1.4 GiB, 2.7 times the experts' 530.
+- **weak, the Q4_K prompt** (32.8 tok/s) is half the Q8_0's (65.9) on the same machine: AVX2 has no Q4_K tile
+  (STATUS backlog: AVX2's own tile), and its 3.2 GB of reads in the prompt. Not separated yet.
+- `tools/ab_modes.sh` died on the zero median (hits 0) and lost the weak rows after it: fixed, tested (#270).
+
+## The 8 GB machine's store: its disk, its plan, its eviction (2026-10-03 night)
+
+R1 phase 3 on the weak machine (LESSONS #271-#279): the arithmetic first (#272), then the deletion series, then the
+race. Predictions in build/prep/predictions.txt, each before its run.
+
+**The limit, measured not nominal; each machine's disk** (#273, closed). `tools/machines.sh` now takes each
+machine's disk in its environment (`TR_EXPERT_DISK_MBPS`: the expert store's reads at that rate, one disk shared by
+the calling thread and the I/O thread, measurement only; `tests/test_experts.c` branch `disk`, 4 mutations red) and
+two limits: at the RAM's nominal bandwidth and at its practical ceiling (this PC's measured 56.3 GB/s, 68% of 83;
+the others estimated at the same 68% until a real PC, question 88). Disks, estimates: the 8 GB laptop's SATA-class
+SSD 500 MB/s, an average one's NVMe 2000. The 10-03 runs again (`sh tools/machines.sh table build/machines`): this
+PC decodes at **98-99% of its RAM's measured ceiling** (Q4_K 72.73 tok/s, Q8_0 41.39), and the average machine's
+emulation at 152-159% of an average machine's estimated ceiling: the emulation draws this PC's RAM, so its decode
+is an upper bound, not an average machine's.
+
+**The eviction, replayed before it is built** (`tools/evict_replay.py`; `make lint` runs its 9 hand-made cases):
+the store's own calls on a route trace (bench/prompts/code.txt, 321 tokens + 256 generated, build/evict), eight
+policies at every store size. It reproduces both measured numbers: the LRU at 83 slots 0 hits of 128 (#271's 0 of
+9010), at 224 slots on Q4_K 166.3 MiB a token (the 10-03 profile: 166.3). Hits a token, of the 128 units:
+
+| slots | LRU (ours) | MRU | random (an mmap's page cache) | per layer balanced | LFU | colibri (an LRU a layer) | **ds4** (hotness halved every 16 tokens) | Belady (the ceiling) |
+|---|---|---|---|---|---|---|---|---|
+| 83 (weak Q8_0, 10-03) | **0** | 10.4 | 17.1 | 36.4 | 46.7 | 36.4 | **47.3** | 65.4 |
+| 128 | 59.6 | 16.9 | 35.1 | 59.6 | 59.9 | 59.6 | 61.7 | 82.9 |
+| 270 | 84.8 | 38.6 | 73.5 | 87.5 | 86.5 | 86.1 | **90.2** | 107.7 |
+| 400 | 102.3 | | | | | | 105.0 | 118.0 |
+| 512 | 113.4 | | | | | | 114.2 | 122.7 |
+| 768 | 124.3 | | | | | | 124.4 | 127.0 |
+
+- **The premise of #271 falls on paper** (#274): "keep the first layers, evict the most recent" (MRU) hits 10 of
+  128, not ~83: the routes move from token to token, and what a store keeps by arrival order goes stale. Under
+  one token's units the lever is the policy (ds4's: 0 -> 47); above it, the store's size (the LRU 0 -> 85 from 83
+  to 270 slots), the policy adding 0-6%.
+- **ds4's policy is the best practical one at every size, and never below the LRU**; colibri's (a fixed LRU a
+  layer) equals the balanced one; the page cache an mmap leans on (llama.cpp; ds4 by default) sits between the LRU
+  and the per-layer ones. Belady stays 18-38% above ds4 at 83-270 slots: what a policy that knew the next token's
+  routes would add.
+
+**The plan's session allowance** (#275): 1.5 GiB set aside (a 4096-position F32 KV and a flat 512 MiB) for a run
+of 353 positions that allocates ~0.19 GiB: on 8 GB, 2.7x the experts' own 0.53. Now the plan takes the session's
+own bytes (olmoe.c `session_bytes`, the one sum the session's guard asks for too) at the positions the run will
+hold (`tr_model_load_plan`; generate and run pass prompt + -n + the draft; chat and serve the default context).
+The weak machine's store: Q8_0 83 -> 290 slots, Q4_K 224 -> 615.
+
+**The deletion series** (`MACHINES_LIST="weak weakr aa" MACHINES_N=32 sh tools/machines.sh build/q121/trochilus.exe
+8`, build/machines_q121; load 1.86 busy, 0.76 the System process). weakr = the weak machine's cores with every
+expert in RAM: its compute alone. Medians of 8, the same tokens in all 58 runs:
+
+| model | arm | prompt tok/s | decode tok/s | disk MiB/token | prompt: disk share | decode: disk share |
+|---|---|---|---|---|---|---|
+| Q4_K | weak (the new plan, disk 0.5 GB/s) | 20.82 | 8.03 | 42.9 | 44% (3203 MiB in 6.7 s) | 72% |
+| Q4_K | weakr | 36.95 | 31.91 | 0 | | |
+| Q8_0 | weak | 20.52 | 1.78 | 252.5 | 82% (6031 MiB) | 94% |
+| Q8_0 | weakr | 114.72 | **42.39** | 0 | | |
+
+- On the 8 GB machine with its disk, **the decode is the disk's** (72% Q4_K, 94% Q8_0) and so is a first Q8_0
+  prompt (82%); the Q4_K prompt is half compute (step 4, AVX2's own Q4_K tile, is its lever).
+- weakr's Q8_0 decode, 42.4 tok/s, is this PC's whole RAM (57 GB/s) drawn by four AVX2 cores: predicted 16-21
+  from a guess never measured (#277 a). A real 8 GB machine's RAM (21 GB/s nominal) would hold it to ~11.
+- With the store partial, a decode token's compute costs 34.8 ms against 31.3 resident (Q4_K: the slots' bytes
+  arriving by DMA, the pointers refreshed each layer).
+
+**The race** (`MACHINES_BIN_weakold=build/q120b/trochilus.exe MACHINES_LIST="weakold weak weakhot aa"`, 5 rounds;
+weakold = the engine of 10-03 with the emulated disk, weak = the new plan with the LRU, weakhot = with ds4's
+eviction; build/race_weak_q8 at -n 16, build/race_weak_q4k at -n 32; load 1.26-1.91 busy). The same tokens in all
+54 runs:
+
+| model | arm | slots | decode tok/s | disk MiB/token | whole run | prompt |
+|---|---|---|---|---|---|---|
+| Q8_0 | weakold | 83 | 0.57 | 816.0 | 42.1 s | 20.50 |
+| Q8_0 | weak | 292 | 1.65 (**2.90x**) | 274.5 | 25.2 s | 20.39 |
+| Q8_0 | weakhot | 292 | 1.70 (**2.98x**) | 266.1 | 25.0 s | 20.23 |
+| Q4_K | weakold | 224 | 2.52 | 171.6 | 27.9 s | 20.85 |
+| Q4_K | weak | 615 | 8.02 (**3.18x**) | 42.9 | 19.5 s | 20.81 |
+| Q4_K | weakhot | 615 | 8.02 (3.18x) | 42.9 | 19.6 s | 20.68 |
+
+- Predicted (02:10 and ~03:00): weakold 0.55-0.60 and 2.4-2.8, in; the plan 2.9-3.3x and 2.9-3.4x, in; the
+  prompts level, in. ds4's eviction 1.08-1.16x on Q8_0: **1.03x, below**: the replay's 8-16% was for 256 tokens,
+  the race ran 16, mostly the first tokens after the prompt (#277 c). Counted at the replay's horizon (one run an
+  arm, `MACHINES_COUNTS=1`, build/counts_test): at 64 tokens 259.6 MiB a token with the LRU, 222.1 with ds4's
+  (816.0 before): **3.67x fewer bytes a token than the engine of 10-03**; at 128 tokens 24% fewer misses a token.
+  At every other size ds4's never misses more (the replay above; this PC at half budget, 128 tokens: 2456 misses
+  against 2518). **Kept, and made the default** (`TR_EXPERT_EVICT=lru` for the LRU).
+
+**The requests in flight, and the references' ways to read a miss** (#269, #273's points b and c):
+`tests/bench_disk_misses.c`, the store's own request shapes on the Q8_0 file (`BENCH_BUILD=build/q123 sh
+tools/bench_native.sh bench_disk_misses <Q8_0> <fresh copy> --runs 5`; a copy made by `xcopy /J`, which no page of
+is held in RAM, for the two ways that go through the system's cache, never a unit twice). Medians of 5, load
+1.45-1.79 busy. The first run of it fell under an agent's checkout (#278) and was run again. Predictions at ~04:00.
+
+A decode token's misses, 8 units a layer (51 MiB), 4 layers a run:
+
+| how | GB/s | ms a layer | against ours | predicted |
+|---|---|---|---|---|
+| **ours**: a unit's three parts in flight together, the units one after the other | 1.87 | 28.6 | 1 | 1.9-2.2 GB/s |
+| ours, every unit of the layer in flight (24 requests) | 1.84 | 29.0 | 0.98 | 0.95-1.10 |
+| ds4: the parts as tasks of 9 threads, a direct read each | 1.87 | 28.6 | 1.00 | 0.95-1.05 |
+| colibri direct (its DIRECT=1): one 6.375 MiB request a unit | 2.13 | 25.1 | **1.14** | 1.10-1.25 |
+| colibri as it ships: one request a unit through the system's cache | **2.49** | 21.5 | **1.33** | 0.5-1.0: fell |
+| llama.cpp: the file mapped, 4 threads faulting its pages | 0.92 | 57.8 | 0.49 | 0.2-0.6 |
+
+A prompt's runs, a whole layer (408 MiB), `--run k`:
+
+| request | 1 run in flight (3 requests) | 2 runs (6) | 4 runs (12) |
+|---|---|---|---|
+| k = 4 experts, 8.5 MiB (a one-pass prompt's on-demand runs) | 3.05 GB/s | **3.29 (+8%)** | 2.39 (-22%, 130-190 ms) |
+| k = 32 experts, 68 MiB (a resident load's) | 3.25 | **3.58 (+10%)** | 3.54 |
+
+- **The count of requests in flight is not the lever on a miss; the request's size is** (24 in flight = 3 in
+  flight = ds4's nine threads, all at 2.125 MiB). One request a unit (colibri's own format) reads 1.14x faster,
+  and through the system's cache 1.33x: the cache manager splits and reads ahead a 6.375 MiB request better than
+  three direct ones of 2.125 (not yet separated: buffered reads of our three parts were not timed). The mmap
+  llama.cpp leans on reads half as fast.
+- **A run more in flight is worth +8-10%** at both sizes (predicted +0-5% and +0-3%: fell, #277 b); four are worse
+  at 8.5 MiB. The engine issues one run at a time today: the second one is a lever for the load and the prompt.
+- On the 8 GB machine's SATA-class disk all of this flattens: 0.5 GB/s is reached by any request of 2 MiB; there the
+  bytes are the lever (the plan and the eviction above), not the shape.
+
+**Today's table, the final binary** (q124: the plan and ds4's eviction by default; `MACHINES_LIST="weak avg pc aa"
+MACHINES_N=32 sh tools/machines.sh build/q124/trochilus.exe 5 q4k q8`, build/machines_q124; load 1.29 busy after;
+the same tokens in all 54 runs; the predictions of ~05:00 all in):
+
+| model | machine | prompt tok/s | decode tok/s | disk MiB/token | decode of the RAM's ceiling |
+|---|---|---|---|---|---|
+| Q4_K | weak (its disk) | 20.74 | 8.05 | 42.9 | (the disk's) |
+| Q4_K | avg | 444.77 | 69.87 | 0 | 152% (this PC's RAM) |
+| Q4_K | pc | 678.53 | 72.49 | 0 | **97%** |
+| Q8_0 | weak (its disk) | 20.40 | **1.92** | 233.8 | (the disk's) |
+| Q8_0 | avg | 400.30 | 41.50 | 0 | 161% (this PC's RAM) |
+| Q8_0 | pc | 582.30 | 41.53 | 0 | **99%** |
+
+The weak Q8_0 at 32 tokens 1.92 (1.70 in the race's 16: ds4's eviction gains with the horizon, #277 c). This PC's
+prompts 3.5-4% above 10-03's (652.5, 562.5): a run's session is now its own 353 positions, not 4096 (a smaller KV
+and score rows); not raced on its own.
+
+## AVX2's own Q4_K tile (2026-10-03)
+
+R1 phase 3, the 8 GB machine's first gap (LESSONS #280-#282). Predictions in build/prep/predictions.txt, each
+before its run.
+
+**Measured before changing.** The weak machine's Q4_K prompt with every expert in RAM (weakr: `-t 4`,
+`TR_CPU_MAX=avx2`) was 37.2 tok/s, and 98.8% of it the Q4_K matmuls (8.5 of 8.6 s, build/machines_q121): 345 G weight
+MACs in 34 core-seconds, 10 G a core-second, ~2.1 a cycle. AVX2 had no W16 panel: a prompt's groups went by rows,
+`q4x_dot2` a token at a time (`q4x_dot_xt` is T calls of it on AVX2), every weight decoded once a token, a scalar
+header, an 8-lane horizontal sum and the f64 steps per row, block and token.
+
+**The references' AVX2 ways** (read, not raced; ORIGINS §Q4_K): ik_llama.cpp converts Q4_K to 8-bit rows from 32
+tokens (`iqk_convert_q4_k_q8_1_r8`, d sc and dmin m folded to fp16 per 32) and runs an 8 rows x 8 tokens GEMM on
+`vpmaddubsw`; llama.cpp's `ggml_gemm_q4_K_8x8_q8_K` runs 8 rows x 16 tokens on rows repacked at load, 32 float
+accumulators that spill. Both ~9 weight MACs an instruction, on 8-bit activations: not the definition's bits. Ours
+pays two exact 16-bit digits: ~4 an instruction.
+
+**Built**: `avx2_q4x_panel` writes the W16 panel in scalar's bytes (16 rows' words transposed 8 x 8 by unpacks and
+128-bit permutes, the row terms by `vpmaddwd` over the stored vectors); `q4x_tile2_t` runs AVX-512's
+arithmetic in two halves of 8 rows: `vpmaddwd` + `vpaddd` for `vpdpwssd` (mod 2^32, the same), the odd row's int64
+by a blend of two shifts for `vpsraq`, int64 to f64 by the 1.5 2^52 constant for `vcvtqq2pd` (every value under
+2^51), the f64 steps by mul and add (exact until d and dmin). The panel and every tile equal scalar's bit for bit
+the first time (test_kernels: 15 panels, 60 tiles on the avx2 tier).
+
+**One core hot** (`bench_q4x --prompt`, 16 rows of 2048, free machine): dot2 3138 ns a token (10.4 GMAC/s); the
+panel 2957 ns (a dot2 token); the tile T = 1-4: 1082 / 1532 / 2076 / 2934 ns (30 / 43 / 47 / 45 GMAC/s). A token
+at groups of 4 / 8 / 40 / 320 rows: 2.1x / 2.8x / 3.9x / 4.2x dot2 (predicted 4-6x at T = 4).
+
+**Raced** (q125 against q124, `MACHINES_LIST="weakrold weakr weakold weak aa"`, 5 rounds, 32 tokens, the same tokens
+in all 34 runs): weakr prompt **36.36 -> 126.98 tok/s (3.49x)**, weak (its disk at 0.5 GB/s) **20.59 -> 34.62
+(1.68x)**, the decode level (31.0 / 31.4, 8.0 / 8.0). Predicted 120-170 and 30-40. On weak the prompt now waits for
+the disk 72.6% of its time (weight_read 6.7 of 9.25 s, 3203 MiB read): its next gap is the disk's (STATUS).
+
+**The tile sequenced** (`tests/bench_q4x_genome.c`, one piece removed at a time, clock 5.09 GHz, free machine):
+
+| T = 3 | ns a call | MACs a cycle |
+|---|---|---|
+| full (= the tier's) | 2125 | 9.09 |
+| without the block's f64 tail | 1781 | 10.84 |
+| and without the windows' int64 split | 1730 | 11.16 |
+| and without the broadcasts (digits from registers) | 1418 | 13.62 |
+| only the tails | 430 | |
+
+The Winograd core alone runs 3.4 vector ops a cycle (of ~4); the block's f64 tail costs 16%, the broadcasts 15%, the
+split 2.5%. Candidates, each checked bit for bit: the odd rows biased in the tile (a split of 3 ops, not 5) 1.002x,
+fma in the exact sums 1.013x, both 1.013x (noise: 3-5%); both halves in one pass at T = 2 (each broadcast for 16
+rows) 0.975x. Rejected. **T = 4 runs 8.09 MACs a cycle against T = 3's 9.09** (T = 2 8.54): its eight accumulators
+spill, its windows' split 565 ns a call against 51 (#280).
+
+**Tiles of 3 on AVX2**: the table's `q4x_tile_max` (AVX2 3, AVX-512 4), the plan's room for tiles of 3. One core: a
+token at G = 40 907 -> 810 ns (-11%), G = 320 837 -> 735 (-12%; not a free machine, structure). Raced (q126 against
+q125, 5 rounds, the same tokens in all 34 runs, load 2.3-2.5): weakr prompt **124.81 -> 137.89 tok/s (1.105x)**, weak
+**34.57 -> 35.09 (1.015x)**, the decode level. Predicted +3-6% and +0-2%: the matmul's tiles weigh more than guessed.
+
+**Since this morning** (two races, each against the binary before): the 8 GB machine's Q4_K prompt 20.6 -> 35.1 tok/s,
+its cores' 36.4 -> 137.9, every token the same. Left on AVX2's tile: the block's f64 tail (16%) and the broadcasts
+(15%); the next lever on weak is the disk.
+
+## A pass reads the next layer ahead (2026-10-03 afternoon)
+
+**The premise first, and it gave zero.** The task was a second run in flight (+8-10% on this PC's NVMe at 8.5 and
+68 MiB, §The disk at its limit). On the 8 GB machine it is nothing by construction: its emulated disk is one queue
+(`disk_emulate`, one clock for both threads), and a SATA-class disk reaches its 0.5 GB/s with any request of 2 MiB.
+What its prompt waited for was not the disk's width but the compute's turn: the 321-token prompt fits one pass
+(n_batch 512), which read every layer's experts on demand and nothing ahead (`weight_read` 6.72 of 9.13 s; the other
+zones 2.39 s, ~150 ms a layer, never overlapped). The layer-major prompt's I/O thread (09-23) needs a prompt longer
+than a pass.
+
+**The arithmetic** (build/ahead/predictions.txt, written before any run): the trace of the same prompt
+(build/evict/Q4_K.trace) asks 949 of 1024 units, 56-64 a layer, so reading the whole next layer ahead wastes ~7% of
+it; read ahead while this layer computes, the compute hides behind the disk, and what the next layer does not ask can
+be dropped while still queued, if the requests are short enough to leave it queued (the store's runs took the whole
+layer, 216 MiB, in one request). A layer's time becomes its disk time plus the unasked units read before it names its
+own: predicted 7.0-7.4 s, 43-46 tok/s (1.23-1.30x), Q8_0 1.13-1.19x.
+
+**Built** (src/models/olmoe.c `forward_pass`, src/memory/experts.c): a pass whose layer named more than half its
+experts reads the next layer ahead (`tr_experts_prefetch_n`, requests of at most 8 MiB a part: 7 Q4_K units, 3 Q8_0;
+`TR_AHEAD_RUN_KIB`), and before the next layer acquires, `tr_experts_prefetch_cancel` drops every unit of it still
+queued that it does not name (slot freed, unit absent, never counted as read). The layer-major prompt keeps its rule
+and its long runs (a later block may ask what the first did not). The read ahead now queues a layer under one lock and
+one wake: the I/O thread used to wake at the first unit and read it alone (#284). Every bit the same (test_prefetch's
+`pass`, `cancel`, `major_kept`, `fail_pass`, `lru` branches, test_experts' `hot` and `cancel`; 39 mutations red, #283).
+
+**Counted** (`MACHINES_COUNTS=1`, the emulated disk kept: the drop depends on how far the disk got, #285): Q4_K 31
+units read and not asked, 43 dropped; Q8_0 22 and 56; the decode's bytes a token unchanged (42.9, 233.8 MiB).
+
+**Raced** (`MACHINES_LIST="weak weakold" MACHINES_N=32 sh tools/machines.sh build/q127/trochilus.exe 5 q4k q8`,
+build/machines_q127, the binary before as weakold; Q4_K 5 rounds, Q8_0 stopped steady at 3; the same tokens in all 24
+runs; load 2.56 before and 2.97 after, just over the 2.5 limit, MsMpEng and the kernel's System, the arms interleaved
+round by round with spreads of 0.0-1.0% on the prompt):
+
+| model | prompt tok/s before | after | | prompt bytes before | after | of the disk's time for them | decode |
+|---|---|---|---|---|---|---|---|
+| Q4_K | 35.26 | **45.49** | **1.290x** | 3203 MiB | 3294 (+2.8%) | 97% | 8.01 -> 7.97 |
+| Q8_0 | 20.29 | **24.55** | **1.210x** | 6031 MiB | 6158 (+2.1%) | 98% | 1.91 -> 1.91 |
+
+- Q4_K inside its prediction; Q8_0 just above it (24.55 against 23.1-24.3 tok/s: the prediction took its hidden
+  compute from one profiled run, 2.8 s; the race's runs before were 0.3 s slower than that run).
+- The 8 GB machine's first prompt is now at its disk's limit for its bytes (97-98%): what is left there is bytes, 2-3%
+  read unasked (the units read before the next layer names its own; an order by likelihood, the next layer's router on
+  this layer's state as colibri's PILOT does in decode, would read the asked ones first), and the first prompt's
+  ~950 units themselves.
+- On this PC (NVMe, 3 GB/s) a whole layer is read ahead before the next one asks: nothing is dropped, every unasked
+  unit read (the counts at this disk: 76). A half-budget store's prompt is not raced yet; there the second run in
+  flight (+8% at 8.5 MiB) would join these short requests.
+- The read ahead now returns once the I/O thread has taken its first run (#286: under the gate's load the thread woke
+  after the next layer had named its own, every time): the disk starts before the compute holds the cores, which a
+  real 4-core machine's spinning pool would otherwise delay; one wake a layer, the weak prompt level (one profiled run
+  each: 7.11 s against 7.15, the same counts, build/ahead/counts3). The later runs of a layer still need the thread
+  scheduled between them: on a real 4-core machine that stays to measure (question 88).
+
+## The prompt's routings, told to the store (2026-10-03 evening)
+
+**The question** (R1 phase 3, the 8 GB machine's next gap): its decode missed 12.7 units a token in the first 31
+tokens after the prompt (Q4_K, 615 slots) against 7.8 later. **What the store held**: a prompt's pass names each unit
+once, and the store of 10-03 added 1 a call, so every unit the prompt read stood at hotness 1; 949 units through 615
+slots left the last ~600 read, the last layers, and the decode's misses evicted by age, the earliest layers first:
+the ones its next token asks first again.
+
+**ds4 does not do that** (read for this piece's verdict, LESSONS #289): its prefill adds a batch's every token row to
+the units it chose (ds4_metal.m:17437-17447, 14359-14362) and halves nothing before the first decode token
+(14292-14306). "ds4's eviction" had been adopted from its decode path only, and the replay's `ds4` modelled ours.
+
+**The replay first** (`tools/evict_replay.py`, build/passage: the prediction written before every run but the first,
+#288). Misses a decode token by window, the Q4_K trace at 615 slots, the decode's hotness as ds4's, the prompt's
+call adding:
+
+| a prompt's call adds | 0-8 | 8-16 | 16-32 | 32-64 | 64-128 | 128-256 | first 32 | all 256 |
+|---|---|---|---|---|---|---|---|---|
+| 1 (the store of 10-03, `once`) | 24.88 | 13.12 | 5.94 | 5.38 | 4.80 | 7.32 | 12.47 | 7.09 |
+| its tokens' routings c, whole (ds4's own) | 6.25 | 2.38 | 4.25 | 4.44 | 4.25 | 7.31 | 4.28 | 5.81 |
+| c x 16 / n | 11.12 | 7.38 | 5.00 | 5.34 | 4.80 | 7.32 | 7.12 | 6.42 |
+| c x 32 / n | 7.38 | 3.62 | 3.88 | 5.09 | 4.80 | 7.32 | 4.69 | 6.08 |
+| **c x 64 / n** | 6.50 | 2.38 | 3.25 | 5.00 | 4.77 | 7.32 | **3.84** | 5.96 |
+| Belady (the ceiling) | 0.00 | 0.00 | 2.19 | 3.53 | 1.53 | 2.98 | 1.09 | 2.45 |
+
+Over the 7 traces (the two weak ones at their slots, Q8_0 at 290; five prompts of 860-1000 tokens at 615), the sums
+of misses a token, first 32 / all 256: `once` 129.4 / 102.3; c x 16/n 105.9 / 99.4; x 32/n 89.5 / 97.2; **x 64/n
+81.4 / 95.7**; x 128/n 82.8 / 95.4; x 256/n 85.2 / 96.1; whole (ds4's) 87.3 / 96.7. The prompt's last 64 or 128
+tokens weighted more: 81.4-85.1 / 95.4-96.3, nothing more. Whole counts lose most on the longest prose prompt
+(prose-en's first 32: 24.1 against 19.7 scaled): a prompt's counts of hundreds outlive many halvings.
+- Predicted (build/passage/predictions.txt): Q8_0 at 290, first 32 15-30% fewer: 36.66 -> 28.66, 22%, in; over 256
+  3-8%: 4%, in. The other traces 2-3x in the first 32: 1.2-3.8x, partly in (prose least).
+
+**Built** (src/memory/experts.c `tr_experts_acquire_counts`, src/models/olmoe.c `olmoe_refresh_experts`): a call
+adds to each unit c x min(1, 64 / n_tok), rounded half up, at least 1 (`TR_EXPERTS_HOT_PROMPT`): a decode token 1 as
+before, a pass its routings scaled to 64 tokens, twice ds4's steady state (32 x a unit's rate between halvings: the
+prompt is fresh at its end). The pass's counts were already there (`s->offsets`, the routing's counting sort).
+Every bit the same (only which units are read moves). Tests: test_experts' `hot` against a reference with counts
+(a third of 800 random calls a pass of 1-300 tokens), its `prompt` case (the liked unit kept), test_prefetch's `heat`
+(`hot_extra`, the hotness beyond one a unit, > 0 under ds4's and 0 under the LRU); 7 mutations red. test_prefetch's
+on/off equality of the decode's misses held only while every hotness was equal (the read ahead never evicts the
+computing layer, a call on demand may): now checked under the LRU, the logits under both (#287).
+
+**Counted** (`MACHINES_COUNTS=1`, MACHINES_N=32, the emulated disk kept, build/passage/counts.log): disk MiB a
+decode token **Q4_K 42.9 -> 14.0** (predicted 12-19), **Q8_0 233.8 -> 184.9** (180-200); the prompt's bytes +0.8-1%.
+
+**Raced**: (`MACHINES_LIST="weak weakold" MACHINES_BIN_weakold=build/q127/trochilus.exe MACHINES_N=32 sh tools/machines.sh build/q128/trochilus.exe 5 q4k q8`, build/machines_q128; both stopped steady after 3 rounds; the same tokens in all 20 runs; load 2.44 before and 2.49 after, under the 2.5 limit, a Windows service (Appinfo) holding one core throughout):
+
+| model | decode tok/s before | after | | prompt tok/s before | after | whole run |
+|---|---|---|---|---|---|---|
+| Q4_K | 8.00 | **15.50** | **1.94x** | 45.22 | 45.14 | 11.24 -> 9.39 s |
+| Q8_0 | 1.91 | **2.38** | **1.25x** | 24.50 | 24.48 | 29.63 -> 26.43 s |
+
+- Predicted from the counts (the old arm's compute and rest, 34.8 and 33.3 ms a token, plus the new bytes at 0.5 GB/s): 15.6 and 2.375 tok/s, ranges 14.5-16 and 2.3-2.45: both in. The prompts level, in.
+- The 8 GB machine's Q4_K decode is now 29 ms of disk and ~35 of compute a token: the disk's share fell from 72% to 46%. Its Q8_0 decode is still the disk's (92%): 184.9 MiB a token, 117 in Belady's replay (256 tokens).
+- What is left between the policy and Belady (replay, 256 tokens): Q4_K 5.96 against 2.45 misses a token, Q8_0 33.75 against 18.35: a policy from the routes (the next layer's router: STATUS §Next steps).
+
 ## Attempts
 
 | Date | What | Before | After | Spread | Outcome |
@@ -5365,3 +5807,86 @@ up always on Q4_K's road. Every output is the same `q4x_dot2` or tile on the sam
 | 2026-10-02 | pretouch: before each hint the calling thread asks for its own next lines (the norms' weights; prefetchw over normed, the prepared row, the router's row) | the decode, no hints (arm B) | 1.0027 +- 0.0022 (8 runs); attn_norm still +54 us a pass, the prep inside qkv +55 us more | in-process A/B, native, free | **out** (patch in build/q102): the serial step's slowdown is not its own lines' latency (question 85) |
 | 2026-10-02 | piece 4, first form: q, k, v and gate, up one call each, a thread's items on each weight in turn | the decode, one call a weight | 0.9914 +- 0.0069 (8 runs), 1.0025 +- 0.0028 (12); qkv_proj +13/+24 us | in-process A/B, native, not free | **replaced**: the blocks 2-3 weights heavy, the tail took the dispatch's gain (LESSONS #260) |
 | 2026-10-02 | piece 4, the form kept: the weights' items as one flat range (`tr_matmul_q4x_prepared_n`) | the decode, one call a weight (14.3-15.1 ms a pass) | **1.0054 +- 0.0007** (12 runs); qkv_proj 1.0283, gate_up 1.0077 | in-process A/B, native, free | **kept**, on by default (`--ab fuse` arm B: the calls apart) |
+| 2026-10-03 | AVX2's own Q4_K W16 panel and tile (two halves of 8 rows), bit-identical | weakr Q4_K prompt 36.36 tok/s (dot2 a token) | **126.98** (3.49x); weak 20.59 -> 34.62 | 0.2-1.1% (one weakr round 13%) | kept: AVX2 and the avx512 tier without VBMI |
+| 2026-10-03 | AVX2's tile: the odd rows biased in the tile (the window's split in 3 ops) | T = 3 2125 ns | 2120 | 3-6% | rejected: level |
+| 2026-10-03 | AVX2's tile: fma in the block's exact sums | T = 3 2125 ns | 2097 (1.013x) | 3-6% | rejected: inside the noise |
+| 2026-10-03 | AVX2's tile: both halves in one pass at T = 2 (a broadcast for 16 rows) | T = 2 1508 ns | 1547 (0.975x) | 4-9% | rejected |
+| 2026-10-03 | AVX2's tiles at most 3 wide (`q4x_tile_max`; T = 4 spills) | weakr prompt 124.81 tok/s | **137.89** (1.105x); weak 34.57 -> 35.09 | 1.1-4.5% | kept |
+
+## The KV grown from the store's room (2026-10-03 night)
+
+**The question** (R1 phase 3, the 8 GB machine's next gap, its first): chat and serve plan the default context, and
+the plan set aside its whole KV at load (4096 positions F32: 1 GiB, with the working memory of passes of 512), for a
+conversation that has written none of it. On the 8 GB machine that is ~150 Q8_0 slots of the 290 a run of its own
+positions keeps.
+
+**The references** (ORIGINS row 7): colibri takes the KV of max_ctx off its cache once (`cap_for_ram`,
+colibri.c:10226-10259; its OLMoE engine the KV of prompt + new tokens, else 4096 F32, olmoe.c:488-524), and its
+`rss_guard` (8412-8464) only lowers the cap, never raises it; ds4's automatic cache ignores the context
+(`(void)ctx_size`, ds4.c:68145) and allocates its KV whole; llama.cpp allocates the KV whole at construction
+(llama-kv-cache.cpp:233), its `--fit` a decision at load. Nobody grows the KV into the cache's memory.
+
+**Built**: the plan leaves the KV out of what it sets aside, and gives the store and the sessions' KV pages one room
+(olmoe.c `kv_room`): before each pass the session takes the pages of the positions it will write (`kv_hold`,
+tr_kv_bytes up to them: the pages a pass faults, `tr_kv_touch_pass`), and the store keeps floor((room - every
+session's KV pages) / slot) slots (`tr_experts_set_slots`): the policy's coldest units go, the ones above the new
+count move below it (their bytes copied whole, their recency kept), and the pages of the slots given back go to the
+system (`tr_pages_release`: MADV_DONTNEED, Windows' decommit; the slab now `tr_pages_alloc`). A session freed gives
+its KV back and the store takes its slots again. A session whose whole context's KV would leave the store under its
+minimum is refused by name, so chat's halving still finds the context that fits; the machine's guard is asked only
+for what the store will not have given back. A forced budget and a resident store share no room (as before). Every
+bit the same: only which units are in RAM moves.
+
+**Counted** (`MACHINES_COUNTS=1`, weak, MACHINES_N=32, the emulated disk kept, build/kvroom; predictions in
+build/kvroom/predictions.txt, written before each run):
+
+| `generate --tokens <321> -n 32` on weak | slots in RAM | made / given / moved | disk MiB a decode token |
+|---|---|---|---|
+| Q8_0, `-c 4096` (a chat's plan), before | 131 | 131 / - / - | 375.9 |
+| Q8_0, `-c 4096`, after | **278** | 291 / 13 / 1 | **193.7** |
+| Q4_K, `-c 4096`, before | 314 | 314 / - / - | 87.4 |
+| Q4_K, `-c 4096`, after | **591** | 617 / 26 / 2 | **16.3** |
+| Q8_0, the run's own positions, before / after | 290 / 291 | | 184.9 / 183.6 |
+| Q4_K, the run's own positions, before / after | 615 / 616 | | 14.0 / 14.0 |
+
+- Predicted: before 125-145 and 310-350 slots (in), after 276-286 and 590-605 (in), made 290-300 and 615-630 (in),
+  given ~14 and ~26 (13, 26: in); disk a token Q8_0 330-450 -> 180-205 (in), Q4_K 35-70 -> 13-18 (the before
+  above: 87.4; the after in); the run's own positions level (in).
+- The old Q8_0 chat store (131 slots) was under the 136 a read ahead needs (2 layers and a margin): its prompt read
+  on demand. The new one reads ahead again.
+
+**Raced** (2026-10-04 00:07, `MACHINES_LIST="weak weakold" MACHINES_BIN_weakold=build/q128/runnable2/trochilus.exe
+MACHINES_N=32 MACHINES_ARGS="-c 4096" sh tools/machines.sh build/trochilus.exe 5 q4k q8`, build/kvroom/race_c4096b;
+3 rounds an arm, stopped steady, every run behind the still-machine guard, load 3.12 before and 1.49 after; the first
+try at 23:03 was stopped: a model download, not ours, held the disk, LESSONS #291):
+
+| a chat's plan, weak | decode tok/s before | after | | prompt tok/s before | after | whole run |
+|---|---|---|---|---|---|---|
+| Q4_K | 4.55 | **14.77** | **3.25x** | 45.45 | 45.41 | 14.07 -> 9.41 s |
+| Q8_0 | 1.22 | **2.29** | **1.88x** | 20.55 | **24.59** | 41.31 -> 26.87 s |
+
+- Predicted (build/kvroom/predictions.txt, from the counts and the old arm's compute): decode Q4_K 4.3-4.9 -> 13.5-15.5,
+  Q8_0 1.15-1.30 -> 2.20-2.40; prompt Q4_K level, Q8_0 ~19-21 -> 23.5-25.5: all in. The same tokens in all 20 runs.
+- The Q8_0 prompt's 1.20x is the read ahead back (the old store's 131 slots were under its 136).
+- A chat on the 8 GB machine now generates as fast as a run of its own length (15.50 and 2.38 tok/s at 290 and 615
+  slots, §The prompt's routings): what the context it may reach costs is paid only when it reaches it.
+
+**On colibri's own engine** (2026-10-04, the offer of UPSTREAM row 7; LESSONS #293): the fork's branch
+`perf/olmoe-kv-room` (`kv_room_fit`: before a forward, each layer's cap down to what the room holds beside the KV's
+pages, its coldest slots freed, `malloc_trim` on glibc) against `dev` `0813cf8`. OLMoE int8 (colibri's conversion),
+`docker run --memory=5g` (the limit counts the page cache), `RAM_GB=5`, cap 0, 4 threads, the model's files dropped
+from the VM's page cache before every run, 32 prompt tokens + 64 generated, 5 alternated rounds after a warm-up
+(colibri `tmp/olmoe-kv-room/race2.log`, manifest validated by its `experiment_manifest.py`):
+
+| colibri, 5 GB | slots a layer | hits / misses | request, median (min-max) | peak RSS |
+|---|---|---|---|---|
+| dev | 16 | 8133 / 4155 | 22.05 s (21.44-22.66) | 3.31 |
+| the room shared | 26 | 9652 / 2636 | **18.52 s** (18.35-18.76), **1.19x** | 4.25 |
+
+- Predicted 12 -> 22 slots, hits ~40 -> 60-65%, **1.4-1.8x**: the slots and hits came out higher (resident ~1.5 GB,
+  not 2.1), the time lower. colibri reads experts through the page cache: the gigabyte dev sets aside holds expert
+  pages there and serves part of its misses without the disk, so 37% fewer misses buy 16% of the time.
+- Every forward's logits byte-identical between the arms (`DUMP`); the same tokens in all 12 runs. A first race was
+  spoiled by another window's gate (dev 38-56 s, #294) and rerun.
+- The freed slots' memory goes back (a scratch program, 16 OLMoE slots from glibc's heap, 14 freed): RSS -84 MB with
+  `malloc_trim(0)`, -0 MB without; from mmap both give it back.

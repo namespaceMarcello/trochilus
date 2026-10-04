@@ -85,6 +85,41 @@ static void test_file(void) {
     /* pread entirely past EOF -> -1 */
     TR_CHECK_EQ_INT(tr_file_pread(f, buf, sizeof buf, sizeof data + 100), -1);
 
+    /* preadv: the file's bytes from offset on into pieces of three sizes, apart, in order; a range
+     * past EOF -> -1, as pread (buffered: one read a piece on Windows, one preadv on POSIX) */
+    {
+        unsigned char a[100], b[1], c[333];
+        tr_iov iov[3] = {{a, sizeof a}, {b, sizeof b}, {c, sizeof c}};
+        size_t scratch_n = tr_file_preadv_scratch(434);
+        void *scratch = scratch_n > 0 ? malloc(scratch_n) : NULL;
+        TR_CHECK_EQ_INT(tr_file_preadv(f, iov, 3, 1000, scratch), 0);
+        TR_CHECK(memcmp(a, data + 1000, sizeof a) == 0);
+        TR_CHECK(b[0] == data[1100]);
+        TR_CHECK(memcmp(c, data + 1101, sizeof c) == 0);
+        TR_CHECK_EQ_INT(tr_file_preadv(f, iov, 3, sizeof data - 200, scratch), -1);
+        free(scratch);
+    }
+
+    /* preadv_n on a buffered file: three requests, each its own offset and pieces, every byte where its
+     * request puts it; one of them past EOF -> -1; no request, or more than the most -> -1 */
+    {
+        unsigned char a[100], b[7], c[333], d[50];
+        tr_iov i0[2] = {{a, sizeof a}, {b, sizeof b}}, i1[1] = {{c, sizeof c}}, i2[1] = {{d, sizeof d}};
+        tr_readv_req req[3] = {{i0, 2, 3000}, {i1, 1, 10}, {i2, 1, 2000}};
+        size_t scratch_n = tr_file_preadv_n_scratch(490, 3);
+        void *scratch = scratch_n > 0 ? malloc(scratch_n) : NULL;
+        TR_CHECK_EQ_INT(tr_file_preadv_n(f, req, 3, scratch), 0);
+        TR_CHECK(memcmp(a, data + 3000, sizeof a) == 0);
+        TR_CHECK(memcmp(b, data + 3100, sizeof b) == 0);
+        TR_CHECK(memcmp(c, data + 10, sizeof c) == 0);
+        TR_CHECK(memcmp(d, data + 2000, sizeof d) == 0);
+        req[1].offset = sizeof data - 100;
+        TR_CHECK_EQ_INT(tr_file_preadv_n(f, req, 3, scratch), -1);
+        TR_CHECK_EQ_INT(tr_file_preadv_n(f, req, 0, scratch), -1);
+        TR_CHECK_EQ_INT(tr_file_preadv_n(f, req, TR_FILE_PREADV_MAX + 1, scratch), -1);
+        free(scratch);
+    }
+
     tr_file_close(f);
 
     /* opening a nonexistent file fails and reports an error */
@@ -169,6 +204,50 @@ static void test_file_direct(void) {
         }
     }
 
+    /* preadv on a direct handle (one ReadFileScatter, one preadv): pages scattered out of order in
+     * memory, the second piece two pages; then a range whose last page runs past the real end */
+    {
+        enum { A = TR_FILE_DIRECT_ALIGN };
+        unsigned char *mem = (unsigned char *)tr_alloc_aligned(6 * A, A);
+        size_t scratch_n = tr_file_preadv_scratch(4 * A);
+        void *scratch = scratch_n > 0 ? malloc(scratch_n) : NULL;
+        TR_CHECK(mem != NULL && (scratch_n == 0 || scratch != NULL));
+        if (mem != NULL && (scratch_n == 0 || scratch != NULL)) {
+            tr_iov iov[2] = {{mem + 4 * A, A}, {mem + A, 2 * A}};
+            TR_CHECK_EQ_INT(tr_file_preadv(f, iov, 2, 0, scratch), 0);
+            TR_CHECK(memcmp(mem + 4 * A, data, A) == 0);
+            TR_CHECK(memcmp(mem + A, data + A, 2 * A) == 0);
+            tr_iov tail[2] = {{mem + 3 * A, A}, {mem, A}}; /* [2A, 4A): the file ends inside the second */
+            TR_CHECK_EQ_INT(tr_file_preadv(f, tail, 2, 2 * A, scratch), 0);
+            TR_CHECK(memcmp(mem + 3 * A, data + 2 * A, A) == 0);
+            TR_CHECK(memcmp(mem, data + 3 * A, (size_t)(SIZE - 3 * A)) == 0);
+        }
+        free(scratch);
+        tr_free_aligned(mem);
+    }
+
+    /* preadv_n on a direct handle (Windows: the three in flight together, each its own page list in the
+     * scratch; POSIX: one after another): pages out of order in memory, one request running past the
+     * real end; every byte where its request puts it */
+    {
+        enum { A = TR_FILE_DIRECT_ALIGN };
+        unsigned char *mem = (unsigned char *)tr_alloc_aligned(6 * A, A);
+        size_t scratch_n = tr_file_preadv_n_scratch(5 * A, 3);
+        void *scratch = scratch_n > 0 ? malloc(scratch_n) : NULL;
+        TR_CHECK(mem != NULL && (scratch_n == 0 || scratch != NULL));
+        if (mem != NULL && (scratch_n == 0 || scratch != NULL)) {
+            tr_iov i0[1] = {{mem + 5 * A, A}}, i1[2] = {{mem + 3 * A, A}, {mem, A}}, i2[1] = {{mem + A, 2 * A}};
+            tr_readv_req req[3] = {{i0, 1, 0}, {i1, 2, 2 * A}, {i2, 1, A}};
+            TR_CHECK_EQ_INT(tr_file_preadv_n(f, req, 3, scratch), 0);
+            TR_CHECK(memcmp(mem + 5 * A, data, A) == 0);
+            TR_CHECK(memcmp(mem + 3 * A, data + 2 * A, A) == 0);
+            TR_CHECK(memcmp(mem, data + 3 * A, (size_t)(SIZE - 3 * A)) == 0);
+            TR_CHECK(memcmp(mem + A, data + A, 2 * A) == 0);
+        }
+        free(scratch);
+        tr_free_aligned(mem);
+    }
+
     tr_file_close(f);
     free(data);
     remove(path);
@@ -247,6 +326,39 @@ static void test_alloc(void) {
             tr_free_aligned(p);
         }
     }
+}
+
+/* tr_pages_*: a block on whole pages, zero; the whole pages inside a range given back and taken again come
+ * back zero (Linux's MADV_DONTNEED, Windows' decommit and commit), the pages the range only reaches into and
+ * the rest of the block keep their bytes. The offsets hold for any page from 4 to 64 KiB. Not checked on
+ * macOS, whose MADV_FREE leaves a page's bytes until the system needs the page. */
+static int g_pages_zeroed;
+
+static void test_pages(void) {
+    enum { K = 65536 };
+    unsigned char *p = (unsigned char *)tr_pages_alloc(4 * K);
+    TR_CHECK(p != NULL);
+    if (p == NULL) return;
+    TR_CHECK_EQ_INT((int64_t)((uintptr_t)p % 4096), 0);
+    int zero = 1;
+    for (size_t i = 0; i < 4 * K; i += 512) zero &= p[i] == 0;
+    TR_CHECK(zero);
+    memset(p, 0xAB, 4 * K);
+    TR_CHECK(tr_pages_release(p + 5, 100) == 0); /* inside one page: nothing to give */
+    TR_CHECK(tr_pages_release(p + K + 100, 2 * K - 95) == 0); /* [K + 100, 3K + 5) */
+    TR_CHECK(tr_pages_commit(p + K + 100, 2 * K - 95) == 0);
+    int kept = p[0] == 0xAB && p[5] == 0xAB && p[K - 1] == 0xAB && p[K] == 0xAB && p[K + 100] == 0xAB &&
+               p[3 * K] == 0xAB && p[3 * K + 4] == 0xAB && p[4 * K - 1] == 0xAB;
+    TR_CHECK(kept);
+#if !defined(__APPLE__)
+    int given = 1;
+    for (size_t i = 2 * K; i < 3 * K; i += 512) given &= p[i] == 0;
+    TR_CHECK(given);
+    if (kept && given) g_pages_zeroed++;
+#endif
+    memset(p + 2 * K, 0x5A, K); /* taken again: writable */
+    TR_CHECK(p[3 * K - 1] == 0x5A && p[3 * K] == 0xAB);
+    tr_pages_free(p, 4 * K);
 }
 
 /* ---- time / mem --------------------------------------------------------- */
@@ -1073,6 +1185,10 @@ int main(int argc, char **argv) {
     test_file();
     test_file_direct();
     test_alloc();
+    test_pages();
+#if !defined(__APPLE__)
+    TR_CHECK(g_pages_zeroed > 0);
+#endif
     test_time();
     test_mem();
     test_pool_sizes();

@@ -297,14 +297,13 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
 
 ## Next steps
 
-**2026-09-24/26, in short** (MEASUREMENTS §Skipping cached positions exactly to §The prompt from 8 to 16
-threads; LESSONS #152-#206): the decode's attention on the GPU (1.31-1.58×); Q4_K decode level with
-llama.cpp at 4 threads (50.4 against 50.2 tok/s); the prompt's attention in tiles (1.31-1.33×); the
-experts balanced at the tail (1.04-1.08×); exp in a vector (prefill 1.05×). Closed as no: SMT, 2 MB pages;
-- **2026-09-26: phase-major and exact Q4_K** (MEASUREMENTS §Phase-major, §Exact sums at the float's speed;
-  LESSONS #207-#222): the tile 164.7 GFLOP/s a core (98.6% of the no-FMA peak); Q4_K in exact integers
-  (kernels.h `q4x_*`) at the float's speed; Q4_K 4 threads prompt level with llama.cpp (220.0 against
-  220.6), decode 1.03x; Q8_0 16 threads prompt 1.33-1.42x.
+- **2026-10-02/03: the disk at its limit** (MEASUREMENTS §The disk at its limit; LESSONS #263-#269): the
+  request's size is the lever (1.9 GB/s at 2 MiB, 3.5 at 64); the store's runs, the slots touched first and a
+  run's three parts in flight: a resident load's read 4.07 -> 1.95 s, a first prompt at half budget 4.39 ->
+  2.76 s (median of 8, the same tokens).
+- **2026-09-24/26** (MEASUREMENTS to §Exact sums at the float's speed; LESSONS #152-#222): the GPU decode
+  attention (1.31-1.58×), Q4_K decode level with llama.cpp at 4 threads, prompt attention in tiles,
+  phase-major (164.7 GFLOP/s a core) and exact Q4_K; Q8_0 16 threads prompt 1.33-1.42x. No: SMT, 2 MB pages.
 - **2026-09-27** (MEASUREMENTS from §The post-it taken apart to §The routers as bf16; LESSONS #223-#253):
   a calibrated gate 1.077x on new code (with a real context 1.146x); the short verify passes at their bytes
   (question 78: Q8_0's 3 rows 62.7 -> 43.0 ms; Q4_K's panel rows brought ahead, then **road (c)**, `q4x_dot_xt`
@@ -314,50 +313,54 @@ experts balanced at the tail (1.04-1.08×); exp in a vector (prefill 1.05×). Cl
   **Question 83** (Marcello: half a prep a token): q/k/v from one prep, gate/up through a map, no gather, the swiglu
   with the down's prep: the prompt **1.058 x 1.0087**, the decode **1.025**, a 3-row pass 1.026; then the argmax
   split over the pool (116-118 -> 6 us a token): a token ~0.7%, a 3-row pass 1.0175. Every bit the same.
-  The KV's pages a pass enters, touched over the pool before its layers (every stream starts a page): kv_write 80 ->
-  50 us a token, the decode +0.17%, a first prompt +0.4%; touched a window ahead instead, they cost the attention 2.4%:
-  **pages present past the streams' ends slow the reads 1-2.4%** (#250; question 84: do the weights' ends pay it too?).
-  Races of environment switches process against process: `tools/ab_env.sh` (A/A 0.2%). The routers kept as bf16
-  where every value fits (all of OLMoE's): the router zone 179-186 -> 120-130 us a token (1.40-1.48x, ~0.4%), the
-  same bits. And the parallel argmax had never run outside `generate --ab` (the session's struct from `malloc`, a field
-  never set, #252): fixed, every run's sample zone 118 -> 5.5 us (+0.74%); the lint now refuses `malloc(sizeof *x)`.
-  The night (MEASUREMENTS §The idle workers, and what lies past a region's end; #254-#256): benches compare layouts
-  by racing them set by set (a round of passes saw the RAM drift 10-30%). **Question 84 answered**: a thread's region
-  end costs ~0.8% of a dense call (a guard page), a thread's q, k, v, o regions one after the other 1.0-1.75%, the
-  experts' nothing: 0.2-0.4% of a token in the dense layout. **The idle workers (piece 3, B)**: `tr_pool_hint` and
-  `tr_matmul_hint`, 1.02-1.14 a call in the bench, **level in the engine** (12 runs 0.9962 +- 0.0039): the serial step
-  after each hint pays what the call gains (#255, question 85). Kept off by default (`TR_POOL_HINT=2` on), tested,
-  16 mutations. **10-02, pretouch**: level (1.0027 +- 0.0022), attn_norm +54 us unchanged (#259): out.
+  The KV's pages touched before a pass's layers: kv_write 80 -> 50 us a token, the decode +0.17% (#250). Environment
+  switches raced process against process (`tools/ab_env.sh`, A/A 0.2%). The routers as bf16: their zone 1.40-1.48x
+  (~0.4% a token), the same bits. The parallel argmax fixed (#252: +0.74%; the lint refuses `malloc(sizeof *x)`).
+  Question 84 answered (a region's end ~0.8% of a dense call; #254-#256). The idle workers (piece 3, B): level in the
+  engine, off by default (`TR_POOL_HINT=2`; #255, question 85). **10-02, pretouch**: out (#259).
   **10-02, piece 4**: q, k, v and gate, up one call each, the weights' items one flat range
   (`tr_matmul_q4x_prepared_n`): the decode **1.0054 +- 0.0007**, the same bits (MEASUREMENTS §Piece 4, #260-#261).
-- **next: the ladder** (ARCHITECTURE §The roadmap, status.json R1-R4): **R1, OLMoE to the end**; its next block,
-  the three machines and their theoretical limit (below average and average emulated: `-t 4`/`-t 8`,
-  `TR_CPU_MAX=avx2`, `TR_GPU=0`, an expert budget within 8/16 GB). Then R1's first prompt's cost, generation's fixed
-  cost, the review, the server; the races with llama.cpp, colibri and ds4 together at R1's close. The decode's
+- **next: the ladder** (ARCHITECTURE §The roadmap, status.json R1-R4): **R1, OLMoE to the end**. **10-03, the three
+  machines measured** (`tools/machines.sh`): the average one at its RAM's limit, this PC at 98-99% of its RAM's measured
+  ceiling. **10-03 night, the 8 GB machine's store** (MEASUREMENTS §The 8 GB machine's store; LESSONS #274-#279): its
+  disk emulated (`TR_EXPERT_DISK_MBPS=500`, a SATA-class estimate), the plan on the run's own positions (the
+  session's exact bytes: Q8_0 83 -> 290 slots, Q4_K 224 -> 615), ds4's eviction the default (replayed first:
+  `tools/evict_replay.py`): the decode **0.57 -> 1.70 tok/s (Q8_0), 2.52 -> 8.02 (Q4_K)**, 3.67x fewer bytes a Q8_0
+  token from disk at 64 tokens. There the decode is the disk's (72-94%), a first Q8_0 prompt 82% disk, the Q4_K
+  prompt half compute. **10-03, AVX2's own Q4_K tile** (MEASUREMENTS §AVX2's own Q4_K tile;
+  #280-#282): the W16 panel in two halves, tiles of 3 (T = 4 spills): the weak Q4_K prompt **20.6 -> 35.1 tok/s**, its
+  cores' 36.4 -> 137.9, the same tokens. **10-03 afternoon, a pass reads the next layer ahead** (MEASUREMENTS §A pass
+  reads the next layer ahead; #283-#285): a second run in flight gives the weak disk nothing (one queue); its one-pass
+  prompt read on demand with the compute never overlapped. Now the next layer is read ahead in 8 MiB requests and
+  what it does not ask dropped unread: the weak prompt **Q4_K 35.3 -> 45.5 tok/s, Q8_0 20.3 -> 24.6**, at 97-98% of
+  its disk's time for its bytes (+2-3% bytes), the same tokens. **10-03 evening, the prompt's routings
+  told to the store** (MEASUREMENTS, same name; #287-#289): a pass adds each unit its tokens' routings scaled to 64:
+  the weak decode **Q4_K 8.00 -> 15.50, Q8_0 1.91 -> 2.38 tok/s**, the same tokens.
+  **10-03 night, the KV grown from the store's room** (MEASUREMENTS, same name; #290-#291): the plan no longer sets
+  the KV aside; the store gives the KV its slots as it is written (`tr_experts_set_slots`).
+  A chat's plan on weak: Q8_0 131 -> 278 slots, disk a token 375.9 ->
+  193.7 MiB; Q4_K 314 -> 591, 87.4 -> 16.3; raced, a chat's decode **Q8_0 1.22 -> 2.29, Q4_K 4.55 -> 14.77 tok/s**.
+  **10-04, offered to colibri** (UPSTREAM row 7; #293-#294): branch `perf/olmoe-kv-room` in the fork (`b9180a4`), its
+  `kv_room_fit` frees each layer's coldest slots as the KV's pages grow. On colibri's own engine in a 5 GB container
+  (the limit counts the page cache): 16 -> 26 slots a layer, misses -37%, a request **1.19x** (22.05 -> 18.52 s), the
+  logits byte-identical; less than ours because colibri reads through the page cache, which fills the room. PR ready
+  (gate green 02:06); opened as **colibri #1873** after Marcello's yes, waiting for its review.
+  **Next** (R1 phase 3, the 8 GB machine): Belady's 18-38% above ds4's (a policy from the routes); then the integrated GPU (r1-igpu:
+  Vulkan; q. 87-88); then R1's first prompt's cost, generation's fixed cost, the review, the server; the races
+  with llama.cpp, colibri and ds4 together at R1's close. The decode's
   speed backlog (R1 phase 3 where the weak machines need it): question 85's serial steps as messages; the pool's
   messages; the prep's bit arithmetic; the dense at 3 rows, AVX2's own xt, #229, questions 79-80, the gate in C,
-  `--spec` by default; the GPU A/B at a free machine; W16's deletion series and AVX2 tile; `dot_row2` dead code;
+  `--spec` by default; the GPU A/B at a free machine; W16's deletion series; AVX2 tile's tails (f64 16%, broadcasts
+  15%); `dot_row2` dead code;
   the race of whole binaries (#243-#244); questions 68, 74, 76; **for Marcello, 59 and 60**.
 
-**2026-09-24**: the gate 428 → 238 s; **M2: Q4_K and Q6_K** exact. **Tests** (09-24/25): `mutate_auto.py`
-lists the mutants no check runs (gcov); open: `threads.c`'s 22 (speed, not bits), `platform.c`'s Windows
-half never mutated. Review of 09-22/23: LESSONS #102–#125.
+Mutants open: `threads.c`'s 22 (speed, not bits), `platform.c`'s Windows half (#268). Steps of 17–20/09: DONE.
 
-Steps of 17–20/09: `docs/archive/DONE.md`; their numbers: `docs/MEASUREMENTS.md`.
-
-**M1 in progress** (project in `docs/ARCHITECTURE.md` §Execution «Experts (M1)», from numbers above):
-expert store with slots allocated at load, index and LRU O(1), not pin from use (LESSONS #93);
-**on-demand reads on calling thread, no I/O thread and no prefetch** (with 1.5 GB/s disk disk is
-bottleneck: k=8 neutral, k=12 −40% in time model; 11–15% only on 3× faster disk: question 43);
-single path (full budget = previous engine); minimum budget one layer plus one token; read error
-fails evaluation, not process. Read as colibri does (three flaws in `docs/UPSTREAM.md` #7–#9;
-taken: expert index → slot, expert in one slot only). Volume encrypted (BitLocker XTS-AES 128 in
-software, question 41) and untouched: factory state of target PCs, M1 designed on ~1.5 GB/s.
-- **Batches 1–3, done** (2026-09-20, detail in DONE): `src/memory/experts.{h,c}`
-  with index and LRU, `olmoe.c` fetching experts from expert store (`--expert-budget`,
-  `TR_EXPERT_BUDGET_MIB`, `experts:` line, `weight_read` zone), and reads **without system cache**
-  (`tr_file_open_direct`, aligned to 4096, `TR_EXPERT_DIRECT=0` to force). Tests: `tests/test_experts.c`,
-  `tests/test_stream.c`, oracles under `min`, real model `cmp` to byte; 23 red mutations.
+**M1** (`docs/ARCHITECTURE.md` §Execution «Experts (M1)»): slots allocated at load, ds4's eviction; demand reads
+on the calling thread, a prompt's next layer read ahead by one I/O thread, nothing ahead in decode; one path (full
+budget = the engine before M1); a read error fails the evaluation, not the process. The volume encrypted
+(BitLocker, question 41) and untouched: the target PCs' factory state.
+- **Batches 1–3, done** (2026-09-20, in DONE): the store, `--expert-budget`, direct reads; 23 red mutations.
 - **Measured 2026-09-20/21** (MEASUREMENTS §M1 measured, §Prefill reads model once per pass):
   **M1 works, the cost is the prompt**: decode 35.5 / 29.6 / 24.3 / 20.6 tok/s at 100 / 75 / 50 /
   25% (64 tokens), 0.90× and 0.87× of resident at 1000 tokens; direct reads give 2.42× the system
@@ -387,9 +390,6 @@ software, question 41) and untouched: factory state of target PCs, M1 designed o
 - **Then**: questions 42 (layer 0), 43 (from which disk up prefetch pays), 46 (fixed cost of decode).
   Three matrices in one read: **no**, three separate GGUF tensors (docs/ORIGINS.md
   §The expert store).
-
-- **Question 44, closed 2026-09-20** (MEASUREMENTS): code behaviour is no small graph; a second
-  model remains.
 
 **Order decided by Marcello 2026-09-19 evening**: (a) **M1**, experts from disk, starting from
 measurements 13–16 and with GGUF and pool folders from component comparison inside (point 5);
@@ -422,16 +422,9 @@ forces width** (`--decode-threads`), never `auto`: no conclusion rests on unvali
    soon as one available (4–8 cores, more memory channels, Apple Silicon no pin, P/E cores).
 3. **Superseded 2026-09-26** (MEASUREMENTS §Phase-major): the exact definition in phase-major order
    runs at the float's peak and levels llama.cpp's int8 prompt at 4 threads, so an int8 mode is no
-   longer the lever; the open question is the other way, E32, a more exact definition (4 digits,
-   correctly rounded 96-99%) at ~0.85× phase-major. Before: **Int8/VNNI in prefill, yes or no** (questions 21 and 28, LESSONS #65): where gap with
-   llama.cpp is (1.8–2.3× on kernel), but not exact. If yes: declared mode (`--fast-prefill`),
-   off by default, with oracle measuring logit shift. Exact path «8 tokens in registers» measured
-   and discarded. Marcello decides, asking 2026-09-19 if anything exists between float and int8:
-   bench measures midway at 16 bits (question 33) before deciding; serial prefill part done
-   (point 4), exact side leaves `expf` (question 37: multiplications 77% of prefill at 512 and 56%
-   at 4000, rest mostly `expf`) and, for decode, 4-bit models. Every inexact mode (int8, and KV
-   at 16 bits point 6 now raises) decided with quality numbers front: equal tokens and KL on real
-   model vs. exact mode (`tools/compare_llamacpp.py` computes it: llama.cpp at 9e–3).
+   longer the lever (its history: MEASUREMENTS questions 21, 28, 33; LESSONS #65). Open the other
+   way: E32, a more exact definition (4 digits, correctly rounded 96-99%) at ~0.85× phase-major.
+   Every inexact mode is decided with equal tokens and KL in front (`tools/compare_llamacpp.py`).
 4. Prefill on long prompts: **exact part and scalar `tr_expf` done** (decisions 2026-09-19 above:
    clean machine 306–315 tok/s at 512, 303–308 at 2048, 276 at 4000). Remain:
    - `tr_expf` in SIMD: **no** (question 39, closed 2026-09-19: 1.01–1.04× estimated, at noise

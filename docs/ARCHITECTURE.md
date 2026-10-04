@@ -135,7 +135,7 @@ remain.
 | `src/format/` | GGUF v3 reader, type table, metadata | ds4 `parse_metadata` / `parse_tensors`, without architecture hooks |
 | `src/kernels/` | CPU kernels per quantized type: scalar + AVX2 + AVX-512 (+VNNI) + NEON, dispatch table | colibri `quant.h`, `expert_ffn.h`; ds4 K-quant references |
 | `src/backend/` | backend interface (tensors on device, graph per token) and CPU backend; today `gpu_attn.{h,c}`: the decode's attention on an NVIDIA GPU with the CPU's bits (driver `nvcuda.dll`/`libcuda.so.1` opened at run time, PTX written in C and compiled by the driver, every float op `.rn`, `tr_expf` ported whole, the KV mirrored in VRAM, zero copy, one warp keeping the GPU awake between layers; `TR_GPU=0` keeps it on the CPU) | execution model: ds4 `ds4_gpu.h`, reduced to generic primitives; the attention kernels: new code, from measurements (`docs/MEASUREMENTS.md` §The decode's attention on the GPU) |
-| `src/memory/` | expert store (M1: RAM / disk; VRAM at M3): units (layer, expert), slots allocated once, direct index and LRU O(1), reads on demand from GGUF | ideas: colibri `olmoe.c` (expert index → slot, expert in one slot), ds4 streaming; choices from our measurements (`docs/MEASUREMENTS.md` §M1): LRU not pin from use, no I/O pool, no prediction-based preloading on slow disks; in the layer-major prompt one I/O thread reads the next layer while this one computes (1.22× at 2048); new code |
+| `src/memory/` | expert store (M1: RAM / disk; VRAM at M3): units (layer, expert), slots allocated once, direct index and LRU O(1), reads on demand from GGUF | ideas: colibri `olmoe.c` (expert index → slot, expert in one slot), ds4 streaming; choices from our measurements (`docs/MEASUREMENTS.md` §M1): LRU not pin from use, no I/O pool, no prediction-based preloading on slow disks; in a prompt one I/O thread reads the next layer while this one computes (layer-major 1.22× at 2048; in one pass in short requests, the units the next layer does not ask dropped unread: 1.21-1.29× on the 8 GB machine); new code |
 | `src/kv/` | KV cache `[layer][head][position]`: a head's positions in row, so attention reads them at RAM bandwidth (`docs/MEASUREMENTS.md` §Decode at long context); every head's stream starting a page, so a pass faults the pages it enters over the pool in one call and never past its end (§The KV's pages touched in time); then prefix reuse, checkpoint to disk with decay-weighted score | layout: new code, from measurements; ideas for the rest: colibri `kv_prefix.h`, `kv_fp8.h`; ds4 `ds4_kvstore.c` |
 | `src/tokenizer/` | byte-level BPE from GGUF metadata (pretokenizer families allowed only with oracle), NFC and Unicode classes probed from HF `tokenizers`, chat template per architecture | ideas: colibri `tok.h` (regex replayed in C), ds4 `vocab_load` (from GGUF); new code |
 | `src/models/` | one graph per family, built from primitives | colibri `olmoe.c`, ds4 / colibri DeepSeek V4 |
@@ -151,10 +151,15 @@ remain.
   control (colibri `st.h`, mmap RSS bug). Dense: loaded at startup. Experts: on demand.
 - **Experts (M1)**: the dense (attention, norms, router, embedding) always stay in RAM; experts
   pass through the store from `src/memory/`. A unit is a (layer, expert) with its three matrices
-  in one slot only; slots are allocated all at load, as many fit in the **budget**. After the
-  router the graph asks for units of the layer (`acquire`): present ones are touched (LRU),
+  in one slot only; slots are allocated at load, as many fit in the **budget** (the plan sets aside
+  the session's working memory at the positions the run will hold, `tr_model_load_plan`, not its KV:
+  the store and the sessions' KV pages share one room, and the store gives a slot's pages back for
+  each slot's bytes of KV the positions reach, `tr_experts_set_slots`, taking them again when the
+  session ends; a forced budget or a resident store keeps its slots). After the
+  router the graph asks for units of the layer (`acquire`): present ones are touched,
   missing ones are read **right away and in sequence, on the calling thread**, from GGUF at tensor
-  positions, evicting the least recently used; units asked by the current pass are not evicted.
+  positions, evicting by ds4's hotness (every routing +1, halved every 16 tokens; the least recent
+  among equals; the LRU under `TR_EXPERT_EVICT=lru`); units asked by the current pass are not evicted.
   Read **without the system cache** (`tr_file_open_direct`), else the model would end in RAM
   a second time, the very memory the budget was to save, and every measurement would report
   RAM bandwidth instead of disk bandwidth. The price is alignment to 4096: the start of a
@@ -165,8 +170,10 @@ remain.
   One path only: with the budget covering all, the store fills at load and never misses,
   which is the old engine. Same bytes in same kernels: logits are byte-identical with any
   budget, and the test demands it. Why this way (`docs/MEASUREMENTS.md` §M1): LRU beats
-  pin from use at any capacity; disk gives the same bandwidth to one and eight readers, so
-  no I/O thread until there is something to overlap; without prediction there is nothing to
+  pin from use at any capacity, and below one token's units an LRU over the layers' cycle hits
+  nothing where ds4's hotness hits 47 of 128 (§The 8 GB machine's store, 2026-10-03); disk gives the same bandwidth to one and eight readers, so
+  no I/O thread until there is something to overlap: a prompt's next layer (it asks nearly every
+  expert; what it does not ask is dropped while still queued); in decode, without prediction, nothing to
   overlap, and prediction (the router of the next layer, 92–95%) on a 1.5 GB/s disk costs
   more than it pays. I/O threads and preloading come together, as option that the plan
   switches on for fast disks (question 43). Minimum budget: units of one whole layer plus
@@ -241,18 +248,23 @@ remain.
 below-average ones, not on this PC. Every model is brought there slowly, to the theoretical limit, each piece
 studied to the bottom and reinvented where the numbers allow.
 
-**The three machines.** Every rung's numbers are measured on all three; the two weaker ones are emulated on
-this PC with the engine's own switches. Each one's limit is its RAM's bandwidth divided by the bytes read a
-token (the theoretical tokens/s); the engine is pushed toward it.
+**The machines** (four since 2026-10-03: nearly every PC has an integrated GPU, sharing its RAM). Every rung's
+numbers are measured on all of them; the weaker ones are emulated on this PC with the engine's own switches.
+Each one's limit is its RAM's bandwidth divided by the bytes read a token (the theoretical tokens/s); the
+engine is pushed toward it. Its compute, the prompt's limit, includes its integrated GPU (R1 phase 3, Vulkan).
 
-| Machine | Emulated with | RAM bandwidth for the limit |
+| Machine | Emulated with | RAM and disk for the limit |
 |---|---|---|
-| below average: 4 cores, 8 GB, no GPU, AVX2 | `-t 4`, `TR_CPU_MAX=avx2`, `TR_GPU=0`, an expert budget that leaves the model within 8 GB | DDR4 single channel, ~21 GB/s |
-| average: 8 cores, 16 GB, no dedicated GPU | `-t 8`, `TR_GPU=0`, a budget within 16 GB | DDR4-3200 dual channel, ~51 GB/s |
-| this PC: Ryzen 9 7940HX, 31 GB, RTX 4070 Laptop | as it is | DDR5-5200 dual channel, ~83 GB/s |
+| below average: 4 cores, AVX2, 8 GB, an integrated GPU sharing them | `-t 4`, `TR_CPU_MAX=avx2`, `TR_GPU=0`, the plan seeing 8 GiB with 4.5 free (`TR_MEM_TOTAL_MIB=8192 TR_MEM_AVAILABLE_MIB=4608`), its disk (`TR_EXPERT_DISK_MBPS=500`) | DDR4 single channel, ~21 GB/s (~14 in practice, estimated); a SATA-class SSD, ~0.5 GB/s (estimated) |
+| average: 8 cores, 16 GB, an integrated GPU only (the commonest laptop) | `-t 8`, `TR_GPU=0`, the plan seeing 16 GiB with 11 free, `TR_EXPERT_DISK_MBPS=2000` | DDR4-3200 dual channel, ~51 GB/s (~35 in practice, estimated); an NVMe, ~2 GB/s (estimated) |
+| average with a small dedicated GPU: the same, plus an NVIDIA of 4-6 GB | the same with the GPU on | ~51 GB/s |
+| this PC: Ryzen 9 7940HX, 31 GB, RTX 4070 Laptop and Radeon 610M | as it is | DDR5-5200 dual channel, ~83 GB/s, 56.3 measured; an NVMe under BitLocker, 3.5 GB/s measured |
 
-What the emulation cannot give: a slower RAM and a slower disk (it gives fewer cores, a narrower CPU, less
-memory). A real weak machine is the final check when one is available.
+All at once: `sh tools/machines.sh <binary> 8` (MEASUREMENTS §The three machines). What the emulation cannot give:
+a slower RAM (a slower disk it gives: `TR_EXPERT_DISK_MBPS`), **another GPU** (it gives fewer cores, a narrower CPU, less memory). **Until real PCs
+are available, every number of an integrated GPU is an estimate**, written as one (MEASUREMENTS question 88): this
+PC's 610M checks the bits, not the speed. With a dedicated and an integrated GPU the engine takes the dedicated
+one; the two together are question 87. A real machine of each kind is the final check when one is available.
 
 **The five phases of a rung.** A rung closes when all five are done on the three machines; the next one
 starts after, never beside it (`tools/lint.py` keeps one rung in progress).
@@ -267,11 +279,11 @@ starts after, never beside it (`tools/lint.py` keeps one rung in progress).
 | Rung | Model | Size | What it adds | The blocks (docs/status.json) |
 |---|---|---|---|---|
 | R0 | OLMoE tiny, random weights | 1 MB | the exact core on every CPU | core, kernels, pool, KV, prompt in blocks, exp, genome: **done** |
-| R1 | OLMoE-1B-7B | ~4 GB Q4_K, ~7 GB Q8_0 | the first model to the end; on 8 GB the Q8_0 needs its experts from disk | done: the expert store, budget, plan, layer order, disk and compute together, the GPU's decode attention, speculation; left: the three machines and their limit (**next**), the first prompt's cost, generation's fixed cost, the review, the server |
+| R1 | OLMoE-1B-7B | ~4 GB Q4_K, ~7 GB Q8_0 | the first model to the end; on 8 GB the Q8_0 needs its experts from disk | done: the expert store, budget, plan, layer order, disk and compute together, the GPU's decode attention, speculation, the machines measured once (10-03); left: the 8 GB machine's limit (**next**: the store under one token's experts, the KV set aside), the integrated GPU for the prompt (Vulkan, a module like CUDA, the weights read in place), the first prompt's cost, generation's fixed cost, the review, the server |
 | R2 | Qwen3-Coder-30B-A3B | ~17 GB Q4 | a real coding model; on 16 GB its experts come from disk | the tiny oracle (GQA, 128 experts, a norm per head), tokenizer and template, the real model (Q4_K_M runs already), the KV checkpoint on disk, Q2_K and IQ2 (the fewest bytes a weight) |
 | R3 | a MoE larger than RAM | > 31 GB | experts from disk at their limit, the GPU's memory | the file reordered by co-activation, the dense weights and the experts on the GPU |
 | R4 | DeepSeek V4 Flash | hundreds of GB | the target of colibri and ds4, on an ordinary machine | its architecture, on everything above |
-| X | off the ladder | — | when a rung needs it, or after the ladder | the assembly lab, Vulkan and Metal, a team of small models (question 86, after R2) |
+| X | off the ladder | — | when a rung needs it, or after the ladder | the assembly lab, Metal, the dedicated and the integrated GPU together (question 87), a team of small models (question 86, after R2) |
 
 The old milestones (2026-09-17 to 10-02, named in LESSONS and MEASUREMENTS) map as: M0 → R0; M1 (experts
 from disk) → R1, its file reorder → R3; M2 (K-quant: Q4_K, Q6_K done) → R2 (Q2_K, IQ2), its assembly → X; M3 (CUDA) → R1 (the decode's

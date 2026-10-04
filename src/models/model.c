@@ -118,6 +118,11 @@ static uint64_t apply_expert_budget_env(uint64_t budget) {
 
 tr_model *tr_model_load_progress(const char *path, tr_pool *pool, uint64_t expert_budget, const tr_progress *progress,
                                  char *err, size_t err_len) {
+    return tr_model_load_plan(path, pool, expert_budget, 0, progress, err, err_len);
+}
+
+tr_model *tr_model_load_plan(const char *path, tr_pool *pool, uint64_t expert_budget, int64_t plan_ctx,
+                             const tr_progress *progress, char *err, size_t err_len) {
     char local_err[256];
     if (err == NULL) {
         err = local_err;
@@ -149,7 +154,7 @@ tr_model *tr_model_load_progress(const char *path, tr_pool *pool, uint64_t exper
     }
 
     /* takes ownership of g, also on failure */
-    void *impl = vt->load(path, g, pool, expert_budget, progress, err, err_len);
+    void *impl = vt->load(path, g, pool, expert_budget, plan_ctx > 0 ? plan_ctx : 0, progress, err, err_len);
     if (impl == NULL) return NULL;
 
     tr_model *m = (tr_model *)calloc(1, sizeof *m);

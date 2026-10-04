@@ -37,9 +37,12 @@ int serve_status(void);
  * tr_model_free + tr_pool_destroy. In an ordinary process these are exactly those calls, the load
  * showing its progress bar on stderr when stderr is a terminal (src/app/bar.c tr_bar_load); in a
  * server the pool and the model are kept for the next request, which gets them back when it asks
- * for the same threads, file and budget. app_release takes either one NULL. */
+ * for the same threads, file and budget. app_release takes either one NULL. plan_ctx: the positions the
+ * command's session will hold, for the expert budget's plan (src/models/model.h tr_model_load_plan; 0: the
+ * default context); a server plans every model for the default context. */
 tr_pool *app_pool(int64_t n_threads);
-tr_model *app_model(const char *path, tr_pool *pool, uint64_t expert_budget, char *err, size_t err_len);
+tr_model *app_model(const char *path, tr_pool *pool, uint64_t expert_budget, int64_t plan_ctx, char *err,
+                    size_t err_len);
 void app_release(tr_model *model, tr_pool *pool);
 /* tr_model_expert_stats counted from this request's app_model: a kept store's counters would
  * otherwise carry every request before. */
