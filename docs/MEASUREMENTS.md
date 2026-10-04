@@ -207,6 +207,7 @@ decides | — | — |
 
 | 87 | **The dedicated and the integrated GPU together** (Marcello, 2026-10-03; a machine with both, like this PC, RTX 4070 + Radeon 610M, and many 16 GB laptops): today the engine takes the dedicated one and leaves the integrated idle. Could the integrated take the work the dedicated cannot hold, or that would travel to it (it reads the RAM in place: the experts the VRAM has no room for, a layer's prompt while the dedicated takes the decode), the same bits on both? | after R1 phase 3 has the integrated GPU (Vulkan): the bytes each one reads a token and its share of the time, one GPU against both, on a machine with both; the prediction first | a laptop's two GPUs are two engines, and one of them sits idle today |
 | 88 | **What the integrated GPU gives on a real machine** (Marcello, 2026-10-03): **until real PCs are available, every number of the integrated GPU is an estimate**, and is written as one (Iris Xe or Radeon 680M ~2-3.4 TFLOPS against ~0.4 of four AVX2 cores: a prompt 3-5x; the UHD of the cheapest machines ~0.2-0.4, about the CPU). This PC's Radeon 610M (2 compute units) checks the bits, not the speed | `tools/machines.sh` on a real 8 or 16 GB laptop with an integrated GPU: the prompt and the decode with and without it, the same tokens | the emulation gives fewer cores and less memory, never another GPU: the integrated machines' prompt limits stay unmeasured until then |
+| 89 | **A MoE larger than RAM: its experts at the disk's limit, the VRAM as their cache** (Marcello, 2026-10-04; rung R3, **not before R2 closes**): Qwen3.8-Flash-Next FP8, 185 GB, 48 layers x 512 experts of 4.9 MB, 10 a token a layer. On this 8 GB-GPU, 31 GB laptop colibri decodes it at 0.75-1.01 tok/s and is disk-bound: it reads the experts buffered at 0.6 GB/s, queue depth ~1.5, against 2.1-3.0 GB/s O_DIRECT on the same drive (LESSONS #297); its VRAM gives more as expert cache than as trunk compute (#296; §Qwen3.8-Flash-Next FP8 on colibri's Vulkan tier). How close to the drive's limit can our store read 4.9 MB experts, and how many misses a token does the VRAM save as a cache tier under the RAM's? | the drive's ceiling for 4.9 MB reads at depth 1-16 (`make bench-disk`); a routing trace of the real model replayed through RAM + VRAM slots (`tools/evict_replay.py`); then the engine on the real model, the same tokens, against colibri on this machine | colibri used 0.6 of the drive's 2-3 GB/s: on a disk-bound decode that is up to 3.5-5x before any compute (an estimate); the VRAM holds ~5% of the experts (1248 of 24576), the RAM ~9% |
 Reference machine: Ryzen 9 7940HX (Zen 4, 16 core / 32 thread, AVX-512 VNNI/BF16), 31 GB
 RAM (2×16 GB DDR5-5200), NVMe Micron 1 TB, GPU RTX 4070 Laptop 8 GB and Radeon 610M (not used
 until M3/M6), Windows 11, MinGW-w64 gcc 15.2 `-O2`. Laptop on power, other programs open
@@ -5890,3 +5891,89 @@ from the VM's page cache before every run, 32 prompt tokens + 64 generated, 5 al
   spoiled by another window's gate (dev 38-56 s, #294) and rerun.
 - The freed slots' memory goes back (a scratch program, 16 OLMoE slots from glibc's heap, 14 freed): RSS -84 MB with
   `malloc_trim(0)`, -0 MB without; from mmap both give it back.
+
+## Qwen3.8-Flash-Next FP8 on colibri's Vulkan tier, the 8 GB laptop GPU (2026-10-04)
+
+What a 185 GB MoE does on this machine (Ryzen 9 7940HX, 2 x 16 GB DDR5-5200, Micron 1 TB NVMe, RTX 4070 Laptop 8 GB
+over PCIe 4.0 x8, Windows 11, "Turbo" power mode, cooling pad), on colibri `dev` `0c4a751` built with its new
+installer (`coli setup --backend vulkan`, MSYS2 UCRT64 gcc 16.2). The official FP8 checkpoint
+(`Qwen/Qwen3.8-Flash-Next-FP8` rev `bcd9f01`, 131 shards), `tools/datapoint.py` persistent, 16 threads, the page
+cache retained (`--no-evict`), every campaign from a copy of the same expert history, two campaigns per
+configuration, the orders ABCCBA and ABBA. The full report is colibri issue **#1900**; raw data, scripts and
+`analyze.py` in colibri `tmp/q38/` (`runs/`, `bench*.sh`, `telemetry.ps1`).
+
+Decode, tok/s, median of 4 different prompts with 128 tokens each (both campaigns):
+
+| colibri configuration | cap | decode | vs CPU |
+|---|---:|---:|---:|
+| CPU only | 16 | 0.75 · 0.74 | — |
+| tier, dense chain on (the default on a discrete GPU), `COLI_VK_DENSE=0` or `=1` | 16 | 0.62-0.65 | −14 % |
+| tier, chain off (`COLI_VK_CHAIN=0`) | 16 | **0.84 · 0.84** | +13 % |
+| CPU only | 48 | 0.90 · 0.90 | — |
+| tier, chain off | 48 | **1.01 · 1.01** | +12 % |
+
+Prefill, tok/s = prompt tokens / time to the first token, prompts of 556 and 453 tokens, cap 48: CPU 2.39 · 2.40,
+chain on 2.48 · 2.45, chain off **2.67 · 2.65**. A ~500-token prompt waits 3-4 minutes for its first token.
+
+- **Disk-bound.** During the runs the NVMe reads ~0.6 GB/s at queue depth ~1.5 and the CPU is busy 19 % of the
+  time; colibri's `iobench` on a shard of the same drive gives 2.12 GB/s (O_DIRECT, 1 thread, 4.69 MB = one FP8
+  expert), 2.40 (16 threads) and 3.05 (8 threads, 19 MB). qwen38 reads experts through the buffered handle; its
+  `COLI_TIMERS` banks cover about a third of a request.
+- **The GPU barely works.** Chain off: 3.7 W mean (peak 14), 10 % utilization, 82 s of device compute in a 965 s
+  campaign, 28 % of routed experts. VRAM is worth more as expert cache than as trunk compute: the chain puts the
+  trunk's 773 matrices (4.17 GiB) in VRAM and leaves the tier 1.87 GiB (389 experts) against 6.00 (1248), and
+  the CPU waits ~340 ms a forward for the device.
+- **The cache is the lever that exists today.** Cap 16 → 48 (RSS 11.6 → 17.9 GB) raises the hit rate ~41 → ~60 %
+  and decode by a fifth; the lowest available RAM fell to 2.2 GB (7.8 at cap 16).
+- **Energy.** J/token, RAPL package + GPU board power (not the whole laptop): 91 CPU at cap 16, 85 chain on, 81.5
+  chain off, 82 CPU at cap 48, 75 chain off at cap 48.
+- **Heat was not a factor.** Tctl 63-71 °C on average, peak 85; GPU ≤ 44 °C, NVMe ≤ 45 °C; no thermal, power or
+  current limiter in any HWiNFO sample, Windows' "% performance limit" at 100 throughout.
+- **For Trochilus:** the 8 GB-GPU, 31 GB-RAM laptop can hold ~5 % of this model's experts in VRAM (1248 of 48 x 512) and ~9 % in RAM
+  at cap 48 (48 a layer); each token routes 10 a layer, and the rest comes from the disk at whatever rate the read path gets. Here that path, not the drive, set
+  the speed (0.6 GB/s used of 2-3 available). How to measure J/token on Windows without admin: LESSONS #295.
+
+## The eviction told the future (2026-10-04)
+
+R1 phase 3, the 8 GB machine: its Q8_0 decode is ~90% disk, and Belady's ceiling stood 1.8x (Q8_0 at 290 slots)
+and 2.4x (Q4_K at 615) under the store's `heat` in misses a token. The premise (STATUS 10-03): a policy from the
+routes, the next layer's router on this layer's state (92-95% of its experts within 12 candidates, question 13) as
+an eviction hint. **Replayed only, nothing built in the engine** (build/routes_hint: `hint.py` and `lookup.py`, the
+predictions written before every run in `predictions.txt`; the final numbers from `tools/evict_replay.py --see`,
+whose `heat` and `opt` the ad hoc script reproduces to the hundredth). Traces build/evict (bench/prompts/code.txt,
+321 tokens + 256 generated). Misses a decode token, the first 32 / all 256:
+
+| the store's victim | Q8_0 at 290 | Q4_K at 615 |
+|---|---|---|
+| `heat` (the store today) | 28.66 / 33.75 | 3.84 / 5.96 |
+| + the next call's units kept (a perfect next-layer hint) | 28.56 / 33.62 | 3.84 / 5.94 |
+| + the next layer's router's top 8 / 12 / 16 kept (`pred_in`) | 28.59-28.62 / 33.64-33.65 | 3.84 / 5.95 |
+| heat halved every 8 / 32 / 64 / 128 / never (16 today) | 29.47 / 34.69; 28.28 / 35.20-37.52 | 3.97 / 6.08; 4.16 / 6.25-7.49 |
+| held to Belady's own slots a layer (its mean occupancy) | 28.28 / 31.88 | 4.19 / 5.93 |
+| LIRS's key (max of recency and the last reuse gap) | 35.47 / 36.80 | 4.28 / 6.50 |
+| the next use estimated as last + the mean gap | 38.59 / 42.35 | 9.50 / 9.71 |
+| heat, ties by that estimate | 28.31 / 34.42 | 3.88 / 6.28 |
+| **`see16`: Belady knowing the next token (16 calls), heat beyond** | 24.53 / 28.68 | 3.66 / 5.58 |
+| `see64`: knowing 4 tokens | 20.31 / 23.09 | 2.81 / 4.96 |
+| `see256`: knowing 16 tokens | 18.19 / 18.35 | 1.69 / 3.67 |
+| `see1024`: knowing 64 tokens | | 1.09 / 2.48 |
+| Belady (`opt`) | 18.19 / 18.35 | 1.09 / 2.45 |
+
+- **The next layer's router as an eviction hint gives 0.3%**: a call evicts ~2 of 290 units, and the 6-8 the next
+  call wants are hot already. Its coverage holds (top 8 / 12 / 16: 0.81-0.82 / 0.91-0.92 / 0.95-0.96 on these
+  traces): the prediction is right, what it predicts is not what the store loses.
+- **Belady's gap lives 4-16 tokens ahead**: the perfect next token takes 15% of Q8_0's misses (a third of the gap),
+  4 tokens two thirds, 16 tokens all of it; Q4_K's larger store needs 64. heat's slots a layer are already
+  Belady's within 1-2, and its 16-token half-life is the best period on all 256.
+- **The text's own past sees 1-2 tokens** (`lookup.py`, the 7 traces): a suffix of >= 3 tokens matches an earlier
+  position at 10-46% of the generated positions (code 18-46%, prose 10%), the next token right in about half; the
+  matched position's routes share 6.4-6.8 of 8 a layer at t, 3.2-5.9 at t+2, and fall to a random earlier
+  position's (1.6-3.3) by t+4 to t+8. Inside that horizon even the perfect next token gave 6-15%: not built.
+- Predictions (build/routes_hint/predictions.txt): the next-layer ceiling 2-7%, out (0.3%); one token ahead half
+  the gap, out (6-15%); the period 32-64 best, out (16); Belady's quotas 20-40% of the gap, out (6%, 0.5%); lookup
+  matches 50-70%, out (10-46%); the past-only estimators within +-5% of heat, out (all worse, up to 1.6x).
+- **Closed**: today's rule is the best one that needs no future, of every rule replayed (the tool's nine and
+  the six here). What is left of the 8 GB
+  machine's decode is in its bytes (a unit's size, the disk's request) and its slots, not in the choice of victim.
+  `tools/evict_replay.py --see H` stays as the instrument for R2-R3's stores (question 89: how far ahead a VRAM
+  tier's policy must see).

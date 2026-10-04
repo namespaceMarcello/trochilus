@@ -1738,3 +1738,13 @@ green. Tests: test_experts' `slots`, test_stream's `kv_room`, test_base's `pages
 Try: `MACHINES_ARGS="-c 4096" MACHINES_COUNTS=1 MACHINES_LIST="weak weakold" MACHINES_BIN_weakold=<before> MACHINES_N=32
 sh tools/machines.sh <binary> 1 q4k q8`; a chat: `build/trochilus chat -m <Q8_0.gguf>` under `TR_MEM_TOTAL_MIB=8192
 TR_MEM_AVAILABLE_MIB=4608`, the slots in the `experts:` line of `--profile` runs.
+
+### 2026-10-04 — The eviction told the future: replayed, closed
+The next layer's router as an eviction hint, replayed on the 8 GB machine's traces before anything is built
+(MEASUREMENTS §The eviction told the future; LESSONS #304-#307): 0.3% fewer misses, though it names 91-96% of the
+next layer's experts. Belady's gap needs 4-16 tokens of the future (Q8_0 at 290: 33.75 misses a token, 28.68
+knowing the next token, 18.35 knowing 16); the text's own repeats see 1-2; past-only estimators and Belady's quotas
+a layer lose or tie: the store's `heat` stays, closed. `tools/evict_replay.py --see H` (Belady knowing only the next
+H calls, heat beyond) stays as the instrument; its `--check` case (16 cases) seen red under two mutations.
+Try: `tools/.venv/Scripts/python.exe tools/evict_replay.py build/evict/Q8_0.trace --slots 290 --see 16,64,256`;
+`tools/.venv/Scripts/python.exe tools/evict_replay.py --check`.

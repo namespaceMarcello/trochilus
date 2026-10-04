@@ -109,7 +109,7 @@ BENCH_BUILD=build/<new> sh tools/bench_native.sh bench_disk_misses <Q8_0> <fresh
 BENCH_BUILD=build/<new> sh tools/bench_native.sh bench_disk_misses <Q8_0> <Q8_0> --run 4|32 --runs 5   # a prompt's runs of k experts (three requests a run), 1, 2 or 4 runs in flight
 build/trochilus run ... --route-trace <file>   # routing trace: experts picked and predicted
 tools/.venv/Scripts/python.exe tools/route_trace_report.py <trace> | --check   # prediction, LRU cache, streaming
-tools/.venv/Scripts/python.exe tools/evict_replay.py <trace> [--slots 83,128,...] [--disk-mbs 500] [--compute-ms 40] | --check   # the expert store's eviction replayed on a route trace: the store's own calls, eight policies (lru, mru, random, layer, lfu, colibri, ds4, opt = Belady's ceiling), hits and MiB a decode token, a tok/s model (MEASUREMENTS §The 8 GB machine's store)
+tools/.venv/Scripts/python.exe tools/evict_replay.py <trace> [--slots 83,128,...] [--disk-mbs 500] [--compute-ms 40] [--see 16,64,256] | --check   # the expert store's eviction replayed on a route trace: the store's own calls, eight policies (lru, mru, random, layer, lfu, colibri, ds4, opt = Belady's ceiling; `--see H`: Belady knowing only the next H calls, heat beyond: how far ahead a policy must see), hits and MiB a decode token, a tok/s model (MEASUREMENTS §The 8 GB machine's store)
 tools/.venv/Scripts/python.exe tools/route_graph_report.py <trace> | --compare | --mask-from   # question 44
 sh tools/mask_quality.sh   # experts off: KL and tokens against whole model (measurement only)
 sh tools/experts_budget.sh measure | misses | direct   # M1: tok/s at 4 budgets, cost of a token, cache yes/no

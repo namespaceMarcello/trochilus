@@ -3,7 +3,7 @@
 machines; LESSONS #271: under one token's units the store's LRU hits nothing).
 
 Usage:
-    evict_replay.py <trace.bin> [--slots 72,83,128,...] [--disk-mbs 500] [--compute-ms 40] [--seeds 5]
+    evict_replay.py <trace.bin> [--slots 72,83,128,...] [--disk-mbs 500] [--compute-ms 40] [--seeds 5] [--see 16,256]
     evict_replay.py --check      hand-made sequences with hand-computed answers (wired into `make lint`)
 
 The trace: `trochilus run ... --route-trace <file>` (src/app/main.c write_route_trace; TRROUTE1 or 2). Only the
@@ -34,9 +34,13 @@ The policies (a victim among the slots this call did not name):
     heat      the store's default (src/memory/experts.c tr_experts_acquire_counts): ds4's, a call adding to
               each unit the routings of its tokens that chose it, as if at most HOT_PROMPT tokens: c x
               min(1, 64 / n_tok), at least 1 (a decode token 1; a prompt pass its tokens' share, scaled to 64)
+    see<H>    (--see H,...) heat knowing the next H calls: a unit not asked within them goes first (the lowest
+              hotness), else the one asked furthest. How far ahead a policy must see to reach Belady (a decode token
+              is n_layers calls; MEASUREMENTS §The eviction told the future)
 The time model (a model, never a measurement): a decode token's time = --compute-ms + its misses' bytes at
 --disk-mbs; tok/s = 1000 / that.
 """
+import bisect
 import heapq
 import random
 import struct
@@ -130,10 +134,25 @@ def replay_colibri(calls, slots, n_expert, n_layers):
     return hits, misses, prompt_misses
 
 
-def replay_ds4(calls, slots, n_expert, heats=None):
+def replay_ds4(calls, slots, n_expert, heats=None, see=None):
     """ds4: the lowest hotness out (the oldest among equals), this call's units never; hotness +1 a routing
-    (heats: + heats[call][k] for the call's k-th unit), halved every 16 decode tokens."""
+    (heats: + heats[call][k] for the call's k-th unit), halved every 16 decode tokens. see=H: the next H calls
+    known, a unit they do not ask out first (by hotness), else the one they ask furthest."""
     present, hot, last = set(), {}, {}
+    uses = {}
+    if see is not None:
+        for j, (_, us) in enumerate(calls):
+            for u in us:
+                uses.setdefault(u, []).append(j)
+
+    def key(p, i):
+        if see is None:
+            return (hot[p], last[p])
+        lst = uses[p]
+        j = bisect.bisect_right(lst, i)
+        if j == len(lst) or lst[j] > i + see:
+            return (0, 0, hot[p], last[p])
+        return (1, -lst[j], hot[p], last[p])
     hits = misses = prompt_misses = 0
     tok_seen = 0
     prev_tok = None
@@ -156,7 +175,7 @@ def replay_ds4(calls, slots, n_expert, heats=None):
                 else:
                     prompt_misses += 1
                 if len(present) >= slots:
-                    v = min((p for p in present if p not in protect), key=lambda p: (hot[p], last[p]))
+                    v = min((p for p in present if p not in protect), key=lambda p: key(p, i))
                     present.discard(v)
                 present.add(u)
             last[u] = i
@@ -164,8 +183,10 @@ def replay_ds4(calls, slots, n_expert, heats=None):
 
 
 def replay(calls, slots, policy, n_expert, seed=0, n_layers=16, heats=None):
-    """(decode hits, decode misses, prompt misses) of one policy at `slots`; ds4 and heat add `heats` (heats_of
-    unscaled and scaled; None: 1 a routing, a call of one token's)."""
+    """(decode hits, decode misses, prompt misses) of one policy at `slots`; ds4, heat and see<H> add `heats`
+    (heats_of unscaled and scaled; None: 1 a routing, a call of one token's)."""
+    if policy.startswith("see"):
+        return replay_ds4(calls, slots, n_expert, heats, int(policy[3:]))
     if policy == "colibri":
         return replay_colibri(calls, slots, n_expert, n_layers)
     if policy == "once":
@@ -308,6 +329,9 @@ def main(argv):
     seeds = int(opts.get("--seeds", "5"))
     calls = calls_of(tr)
     heats = {"ds4": heats_of(tr, False), "heat": heats_of(tr)}
+    sees = [f"see{h}" for h in opts["--see"].split(",")] if "--see" in opts else []
+    for pol in sees:
+        heats[pol] = heats["heat"]
     n_dec = tr["n_tokens"] - tr["n_prompt"]
     ub = tr["expert_bytes"]
     print(f"{path}: {tr['n_prompt']} prompt tokens, {n_dec} generated, {tr['n_layers']} layers x {tr['n_expert']} "
@@ -317,7 +341,7 @@ def main(argv):
     for S in slots_list:
         if S < max(len(u) for _, u in calls):
             continue
-        for pol in POLICIES:
+        for pol in POLICIES + sees:
             runs = [replay(calls, S, pol, tr["n_expert"], seed, tr["n_layers"], heats.get(pol))
                     for seed in range(seeds if pol == "random" else 1)]
             h = sum(r[0] for r in runs) / len(runs)
@@ -401,6 +425,13 @@ def run_check():
         got = replay(calls, 3, pol, 8, heats=heats_of(tr, scaled) + [[1]])
         if got[0] != want:
             fails.append(f"{pol} against heat: {got} want {want} hits")
+    # see<H>: 2 slots, decode calls 0 0 1 2 1. heat (see0 too: nothing within 0 calls) lets 2 evict the cooler 1,
+    # which then misses: 1 hit. see1 knows call 4 asks 1 and nothing asks 0 again: 0 goes, 1 hits: 2 hits
+    calls = [(t, [u]) for t, u in enumerate([0, 0, 1, 2, 1])]
+    for pol, want in [("heat", (1, 4, 0)), ("see0", (1, 4, 0)), ("see1", (2, 3, 0))]:
+        got = replay(calls, 2, pol, ne, heats=[[1]] * 5)
+        if got != want:
+            fails.append(f"{pol}: {got} want {want}")
     # heat_add: c as is up to 64 tokens, else c x 64 / n rounded half up, at least 1
     for c, n, want in [(5, 64, 5), (3, 128, 2), (10, 321, 2), (1, 321, 1), (1, 1, 1)]:
         if heat_add(c, n) != want:
@@ -408,7 +439,7 @@ def run_check():
     for f in fails:
         print("evict_replay --check:", f)
     if not fails:
-        print("evict_replay --check: ok (13 cases)")
+        print("evict_replay --check: ok (16 cases)")
     return 1 if fails else 0
 
 

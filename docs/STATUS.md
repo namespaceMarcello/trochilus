@@ -4,6 +4,8 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
 
 ## Decisions
 
+- 2026-10-04 — **Qwen3.8-Flash-Next FP8's expert queue belongs to R3** (Marcello): its experts at the drive's
+  limit and the VRAM as their cache, question 89 (colibri measured: 0.6 of 2-3 GB/s used, #296-#297). Not before R2.
 - 2026-10-02 — **The roadmap is a ladder of models, for the machines most people own** (Marcello): R1 OLMoE,
   R2 Qwen3-Coder-30B, R3 a MoE larger than RAM, R4 DeepSeek V4; each through five phases (exact, studied, at
   the theoretical limit on three machines, usable, raced) before the next; one rung in progress (lint). The
@@ -340,12 +342,14 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
   the KV aside; the store gives the KV its slots as it is written (`tr_experts_set_slots`).
   A chat's plan on weak: Q8_0 131 -> 278 slots, disk a token 375.9 ->
   193.7 MiB; Q4_K 314 -> 591, 87.4 -> 16.3; raced, a chat's decode **Q8_0 1.22 -> 2.29, Q4_K 4.55 -> 14.77 tok/s**.
-  **10-04, offered to colibri** (UPSTREAM row 7; #293-#294): branch `perf/olmoe-kv-room` in the fork (`b9180a4`), its
-  `kv_room_fit` frees each layer's coldest slots as the KV's pages grow. On colibri's own engine in a 5 GB container
-  (the limit counts the page cache): 16 -> 26 slots a layer, misses -37%, a request **1.19x** (22.05 -> 18.52 s), the
-  logits byte-identical; less than ours because colibri reads through the page cache, which fills the room. PR ready
-  (gate green 02:06); opened as **colibri #1873** after Marcello's yes, waiting for its review.
-  **Next** (R1 phase 3, the 8 GB machine): Belady's 18-38% above ds4's (a policy from the routes); then the integrated GPU (r1-igpu:
+  **10-04, offered to colibri** (UPSTREAM row 7; #293-#294): `kv_room_fit` in the fork (`perf/olmoe-kv-room`), its
+  coldest slots freed as the KV grows; on colibri's own engine (5 GB container) 16 -> 26 slots a layer, misses -37%,
+  a request **1.19x**, the logits byte-identical (less than ours: its page cache fills the room). **colibri #1873**,
+  waiting for its review. **10-04 evening, the eviction told the future** (MEASUREMENTS, same name; #304-#307):
+  the next layer's router as a hint 0.3% fewer misses; Belady needs 4-16 tokens ahead (`evict_replay.py --see`);
+  heat is the best rule without the future: closed.
+  **Next** (R1 phase 3, the 8 GB machine): its decode's bytes, not its victims (a miss as one request, the prompt's
+  last 2-3%, this PC at half budget); then the integrated GPU (r1-igpu:
   Vulkan; q. 87-88); then R1's first prompt's cost, generation's fixed cost, the review, the server; the races
   with llama.cpp, colibri and ds4 together at R1's close. The decode's
   speed backlog (R1 phase 3 where the weak machines need it): question 85's serial steps as messages; the pool's
