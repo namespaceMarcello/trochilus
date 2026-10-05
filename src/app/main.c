@@ -588,6 +588,7 @@ static int cmd_generate(int argc, char **argv) {
         app_release(model, pool);
         return 1;
     }
+    tr_session_set_greedy(sess, 1); /* greedy tokens only: the head's argmax by a bound */
     /* the switch an A/B flips: none (the A/A, the tool's own noise) or one the model knows */
     int ab_sw = 0;
     if (ab_name != NULL && (ab_sw = tr_session_ab_switch(sess, ab_name)) < 0) {
@@ -820,8 +821,10 @@ static int cmd_logits(int argc, char **argv) {
     const char *model_path = NULL, *tokens_str = NULL, *out_path = NULL, *expert_mask_path = NULL;
     int64_t n_threads = 0, decode_threads = 0, chunk = 1;
     uint64_t expert_budget = 0;
+    int check_argmax = 0;
     /* -b k: tokens evaluated k at a time (one forward pass each), one logits row per
-     * evaluation, for the last token of each; -b 1 gives every position */
+     * evaluation, for the last token of each; -b 1 gives every position. --check-argmax: the session greedy, each
+     * row's token found by the pass (the head by a bound) against the scan of the row written, every row */
     const opt opts[] = {OPT_STR("-m", &model_path),
                         OPT_STR("--tokens", &tokens_str),
                         OPT_STR("--out", &out_path),
@@ -829,12 +832,14 @@ static int cmd_logits(int argc, char **argv) {
                         OPT_NUM("--decode-threads", &decode_threads, 0, INT_MAX),
                         OPT_BUDGET(&expert_budget),
                         OPT_STR("--expert-mask", &expert_mask_path),
-                        OPT_NUM("-b", &chunk, 1, INT64_MAX)};
+                        OPT_NUM("-b", &chunk, 1, INT64_MAX),
+                        OPT_FLAG("--check-argmax", &check_argmax)};
     if (parse_opts("logits", argc, argv, opts, N_OPTS(opts)) != 0 || model_path == NULL || tokens_str == NULL ||
         out_path == NULL) {
         fprintf(stderr, "usage: trochilus logits -m <file.gguf> --tokens id,id,... --out <file> [-t threads] [-b batch]\n"
                         "                       [--decode-threads <n>] [--expert-budget <MiB|min>]\n"
-                        "                       [--expert-mask <file>]  (measurement only: experts switched off)\n");
+                        "                       [--expert-mask <file>]  (measurement only: experts switched off)\n"
+                        "                       [--check-argmax]  (each row's greedy token by the pass against the scan)\n");
         return 2;
     }
 
@@ -884,13 +889,27 @@ static int cmd_logits(int argc, char **argv) {
 
     const tr_model_info *info = tr_model_get_info(model);
     int rc = 0;
+    int64_t n_checked = 0, n_differ = 0;
+    if (check_argmax) tr_session_set_greedy(sess, 1);
     for (int64_t i = 0; i < n_tokens; i += chunk) {
         if (tr_session_eval(sess, &tokens[i], n_tokens - i < chunk ? n_tokens - i : chunk) != 0) {
             fprintf(stderr, "logits: evaluation failed at token %" PRId64 "\n", i);
             rc = 1;
             break;
         }
+        const int32_t by_pass = check_argmax ? tr_session_argmax(sess, 0, info->vocab_size) : 0;
         const float *logits = tr_session_logits(sess);
+        if (check_argmax) {
+            int32_t best = 0;
+            for (int64_t v = 1; v < info->vocab_size; v++)
+                if (logits[v] > logits[best]) best = (int32_t)v;
+            n_checked++;
+            if (best != by_pass) {
+                n_differ++;
+                fprintf(stderr, "logits: row %" PRId64 ": the pass's token %d, the scan's %d\n", n_checked - 1,
+                        (int)by_pass, (int)best);
+            }
+        }
         if (fwrite(logits, sizeof(float), (size_t)info->vocab_size, out) != (size_t)info->vocab_size) {
             fprintf(stderr, "logits: write failed\n");
             rc = 1;
@@ -900,6 +919,10 @@ static int cmd_logits(int argc, char **argv) {
 
     print_experts(model);
     print_gpu(model, sess);
+    if (check_argmax) {
+        fprintf(stderr, "logits: --check-argmax: %" PRId64 " rows, %" PRId64 " differ\n", n_checked, n_differ);
+        if (n_differ > 0) rc = 1;
+    }
 
     fclose(out);
     free(tokens);
@@ -1170,6 +1193,7 @@ static int cmd_run(int argc, char **argv) {
         fprintf(stderr, "error: %s\n", err);
         goto done;
     }
+    tr_session_set_greedy(sess, 1); /* greedy tokens only: the head's argmax by a bound */
     if (expert_mask_path != NULL && apply_expert_mask(model, expert_mask_path) != 0) goto done;
     tr_model_set_decode_threads(model, (int)decode_threads);
     const tr_model_info *info = tr_model_get_info(model);
@@ -1445,6 +1469,7 @@ static int cmd_chat(int argc, char **argv) {
         fprintf(stderr, "error: %s\n", err);
         goto done;
     }
+    tr_session_set_greedy(sess, 1); /* greedy tokens only: the head's argmax by a bound */
     if (n_ctx <= 0 && ctx < info->n_ctx_train)
         fprintf(stderr, "(not enough free RAM for %" PRId64 " tokens of conversation: using %" PRId64
                         "; close other programs for longer conversations)\n", info->n_ctx_train, ctx);

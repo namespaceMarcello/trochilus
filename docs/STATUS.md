@@ -340,15 +340,16 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
   **10-03 night, the KV grown from the store's room** (MEASUREMENTS, same name; #290-#291): the store gives the KV
   its slots as it is written; a chat's decode on weak **Q8_0 1.22 -> 2.29, Q4_K 4.55 -> 14.77 tok/s**.
   **10-04, offered to colibri** (UPSTREAM row 7; #293-#294): `kv_room_fit` (fork branch `perf/olmoe-kv-room`), on
-  colibri's engine a request **1.19x**, the logits byte-identical: **colibri #1873**, waiting for its review.
+  colibri's engine a request **1.19x**, the logits byte-identical: **colibri #1873**, in review.
   **10-04**: the eviction told the future closed (#304-#307); the routes as time: the window is the limit (#309-#313).
   **10-05, the arrival order** (#314-#318): the weak decode **Q4_K 14.98 -> 16.08, Q8_0 2.33 -> 2.40 tok/s**.
   **10-05, the router's read ahead** (#323-#332): the weak decode **Q4_K 1.031, Q8_0 1.000-1.005**. Owed: the old
   binary's race (#332), avg's Q8_0. **10-05, question 94** (#335-#338): a draft from the store's experts loses on
-  every machine (0.74-0.98x, model): not built. **10-05, question 73 phase 1** (#341-#345; MEASUREMENTS §The head's
-  argmax by a bound): greedy positions leave 0.3% of the head's rows; the head 1.94 -> ~1.08 ms (bench, Q8_0, 16
-  threads); by the model a token **1.035x on avg and pc (Q8_0), 1.018x on weak (Q4_K)**, none loses: phase 2 builds it.
-  **Next**: question 73 phase 2 (build/prompt-head.md); question 95 (free drafts on weak Q4_K); a miss as one
+  every machine (0.74-0.98x, model): not built. **10-05, question 73, the head by a bound** (#341-#346;
+  MEASUREMENTS §The head's argmax by a bound, phase 2): a greedy token computes ~10 of the head's 50304 rows, the same
+  token; the decode **Q8_0 1.046x pc, 1.041x avg; Q4_K 1.022x pc, 1.009x avg, 1.015x weak**: on by default.
+  **Next**: the README's llama.cpp table raced again (Q8_0's decode moved); the verify passes' k-row bound;
+  question 95 (drafts on weak Q4_K); a miss as one
   request, this PC at half budget; the integrated GPU (r1-igpu: Vulkan; q. 87-88); R1's first prompt's cost,
   generation's fixed cost, the review, the server; the races with llama.cpp, colibri and ds4 at R1's close. The
   decode's backlog (R1 phase 3 where the weak machines need it): question 85's serial steps as messages; the pool's

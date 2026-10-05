@@ -131,6 +131,11 @@ const float *tr_session_logits_back(const tr_session *s, int64_t back);
  * winning, index 0 when nothing is larger; on the model's pool (tr_argmax_f32), each worker the logits the head's
  * matmul left in its cache. */
 int32_t tr_session_argmax(const tr_session *s, int64_t back, int64_t n);
+/* on: the caller reads a one-row pass's greedy token (tr_session_argmax over the whole vocabulary) and seldom its
+ * logits, so a model whose head has planes finds the token by a bound in the pass instead of computing every logit
+ * (kernels.h §The output head by a bound: the same token by construction); the logits stay readable, computed when
+ * first asked. Off (the default): every pass computes its logits. Changes speed only, never a result. */
+void tr_session_set_greedy(tr_session *s, int on);
 /* Number of tokens already in the KV cache. */
 int64_t tr_session_pos(const tr_session *s);
 /* Tokens the session has room for (what tr_session_create settled on). */
@@ -289,6 +294,10 @@ typedef struct {
      * that name; then before a pass its arm. NULL: the architecture has none. */
     int (*ab_switch)(const char *name);
     void (*ab_set)(void *session, int sw, int arm);
+    /* tr_session_set_greedy, and the greedy token of logit row back among the first n when the pass found it without
+     * the logits (the head by a bound), -1 otherwise. NULL: never. */
+    void (*set_greedy)(void *session, int on);
+    int32_t (*argmax)(const void *session, int64_t back, int64_t n);
 } tr_arch_vtable;
 
 #endif

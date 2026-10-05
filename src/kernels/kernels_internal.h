@@ -237,6 +237,11 @@ const tr_kernels *tr_kernels_scalar(void);
  * compiled for this architecture, or not supported by this CPU and OS. */
 const tr_kernels *tr_kernels_x86_tier(const char *tier);
 
+/* head_bound.c: the head's plane kernels into a table, the scalar definitions; on x86 with F16C, AVX2's, the bounds
+ * AVX-512's where vnni512 (BW, VL, DQ, VNNI): every one the scalar's bits */
+void tr_hb_fill_scalar(tr_kernels *k);
+void tr_hb_fill_x86(tr_kernels *k, int f16c, int vnni512);
+
 /* Tests only: makes k the active table; NULL goes back to the tier tr_kernels_init chooses.
  * The engine reads the active table at every matmul and every attention, so a test can wrap a
  * tier's kernels with counters and see which ones a model really runs

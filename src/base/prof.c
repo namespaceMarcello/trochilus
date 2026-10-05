@@ -162,6 +162,7 @@ void tr_prof_print(const tr_prof *p, FILE *out) {
             if (a->bytes > 0 && p->tokens[ph] > 0)
                 fprintf(out, " %10.1f %8.2f", (double)a->bytes / (double)p->tokens[ph] / (1024.0 * 1024.0),
                         s > 0 ? (double)a->bytes / s / 1e9 : 0.0);
+            if (a->rows > 0) fprintf(out, "   rows/call %.1f", (double)a->rows / (double)a->calls);
             fprintf(out, "\n");
         }
     }
@@ -184,9 +185,11 @@ void tr_prof_write_json(const tr_prof *p, FILE *out) {
         int first = 1;
         for (int z = 0; z < TR_PROF_ZONE_COUNT; z++) {
             if (acc[z].calls == 0) continue;
-            fprintf(out, "%s\"%s\":{\"calls\":%llu,\"seconds\":%.9f,\"bytes\":%llu}", first ? "" : ",",
+            fprintf(out, "%s\"%s\":{\"calls\":%llu,\"seconds\":%.9f,\"bytes\":%llu", first ? "" : ",",
                     zone_names[z], (unsigned long long)acc[z].calls, (double)acc[z].ticks / rate,
                     (unsigned long long)acc[z].bytes);
+            if (acc[z].rows > 0) fprintf(out, ",\"rows\":%llu", (unsigned long long)acc[z].rows);
+            fprintf(out, "}");
             first = 0;
         }
         fprintf(out, "}}");

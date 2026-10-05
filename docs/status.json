@@ -447,6 +447,10 @@
         {
           "v": "tools ready for the next model: tools/weights_genome.py, route_union_report.py, kv_repeats_report.py, draft_agreement.sh",
           "d": "2026-09-24"
+        },
+        {
+          "v": "the output head by a bound (question 73): a greedy token computes about 10 of its 50304 rows, the others bounded from their scales and top bits, the token the same by construction; the head 2.0 -> 1.1 ms (Q8_0), the decode 1.041-1.046x (Q8_0), 1.009-1.022x (Q4_K)",
+          "d": "2026-10-05"
         }
       ],
       "questions": [
@@ -462,8 +466,8 @@
         },
         {
           "n": 73,
-          "state": "open",
-          "text": "the most likely token from the output head's high half, exact only on the rows that can still win. Phase 1 done (10-05): on the engine's own greedy tokens only 0.3% of the 50304 rows can still win; the head 1.94 -> about 1.08 ms in a bench (Q8_0, 16 threads); by the model a token 1.035x on the average machine and this PC (Q8_0), 1.018x on the 8 GB machine (Q4_K), none loses. Decided: build it (phase 2), then race"
+          "state": "closed",
+          "text": "the most likely token from the output head's high half, exact only on the rows that can still win. Done (10-05): the head held as two planes (the same bytes), a greedy token computes about 10 of the 50304 rows, the same token at every position of 13 texts on both models; raced, the decode 1.046x on this PC and 1.041x on the average machine (Q8_0), 1.022x / 1.009x / 1.015x on this PC, the average and the 8 GB machine (Q4_K): on by default. Open: the verify passes (a k-row bound)"
         }
       ],
       "files": [

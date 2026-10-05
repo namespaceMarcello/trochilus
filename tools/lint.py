@@ -125,7 +125,8 @@ def check_tests_no_tmpfile():
 # Hot zone (docs/ARCHITECTURE.md §Hot path): code that runs for every token, between
 # /* hot: begin */ and /* hot: end */. A line may allow a name with /* hot-ok: name -- reason */.
 HOT_FILES = ["src/models/olmoe.c", "src/models/model.c", "src/kernels/kernels.c", "src/kernels/kernels_x86.c",
-             "src/kernels/kernels_internal.h", "src/kernels/expf.c", "src/base/threads.c", "src/base/prof.h",
+             "src/kernels/kernels_internal.h", "src/kernels/expf.c", "src/kernels/head_bound.c", "src/base/threads.c",
+             "src/base/prof.h",
              "src/kv/kv.c", "src/kv/kv.h", "src/backend/gpu_attn.c", "src/backend/gpu_attn.h"]
 HOT_RULES = [
     ("allocation", re.compile(r"\b(malloc|calloc|realloc|free|tr_alloc_aligned|tr_free_aligned|"

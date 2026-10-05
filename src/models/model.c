@@ -472,6 +472,10 @@ const float *tr_session_logits_back(const tr_session *s, int64_t back) {
 }
 
 int32_t tr_session_argmax(const tr_session *s, int64_t back, int64_t n) {
+    if (!s->ab_serial_argmax && s->vt->argmax != NULL) { /* found by the pass (the head by a bound) */
+        const int32_t r = s->vt->argmax(s->impl, back, n);
+        if (r >= 0) return r;
+    }
     const float *x = tr_session_logits_back(s, back);
     if (s->ab_serial_argmax) { /* the scan the parallel one is defined by, on this thread */
         int64_t best = 0;
@@ -484,6 +488,10 @@ int32_t tr_session_argmax(const tr_session *s, int64_t back, int64_t n) {
 
 const float *tr_session_logits(const tr_session *s) {
     return s->vt->logits(s->impl, 0);
+}
+
+void tr_session_set_greedy(tr_session *s, int on) {
+    if (s->vt->set_greedy != NULL) s->vt->set_greedy(s->impl, on);
 }
 
 int64_t tr_session_pos(const tr_session *s) {

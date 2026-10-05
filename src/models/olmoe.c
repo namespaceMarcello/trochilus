@@ -78,7 +78,10 @@ typedef struct {
 
     float *output_norm; /* [n_embd] */
     tr_mat token_embd;    /* rows=vocab, cols=n_embd */
-    tr_mat output;          /* rows=vocab, cols=n_embd */
+    tr_mat output;          /* rows=vocab, cols=n_embd; data NULL when held as head_hb's planes */
+    /* The head as its two planes (kernels.h §The output head by a bound; read_head): a greedy token's argmax by a
+     * bound, every logit from the planes bit for bit; rows 0 when TR_HEAD_BOUND=0 or the type has none: m->output */
+    tr_hb_head head_hb;
     olmoe_layer *layers;      /* [n_layers] */
 
     tr_gguf *gguf;       /* kept open for the model's life: tr_experts reads straight from it
@@ -178,6 +181,14 @@ typedef struct {
     float *logits;    /* [n_logits_max][vocab], oldest kept position first */
     int64_t n_logits_max; /* rows the buffer holds (TR_LOGIT_ROWS_MAX, never more than B) */
     int64_t n_logits;     /* rows the last pass filled */
+    /* The head by a bound (m->head_hb.rows > 0): greedy (tr_session_set_greedy) makes a one-row pass compute its argmax
+     * by the bound instead of its logits. head_known: the last pass did, head_argmax is its token; head_pending: its
+     * logits are not computed yet, olmoe_logits computes them from head_h, its normed row, if asked */
+    tr_hb_scratch hb;
+    int greedy, head_known, head_pending;
+    int32_t head_argmax;
+    float *head_h;            /* [n_embd] */
+    int64_t head_rows, head_calls; /* rows computed exactly over the argmax calls (the profile's counter) */
     float *scores;    /* attention scores, a group of rows per pool worker: [n_workers][OLMOE_ATTN_QUERIES][score_stride] */
     int64_t score_stride; /* floats from a row of scores to the next: n_ctx and some (score_row_stride) */
     int64_t n_workers;
@@ -381,6 +392,54 @@ static int read_mat(tr_gguf *g, olmoe_model *m, load_progress *lp, const char *n
     out->rows = rows;
     out->cols = cols;
     out->data = raw;
+    return 0;
+}
+
+/* Rows of the head read a time while its planes are built: a few hundred KiB beside the planes, never the head twice */
+#define OLMOE_HEAD_CHUNK_ROWS 256
+
+/* The output head: as its two planes (kernels.h §The output head by a bound: the same bytes) when its type has them
+ * and TR_HEAD_BOUND is not 0, read OLMOE_HEAD_CHUNK_ROWS rows at a time and split; m->output keeps the shape, its data
+ * NULL. Else read_mat's. */
+static int read_head(tr_gguf *g, olmoe_model *m, load_progress *lp, char *err, size_t err_len) {
+    const char *name = "output.weight";
+    const tr_gguf_tensor *t = tr_gguf_find_tensor(g, name);
+    const char *env = getenv("TR_HEAD_BOUND");
+    if (t == NULL || (env != NULL && env[0] == '0') || !tr_hb_supports(t->type, m->n_embd))
+        return read_mat(g, m, lp, name, m->n_embd, m->vocab, &m->output, err, err_len);
+    if (check_shape(t, 2, (uint64_t)m->n_embd, (uint64_t)m->vocab, 1, err, err_len) != 0) return -1;
+    const int64_t rows = m->vocab, cols = m->n_embd;
+    const size_t rb = tr_row_bytes(t->type, cols), hb = tr_hb_hi_bytes(t->type, cols), lb = tr_hb_lo_bytes(t->type, cols);
+    unsigned char *planes = (unsigned char *)tr_alloc_aligned((size_t)rows * rb, 64);
+    unsigned char *chunk = (unsigned char *)tr_alloc_aligned((size_t)OLMOE_HEAD_CHUNK_ROWS * rb, 64);
+    if (planes == NULL || chunk == NULL || track(m, planes) != 0) {
+        snprintf(err, err_len, "out of memory loading '%s'", name);
+        tr_free_aligned(chunk);
+        if (planes != NULL && (m->n_owned == 0 || m->owned[m->n_owned - 1] != planes)) tr_free_aligned(planes);
+        return -1;
+    }
+    unsigned char *hi = planes, *lo = planes + (size_t)rows * hb;
+    for (int64_t r0 = 0; r0 < rows; r0 += OLMOE_HEAD_CHUNK_ROWS) {
+        const int64_t nr = rows - r0 < OLMOE_HEAD_CHUNK_ROWS ? rows - r0 : OLMOE_HEAD_CHUNK_ROWS;
+        if (tr_gguf_read_range(g, t, (uint64_t)r0 * rb, chunk, (uint64_t)nr * rb) != 0) {
+            snprintf(err, err_len, "failed reading tensor '%s'", name);
+            tr_free_aligned(chunk);
+            return -1;
+        }
+        for (int64_t r = 0; r < nr; r++)
+            tr_hb_planes(t->type, chunk + (size_t)r * rb, cols, hi + (size_t)(r0 + r) * hb, lo + (size_t)(r0 + r) * lb);
+    }
+    tr_free_aligned(chunk);
+    progress_add(lp, t->n_bytes);
+    m->output.type = t->type;
+    m->output.rows = rows;
+    m->output.cols = cols;
+    m->output.data = NULL;
+    m->head_hb.type = t->type;
+    m->head_hb.rows = rows;
+    m->head_hb.cols = cols;
+    m->head_hb.hi = hi;
+    m->head_hb.lo = lo;
     return 0;
 }
 
@@ -803,7 +862,7 @@ static void *olmoe_load(const char *path, tr_gguf *g, tr_pool *pool, uint64_t ex
     m->output_norm = read_vec(g, m, &lp, "output_norm.weight", m->n_embd, err, err_len);
     if (m->output_norm == NULL) goto fail;
 
-    if (read_mat(g, m, &lp, "output.weight", m->n_embd, m->vocab, &m->output, err, err_len) != 0) goto fail;
+    if (read_head(g, m, &lp, err, err_len) != 0) goto fail;
 
     m->layers = (olmoe_layer *)calloc((size_t)m->n_layers, sizeof(olmoe_layer));
     if (m->layers == NULL) {
@@ -978,6 +1037,8 @@ static void olmoe_session_free(void *session) {
     tr_free_aligned(s->h2);
     tr_free_aligned(s->h3);
     tr_free_aligned(s->logits);
+    tr_free_aligned(s->head_h);
+    tr_hb_scratch_free(&s->hb);
     tr_free_aligned(s->scores);
     tr_pm_scratch_free(&s->pm);
     tr_free_aligned(s->x_all);
@@ -1035,6 +1096,12 @@ static uint64_t session_bytes(const olmoe_model *m, int64_t vocab, int64_t n_wor
                              tr_pm_scratch_bytes((int)n_workers, m->n_expert, B * U, pm_cols, pm_x);
     /* the logits' rows: the scratch above counts one */
     scratch_bytes += (uint64_t)((B < TR_LOGIT_ROWS_MAX ? B : TR_LOGIT_ROWS_MAX) - 1) * (uint64_t)vocab * sizeof(float);
+    /* the head by a bound's (tr_hb_scratch_init), counted whether the head has planes or not: a bound and a candidate
+     * a row, the prepared token and its normed row, two rebuilt rows (Q8_0's are the wider) and a line a worker, the
+     * logits' rows prepared for Q4_K */
+    scratch_bytes += (uint64_t)vocab * 8 + tr_hb_prep_bytes(m->n_embd) + (uint64_t)m->n_embd * sizeof(float) +
+                     (uint64_t)n_workers * (2 * ((uint64_t)tr_row_bytes(TR_TYPE_Q8_0, m->n_embd) + 64) + 64) +
+                     (uint64_t)TR_LOGIT_ROWS_MAX * tr_q4x_bytes(m->n_embd);
     uint64_t x_all_bytes = store_partial ? (uint64_t)ctx * (uint64_t)m->n_embd * sizeof(float) : 0;
     return kv_bytes + scratch_bytes + x_all_bytes;
 }
@@ -1157,8 +1224,14 @@ static void *olmoe_session_create(void *model, int64_t n_ctx, int64_t n_batch, c
     s->scores = alloc_f32(n_workers * OLMOE_ATTN_QUERIES * s->score_stride);
     if (store_partial) s->x_all = alloc_f32(actual_ctx * m->n_embd);
     int pm_rc = tr_pm_scratch_init(&s->pm, (int)n_workers, m->n_expert, B * U, pm_cols, pm_x);
+    int hb_rc = 0;
+    if (m->head_hb.rows > 0) {
+        hb_rc = tr_hb_scratch_init(&s->hb, &m->head_hb, (int)n_workers, s->n_logits_max);
+        s->head_h = alloc_f32(m->n_embd);
+        if (s->head_h == NULL) hb_rc = -1;
+    }
 
-    if (kv_rc != 0 || pm_rc != 0 || s->rope_cos == NULL || s->rope_sin == NULL || s->x == NULL ||
+    if (kv_rc != 0 || pm_rc != 0 || hb_rc != 0 || s->rope_cos == NULL || s->rope_sin == NULL || s->x == NULL ||
         s->normed == NULL || s->attn_out == NULL || s->ffn_out == NULL || s->q == NULL || s->attn_concat == NULL ||
         s->k == NULL || s->v == NULL || s->router == NULL || s->sel_id == NULL || s->sel_w == NULL ||
         s->place == NULL || s->offsets == NULL || s->acquire_ids == NULL || s->wave == NULL || s->wave_w == NULL ||
@@ -1864,6 +1937,28 @@ static int forward_layer(olmoe_model *m, olmoe_session *s, int64_t L, const int3
     return 0;
 }
 
+/* A greedy one-row pass's head (forward_logits): its token by the bound (tr_hb_argmax) over the whole vocabulary, the
+ * normed row h kept for olmoe_logits; the lm_head zone counts the high plane and the rows computed. When the bound
+ * cannot prune, tr_hb_argmax has computed every logit into s->logits: nothing pending. */
+static void head_argmax(const olmoe_model *m, olmoe_session *s, const float *h) {
+    tr_prof *prof = &s->prof;
+    uint64_t t = tr_prof_begin(prof);
+    tr_hb_result res;
+    s->head_argmax = tr_hb_argmax(m->pool, &m->head_hb, h, m->vocab, &s->hb, s->logits, &res);
+    tr_prof_end(prof, TR_PROF_LM_HEAD, t);
+    const uint64_t hb = tr_hb_hi_bytes(m->head_hb.type, m->n_embd), lb = tr_hb_lo_bytes(m->head_hb.type, m->n_embd);
+    tr_prof_count(prof, TR_PROF_LM_HEAD, res.full ? (uint64_t)m->vocab * (hb + lb)
+                                                  : (uint64_t)m->vocab * hb + (uint64_t)res.rows * (hb + lb), 0);
+    tr_prof_count_rows(prof, TR_PROF_LM_HEAD, (uint64_t)res.rows);
+    s->head_rows += res.rows;
+    s->head_calls++;
+    s->head_known = 1;
+    if (!res.full) {
+        memcpy(s->head_h, h, (size_t)m->n_embd * sizeof(float));
+        s->head_pending = 1;
+    }
+}
+
 /* Logits of the last n_logits rows of x ([n_tok][n_embd]; 0: none). One row per kept position:
  * every row is its own dot_row over the same weights, so a row is bit-identical to the logits
  * that token gives alone (tests/test_spec.c). */
@@ -1874,17 +1969,26 @@ static void forward_logits(olmoe_model *m, olmoe_session *s, float *x, int64_t n
     int64_t n_embd = m->n_embd;
     float *rows = x + (n_tok - n_logits) * n_embd;
     const int64_t off[2] = {0, n_logits};
-    hint_next(m, s, &m->output, off, 1, &s->pm); /* one row of logits; the last mix has read the workers' rows */
+    const int planes = m->head_hb.rows > 0;
+    /* one row of logits; the last mix has read the workers' rows */
+    if (!planes) hint_next(m, s, &m->output, off, 1, &s->pm);
+    else if (s->greedy && n_logits == 1 && !s->ab_no_idle) tr_hb_hint(pool, &m->head_hb, m->vocab, s->hint_bytes);
 
     uint64_t t = tr_prof_begin(prof);
     for (int64_t i = 0; i < n_logits; i++) tr_rmsnorm(rows + i * n_embd, m->output_norm, n_embd, m->rms_eps);
     tr_prof_end(prof, TR_PROF_OUTPUT_NORM, t);
 
+    s->head_known = s->head_pending = 0;
+    s->n_logits = n_logits;
+    if (planes && s->greedy && n_logits == 1) {
+        head_argmax(m, s, rows);
+        return;
+    }
     t = tr_prof_begin(prof);
-    tr_matmul_s(pool, &m->output, rows, n_logits, s->logits, &s->pm);
+    if (planes) tr_hb_logits(pool, &m->head_hb, rows, n_logits, s->logits, &s->hb);
+    else tr_matmul_s(pool, &m->output, rows, n_logits, s->logits, &s->pm);
     tr_prof_end(prof, TR_PROF_LM_HEAD, t);
     tr_prof_count(prof, TR_PROF_LM_HEAD, mat_bytes(&m->output), 0);
-    s->n_logits = n_logits;
 }
 
 /* One forward pass over n_tok tokens (1 <= n_tok <= n_batch): embed, every layer in order, then
@@ -2185,10 +2289,32 @@ static int olmoe_prefetch_drain(olmoe_model *m, olmoe_session *s) {
     return rc;
 }
 
+/* The logits a greedy pass left to compute (head_pending) are computed here from its normed row, the first time they
+ * are asked: the session is the caller's, the const of the table's signature is the reader's promise only. */
 static const float *olmoe_logits(const void *session, int64_t back) {
-    const olmoe_session *s = (const olmoe_session *)session;
+    olmoe_session *s = (olmoe_session *)(uintptr_t)session;
     if (back < 0 || back >= s->n_logits) return NULL;
+    if (s->head_pending) {
+        tr_prof *prof = &s->prof;
+        uint64_t t = tr_prof_begin(prof);
+        tr_hb_logits(s->m->pool, &s->m->head_hb, s->head_h, 1, s->logits, &s->hb);
+        tr_prof_end(prof, TR_PROF_LM_HEAD, t);
+        tr_prof_count(prof, TR_PROF_LM_HEAD, mat_bytes(&s->m->output), 0);
+        s->head_pending = 0;
+    }
     return s->logits + (s->n_logits - 1 - back) * s->m->vocab;
+}
+
+/* The greedy token of the last pass's last row over the whole vocabulary, when the bound found it (head_known); -1:
+ * the caller scans the logits */
+static int32_t olmoe_argmax(const void *session, int64_t back, int64_t n) {
+    const olmoe_session *s = (const olmoe_session *)session;
+    return s->head_known && back == 0 && n == s->m->vocab && s->n_logits == 1 ? s->head_argmax : -1;
+}
+
+static void olmoe_set_greedy(void *session, int on) {
+    olmoe_session *s = (olmoe_session *)session;
+    s->greedy = on != 0;
 }
 
 static int64_t olmoe_pos(const void *session) {
@@ -2212,7 +2338,7 @@ static int olmoe_rewind(void *session, int64_t n) {
     olmoe_session *s = (olmoe_session *)session;
     if (n < 0 || n > s->pos) return -1;
     s->pos = n;
-    s->n_logits = 0; /* the kept rows describe positions that may no longer be in the cache */
+    s->n_logits = 0; /* the kept rows describe positions that may no longer be in the cache (and the head's token) */
     return 0;
 }
 
@@ -2487,4 +2613,6 @@ const tr_arch_vtable tr_olmoe_vtable = {
     olmoe_gpu_tokens,
     olmoe_ab_switch,
     olmoe_ab_set,
+    olmoe_set_greedy,
+    olmoe_argmax,
 };

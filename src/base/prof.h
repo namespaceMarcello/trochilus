@@ -62,6 +62,7 @@ typedef struct {
     uint64_t calls;
     uint64_t ticks;
     uint64_t bytes;           /* weights and KV cache read by the zone's kernels */
+    uint64_t rows;            /* a matrix's rows computed exactly, where the zone counts them (lm_head by the bound) */
 } tr_prof_acc;
 
 typedef struct tr_prof {
@@ -114,6 +115,10 @@ static inline void tr_prof_count(tr_prof *p, tr_prof_zone z, uint64_t weight_byt
         p->weight_bytes_touched[p->phase] += weight_bytes;
         p->io_bytes[p->phase] += io_bytes;
     }
+}
+
+static inline void tr_prof_count_rows(tr_prof *p, tr_prof_zone z, uint64_t rows) {
+    if (p != NULL && p->enabled) p->acc[p->phase][z].rows += rows;
 }
 
 static inline void tr_prof_count_kv(tr_prof *p, tr_prof_zone z, uint64_t kv_bytes) {

@@ -2699,6 +2699,7 @@ const tr_kernels *tr_kernels_x86_tier(const char *tier) {
             g_avx2.q4x_tile_max = 3;
             g_avx2.dot_row[TR_TYPE_Q6_K] = avx2_dot_row_q6_k;
             g_avx2.dot_row_x4[TR_TYPE_Q6_K] = avx2_dot_row_x4_q6_k;
+            tr_hb_fill_x86(&g_avx2, c->f16c, 0);
             g_avx2_built = 1;
         }
         return &g_avx2;
@@ -2752,6 +2753,8 @@ const tr_kernels *tr_kernels_x86_tier(const char *tier) {
             }
             g_avx512.pm_interleave = avx512_pm_interleave;
             g_avx512.pm_tile = avx512_pm_tile;
+            tr_hb_fill_x86(&g_avx512, c->f16c,
+                           c->f16c && c->avx512bw && c->avx512vl && c->avx512dq && c->avx512vnni);
             g_avx512_built = 1;
         }
         return &g_avx512;

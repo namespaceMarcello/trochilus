@@ -529,6 +529,7 @@ static void build_scalar_table(tr_kernels *k) {
     k->dequant_row[TR_TYPE_Q4_K] = k_dequant_q4_k;
     k->dequant_row[TR_TYPE_Q6_K] = k_dequant_q6_k;
     k->expf_f32 = k_expf_f32;
+    tr_hb_fill_scalar(k);
 }
 
 const tr_kernels *tr_kernels_scalar(void) {

@@ -776,6 +776,17 @@ static void test_chat(const char *m) {
 
 /* records "<length>\n<flag><role 0x1F content>[0x1E ...]" (src/app/main.c cmd_chat_template);
  * a role other than system, user and assistant renders nothing (src/tokenizer/chat.c) */
+/* logits --check-argmax on a model whose head has planes (Q8_0, n_embd 256): every row's token found by the pass's
+ * bound against the scan of the row written, and the count on stderr */
+static void test_check_argmax(const char *m) {
+    char lpath[700];
+    in_dir(lpath, sizeof lpath, "test_cli_check.bin");
+    expect("logits --check-argmax", cli("logits -m %s --tokens 5,7,9,11,13,17,19,23 -b 1 --out %s --check-argmax", m, lpath),
+           0);
+    ERR_HAS("logits: --check-argmax: 8 rows, 0 differ");
+    remove(lpath);
+}
+
 static void test_chat_template(const char *m) {
     char file[700];
     in_dir(file, sizeof file, "test_cli_records.bin");
@@ -871,6 +882,12 @@ int main(int argc, char **argv) {
     test_run(model, model257);
     test_chat(model);
     test_chat_template(model);
+    synth_params PQ = {1, 256, 2, 2, 256, 4, 2, SYNTH_TOK_MIN_VOCAB, 64, TR_TYPE_Q8_0};
+    char model_q8[600];
+    TR_CHECK(synth_write(&PQ, self, "test_cli_q8.gguf", model_q8, sizeof model_q8) == 0);
+    native_path(model_q8);
+    test_check_argmax(model_q8);
+    remove(model_q8);
 
 #ifndef _WIN32
     /* --profile-json: the model's path in valid JSON, a tab in it written as \u0009, a quote and

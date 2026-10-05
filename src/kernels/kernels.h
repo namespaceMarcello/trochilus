@@ -89,6 +89,33 @@ int tr_f32_to_bf16_exact(void *data, int64_t n);
  * buffers held before, LESSONS #246). */
 size_t tr_q4x_bytes(int64_t n);
 
+/* ---- The output head by a bound (head_bound.c; docs/MEASUREMENTS.md §The head's argmax by a bound) ----
+ * A Q8_0 or Q4_K head of n columns (a multiple of 256, at most TR_HB_COLS_MAX) is split at load into two planes, the
+ * same bytes: the high plane holds a row's scales and its codes' top bits, the low plane the rest.
+ *   Q8_0, a block of 32 b: hi = [nb x 2 B: the f16 scales][nb x 16 B: byte i = u_i | u_(i+16) << 4, u = (q >> 4) + 8],
+ *     lo = [nb x 16 B: byte i = (q_i & 15) | (q_(i+16) & 15) << 4];
+ *   Q4_K, a super-block: hi = [16 B: d, dmin and the twelve scale bytes][64 B: q_k >> 2 at byte 32 (k / 128) + k % 32,
+ *     shift 2 ((k % 128) / 32)][32 B: bit 1 of q_k at byte k / 8, bit k % 8], lo = [32 B: bit 0, the same way].
+ * A token h is prepared once (tr_hb_prep_build): per block of 32, delta = max|h| / 32639 and h ~ delta (256 X + Xl),
+ * two int8 digits, with the block's terms, where the float sums' margin (2^-16 of the terms' magnitudes), h's own
+ * rounding (sum |h - delta (256 X + Xl)| at the codes' largest) and the engine's Q4_K rounding of h (2^-30 of a
+ * super-block's max|h| an element) are folded in. A row's bound from its high plane
+ *   Q8_0: U = sum_b d_b (a_b I_b + be_b) + |d_b| g_b,                      I_b = sum_k u_k (256 X_k + Xl_k)
+ *   Q4_K: U = sum_j d sc_j (a_j I_j + be_j) + |d| sc_j g_j - dmin m_j H_j + |dmin| m_j mu_j,   I_j over q >> 1
+ * is at or above the engine's own value of the row (dot_row, q4x_dot2) for every h of finite |h| <= 2^64: only the
+ * rows whose bound reaches the best exact score found can be the argmax. Every tier's float order: I_b as eight int32
+ * lanes of four elements (exact), lane l of block b (Q4_K: sub-block) into chain b % 4 as acc + (float)P * coef, coef
+ * = d a (Q4_K: (d sc) a), the side terms of block b into lane b % 8 in the order written above, then lane l = ((c0 +
+ * c2) + (c1 + c3)) + side and the eight lanes ((l0 + l4) + (l2 + l6)) + ((l1 + l5) + (l3 + l7)). */
+#define TR_HB_COLS_MAX 16384
+/* The rows of the largest bounds computed first: the best of their scores is the threshold (1.02-1.1x the least rows
+ * computed; the best bound's row alone 1.2-2.7x: docs/MEASUREMENTS.md, LESSONS #345) */
+#define TR_HB_TOP 4
+typedef struct {
+    int8_t *X, *Xl;             /* n each */
+    float *a, *be, *g, *H, *mu; /* n / 32 each (H, mu: Q4_K's) */
+} tr_hb_prep;
+
 /* Kernel table. Filled once by tr_kernels_init from tr_cpu(); read-only afterwards. */
 typedef struct {
     const char *tier;   /* "scalar", "avx2", "avx512", "neon" ... */
@@ -181,6 +208,11 @@ typedef struct {
     void (*q4x_panel)(const void *rows, size_t row_bytes, int64_t n, void *panel, const void *next);
     void (*q4x_tile)(const void *panel, const void *const *xq, int64_t n, int T, float *y, int64_t y_stride);
     int q4x_tile_max;
+    /* The head's planes (above): hb_bounds writes U[r] = the bound of row r < rows (their high planes consecutive,
+     * tr_hb_hi_bytes apart) against p, every tier the scalar's bits; hb_rebuild a row's original bytes from its two
+     * planes. NULL for a type without planes. */
+    void (*hb_bounds[TR_TYPE_COUNT])(const unsigned char *hi, int64_t rows, const tr_hb_prep *p, int64_t n, float *U);
+    void (*hb_rebuild[TR_TYPE_COUNT])(const unsigned char *hi, const unsigned char *lo, int64_t n, unsigned char *row);
     /* decode one row of n elements to f32 */
     void (*dequant_row[TR_TYPE_COUNT])(const void *row, float *out, int64_t n);
     /* y[i] = tr_expf(x[i]) for i < n, element-wise; y may be x (in place). The exponential of the
@@ -321,6 +353,63 @@ void tr_swiglu_prepare(tr_pool *pool, float *x, const float *y, int64_t n_rows, 
  * order from (x[0], 0) with the same strict >: the scan's index by construction (docs/MEASUREMENTS.md §The argmax in
  * parallel). */
 int32_t tr_argmax_f32(tr_pool *pool, const float *x, int64_t n);
+
+/* ---- the output head by a bound (the table's hb_* and their layout above) ---- */
+
+/* 1 when a head of this type and n columns has planes: Q8_0 or Q4_K, n a multiple of 256 up to TR_HB_COLS_MAX */
+int tr_hb_supports(tr_type type, int64_t n);
+/* bytes of a row's high and low plane (0 without planes); together tr_row_bytes(type, n) */
+size_t tr_hb_hi_bytes(tr_type type, int64_t n);
+size_t tr_hb_lo_bytes(tr_type type, int64_t n);
+/* the planes of one row (scalar: once, at load) */
+void tr_hb_planes(tr_type type, const void *row, int64_t n, unsigned char *hi, unsigned char *lo);
+/* bytes of a prepared token (64-byte aligned), and a tr_hb_prep over buf (64-byte aligned) */
+size_t tr_hb_prep_bytes(int64_t n);
+tr_hb_prep tr_hb_prep_view(void *buf, int64_t n);
+/* h (n floats) prepared for type's bound into p (the scalar definition, every tier's): 0, or -1 (p undefined) when h
+ * holds a NaN, an infinity or an |h| above 2^64 */
+int tr_hb_prep_build(tr_type type, const float *h, int64_t n, const tr_hb_prep *p);
+
+/* A head held as its two planes: rows of cols, row r's at hi + r * tr_hb_hi_bytes and lo + r * tr_hb_lo_bytes */
+typedef struct {
+    tr_type type;
+    int64_t rows, cols;
+    const unsigned char *hi, *lo;
+} tr_hb_head;
+/* A session's memory for its head calls: the prepared token, a bound and a candidate a row, the prepared input rows of
+ * Q4_K's road, two rebuilt rows and a cache line of results a worker */
+typedef struct {
+    int n_workers;
+    int64_t max_tokens;
+    void *prep_buf;
+    tr_hb_prep prep;
+    float *U;
+    int32_t *ids;
+    unsigned char *xq;
+    size_t xq_row;
+    unsigned char *rows;
+    size_t row_stride;
+    unsigned char *workers;
+} tr_hb_scratch;
+/* for a pool of up to n_workers and calls of up to max_tokens input rows: 0, or -1 (nothing held) */
+int tr_hb_scratch_init(tr_hb_scratch *s, const tr_hb_head *w, int n_workers, int64_t max_tokens);
+void tr_hb_scratch_free(tr_hb_scratch *s);
+typedef struct {
+    int64_t rows; /* computed exactly: the TR_HB_TOP of the largest bounds and those reaching the threshold */
+    int full;     /* 1: every row computed into y (h, a bound or a score not finite) */
+} tr_hb_result;
+/* y[t * rows + r] = row r against x + t * cols (t < n_tokens <= max_tokens), from the planes: tr_matmul_s's bits on
+ * the original rows (dot_row's, Q4_K's integer definition) */
+void tr_hb_logits(tr_pool *pool, const tr_hb_head *w, const float *x, int64_t n_tokens, float *y, tr_hb_scratch *s);
+/* tr_argmax_f32 over the first n of the logits tr_hb_logits would give h, by construction: region 1 the bounds and
+ * each worker's TR_HB_TOP largest; those rows exactly, the best score the threshold; region 2 the rows whose bound
+ * reaches it, exactly, the lowest row of the largest. When h, a bound or a score is not finite, every row into y
+ * (rows floats) and tr_argmax_f32 (res->full); else y untouched. */
+int32_t tr_hb_argmax(tr_pool *pool, const tr_hb_head *w, const float *h, int64_t n, tr_hb_scratch *s, float *y,
+                     tr_hb_result *res);
+/* The idle workers' hint for tr_hb_argmax over n rows (tr_matmul_hint's for the bound's region 1): each the first
+ * half of its region of the high plane, at most max_bytes. Moves no data the call reads. */
+void tr_hb_hint(tr_pool *pool, const tr_hb_head *w, int64_t n, size_t max_bytes);
 /* Causal attention of one query head over n_pos cached positions. `keys` and `values`
  * hold n_pos slots of `stride` floats; this head reads head_dim floats at `offset` in
  * each slot. scores[t] = dot_f32(q, k_t) * scale, softmax over t < n_pos, then

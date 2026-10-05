@@ -1840,3 +1840,23 @@ How to try it: `sh tools/bench_native.sh bench_head_bound --runs 21 --threads 4,
 `build/q73/data.sh` in the container, then `tools/.venv/Scripts/python.exe tools/head_bound.py <model.gguf>
 build/q73/data/*_Q8_0.f32 --study build/q73/rows` and `--report build/q73/rows/*.npz`; the model:
 `tools/.venv/Scripts/python.exe build/q73/model.py`.
+
+### 2026-10-05 — The head's argmax by a bound, phase 2: in the engine (question 73)
+A greedy token no longer computes the 50304 rows of the output head: the head is held as its two planes (the same
+bytes, split at load by `read_head`), each row gets a provable upper bound from its scales and top bits, and only the
+rows whose bound reaches the best exact score are computed, bit for bit as before. `src/kernels/head_bound.c` (new):
+the token's prep, the plane kernels (scalar definition, AVX2, AVX-512 VNNI, every tier the scalar's bits), the rebuild
+of a row from its planes, the argmax in two regions and every logit from the planes; `tr_session_set_greedy`
+(generate, run, chat) makes a one-row pass find its token by the bound, and the logits stay readable (computed when
+first asked); `logits`, verify passes and every other session compute every row from the planes. `TR_HEAD_BOUND=0`:
+the original rows, today's road. The profile's lm_head line counts the rows computed (`rows/call`); `trochilus logits
+--check-argmax` compares every row's token by the pass with the scan. Tests: `tests/test_head_bound.c` (planes, tiers,
+bounds against the engine's rows on random, adversarial and tight heads, the argmax against the scan, logits),
+`tests/test_head_model.c` (the engine, greedy and not, lazy logits, verify passes), `test_cli` (`--check-argmax`);
+`tools/mutate_head.sh` (20 mutations, all red). The real models against phase 1's binary: 13 texts x 2 models, the
+same tokens, logits and argmax at every position. Raced (`tools/ab_env.sh`): about 10 rows computed a token; the decode
+Q8_0 1.046x on this PC and 1.041x on the average machine, Q4_K 1.022x / 1.009x / 1.015x on this PC, the average and
+the 8 GB machine; on by default (MEASUREMENTS §The head's argmax by a bound, phase 2).
+
+How to try it: `build/trochilus generate -m <Q8_0 or Q4_K.gguf> -p 64 -n 100 --profile` (the lm_head line's rows/call),
+`TR_HEAD_BOUND=0` for today's road; `build/trochilus logits -m <f.gguf> --tokens <ids> --out x -b 1 --check-argmax`.
