@@ -85,7 +85,10 @@ to the conversation a page at a time as it is written, which none of colibri, ds
 machine a chat keeps 278 Q8_0 experts in RAM instead of 131 and reads 193.7 MiB a token from disk instead of
 375.9 (Q4_K: 591 instead of 314, 16.3 MiB instead of 87.4): its generation goes from 1.22 to 2.29 tok/s
 (Q8_0) and from 4.55 to 14.77 (Q4_K), its Q8_0 prompt from 20.55 to 24.59, the same tokens (2026-10-04, median of
-3, stopped steady).
+3, stopped steady). A layer whose experts are not all in RAM now computes the ones that are while its disk reads
+the others, each late one as its bytes land, the same bytes and the same bits: on the 8 GB machine generation goes
+from 14.98 to 16.08 tok/s (Q4_K) and from 2.33 to 2.40 (Q8_0), the same tokens (2026-10-05, median of 3, stopped
+steady). ds4 splits a layer this way on its GPU from three misses; colibri and llama.cpp wait for each.
 
 ## How it keeps up, bit for bit
 

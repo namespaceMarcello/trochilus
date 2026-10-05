@@ -40,7 +40,7 @@ else
       what = ""
       if ($8 == "yes" || $8 ~ /\/yes$/) what = "a load generator"
       else if (index($8, build) == 1) what = "a program of build/"
-      else if (args ~ /tools\/(prefill_context|decode_context|threads_phase|remeasure|experts_budget|prefill_overlap|serve_first_prompt|ab_modes|ab_speed|ab_spec|platform_bits|busy_machine)\.sh|tools\/profile_suite\.py/) what = "a measuring script"
+      else if (args ~ /tools\/(prefill_context|decode_context|threads_phase|remeasure|experts_budget|prefill_overlap|serve_first_prompt|ab_modes|ab_speed|ab_spec|platform_bits|busy_machine|ab_env|ab_inproc|ab_zone|bench_ggml_decode|bench_kernels|bench_native|bench_q4k_genome|bench_q4x|disk_race|machines|machine_still|race_llama|race_q4k|race_smt|row_price)\.sh|tools\/profile_suite\.py/) what = "a measuring script"
       if (what != "") print what " pid " $1 ":" args }')
 fi
 # a plain listing, filtered here: the same call the guard makes before every run. With a filter

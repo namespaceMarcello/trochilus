@@ -87,13 +87,13 @@ run "a slot in flight may be a victim (ds4's)" asan "test_experts test_prefetch 
 
 # counting and failures
 run "read ahead not counted as prefetched" gcc "test_experts test_prefetch test_hot" $B \
-  "    x->stats.prefetched++;
+  "    else x->stats.prefetched++;
 " ""
 run "read ahead not counted as a miss" gcc "test_experts test_prefetch" $B "    x->stats.misses++;
-    x->stats.prefetched++;" "    x->stats.prefetched++;"
+    if (job.demand) x->stats.arrived++;" "    if (job.demand) x->stats.arrived++;"
 run "the wait time is not measured" gcc "test_experts" $B "        x->stats.prefetch_wait_sec += tr_time_sec() - t0;
 " ""
-run "a failed read ahead is not reported" gcc "test_experts test_prefetch" $B "        x->prefetch_failed = 1;
+run "a failed read ahead is not reported" gcc "test_experts test_prefetch" $B "        if (!job.demand) x->prefetch_failed = 1; /* a call's own unit fails that call (tr_experts_acquire_take) */
 " ""
 run "a failure is reported forever" gcc "test_experts" $B "    x->prefetch_failed = 0;
     return failed ? -1 : 0;" "    return failed ? -1 : 0;"
@@ -152,7 +152,7 @@ run "a dropped unit stays in the index" gcc "test_prefetch" $B "cold end, as a f
         x->slot_of[x->slots[s].unit] = -1;
         x->slots[s].unit = -1;" "cold end, as a failed read leaves it (prefetch_take) */"
 run "the read ahead returns before its first run is taken" gcc "test_experts test_prefetch" $B \
-  "        while (x->q_len >= queued) tr_monitor_wait(x->mon);" ""
+  "    while (x->q_len >= queued) tr_monitor_wait(x->mon);" ""
 run "the short requests ignored" gcc "test_prefetch" $B \
   " && (job.cap == 0 || left < job.cap)) {" ") {"
 run "TR_PREFETCH=0 ignored" gcc "test_prefetch" $O \

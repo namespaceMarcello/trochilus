@@ -120,6 +120,8 @@ typedef struct {
                                            * handle is behind read_ctx); 0: an ordinary buffered one */
     uint64_t prefetched;                  /* units the I/O thread read ahead (tr_experts_prefetch),
                                            * counted in misses and bytes_read too once taken in */
+    uint64_t arrived;                     /* units a call's I/O thread read while it computed the present
+                                           * ones (tr_experts_acquire_async), in misses and bytes_read too */
     double prefetch_wait_sec;             /* time tr_experts_acquire and tr_experts_prefetch_wait
                                            * spent waiting for units still in flight */
     uint64_t cancelled;                   /* units queued ahead and dropped before a byte of them was
@@ -191,6 +193,20 @@ int tr_experts_acquire(tr_experts *x, int64_t layer, const int64_t *ids, int64_t
  * n_tok), rounded half up, at least 1. tr_experts_acquire is this with NULL and 1. */
 int tr_experts_acquire_counts(tr_experts *x, int64_t layer, const int64_t *ids, const int64_t *counts,
                               int64_t n_tok, int64_t n);
+/* tr_experts_acquire_counts with the missing units read by the I/O thread while the caller computes the present
+ * ones (docs/MEASUREMENTS.md §The arrival order built): the same hotness, the same victims, the same runs and
+ * bytes, the reads queued in the order given under one wake, and the call returns once the I/O thread has taken
+ * the first. Returns the units queued (0: every one present), -1 as tr_experts_acquire_counts. Until
+ * tr_experts_acquire_take takes a queued unit in, tr_experts_part gives NULL for it and it counts as present (no
+ * victim, no second read). Reading ahead not started (tr_experts_prefetch_start): tr_experts_acquire_counts,
+ * 0 on success. Allocates nothing. */
+int64_t tr_experts_acquire_async(tr_experts *x, int64_t layer, const int64_t *ids, const int64_t *counts,
+                                 int64_t n_tok, int64_t n);
+/* Takes in the units (layer, ids[i]) of a tr_experts_acquire_async call in the order given (the order its reads
+ * land): the first at_least waited for, then each next one only while its read has already landed. A unit not
+ * in flight is passed over. Returns how many of ids were passed (at_least <= it <= n; n: all in), or -1 if a
+ * read failed or a unit is absent: the failed unit absent, the store consistent. Allocates nothing. */
+int64_t tr_experts_acquire_take(tr_experts *x, int64_t layer, const int64_t *ids, int64_t n, int64_t at_least);
 /* Part p of (layer, expert), 64-byte aligned on a buffered store (read_align == 1); on a direct
  * store its address follows wherever that part's bytes actually start inside its own aligned read,
  * which moves every time the slot is refilled, and carries no alignment guarantee of its own. NULL

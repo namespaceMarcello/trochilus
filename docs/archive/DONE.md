@@ -1759,3 +1759,16 @@ the arrival order alone 1.084x (Q4_K) and 1.038x (Q8_0) with no byte more. The t
 cases (33) and fails if a written check never ran (LESSONS #309); 11 hand-computed cases, nine mutations red.
 Try: `tools/.venv/Scripts/python.exe tools/evict_replay.py build/evict/Q4_K.trace --slots 615 --compute-ms 34.8
 --prefetch 4,8,12 --arrive 0,1 --src in,oracle`; `tools/.venv/Scripts/python.exe tools/evict_replay.py --check`.
+
+### 2026-10-05 — The arrival order: a layer's misses read while its present experts compute
+
+What it is: on a partial expert store (the 8 GB machine), a layer's missing experts are read by the store's I/O
+thread while the experts already in RAM compute; the late ones are computed in waves as their bytes land. The same
+bytes, the same victims, the logits to the bit (src/memory/experts.c `tr_experts_acquire_async` / `_take`,
+src/models/olmoe.c `arrival_layout`, `expert_stages`, `olmoe_take_late`). On the emulated 8 GB machine the decode 14.98 -> 16.08 tok/s (Q4_K) and 2.33 -> 2.40 (Q8_0), the prompt unchanged (three races). Also: `tools/orphans.sh` and `orphans.ps1` list every measuring script, checked by `tools/lint.py` (LESSONS #317); `tools/machines.sh` gains avgold and pcold.
+`tools/evict_replay.py --arrive 0,1,2,3 --wave-ms` replays the variants (ds4's split from three misses among them);
+`generate --ab arrive` (B: today's calling thread) and `--ab waves` (B: one wave after the last lands).
+
+How to try it: `make check`; `MSYS_NO_PATHCONV=1 docker run --rm -e ONLY=arrival -v "$(pwd -W):/src" -w /src
+trochilus-dev:local sh tools/mutate_experts.sh` (and `mutate_stream.sh`): every line RED; the race:
+`MACHINES_LIST="weak weakold" MACHINES_BIN_weakold=<before> sh tools/machines.sh <binary> 5 q4k q8`.

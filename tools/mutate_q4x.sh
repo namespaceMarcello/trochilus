@@ -216,8 +216,8 @@ run "act: each row prepared before its swiglu" $C \
   "        k->q4x_prep(c->sw.x + r * c->n, c->n, c->xq + (size_t)r * c->xq_row);@@        swiglu_body(&c->sw, r * c->n, (r + 1) * c->n, worker);"
 run "act: row r prepared into the place of row r + 1" $C "c->xq + (size_t)r * c->xq_row);" "c->xq + (size_t)(r + 1) * c->xq_row);"
 run "model: the down on rows the act never prepared" $O \
-  "if (act_road) tr_swiglu_prepare(pool, s->h1, s->h2, n_rows, n_ff, s->pm.xq);" \
-  "if (act_road) tr_swiglu(pool, s->h1, s->h2, n_rows * n_ff);"
+  "if (act_road) tr_swiglu_prepare(pool, h1, h2, rows, n_ff, xq);" \
+  "if (act_road) tr_swiglu(pool, h1, h2, rows * n_ff);"
 # the argmax split over the pool (test_kernels' test_argmax)
 run "argmax: a lane's ties to the later index" $C "if (c->x[i + l] > bv[l]) {" "if (c->x[i + l] >= bv[l]) {"
 run "argmax: the lanes' ties to the higher index" $C "(bv[l] == v && bi[l] < idx)" "(bv[l] == v && bi[l] > idx)"

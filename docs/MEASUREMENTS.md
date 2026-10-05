@@ -6028,3 +6028,93 @@ only after the layer: the window is the next layer's attention) at best 1.016 (Q
   over the resident experts while an I/O thread reads the misses, then over the late ones), raced on the 8 GB
   machine against the model's 1.084 / 1.038; the router's read ahead after, on top, only if the race keeps the
   model's word.
+
+## The arrival order built (question 90, 2026-10-05)
+
+R1 phase 3, the 8 GB machine. §The routes as time found a layer's own resident experts the larger window: computed
+while its miss is read, 1.084 (Q4_K) and 1.038 (Q8_0) in the model, no byte more. **Built**: at the router the store
+queues a layer's misses to its I/O thread (`tr_experts_acquire_async`: the same hotness, victims, runs and bytes as
+`tr_experts_acquire_counts`, one wake, back once the thread has taken the first), the engine groups the used experts
+present first, late after (`arrival_layout`: each row moved to its expert's group, keeping its place among that
+expert's rows), computes the present groups' stages (gate and up, the activation, the down), then takes the late
+units in waves (`tr_experts_acquire_take`: the first waited for, the next ones while already landed) and runs each
+wave's stages; the combine unchanged, in slot order: the bits are the definition's (test_stream arrival: the
+resident's logits in every arm, Q4_K's roads and F32's). A pass's read ahead of the next layer waits until the late
+units are in (its own wait for its first unit would wait behind them). `--ab arrive` B: today's calling thread;
+`--ab waves` B: one wave after the last lands.
+
+**The references** (read 10-05, ORIGINS row 7): colibri reads a miss inside its expert loop, the experts after it
+waiting (`moe`, olmoe.c:925-948); ds4 splits exactly this way on its GPU, resident experts in a masked pass while its
+pread pool reads, the missing after, the down and sum once in slot order, but only from three misses
+(`split_worthwhile`, ds4_metal.m:13095); llama.cpp's mmap stalls only the faulting thread (no barrier between experts
+in `mul_mat_id`, ggml-cpu.c:1663-1729).
+
+**The variants replayed first** (`evict_replay.py --arrive 0,1,2,3 --wave-ms`, predictions in
+build/routes_time/predictions.txt, every one in its range):
+
+| variant (head 0.05, no read ahead) | Q4_K | Q8_0 | with 0.05 ms a wave |
+|---|---|---|---|
+| a1: each late unit as it lands | 1.084 | 1.038 | 1.081 / 1.036 |
+| a2: two waves (the resident, then every late one) | 1.079 | 1.029 | 1.076 / 1.028 |
+| a3: a2 from three late units (ds4's threshold) | 1.004 | 1.009 | |
+| a1 + the router's top 8 read ahead | 1.129 | 1.043 | 1.127 / 1.043 |
+
+ds4's threshold costs nearly all of it on a CPU (a wave is three pool regions, not a GPU submit): ours splits at the
+first miss, and takes each wave as it lands (a1).
+
+**Counts** (`MACHINES_COUNTS=1`, build/q90/counts and counts_var): the decode's disk a token 16.0 MiB (Q4_K) and
+189.5 (Q8_0) against the old binary's 15.9 and 189.6; the old binary against itself 15.9-16.3 and 189.7: a pass's
+read ahead drops by the disk's timing (#285), so the counts move within that spread on both models (LESSONS #316).
+
+**The race** (tools/machines.sh, weak against weakold = fa9a7e4, 5 rounds, build/q90/race; predictions in
+build/q90/predictions.txt):
+
+| the 8 GB machine (weak), code.txt's 321 tokens, then 64 | Q4_K before | after | gain | Q8_0 before | after | gain |
+|---|---|---|---|---|---|---|
+| decode tok/s | 14.91 | **15.59** | **1.046** | 2.33 | **2.40** | **1.030** |
+| prompt tok/s | 45.29 | 45.32 | 1.001 | 24.51 | 24.51 | 1.000 |
+| disk MiB a decode token | 15.8 | 15.7 | | 189.7 | 189.6 | |
+
+Medians of 3 (stopped steady after round 3 of 5, every arm within 0.4-0.9%), the same tokens in all 10 runs.
+
+- The predictions: Q4_K 1.05-1.08, **out** (1.046, just under); Q8_0 1.02-1.04, in; the prompt +-2%, in. The engine
+  kept 55% of the model's Q4_K gain (0.046 of 0.084) and 79% of Q8_0's (0.030 of 0.038).
+- **The load was not low at the race's end** (the Docker VM's bursts, up to 5.8 logical processors between rounds):
+  the race's own verdict is *structure, not results*; its arms rotate round by round, so the ratio stands as
+  structure until the confirmation race (owed, with the machines whose experts fit in RAM, avg and pc, predicted
+  unchanged, and `--ab waves` in one process).
+- **The rounds drifted** (build/q90/race/q4k/ab_modes.txt): the profiled runs, first, 16.03 against 14.73 tok/s
+  (1.088); round 0 15.88 against 14.56 (1.091); rounds 1-3, as the Docker VM's bursts rose, 15.55-15.68 against
+  14.80-14.94 (1.046). Q8_0 steady (1.026-1.030). The quiet machine's ratio is the model's (1.084): the gain may
+  depend on the background load (the arrival order hands work between three threads a layer with a miss), to
+  measure in one process (`--ab arrive`, no drift between arms) and under `tools/busy_machine.sh`.
+- **The decode's genome, the profiled runs** (Q4_K, ms a token): disk waits (weight_read) 33.43 -> 28.75, the
+  rest 34.42 -> 33.60; the disk's own time for its 15.8 MiB at 500 MB/s is 33.1 ms. The 4.7 ms hidden are the
+  present experts' stages (gate, up, down 1.31 ms a layer, 7 of 8 of them) in the ~4 layers a token with a
+  miss: everything the arrival order can hide, hidden. The model's layer counted 1.55 ms after the router
+  (0.75 of 2.07), the engine's experts take 1.33: the model's 1.084 holds 17% more compute than there is.
+- Where Q4_K's other half went is the next measurement, one piece at a time: the waves' extra pool regions (three a
+  wave), the I/O thread's wake once a layer with a miss (`queue_wake`), and the model's even split of a layer's
+  compute among its units.
+
+**The confirmation** (10-05 night, Chrome closed, the load 1.6-2.9 logical processors; build/q90/race2, race3,
+ab_*; predictions in build/q90/predictions.txt, every one of race3's in):
+
+| the 8 GB machine | Q4_K before | after | gain | Q8_0 before | after | gain |
+|---|---|---|---|---|---|---|
+| race3 decode tok/s (6 rounds, median of 3; each round) | 14.98 | **16.08** | **1.073** (1.061-1.073) | 2.33 | **2.40** | **1.030** (each 1.030) |
+| race3 prompt tok/s | 45.47 | 45.48 | 1.000 | 24.51 | 24.56 | 1.002 |
+| race2 decode (the load 2-3.5) | 14.55 | 15.74 | 1.082 | 2.33 | 2.39 | 1.026 |
+| one process, `--ab arrive`, B (the calling thread) / A | | | 1.110 +- 0.0005 (1.109 before) | | | 0.977 +- 0.0004 (0.979) |
+| one process, `--ab waves`, B (two waves) / A | | | 1.036 +- 0.001 | | | 0.961 +- 0.003 |
+
+- **Kept** (the default each late unit as it lands): three races faster on both models, the same bytes and bits.
+- **The two instruments disagree on Q8_0** (LESSONS #318): in one process the arrival arm's every compute zone
+  slows (qkv_proj +8% Q4_K, +22% Q8_0), and Q8_0's disk waits grow 6.8 ms a token; the races' arms run whole
+  processes of one mode. Two waves beat each unit as it lands on Q8_0 by 4-5.5% in one process, lose on Q4_K
+  by 3.5% (#319; the model 0.5-0.9%): a wave's handoff costs ~1 ms there, its own compute 0.6.
+- **The binary's own share, not found**: on the machines whose experts fit in RAM the new binary's Q4_K read
+  1.023 (pc) and 1.063 (avg) where its new code never runs, Q8_0 0.994 and 1.002 (race2); this PC's A/A (pc
+  against aa, the same binary) spread 7-70% (another window's test gates beside it, #321): inconclusive.
+- Next, one handoff at a time (#318): each take's wake from its read's end, the I/O thread's gap between
+  requests, waves a token; then a wait that spins before it blocks, and the waves by the numbers.

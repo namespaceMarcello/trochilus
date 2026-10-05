@@ -126,5 +126,30 @@ run "session free: the slots not taken again" $O \
 run "session guard: the room's check off" $O \
   "        if (m->kv_held + kv_full + least > m->kv_room) {" \
   "        if (0) {"
+# the arrival order (test_stream arrival): a layer's misses read by the I/O thread while its present experts compute
+run "arrival: the misses read on the calling thread" $O \
+  "    int64_t rc = s->ab_sync ? tr_experts_acquire_counts" \
+  "    int64_t rc = 1 ? tr_experts_acquire_counts"
+run "arrival: a row left in its id order's place" $O \
+  "        s->place[j] = offs[grp_of[e]] + s->place[j] - s->offsets[e];" \
+  "        (void)grp_of;"
+run "arrival: the late groups first" $O \
+  "            if (s->offsets[e + 1] > s->offsets[e] && (layer->gate_exps[e].data == NULL) == late) {" \
+  "            if (s->offsets[e + 1] > s->offsets[e] && (layer->gate_exps[e].data == NULL) != late) {"
+run "arrival: a wave's offsets from the layer's start" $O \
+  "        for (int64_t i = 0; i <= k; i++) wo[i] = offs[g + i] - offs[g];" \
+  "        for (int64_t i = 0; i <= k; i++) wo[i] = offs[g + i];"
+run "arrival: a wave's tokens through the first rows' map" $O \
+  "            !tr_matmul_q4x_prepared_n(pool, wgu, 2, offsets, n_groups, s->xq_tok, s->xmap + row0, ygu, &s->pm)) {" \
+  "            !tr_matmul_q4x_prepared_n(pool, wgu, 2, offsets, n_groups, s->xq_tok, s->xmap, ygu, &s->pm)) {"
+run "arrival: a wave's down reads another wave's activations" $O \
+  "    if (act_road) tr_matmul_q4x_prepared(pool, w + 2 * stride, offsets, n_groups, xq, NULL, h3, &s->pm);" \
+  "    if (act_road) tr_matmul_q4x_prepared(pool, w + 2 * stride, offsets, n_groups, xq + (row0 > 0 ? 64 : 0), NULL, h3, &s->pm);"
+run "arrival: a late unit's weights not refreshed in its group" $O \
+  "            s->wave_w[p * n_expert + i].data = d;" \
+  "            (void)d;"
+run "arrival: a wave's floats from the first rows" $O \
+  "        tr_matmul_grouped_s(pool, w, offsets, n_groups, s->xg + row0 * n_embd, h1, &s->pm);" \
+  "        tr_matmul_grouped_s(pool, w, offsets, n_groups, s->xg, h1, &s->pm);"
 }
 main "$@"; exit

@@ -8,7 +8,7 @@
 # except the processes above this one (the script that is asking). Used by tools/orphans.sh.
 param([string]$Repo, [string]$Callers = '')
 $build = (Join-Path $Repo 'build').TrimEnd('\') + '\'
-$scripts = 'tools[/\\](prefill_context|decode_context|threads_phase|remeasure|experts_budget|prefill_overlap|serve_first_prompt|ab_modes|ab_speed|ab_spec|platform_bits|busy_machine)\.sh|tools[/\\]profile_suite\.py'
+$scripts = 'tools[/\\](prefill_context|decode_context|threads_phase|remeasure|experts_budget|prefill_overlap|serve_first_prompt|ab_modes|ab_speed|ab_spec|platform_bits|busy_machine|ab_env|ab_inproc|ab_zone|bench_ggml_decode|bench_kernels|bench_native|bench_q4k_genome|bench_q4x|disk_race|machines|machine_still|race_llama|race_q4k|race_smt|row_price)\.sh|tools[/\\]profile_suite\.py'
 $all = Get-CimInstance Win32_Process
 $byId = @{}
 foreach ($p in $all) { $byId[[int]$p.ProcessId] = $p }

@@ -61,6 +61,14 @@
  *   disk         the emulated disk (cfg.disk_bytes_per_sec): a layer on demand and a load in runs take
  *                at least their bytes at the rate, and not twice that; the I/O thread and the calling
  *                thread reading at once share one disk (their bytes one after the other)
+ *   arrival      tr_experts_acquire_async / _take (a call's misses read by the I/O thread while the caller
+ *                computes the present units): (twins) against tr_experts_acquire_counts on the same random
+ *                calls, LRU and HOT, at the I/O thread's smallest store and two slots more, runs on: after
+ *                every call the same units, hits, misses, evictions, bytes and requests, a queued unit
+ *                unreadable until taken, takes of random lengths stopping where a read has not landed;
+ *                (order) at 0.1 s a read nothing landed at once, the first waited for and the second not,
+ *                counted arrived; (fail) a failed read fails its take, only that unit absent, nothing
+ *                reported again by the wait; (sync) no I/O thread: the misses read in the call
  *
  * Every test above align_reuse runs twice, at read_align 1 (buffered, today's layout) and
  * TR_FILE_DIRECT_ALIGN (direct, Step B): same contents, same LRU behaviour, same counters either
@@ -1902,6 +1910,161 @@ static void test_disk_emulated(uint64_t align) {
     }
 }
 
+/* ---- arrival: tr_experts_acquire_async and tr_experts_acquire_take, a call's misses read by the I/O thread ---- */
+
+static int64_t g_ar_twin, g_ar_twin_hot, g_ar_twin_runs, g_ar_twin_partial, g_ar_order, g_ar_fail, g_ar_sync;
+
+/* the twins: one store through tr_experts_acquire_counts, the other through tr_experts_acquire_async and takes
+ * of random lengths, the same random calls (ids in increasing order, as the engine gives them): after every call
+ * the same units present, the same hits, misses, evictions, bytes and requests, every unit of the call exact */
+static void arrival_twins(uint64_t align, int evict, uint64_t slots) {
+    char err[256];
+    fake_run_file ra, rb;
+    memset(&ra, 0, sizeof ra);
+    memset(&rb, 0, sizeof rb);
+    ra.f.align_check = rb.f.align_check = align;
+    tr_experts_config ca = rn_cfg(slots, &ra, align, 0), cb = rn_cfg(slots, &rb, align, 0);
+    ca.evict = cb.evict = evict;
+    tr_experts *a = tr_experts_create(&ca, err, sizeof err), *b = tr_experts_create(&cb, err, sizeof err);
+    TR_CHECK(a != NULL && b != NULL);
+    if (a == NULL || b == NULL) {
+        tr_experts_free(a);
+        tr_experts_free(b);
+        return;
+    }
+    TR_CHECK(tr_experts_prefetch_start(b) == 0);
+    rng_state = 0x9e3779b9u ^ (uint32_t)slots ^ (uint32_t)(evict * 77);
+    int same = 1, exact = 1;
+    for (int call = 0; call < 400 && same && exact; call++) {
+        int64_t layer = (int64_t)(rng_next() % RN_LAYERS), n = 1 + (int64_t)(rng_next() % RN_EXPERT), ids[RN_EXPERT];
+        int64_t pool[RN_EXPERT] = {0, 1, 2, 3, 4, 5}, counts[RN_EXPERT];
+        shuffle_prefix(pool, RN_EXPERT, n);
+        int64_t k = 0; /* the chosen ones in increasing order */
+        for (int64_t e = 0; e < RN_EXPERT; e++)
+            for (int64_t i = 0; i < n; i++)
+                if (pool[i] == e) ids[k++] = e;
+        int64_t n_tok = rng_next() % 4 == 0 ? 100 : 1;
+        for (int64_t i = 0; i < n; i++) counts[i] = n_tok == 1 ? 1 : 1 + (int64_t)(rng_next() % 40);
+        TR_CHECK(tr_experts_acquire_counts(a, layer, ids, counts, n_tok, n) == 0);
+        int64_t queued = tr_experts_acquire_async(b, layer, ids, counts, n_tok, n);
+        TR_CHECK(queued >= 0);
+        int none_visible = 1; /* a queued unit is never readable before it is taken in */
+        int64_t absent = 0;
+        for (int64_t i = 0; i < n; i++)
+            if (tr_experts_part(b, layer, ids[i], 0) == NULL) absent++;
+        none_visible = absent == queued;
+        TR_CHECK(none_visible);
+        for (int64_t done = 0; done < n;) {
+            int64_t at_least = 1 + (int64_t)(rng_next() % (uint32_t)(n - done));
+            int64_t got = tr_experts_acquire_take(b, layer, ids + done, n - done, at_least);
+            TR_CHECK(got >= at_least && got <= n - done);
+            if (got < at_least) break;
+            if (got < n - done) g_ar_twin_partial++;
+            done += got;
+        }
+        for (int64_t i = 0; i < n; i++) exact &= rn_unit_ok(b, layer, ids[i]);
+        for (int64_t u = 0; u < RN_LAYERS * RN_EXPERT; u++)
+            same &= (tr_experts_part(a, u / RN_EXPERT, u % RN_EXPERT, 0) != NULL) ==
+                    (tr_experts_part(b, u / RN_EXPERT, u % RN_EXPERT, 0) != NULL);
+        tr_experts_stats sa, sb;
+        tr_experts_get_stats(a, &sa);
+        tr_experts_get_stats(b, &sb);
+        same &= sa.hits == sb.hits && sa.misses == sb.misses && sa.evictions == sb.evictions &&
+                sa.bytes_read == sb.bytes_read && sa.requests == sb.requests && sb.arrived == sb.misses &&
+                sb.prefetched == 0;
+        if (queued > 0) g_ar_twin++;
+        if (queued > 0 && evict == TR_EXPERTS_EVICT_HOT) g_ar_twin_hot++;
+    }
+    TR_CHECK(same);
+    TR_CHECK(exact);
+    TR_CHECK_EQ_INT(rb.bad_align, 0);
+    if (rb.max_pieces > 1) g_ar_twin_runs++; /* the I/O thread joined consecutive misses into runs */
+    tr_experts_free(a);
+    tr_experts_free(b);
+}
+
+static void test_arrival(uint64_t align) {
+    for (int evict = TR_EXPERTS_EVICT_LRU; evict <= TR_EXPERTS_EVICT_HOT; evict++) {
+        arrival_twins(align, evict, 2 * RN_EXPERT + RN_USED);
+        arrival_twins(align, evict, 2 * RN_EXPERT + RN_USED + 2);
+    }
+
+    uint64_t slot_bytes = tr_experts_slot_bytes(&PART_BYTES_TABLE[0][0], N_LAYERS, align);
+    shared_file f;
+    shared_init(&f, align);
+    char err[256];
+    static const int64_t three[3] = {0, 1, 2};
+
+    /* order: three misses at 0.1 s a read (a unit is three): none landed at once, the first waited for and
+     * the next still in flight, then the other two; each exact; counted arrived, not read ahead */
+    {
+        tr_experts_config cfg = mk_cfg((uint64_t)PREFETCH_SLOTS * slot_bytes, shared_read, &f, align);
+        tr_experts *x = tr_experts_create(&cfg, err, sizeof err);
+        TR_CHECK(x != NULL && tr_experts_prefetch_start(x) == 0);
+        if (x != NULL) {
+            TR_CHECK(tr_experts_acquire(x, 0, ALL_EXPERTS, N_EXPERT) == 0);
+            f.delay = 0.1;
+            TR_CHECK_EQ_INT(tr_experts_acquire_async(x, 1, three, NULL, 1, 3), 3);
+            int64_t now = tr_experts_acquire_take(x, 1, three, 3, 0);
+            int64_t first = tr_experts_acquire_take(x, 1, three, 3, 1);
+            int ok = now == 0 && first == 1 && unit_ok(x, 1, 0, align) && unit_absent(x, 1, 1) && unit_absent(x, 1, 2);
+            TR_CHECK_EQ_INT(now, 0);
+            TR_CHECK_EQ_INT(first, 1);
+            TR_CHECK(unit_absent(x, 1, 1) && unit_absent(x, 1, 2));
+            TR_CHECK_EQ_INT(tr_experts_acquire_take(x, 1, three + 1, 2, 2), 2);
+            f.delay = 0.0;
+            ok &= layer_ok(x, 0, align) && unit_ok(x, 1, 0, align) && unit_ok(x, 1, 1, align) && unit_ok(x, 1, 2, align);
+            TR_CHECK(ok);
+            tr_experts_stats st;
+            tr_experts_get_stats(x, &st);
+            TR_CHECK_EQ_INT(st.arrived, 3);
+            TR_CHECK_EQ_INT(st.prefetched, 0);
+            TR_CHECK_EQ_INT(st.misses, N_EXPERT + 3);
+            if (ok && st.arrived == 3) g_ar_order++;
+            tr_experts_free(x);
+        }
+    }
+
+    /* fail: the I/O thread's first read fails: the take is -1, that unit absent, the others in; the wait reports
+     * nothing more (the call already failed), and the unit is read on demand after, exact */
+    {
+        tr_experts_config cfg = mk_cfg((uint64_t)PREFETCH_SLOTS * slot_bytes, shared_read, &f, align);
+        tr_experts *x = tr_experts_create(&cfg, err, sizeof err);
+        TR_CHECK(x != NULL && tr_experts_prefetch_start(x) == 0);
+        if (x != NULL) {
+            TR_CHECK(tr_experts_acquire(x, 0, ALL_EXPERTS, N_EXPERT) == 0);
+            atomic_store(&f.fail_io, 1);
+            TR_CHECK_EQ_INT(tr_experts_acquire_async(x, 1, three, NULL, 1, 3), 3);
+            TR_CHECK_EQ_INT(tr_experts_acquire_take(x, 1, three, 3, 3), -1);
+            int ok = unit_absent(x, 1, 0);
+            TR_CHECK(ok);
+            TR_CHECK(tr_experts_prefetch_wait(x) == 0);
+            ok &= unit_ok(x, 1, 1, align) && unit_ok(x, 1, 2, align);
+            TR_CHECK(tr_experts_acquire(x, 1, three, 3) == 0);
+            ok &= unit_ok(x, 1, 0, align) && unit_ok(x, 1, 1, align) && unit_ok(x, 1, 2, align) && layer_ok(x, 0, align);
+            TR_CHECK(ok);
+            if (ok) g_ar_fail++;
+            tr_experts_free(x);
+        }
+        atomic_store(&f.fail_io, 0);
+    }
+
+    /* sync: no I/O thread (one slot short of it): the misses read in the call, 0 queued, every unit present */
+    {
+        tr_experts_config cfg = mk_cfg((uint64_t)(PREFETCH_SLOTS - 1) * slot_bytes, shared_read, &f, align);
+        tr_experts *x = tr_experts_create(&cfg, err, sizeof err);
+        TR_CHECK(x != NULL && tr_experts_prefetch_start(x) == 1);
+        if (x != NULL) {
+            TR_CHECK_EQ_INT(tr_experts_acquire_async(x, 1, three, NULL, 1, 3), 0);
+            TR_CHECK_EQ_INT(tr_experts_acquire_take(x, 1, three, 3, 3), 3);
+            int ok = unit_ok(x, 1, 0, align) && unit_ok(x, 1, 1, align) && unit_ok(x, 1, 2, align);
+            TR_CHECK(ok);
+            if (ok) g_ar_sync++;
+            tr_experts_free(x);
+        }
+    }
+}
+
 int main(void) {
     t_test_thread = 1;
     build_part_offsets();
@@ -1924,8 +2087,16 @@ int main(void) {
         test_disk_emulated(align);
         test_hot(align);
         test_slots(align);
+        test_arrival(align);
     }
     test_align_reuse();
+    TR_CHECK(g_ar_twin > 0);
+    TR_CHECK(g_ar_twin_hot > 0);
+    TR_CHECK(g_ar_twin_runs > 0);
+    TR_CHECK(g_ar_twin_partial > 0);
+    TR_CHECK(g_ar_order > 0);
+    TR_CHECK(g_ar_fail > 0);
+    TR_CHECK(g_ar_sync > 0);
     TR_CHECK(g_sl_hot > 0);
     TR_CHECK(g_sl_lru > 0);
     TR_CHECK(g_sl_clamp > 0);

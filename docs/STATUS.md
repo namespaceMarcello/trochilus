@@ -315,9 +315,8 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
   **Question 83** (Marcello: half a prep a token): q/k/v from one prep, gate/up through a map, no gather, the swiglu
   with the down's prep: the prompt **1.058 x 1.0087**, the decode **1.025**, a 3-row pass 1.026; then the argmax
   split over the pool (116-118 -> 6 us a token): a token ~0.7%, a 3-row pass 1.0175. Every bit the same.
-  The KV's pages touched before a pass's layers: kv_write 80 -> 50 us a token, the decode +0.17% (#250). Environment
-  switches raced process against process (`tools/ab_env.sh`, A/A 0.2%). The routers as bf16: their zone 1.40-1.48x
-  (~0.4% a token), the same bits. The parallel argmax fixed (#252: +0.74%; the lint refuses `malloc(sizeof *x)`).
+  The KV's pages touched before a pass's layers: the decode +0.17% (#250). Environment switches raced process
+  against process (`tools/ab_env.sh`). The routers as bf16: ~0.4% a token, the same bits. The parallel argmax fixed (#252: +0.74%; the lint refuses `malloc(sizeof *x)`).
   Question 84 answered (a region's end ~0.8% of a dense call; #254-#256). The idle workers (piece 3, B): level in the
   engine, off by default (`TR_POOL_HINT=2`; #255, question 85). **10-02, pretouch**: out (#259).
   **10-02, piece 4**: q, k, v and gate, up one call each, the weights' items one flat range
@@ -342,13 +341,14 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
   its slots as it is written; a chat's decode on weak **Q8_0 1.22 -> 2.29, Q4_K 4.55 -> 14.77 tok/s**.
   **10-04, offered to colibri** (UPSTREAM row 7; #293-#294): `kv_room_fit` (fork branch `perf/olmoe-kv-room`), on
   colibri's engine a request **1.19x**, the logits byte-identical: **colibri #1873**, waiting for its review.
-  **10-04 evening, the eviction told the future** (#304-#307): the next layer's router as a hint 0.3% fewer misses;
-  Belady needs 4-16 tokens ahead; heat stays: closed. **10-04 night, the routes as time** (MEASUREMENTS, same name;
-  #309-#313; replayed, `evict_replay.py --prefetch`): the window, not the prediction, is the limit
-  (the true next call read ahead 1.12x of a 1.82x bound, the router's top 8 1.066 at +14% bytes); a layer's experts
-  computed as their bytes arrive **1.084 Q4_K, 1.038 Q8_0** with no byte more; both 1.129.
-  **Next** (R1 phase 3, the 8 GB machine): **question 90, the arrival order built and raced** (the router's read
-  ahead after, only if the race keeps the model's word); then a miss as one request, the prompt's last 2-3%, this PC
+  **10-04, the eviction told the future** (#304-#307): closed, heat stays. **10-04 night, the routes as time**
+  (#309-#313, replayed): the window, not the prediction, is the limit. **10-05, the arrival order** (MEASUREMENTS
+  §The arrival order built; #314-#317): a layer's misses read by the I/O thread while its present experts compute,
+  the late ones in waves as they land, the same bytes and bits: the weak decode **Q4_K 14.98 -> 16.08, Q8_0 2.33 ->
+  2.40 tok/s** (three races); in one process Q4_K 1.110, Q8_0 0.977 (#318); ds4's split replays 1.004.
+  **Next** (R1 phase 3, the 8 GB machine): the handoffs one at a time (#318-#319: each take's wake, the I/O
+  thread's gap, waves a token), a wait that spins before it blocks, the waves by the numbers; the router's read ahead
+  on top (model 1.129) after; then a miss as one request, the prompt's last 2-3%, this PC
   at half budget; then the integrated GPU (r1-igpu:
   Vulkan; q. 87-88); then R1's first prompt's cost, generation's fixed cost, the review, the server; the races
   with llama.cpp, colibri and ds4 together at R1's close. The decode's

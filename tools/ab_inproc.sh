@@ -3,7 +3,7 @@
 # (generate --ab), each arm's zones timed apart, N runs; then tools/ab_inproc.py. Both arms run in one file, one
 # memory and one set of threads: what two files of the same bytes differ by (1-2%, docs/LESSONS.md #243) and the
 # slots of a run-by-run race cannot enter. Native, still machine (tools/measure_guard.lib), the attention on the
-# CPU (TR_GPU=0), every pass on the given threads (--decode-threads). code-edit.txt, 200 tokens.
+# CPU (TR_GPU=0), every pass on the given threads (--decode-threads). code-edit.txt, 200 tokens (AB_INPROC_N).
 #
 #   sh tools/ab_inproc.sh <binary> <switch> [runs] [model] [threads] [draft]
 #       switch: none (the A/A: the tool's own noise), or one the binary knows (generate --ab);
@@ -11,6 +11,8 @@
 #   AB_INPROC_OUT (default build/ab_inproc) takes the runs; a folder that already holds some is refused.
 #   AB_INPROC_PROMPT=R adds --ab-prompt R: the prompt evaluated R times more a run (a multiple of 4), its arms
 #   A B B A, for a switch that changes the prompt's road.
+#   AB_INPROC_N (default 200): the tokens a run generates; fewer keep a slow machine's run within 60 s (the
+#   8 GB machine's Q8_0: 80, after its 411-token prompt).
 set -e
 # The body is one function, called on the last line: the shell parses all of it before it runs
 # any, so editing this file while it runs cannot change a run under way (docs/LESSONS.md #69).
@@ -48,7 +50,7 @@ IDS=$($B tokenize -m $MF -f bench/prompts/code-edit.txt)
 k=1
 while [ $k -le "$R" ]; do
   eval "$AB_GUARD" || { echo "ab_inproc: machine busy or marker lost"; exit 3; }
-  cleanup_run $B generate -m $MF --tokens "$IDS" -n 200 -t $T --decode-threads $T $SPEC --ab $SW \
+  cleanup_run $B generate -m $MF --tokens "$IDS" -n "${AB_INPROC_N:-200}" -t $T --decode-threads $T $SPEC --ab $SW \
     --profile-json "$OUT/run-$k.json" > "$OUT/run-$k.out" 2>&1
   grep '^ab:' "$OUT/run-$k.out" || true
   k=$((k + 1))

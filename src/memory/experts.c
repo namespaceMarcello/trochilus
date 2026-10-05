@@ -25,6 +25,7 @@ typedef struct {
 typedef struct {
     int64_t layer, id;
     int64_t cap; /* the most units one run of it carries (tr_experts_prefetch_n), 0: run_take's */
+    int demand;  /* 1: a call's own unit (tr_experts_acquire_async), counted arrived; 0: read ahead */
     tr_experts_read_fn read;
     tr_experts_readv_fn readv;
     void *read_ctx;
@@ -672,14 +673,54 @@ static int prefetch_take(tr_experts *x, int32_t s) {
         x->slots[s].unit = -1;
         lru_unlink(x, s);
         lru_push_back(x, s);
-        x->prefetch_failed = 1;
+        if (!job.demand) x->prefetch_failed = 1; /* a call's own unit fails that call (tr_experts_acquire_take) */
         return -1;
     }
     for (int p = 0; p < TR_EXPERT_PARTS; p++)
         x->slot_part_shift[(size_t)s * TR_EXPERT_PARTS + (size_t)p] = job.shift[p];
     x->stats.misses++;
-    x->stats.prefetched++;
+    if (job.demand) x->stats.arrived++;
+    else x->stats.prefetched++;
     return 0;
+}
+
+/* Slot v reserved for (layer, id) and queued for the I/O thread, under x->mon: its unit evicted, the new one
+ * present to the index, hot in the LRU, in flight until taken in. cap: the job's (tr_experts_prefetch_n);
+ * demand: the job's. */
+static void reserve_slot(tr_experts *x, int32_t v, int64_t layer, int64_t id, int64_t cap, int demand) {
+    experts_slot *sl = &x->slots[v];
+    if (sl->unit != -1) {
+        x->slot_of[sl->unit] = -1;
+        x->stats.evictions++;
+    }
+    int64_t unit = layer * x->n_expert + id;
+    sl->unit = (int32_t)unit;
+    x->slot_of[unit] = v;
+    lru_unlink(x, v);
+    lru_push_front(x, v);
+    x->pending[v] = 1;
+    x->n_pending++;
+
+    experts_job *job = &x->jobs[v];
+    memset(job, 0, sizeof *job);
+    job->layer = layer;
+    job->id = id;
+    job->cap = cap;
+    job->demand = demand;
+    job->read = x->read;
+    job->readv = x->readv;
+    job->read_ctx = x->read_ctx;
+    x->queue[(x->q_head + x->q_len) % x->n_alloc] = v;
+    x->q_len++;
+}
+
+/* After queuing `queued` slots under x->mon: the I/O thread woken, and the first of them taken before the
+ * caller computes on: the disk starts now, not whenever the I/O thread is next scheduled (a loaded machine, a
+ * pool busy on every core: LESSONS #286). The queue is in order: fewer than `queued` left, the first is out. */
+static void queue_wake(tr_experts *x, int64_t queued) {
+    if (queued <= 0) return;
+    tr_monitor_broadcast(x->mon);
+    while (x->q_len >= queued) tr_monitor_wait(x->mon);
 }
 
 int tr_experts_prefetch_start(tr_experts *x) {
@@ -730,37 +771,10 @@ int64_t tr_experts_prefetch_n(tr_experts *x, int64_t layer, int64_t keep, uint64
         if (x->slot_of[unit] != -1) continue;
         int32_t v = coldest_victim(x, layer, keep);
         if (v == -1) break;
-        experts_slot *sl = &x->slots[v];
-        if (sl->unit != -1) {
-            x->slot_of[sl->unit] = -1;
-            x->stats.evictions++;
-        }
-        /* reserved: present to the index, hot in the LRU, in flight until taken in */
-        sl->unit = (int32_t)unit;
-        x->slot_of[unit] = v;
-        lru_unlink(x, v);
-        lru_push_front(x, v);
-        x->pending[v] = 1;
-        x->n_pending++;
-
-        experts_job *job = &x->jobs[v];
-        memset(job, 0, sizeof *job);
-        job->layer = layer;
-        job->id = id;
-        job->cap = cap;
-        job->read = x->read;
-        job->readv = x->readv;
-        job->read_ctx = x->read_ctx;
-        x->queue[(x->q_head + x->q_len) % x->n_alloc] = v;
-        x->q_len++;
+        reserve_slot(x, v, layer, id, cap, 0);
         queued++;
     }
-    if (queued > 0) {
-        tr_monitor_broadcast(x->mon);
-        /* the first of them taken before the caller computes on: the disk starts now, not whenever the
-         * I/O thread is next scheduled (a loaded machine, a pool busy on every core: LESSONS #286) */
-        while (x->q_len >= queued) tr_monitor_wait(x->mon);
-    }
+    queue_wake(x, queued);
     tr_monitor_unlock(x->mon);
     return queued;
 }
@@ -940,8 +954,11 @@ static uint32_t hot_add(int64_t count, int64_t n_tok) {
     return a < 1 ? 1u : (uint32_t)(a < TR_EXPERTS_HOT_PROMPT ? a : TR_EXPERTS_HOT_PROMPT);
 }
 
-int tr_experts_acquire_counts(tr_experts *x, int64_t layer, const int64_t *ids, const int64_t *counts,
-                              int64_t n_tok, int64_t n) {
+/* tr_experts_acquire_counts, and with async (the I/O thread started) tr_experts_acquire_async: the second pass
+ * reserves and queues where the other reads, the victims taken in the same order by the same rule. Returns the
+ * units queued, or -1. */
+static int64_t acquire_body(tr_experts *x, int64_t layer, const int64_t *ids, const int64_t *counts, int64_t n_tok,
+                            int64_t n, int async) {
     if (layer < 0 || layer >= x->n_layers) return -1;
     if (n < 1 || n > x->n_expert) return -1;
 
@@ -984,7 +1001,26 @@ int tr_experts_acquire_counts(tr_experts *x, int64_t layer, const int64_t *ids, 
 
     /* second pass: read the missing ones, in the order given. n_slots > n (tr_experts_create's
      * minimum), and the first pass already made every present unit of this call hot, so the
-     * victim taken here is never one of this call's own units. */
+     * victim taken here is never one of this call's own units. Async: each one's victim taken as
+     * experts_fill_slot takes it (a reserved slot is hot and in flight, as a filled one is hot and
+     * named), reserved and queued; the I/O thread joins consecutive ids into the runs read here */
+    if (async && x->io != NULL) {
+        int64_t queued = 0;
+        tr_monitor_lock(x->mon);
+        for (int64_t i = 0; i < n; i++) {
+            int64_t unit = layer * x->n_expert + ids[i];
+            if (x->slot_of[unit] != -1) continue;
+            int32_t v = coldest_victim(x, -1, -1);
+            if (v == -1) break; /* every slot in flight: tr_experts_prefetch_start's margin forbids it */
+            reserve_slot(x, v, layer, ids[i], 0, 1);
+            queued++;
+        }
+        queue_wake(x, queued);
+        tr_monitor_unlock(x->mon);
+        for (int64_t i = 0; i < n; i++)
+            if (x->slot_of[layer * x->n_expert + ids[i]] == -1) return -1;
+        return queued;
+    }
     for (int64_t i = 0; i < n;) {
         int64_t id = ids[i];
         int64_t unit = layer * x->n_expert + id;
@@ -1000,6 +1036,35 @@ int tr_experts_acquire_counts(tr_experts *x, int64_t layer, const int64_t *ids, 
         i += k;
     }
     return 0;
+}
+
+int tr_experts_acquire_counts(tr_experts *x, int64_t layer, const int64_t *ids, const int64_t *counts,
+                              int64_t n_tok, int64_t n) {
+    return acquire_body(x, layer, ids, counts, n_tok, n, 0) < 0 ? -1 : 0;
+}
+
+int64_t tr_experts_acquire_async(tr_experts *x, int64_t layer, const int64_t *ids, const int64_t *counts,
+                                 int64_t n_tok, int64_t n) {
+    return acquire_body(x, layer, ids, counts, n_tok, n, 1);
+}
+
+int64_t tr_experts_acquire_take(tr_experts *x, int64_t layer, const int64_t *ids, int64_t n, int64_t at_least) {
+    if (layer < 0 || layer >= x->n_layers) return -1;
+    int64_t i = 0;
+    for (; i < n; i++) {
+        if (ids[i] < 0 || ids[i] >= x->n_expert) return -1;
+        int32_t s = x->slot_of[layer * x->n_expert + ids[i]];
+        if (s == -1) return -1;
+        if (x->pending == NULL || !x->pending[s]) continue;
+        if (i >= at_least) {
+            tr_monitor_lock(x->mon);
+            int landed = x->jobs[s].done;
+            tr_monitor_unlock(x->mon);
+            if (!landed) break;
+        }
+        if (prefetch_take(x, s) != 0) return -1;
+    }
+    return i;
 }
 
 const void *tr_experts_part(const tr_experts *x, int64_t layer, int64_t expert, int part) {

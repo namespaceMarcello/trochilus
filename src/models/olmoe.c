@@ -151,6 +151,14 @@ typedef struct {
     int64_t *acquire_ids; /* [2 n_expert] scratch: this pass's non-empty experts of the current layer, then
                            * each one's rows, for tr_experts_acquire_counts (olmoe_refresh_experts, outside
                            * the hot zone) */
+    /* the arrival order (docs/MEASUREMENTS.md §The arrival order built): a layer whose call left late units (read
+     * by the store's I/O thread while the present ones compute) runs its used experts as groups, the present ones
+     * first, then the late ones in waves as they land. wave: [4 n_expert + 2] int64, the group of each expert,
+     * the expert of each group, the groups' row offsets [n_expert + 1], a wave's own [n_expert + 1]; wave_w:
+     * [3][n_expert] each group's gate, up and down */
+    int64_t *wave;
+    tr_mat *wave_w;
+    int64_t n_ids, n_late, n_groups; /* the layer's used experts, its late units, its groups (n_late > 0 only) */
     unsigned char *taken; /* [n_workers][n_expert] scratch of the router's choice, a row per pool worker */
     float *xg;        /* [B*U][n_embd] expert inputs, grouped by expert (the roads that read floats) */
     /* [B][tr_q4x_bytes(n_embd)]: the pass's token rows prepared once for Q4_K's integer road, read by q, k and
@@ -161,6 +169,8 @@ typedef struct {
     int ab_old_act;   /* generate --ab act's arm B: the swiglu apart, the down preparing its own rows */
     int ab_no_idle;   /* generate --ab idle's arm B: no hints to the idle workers (hint_next) */
     int ab_no_fuse;   /* generate --ab fuse's arm B: q, k, v and gate, up one call each (tr_matmul_q4x_prepared_n) */
+    int ab_sync;      /* generate --ab arrive's arm B: a layer's misses read on the calling thread, then its experts */
+    int ab_waves2;    /* generate --ab waves's arm B: the late units in one wave, after the last lands */
     size_t hint_bytes; /* a hint's bytes a worker: OLMOE_HINT_BYTES, or TR_HINT_KB (research) */
     float *h1, *h2;   /* [B*U][n_ff] gate and up outputs */
     float *h3;        /* [B*U][n_embd] down outputs */
@@ -931,6 +941,8 @@ static void olmoe_session_free(void *session) {
     tr_free_aligned(s->place);
     tr_free_aligned(s->offsets);
     tr_free_aligned(s->acquire_ids);
+    tr_free_aligned(s->wave);
+    tr_free_aligned(s->wave_w);
     tr_free_aligned(s->taken);
     tr_free_aligned(s->xg);
     tr_free_aligned(s->xq_tok);
@@ -983,7 +995,8 @@ static uint64_t session_bytes(const olmoe_model *m, int64_t vocab, int64_t n_wor
                            (uint64_t)B * (uint64_t)U * (uint64_t)(m->n_embd * 2 + m->n_ff * 2) +
                            (uint64_t)(n_workers * OLMOE_ATTN_QUERIES * score_row_stride(ctx) + vocab) +
                            rope_elems * 2;
-    uint64_t scratch_i64 = (uint64_t)B * (uint64_t)U * 3 + (uint64_t)m->n_expert + 1 + (uint64_t)m->n_expert;
+    uint64_t scratch_i64 = (uint64_t)B * (uint64_t)U * 3 + (uint64_t)m->n_expert + 1 + (uint64_t)m->n_expert +
+                           (uint64_t)(4 * m->n_expert + 2) + (uint64_t)(3 * m->n_expert) * sizeof(tr_mat) / 8;
     const uint64_t xq_tok_bytes = (uint64_t)B * tr_q4x_bytes(m->n_embd);
     /* the phase-major matmul's scratch: the largest input a prompt's call passes (the experts' gathered rows),
      * the widest row, a panel per worker */
@@ -1084,6 +1097,8 @@ static void *olmoe_session_create(void *model, int64_t n_ctx, int64_t n_batch, c
     s->place = (int64_t *)tr_alloc_aligned((size_t)(B * U) * sizeof(int64_t), 64);
     s->offsets = (int64_t *)tr_alloc_aligned((size_t)(m->n_expert + 1) * sizeof(int64_t), 64);
     s->acquire_ids = (int64_t *)tr_alloc_aligned((size_t)(2 * m->n_expert) * sizeof(int64_t), 64);
+    s->wave = (int64_t *)tr_alloc_aligned((size_t)(4 * m->n_expert + 2) * sizeof(int64_t), 64);
+    s->wave_w = (tr_mat *)tr_alloc_aligned((size_t)(3 * m->n_expert) * sizeof(tr_mat), 64);
     s->taken = (unsigned char *)tr_alloc_aligned((size_t)(n_workers * m->n_expert), 64);
     s->xg = alloc_f32(B * U * m->n_embd);
     s->xq_tok = (unsigned char *)tr_alloc_aligned((size_t)xq_tok_bytes, 64);
@@ -1102,7 +1117,8 @@ static void *olmoe_session_create(void *model, int64_t n_ctx, int64_t n_batch, c
     if (kv_rc != 0 || pm_rc != 0 || s->rope_cos == NULL || s->rope_sin == NULL || s->x == NULL ||
         s->normed == NULL || s->attn_out == NULL || s->ffn_out == NULL || s->q == NULL || s->attn_concat == NULL ||
         s->k == NULL || s->v == NULL || s->router == NULL || s->sel_id == NULL || s->sel_w == NULL ||
-        s->place == NULL || s->offsets == NULL || s->acquire_ids == NULL || s->taken == NULL || s->xg == NULL ||
+        s->place == NULL || s->offsets == NULL || s->acquire_ids == NULL || s->wave == NULL || s->wave_w == NULL ||
+        s->taken == NULL || s->xg == NULL ||
         s->xq_tok == NULL || s->xmap == NULL || s->h1 == NULL || s->h2 == NULL || s->h3 == NULL || s->logits == NULL ||
         s->scores == NULL ||
         (store_partial && s->x_all == NULL)) {
@@ -1411,8 +1427,15 @@ static void route_trace_record(olmoe_session *s, int64_t L, const int32_t *token
 /* Defined below, after the hot zone (docs/ARCHITECTURE.md Esperti M1): acquires layer L's
  * non-empty experts from the shared store (reading the missing ones from disk) and refreshes
  * every expert's tr_mat.data for this layer, called once per layer from forward_layer. Allocates
- * nothing: it only touches s->acquire_ids, sized at session create. -1 on a failed read. */
+ * nothing: it only touches s->acquire_ids, sized at session create. -1 on a failed read. With the
+ * store's I/O thread (and not --ab arrive's arm B) the missing ones are left to it: s->n_late of
+ * them, their data NULL until olmoe_take_late takes them in. */
 static int olmoe_refresh_experts(olmoe_model *m, olmoe_session *s, int64_t L, int64_t n_tok);
+
+/* Defined below, after the hot zone: takes in the late units of groups [g0, g0 + n) of layer L (s->wave) as
+ * they land, the first waited for (all n under --ab waves's arm B), the next ones while already in; their
+ * data refreshed in the layer and in s->wave_w. The groups taken (>= 1), or -1 on a failed read. */
+static int64_t olmoe_take_late(olmoe_model *m, olmoe_session *s, int64_t L, int64_t g0, int64_t n);
 
 /* Defined below, after the hot zone: the KV's pages of positions [0, end) taken from the store's room before a
  * pass faults them (the store gives slots back, tr_experts_set_slots); nothing when they are held already. */
@@ -1447,6 +1470,79 @@ static void forward_embed(olmoe_model *m, olmoe_session *s, const int32_t *token
 static void hint_next(const olmoe_model *m, olmoe_session *s, const tr_mat *w, const int64_t *offsets,
                       int64_t n_groups, const tr_pm_scratch *pm) {
     if (!s->ab_no_idle) tr_matmul_hint(m->pool, w, offsets, n_groups, pm, s->hint_bytes);
+}
+
+/* The arrival order's groups (s->wave, s->wave_w): layer L's used experts, the present ones, then the late ones
+ * (data NULL), each set in id order; every (token, slot) row moved to its expert's group, keeping its place among
+ * that expert's rows. s->offsets stays the id order's. A row's values never depend on its group: each output is
+ * its own dot of the same weights and the same input row (tests/test_stream.c: the logits to the bit). */
+static void arrival_layout(olmoe_model *m, olmoe_session *s, int64_t L, int64_t n_rows) {
+    const int64_t n_expert = m->n_expert;
+    const olmoe_layer *layer = &m->layers[L];
+    int64_t *grp_of = s->wave, *grp_id = grp_of + n_expert, *offs = grp_id + n_expert;
+    tr_mat *w = s->wave_w;
+    int64_t g = 0;
+    for (int late = 0; late < 2; late++)
+        for (int64_t e = 0; e < n_expert; e++)
+            if (s->offsets[e + 1] > s->offsets[e] && (layer->gate_exps[e].data == NULL) == late) {
+                grp_of[e] = g;
+                grp_id[g++] = e;
+            }
+    s->n_groups = g;
+    offs[0] = 0;
+    for (int64_t i = 0; i < g; i++) {
+        const int64_t e = grp_id[i];
+        offs[i + 1] = offs[i] + s->offsets[e + 1] - s->offsets[e];
+        w[i] = layer->gate_exps[e];
+        w[n_expert + i] = layer->up_exps[e];
+        w[2 * n_expert + i] = layer->down_exps[e];
+    }
+    for (int64_t j = 0; j < n_rows; j++) {
+        const int64_t e = s->sel_id[j];
+        s->place[j] = offs[grp_of[e]] + s->place[j] - s->offsets[e];
+    }
+}
+
+/* The expert stages (gate and up, the activation, the down) over n_groups groups of weights w (gate), w + stride
+ * (up), w + 2 stride (down), whose rows are [row0, row0 + offsets[n_groups]) of the grouped buffers (offsets from
+ * 0). gu_road, act_road: forward_layer's choice of roads, taken for the whole layer. */
+static void expert_stages(olmoe_model *m, olmoe_session *s, const tr_mat *w, int64_t stride, const int64_t *offsets,
+                          int64_t n_groups, int64_t row0, int gu_road, int act_road) {
+    tr_pool *pool = m->pool;
+    tr_prof *prof = &s->prof;
+    const int64_t n_embd = m->n_embd, n_ff = m->n_ff, rows = offsets[n_groups];
+    float *h1 = s->h1 + row0 * n_ff, *h2 = s->h2 + row0 * n_ff, *h3 = s->h3 + row0 * n_embd;
+    /* a wave's activations prepared from pm.xq's start: its own down reads them right after, and a wave runs whole
+     * before the next (mutate_stream.sh: an offset by row0 gave the same bits, LESSONS #315) */
+    unsigned char *xq = act_road ? (unsigned char *)s->pm.xq : NULL;
+
+    uint64_t t = tr_prof_begin(prof);
+    if (gu_road) { /* tr_q4x_road said yes: both take the road (the same test inside), in one call (piece 4) */
+        const tr_mat *const wgu[2] = {w, w + stride};
+        float *const ygu[2] = {h1, h2};
+        if (s->ab_no_fuse ||
+            !tr_matmul_q4x_prepared_n(pool, wgu, 2, offsets, n_groups, s->xq_tok, s->xmap + row0, ygu, &s->pm)) {
+            tr_matmul_q4x_prepared(pool, w, offsets, n_groups, s->xq_tok, s->xmap + row0, h1, &s->pm);
+            tr_matmul_q4x_prepared(pool, w + stride, offsets, n_groups, s->xq_tok, s->xmap + row0, h2, &s->pm);
+        }
+    } else {
+        tr_matmul_grouped_s(pool, w, offsets, n_groups, s->xg + row0 * n_embd, h1, &s->pm);
+        tr_matmul_grouped_s(pool, w + stride, offsets, n_groups, s->xg + row0 * n_embd, h2, &s->pm);
+    }
+    tr_prof_end(prof, TR_PROF_EXPERT_GATE_UP, t);
+
+    /* on Q4_K's road the down's rows are prepared by the call that makes them, each row while it is in its core's
+     * cache, into pm.xq: the down reads them right after, no call between (the phase-major road, which shares that
+     * memory, never runs in between) */
+    t = tr_prof_begin(prof);
+    if (act_road) tr_swiglu_prepare(pool, h1, h2, rows, n_ff, xq);
+    else tr_swiglu(pool, h1, h2, rows * n_ff);
+    tr_prof_end(prof, TR_PROF_EXPERT_ACT, t);
+
+    t = tr_prof_begin(prof);
+    if (act_road) tr_matmul_q4x_prepared(pool, w + 2 * stride, offsets, n_groups, xq, NULL, h3, &s->pm);
+    else tr_matmul_grouped_s(pool, w + 2 * stride, offsets, n_groups, h1, h3, &s->pm);
+    tr_prof_end(prof, TR_PROF_EXPERT_DOWN, t);
 }
 
 /* One layer over n_tok tokens (1 <= n_tok <= n_batch) at positions pos0..pos0+n_tok-1, in place
@@ -1631,18 +1727,30 @@ static int forward_layer(olmoe_model *m, olmoe_session *s, int64_t L, const int3
     tr_prof_end(prof, TR_PROF_ROUTER, t);
     tr_prof_count(prof, TR_PROF_ROUTER, mat_bytes(&layer->gate_inp), 0);
 
-    /* the shared store's turn (Experts (M1)): acquire this layer's non-empty experts (missing
-     * ones read from disk here) and refresh every expert's data pointer, NULL for the ones
-     * not in RAM -- a wrong read then crashes instead of reading stale bytes. */
+    /* the shared store's turn (Experts (M1)): acquire this layer's non-empty experts and refresh every expert's
+     * data pointer, NULL for the ones not in RAM -- a wrong read then crashes instead of reading stale bytes.
+     * The missing ones are read by the store's I/O thread (s->n_late of them) while the present ones compute:
+     * the arrival order, its groups the present experts first (arrival_layout), the late ones after, in waves */
     if (olmoe_refresh_experts(m, s, L, n_tok) != 0) return -1;
-    hint_next(m, s, layer->gate_exps, s->offsets, n_expert, &s->pm); /* its pointers refreshed; after the prep */
+    const tr_mat *w = layer->gate_exps;
+    const int64_t *offs = s->offsets;
+    int64_t n_groups = n_expert, n_now = n_expert;
+    if (s->n_late > 0) {
+        arrival_layout(m, s, L, n_rows);
+        w = s->wave_w;
+        offs = s->wave + 2 * n_expert;
+        n_groups = s->n_groups;
+        n_now = n_groups - s->n_late;
+    }
+    hint_next(m, s, w, offs, n_now, &s->pm); /* its pointers refreshed; after the prep */
 
     /* experts in stages, each one job over every (token, slot) row grouped by expert. Gate and up on Q4_K's
      * road read each token's row prepared once, a grouped row through xmap (no copy); on a road that reads
-     * floats, the rows gathered */
+     * floats, the rows gathered. The roads are chosen once for the layer: a road reads its weights' type and
+     * shape, never their bytes, and a wave's groups and rows are fewer than the layer's */
     t = tr_prof_begin(prof);
-    const int gu_road = !s->ab_old_prep && tr_q4x_road(pool, layer->gate_exps, s->offsets, n_expert, &s->pm) &&
-                        tr_q4x_road(pool, layer->up_exps, s->offsets, n_expert, &s->pm);
+    const int gu_road = !s->ab_old_prep && tr_q4x_road(pool, w, offs, n_groups, &s->pm) &&
+                        tr_q4x_road(pool, w + n_expert, offs, n_groups, &s->pm);
     if (gu_road) {
         tr_q4x_prepare(pool, s->normed, n_tok, n_embd, s->xq_tok);
         for (int64_t j = 0; j < n_rows; j++) s->xmap[s->place[j]] = j / n_used;
@@ -1656,37 +1764,19 @@ static int forward_layer(olmoe_model *m, olmoe_session *s, int64_t L, const int3
         tr_parallel_for(pool, n_rows, per_chunk * n_used, gather_body, &gc);
     }
     tr_prof_end(prof, TR_PROF_EXPERT_GATHER, t);
-
-    t = tr_prof_begin(prof);
-    if (gu_road) { /* tr_q4x_road said yes: both take the road (the same test inside), in one call (piece 4) */
-        const tr_mat *const wgu[2] = {layer->gate_exps, layer->up_exps};
-        float *const ygu[2] = {s->h1, s->h2};
-        if (s->ab_no_fuse ||
-            !tr_matmul_q4x_prepared_n(pool, wgu, 2, s->offsets, n_expert, s->xq_tok, s->xmap, ygu, &s->pm)) {
-            tr_matmul_q4x_prepared(pool, layer->gate_exps, s->offsets, n_expert, s->xq_tok, s->xmap, s->h1, &s->pm);
-            tr_matmul_q4x_prepared(pool, layer->up_exps, s->offsets, n_expert, s->xq_tok, s->xmap, s->h2, &s->pm);
-        }
-    } else {
-        tr_matmul_grouped_s(pool, layer->gate_exps, s->offsets, n_expert, s->xg, s->h1, &s->pm);
-        tr_matmul_grouped_s(pool, layer->up_exps, s->offsets, n_expert, s->xg, s->h2, &s->pm);
-    }
-    tr_prof_end(prof, TR_PROF_EXPERT_GATE_UP, t);
-
-    /* on Q4_K's road the down's rows are prepared by the call that makes them, each row while it is in its core's
-     * cache, into pm.xq: the down reads them right after, no call between (the phase-major road, which shares that
-     * memory, never runs in between) */
     const int act_road = !s->ab_old_prep && !s->ab_old_act &&
-                         tr_q4x_road(pool, layer->down_exps, s->offsets, n_expert, &s->pm) && s->pm.xq != NULL &&
+                         tr_q4x_road(pool, w + 2 * n_expert, offs, n_groups, &s->pm) && s->pm.xq != NULL &&
                          (uint64_t)n_rows * tr_q4x_bytes(n_ff) <= (uint64_t)s->pm.xq_bytes;
-    t = tr_prof_begin(prof);
-    if (act_road) tr_swiglu_prepare(pool, s->h1, s->h2, n_rows, n_ff, s->pm.xq);
-    else tr_swiglu(pool, s->h1, s->h2, n_rows * n_ff);
-    tr_prof_end(prof, TR_PROF_EXPERT_ACT, t);
 
-    t = tr_prof_begin(prof);
-    if (act_road) tr_matmul_q4x_prepared(pool, layer->down_exps, s->offsets, n_expert, s->pm.xq, NULL, s->h3, &s->pm);
-    else tr_matmul_grouped_s(pool, layer->down_exps, s->offsets, n_expert, s->h1, s->h3, &s->pm);
-    tr_prof_end(prof, TR_PROF_EXPERT_DOWN, t);
+    expert_stages(m, s, w, n_expert, offs, n_now, 0, gu_road, act_road);
+    for (int64_t g = n_now; g < n_groups;) { /* the late units, a wave of every one landed, the first waited for */
+        const int64_t k = olmoe_take_late(m, s, L, g, n_groups - g);
+        if (k < 0) return -1;
+        int64_t *wo = s->wave + 3 * n_expert + 1;
+        for (int64_t i = 0; i <= k; i++) wo[i] = offs[g + i] - offs[g];
+        expert_stages(m, s, w + g, n_expert, wo, k, offs[g], gu_road, act_road);
+        g += k;
+    }
     if (prof->enabled) {
         for (int64_t e = 0; e < n_expert; e++)
             if (s->offsets[e + 1] > s->offsets[e]) {
@@ -1883,6 +1973,8 @@ static void kv_hold(olmoe_model *m, olmoe_session *s, int64_t end) {
     store_fit(m);
 }
 
+static void olmoe_read_ahead(olmoe_model *m, olmoe_session *s, int64_t L);
+
 /* Outside the hot zone (docs/ARCHITECTURE.md Esperti M1): allocates nothing, using only
  * s->acquire_ids (sized at session create). Called once per layer from forward_pass. */
 static int olmoe_refresh_experts(olmoe_model *m, olmoe_session *s, int64_t L, int64_t n_tok) {
@@ -1904,16 +1996,61 @@ static int olmoe_refresh_experts(olmoe_model *m, olmoe_session *s, int64_t L, in
     /* a pass's read ahead of this layer: what this call does not name is dropped while still queued */
     if (s->cancel_layer == L) tr_experts_prefetch_cancel(m->experts, L, s->acquire_ids, n_ids);
     s->cancel_layer = -1;
-    int rc = tr_experts_acquire_counts(m->experts, L, s->acquire_ids, counts, n_tok, n_ids);
+    int64_t rc = s->ab_sync ? tr_experts_acquire_counts(m->experts, L, s->acquire_ids, counts, n_tok, n_ids)
+                            : tr_experts_acquire_async(m->experts, L, s->acquire_ids, counts, n_tok, n_ids);
     tr_prof_end(&s->prof, TR_PROF_WEIGHT_READ, t);
     tr_experts_get_stats(m->experts, &after);
     uint64_t read_bytes = after.bytes_read - before.bytes_read;
     tr_prof_count(&s->prof, TR_PROF_WEIGHT_READ, read_bytes, read_bytes);
+    s->n_ids = n_ids;
+    s->n_late = rc > 0 ? rc : 0;
+    /* with late units the disk is theirs first: the next layer's read ahead once they are in (olmoe_take_late);
+     * issued now, its wait for its first unit would wait behind them */
+    if (rc < 0) s->prefetch_layer = -1;
+    else if (s->n_late == 0) olmoe_read_ahead(m, s, L);
 
-    /* this layer's units in hand: read the next layer's ahead while this one computes -- a pass's
-     * once this call named more than half the experts (OLMOE_AHEAD_RUN_BYTES), a layer-major
-     * block's once it named nearly every one (OLMOE_PREFETCH_SPARE_DIV) */
-    if (rc == 0 && s->prefetch_layer >= 0) {
+    /* every expert of the layer, present or not: a stale pointer from a past layer's turn must
+     * never survive, so a wrong read crashes instead of reading someone else's bytes. */
+    for (int64_t e = 0; e < n_expert; e++) {
+        layer->exps[e].data = tr_experts_part(m->experts, L, e, 0);
+        layer->exps[n_expert + e].data = tr_experts_part(m->experts, L, e, 1);
+        layer->exps[2 * n_expert + e].data = tr_experts_part(m->experts, L, e, 2);
+    }
+    return rc < 0 ? -1 : 0;
+}
+
+static int64_t olmoe_take_late(olmoe_model *m, olmoe_session *s, int64_t L, int64_t g0, int64_t n) {
+    olmoe_layer *layer = &m->layers[L];
+    const int64_t n_expert = m->n_expert;
+    const int64_t *grp_id = s->wave + n_expert;
+    tr_experts_stats before, after;
+    tr_experts_get_stats(m->experts, &before);
+    uint64_t t = tr_prof_begin(&s->prof);
+    int64_t k = tr_experts_acquire_take(m->experts, L, grp_id + g0, n, s->ab_waves2 ? n : 1);
+    tr_prof_end(&s->prof, TR_PROF_WEIGHT_READ, t);
+    tr_experts_get_stats(m->experts, &after);
+    uint64_t read_bytes = after.bytes_read - before.bytes_read;
+    tr_prof_count(&s->prof, TR_PROF_WEIGHT_READ, read_bytes, read_bytes);
+    if (k < 1) {
+        s->prefetch_layer = -1;
+        return -1;
+    }
+    for (int64_t i = g0; i < g0 + k; i++)
+        for (int p = 0; p < TR_EXPERT_PARTS; p++) {
+            const void *d = tr_experts_part(m->experts, L, grp_id[i], p);
+            layer->exps[p * n_expert + grp_id[i]].data = d;
+            s->wave_w[p * n_expert + i].data = d;
+        }
+    if (g0 + k == s->n_groups) olmoe_read_ahead(m, s, L);
+    return k;
+}
+
+/* layer L's units in hand: read the next layer's ahead while this one computes -- a pass's once the layer's call
+ * named more than half the experts (OLMOE_AHEAD_RUN_BYTES), a layer-major block's once it named nearly every one
+ * (OLMOE_PREFETCH_SPARE_DIV) */
+static void olmoe_read_ahead(olmoe_model *m, olmoe_session *s, int64_t L) {
+    const int64_t n_expert = m->n_expert, n_ids = s->n_ids;
+    if (s->prefetch_layer >= 0) {
         if (s->prefetch_pass && 2 * n_ids > n_expert) {
             if (tr_experts_prefetch_n(m->experts, s->prefetch_layer, L, s->ahead_run_bytes) > 0) {
                 s->cancel_layer = s->prefetch_layer;
@@ -1924,15 +2061,6 @@ static int olmoe_refresh_experts(olmoe_model *m, olmoe_session *s, int64_t L, in
         }
     }
     s->prefetch_layer = -1;
-
-    /* every expert of the layer, present or not: a stale pointer from a past layer's turn must
-     * never survive, so a wrong read crashes instead of reading someone else's bytes. */
-    for (int64_t e = 0; e < n_expert; e++) {
-        layer->exps[e].data = tr_experts_part(m->experts, L, e, 0);
-        layer->exps[n_expert + e].data = tr_experts_part(m->experts, L, e, 1);
-        layer->exps[2 * n_expert + e].data = tr_experts_part(m->experts, L, e, 2);
-    }
-    return rc;
 }
 
 static int olmoe_prefetch_drain(olmoe_model *m, olmoe_session *s) {
@@ -2159,13 +2287,15 @@ static void route_trace_record(olmoe_session *s, int64_t L, const int32_t *token
 /* the in-process A/B's switches (tr_session_ab_switch), arm 1 the road before: prep, the prep once a row (every
  * matmul preparing its own rows, the experts' rows gathered, the swiglu apart); act, only the swiglu and the down's
  * prep in one call; idle, no hints to the idle workers; fuse, q, k, v and gate, up one call each */
-enum { OLMOE_AB_PREP = 1, OLMOE_AB_ACT = 2, OLMOE_AB_IDLE = 3, OLMOE_AB_FUSE = 4 };
+enum { OLMOE_AB_PREP = 1, OLMOE_AB_ACT = 2, OLMOE_AB_IDLE = 3, OLMOE_AB_FUSE = 4, OLMOE_AB_ARRIVE = 5, OLMOE_AB_WAVES = 6 };
 
 static int olmoe_ab_switch(const char *name) {
     if (strcmp(name, "prep") == 0) return OLMOE_AB_PREP;
     if (strcmp(name, "act") == 0) return OLMOE_AB_ACT;
     if (strcmp(name, "idle") == 0) return OLMOE_AB_IDLE;
     if (strcmp(name, "fuse") == 0) return OLMOE_AB_FUSE;
+    if (strcmp(name, "arrive") == 0) return OLMOE_AB_ARRIVE;
+    if (strcmp(name, "waves") == 0) return OLMOE_AB_WAVES;
     return -1;
 }
 
@@ -2175,6 +2305,8 @@ static void olmoe_ab_set(void *session, int sw, int arm) {
     if (sw == OLMOE_AB_ACT) s->ab_old_act = arm;
     if (sw == OLMOE_AB_IDLE) s->ab_no_idle = arm;
     if (sw == OLMOE_AB_FUSE) s->ab_no_fuse = arm;
+    if (sw == OLMOE_AB_ARRIVE) s->ab_sync = arm;
+    if (sw == OLMOE_AB_WAVES) s->ab_waves2 = arm;
 }
 
 const tr_arch_vtable tr_olmoe_vtable = {

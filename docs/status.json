@@ -1,7 +1,7 @@
 {
   "project": "Trochilus",
   "subtitle": "AI for the machines most people own: one model at a time, to the end, exact and at the theoretical limit on three machines",
-  "updated": "2026-10-04",
+  "updated": "2026-10-05",
   "states": {
     "done": "finished and proven: green tests in make check",
     "in-progress": "we are working on it now",
@@ -1137,13 +1137,22 @@
         {
           "v": "reading experts ahead on the 8 GB machine, modelled on the real routes before any code: the next layer's router reading its experts during this layer's compute gives 1.066x (Q4_K), because one layer's compute (2.2 ms) is a third of one expert's read (7.1 ms); computing a layer's experts already in RAM while its missing one is read gives 1.084x (Q4_K) and 1.038x (Q8_0) with no byte more; both 1.129x",
           "d": "2026-10-04"
+        },
+        {
+          "v": "built: a layer's missing experts read by a second thread while the experts already in RAM compute, the late ones computed as they land; the same bytes from disk, the same bits: on the 8 GB machine generation 14.98 -> 16.08 tok/s (Q4_K, 1.073x) and 2.33 -> 2.40 (Q8_0, 1.030x) in three races, the prompt unchanged; ds4 does it on its GPU from three misses only, which replayed here keeps almost nothing (1.004x)",
+          "d": "2026-10-05"
         }
       ],
       "questions": [
         {
           "n": 90,
+          "state": "closed",
+          "text": "a decode layer's experts computed as their bytes arrive: built and raced (10-05): 1.073x (Q4_K) and 1.030x (Q8_0) on the 8 GB machine, against the model's 1.084 / 1.038"
+        },
+        {
+          "n": 91,
           "state": "open",
-          "text": "a decode layer's experts computed as their bytes arrive (the resident ones while an I/O thread reads the misses): does the engine keep the model's 1.084x (Q4_K) and 1.038x (Q8_0) on the 8 GB machine"
+          "text": "why, in one process, the arrival order's arm slows every compute zone (qkv_proj +8% Q4_K, +22% Q8_0) and two waves beat one a unit on Q8_0 (LESSONS #318-#319): each handoff's latency measured, then a wait that spins before it blocks"
         }
       ],
       "files": [
@@ -1157,7 +1166,8 @@
         "tests/bench_q4x_genome.c",
         "src/memory/experts.c (tr_experts_set_slots)",
         "src/models/olmoe.c (kv_room, kv_hold)",
-        "src/base/platform.c (tr_pages_*)"
+        "src/base/platform.c (tr_pages_*)",
+        "src/memory/experts.c (tr_experts_acquire_async, the arrival order)"
       ],
       "commands": [
         "sh tools/machines.sh <binary> 8 q4k q8",
@@ -1165,7 +1175,8 @@
         "tools/.venv/Scripts/python.exe tools/evict_replay.py <trace> --slots 290 --see 16,64,256",
         "sh tools/machines.sh table build/machines",
         "MACHINES_ARGS=\"-c 4096\" MACHINES_COUNTS=1 MACHINES_LIST=\"weak weakold\" MACHINES_BIN_weakold=<before> sh tools/machines.sh <binary> 1 q4k q8",
-        "tools/.venv/Scripts/python.exe tools/evict_replay.py <trace> --slots 615 --compute-ms 34.8 --prefetch 4,8,12 --arrive 0,1"
+        "tools/.venv/Scripts/python.exe tools/evict_replay.py <trace> --slots 615 --compute-ms 34.8 --prefetch 4,8,12 --arrive 0,1",
+        "tools/.venv/Scripts/python.exe tools/evict_replay.py <trace> --slots 615 --compute-ms 34.8 --prefetch 8 --src in --arrive 0,1,2,3 --wave-ms 0.05"
       ],
       "depends": [
         "m1-plan",

@@ -396,9 +396,10 @@ static void print_experts(const tr_model *model) {
                 st.read_sec);
         /* read ahead by the I/O thread (a prompt taken layer by layer), and how long the compute
          * still waited for it: only when it happened, so every other line reads as before */
-        if (st.prefetched > 0)
-            fprintf(stderr, ", %llu of them read ahead, %.2f s waited", (unsigned long long)st.prefetched,
-                    st.prefetch_wait_sec);
+        if (st.prefetched > 0) fprintf(stderr, ", %llu of them read ahead", (unsigned long long)st.prefetched);
+        /* a layer's misses read by the I/O thread while its present experts computed (the arrival order) */
+        if (st.arrived > 0) fprintf(stderr, ", %llu read under the compute", (unsigned long long)st.arrived);
+        if (st.prefetched > 0 || st.arrived > 0) fprintf(stderr, ", %.2f s waited", st.prefetch_wait_sec);
         /* queued ahead and dropped unread: the next layer's call did not name them (a pass's read ahead) */
         if (st.cancelled > 0) fprintf(stderr, ", %llu dropped unread", (unsigned long long)st.cancelled);
         /* slots whose pages went to the KV as the positions advanced (olmoe.c kv_hold), of the ones made */

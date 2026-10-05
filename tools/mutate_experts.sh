@@ -225,6 +225,25 @@ run "set_slots: under the minimum" $E \
 run "set_slots: a slot taken back left out of the list" $E \
   "            lru_push_back(x, (int32_t)s); /* free, at the cold end */" \
   "            (void)s;"
+# tr_experts_acquire_async / _take (test_experts arrival): a call's misses read by the I/O thread
+run "arrival: a queued unit's victim by the read ahead's rule" $E \
+  "            int32_t v = coldest_victim(x, -1, -1);" \
+  "            int32_t v = coldest_victim(x, layer, -1);"
+run "arrival: a reserved slot left cold" $E \
+  "    lru_push_front(x, v);" \
+  "    lru_push_back(x, v);"
+run "arrival: a take waits for every unit" $E \
+  "        if (i >= at_least) {" \
+  "        if (0) {"
+run "arrival: counted as read ahead" $E \
+  "    if (job.demand) x->stats.arrived++;" \
+  "    if (0) x->stats.arrived++;"
+run "arrival: a failed call's unit reported again by the wait" $E \
+  "        if (!job.demand) x->prefetch_failed = 1;" \
+  "        x->prefetch_failed = 1;"
+run "arrival: the misses read in the call" $E \
+  "    if (async && x->io != NULL) {" \
+  "    if (0) {"
 run "pages: release keeps the pages (test_base)" src/base/platform.c \
   "    return madvise((void *)lo, hi - lo, MADV_DONTNEED) == 0 ? 0 : -1;" \
   "    return 0;" test_base

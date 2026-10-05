@@ -163,8 +163,8 @@ echo "done: $OUT"
 # docs/MEASUREMENTS.md §The disk at its limit).
 # weakr: the weak machine's cores with every expert in RAM (no TR_MEM_*): its compute alone, the deletion
 # series' first piece (R1 phase 3, docs/MEASUREMENTS.md §The three machines). weakhot: weak with ds4's eviction
-# (TR_EXPERT_EVICT=hot); weakold and weakrold: weak and weakr again, for a binary of before (MACHINES_BIN_weakold,
-# MACHINES_BIN_weakrold).
+# (TR_EXPERT_EVICT=hot); weakold, weakrold, avgold and pcold: weak, weakr, avg and pc again, for a binary of before
+# (MACHINES_BIN_weakold, MACHINES_BIN_weakrold, MACHINES_BIN_avgold, MACHINES_BIN_pcold).
 MACHINES="weak|TR_GPU=0 TR_CPU_MAX=avx2 TR_MEM_TOTAL_MIB=8192 TR_MEM_AVAILABLE_MIB=4608 TR_EXPERT_DISK_MBPS=500|-t 4|21|14.3
 weakr|TR_GPU=0 TR_CPU_MAX=avx2|-t 4|21|14.3
 weakhot|TR_GPU=0 TR_CPU_MAX=avx2 TR_MEM_TOTAL_MIB=8192 TR_MEM_AVAILABLE_MIB=4608 TR_EXPERT_DISK_MBPS=500 TR_EXPERT_EVICT=hot|-t 4|21|14.3
@@ -172,7 +172,9 @@ weakold|TR_GPU=0 TR_CPU_MAX=avx2 TR_MEM_TOTAL_MIB=8192 TR_MEM_AVAILABLE_MIB=4608
 weakrold|TR_GPU=0 TR_CPU_MAX=avx2|-t 4|21|14.3
 avg|TR_GPU=0 TR_MEM_TOTAL_MIB=16384 TR_MEM_AVAILABLE_MIB=11264 TR_EXPERT_DISK_MBPS=2000|-t 8|51|34.6
 avgd|TR_MEM_TOTAL_MIB=16384 TR_MEM_AVAILABLE_MIB=11264 TR_EXPERT_DISK_MBPS=2000|-t 8|51|34.6
-pc|||83|56.3"
+avgold|TR_GPU=0 TR_MEM_TOTAL_MIB=16384 TR_MEM_AVAILABLE_MIB=11264 TR_EXPERT_DISK_MBPS=2000|-t 8|51|34.6
+pc|||83|56.3
+pcold|||83|56.3"
 
 # MACHINES_COUNTS=1: counts, not times. One profiled run an arm, no marker and no still machine: the expert
 # store's slots, hits, misses and bytes are exact counts, the same on a busy machine (every race of 2026-10-03:

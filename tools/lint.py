@@ -325,6 +325,32 @@ def check_scripts_clean_up():
             fail(84, f"tools/{f.name}: {msg}")
 
 
+def orphan_names(text):
+    """the tools/*.sh names an orphans list matches: the alternation before `)\\.sh`."""
+    m = re.search(r"\(([a-z0-9_|]+)\)\\\.sh", text)
+    return set(m.group(1).split("|")) if m else set()
+
+
+def check_orphans_lists():
+    """#317: a race's machines.sh, its wrapper stopped, kept the machine's marker, and tools/orphans.sh did not
+    see it: its list, written by hand in September, missed 14 of the 22 scripts that load tools/measure_guard.lib.
+    Both lists (orphans.sh for Linux, orphans.ps1 for Windows) hold every such script but the guard's own tests."""
+    sh = orphan_names((ROOT / "tools" / "orphans.sh").read_text(encoding="utf-8"))
+    ps1 = orphan_names((ROOT / "tools" / "orphans.ps1").read_text(encoding="utf-8"))
+    if not sh or not ps1:
+        fail(317, "tools/orphans.sh or orphans.ps1: no list of measuring scripts found")
+        return
+    guarded = {f.stem for f in (ROOT / "tools").glob("*.sh")
+               if re.search(r"^\s*\. tools/measure_guard\.lib\s*$", f.read_text(encoding="utf-8"), flags=re.M)
+               and not f.stem.startswith(("test_", "mutate_"))}
+    for name in sorted(guarded - sh):
+        fail(317, f"tools/orphans.sh: tools/{name}.sh measures (tools/measure_guard.lib) and is not in its list")
+    for name in sorted(guarded - ps1):
+        fail(317, f"tools/orphans.ps1: tools/{name}.sh measures (tools/measure_guard.lib) and is not in its list")
+    for name in sorted(sh ^ ps1):
+        fail(317, f"tools/orphans.sh and orphans.ps1 differ: {name}")
+
+
 def tee_problems(text):
     """lines of a shell script that pipe into tee something that can fail."""
     problems = []
@@ -746,7 +772,7 @@ def check_mutations_apply():
 def main():
     for check in (check_docs_control_chars, check_line_endings, check_doc_limits, check_no_future_dates, check_lessons_table,
                   check_type_table, check_tests_no_tmpfile, check_hot_zones, check_global_state,
-                  check_makefile_recipes_ascii, check_shell_scripts_whole, check_scripts_clean_up,
+                  check_makefile_recipes_ascii, check_shell_scripts_whole, check_scripts_clean_up, check_orphans_lists,
                   check_no_failure_into_tee, check_struct_calloc, check_expf_table, check_readme_numbers,
                   check_english, check_status_json, check_one_rung, check_upstream_verdicts, check_mutations_apply):
         check()

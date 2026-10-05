@@ -192,6 +192,7 @@ int app_expert_stats(const tr_model *model, tr_experts_stats *out) {
         out->bytes_read -= g_serve.base.bytes_read;
         out->read_sec -= g_serve.base.read_sec;
         out->prefetched -= g_serve.base.prefetched;
+        out->arrived -= g_serve.base.arrived;
         out->prefetch_wait_sec -= g_serve.base.prefetch_wait_sec;
         out->cancelled -= g_serve.base.cancelled;
     }

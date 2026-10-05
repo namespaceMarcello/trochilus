@@ -56,6 +56,12 @@
  *                the file's dense + expert tensor bytes, one report per dense tensor and per
  *                expert unit, done strictly growing and ending on total; at the smallest store
  *                (really partial): total == dense bytes only, one report per dense tensor
+ *   arrival      a layer's misses read by the store's I/O thread while its present experts compute
+ *                (olmoe_refresh_experts, arrival_layout, olmoe_take_late): 6 layers, 4 of 8 experts used,
+ *                at the I/O thread's smallest store and 6 slots more, Q4_K (its integer roads) and F32,
+ *                pool of 4: one-token passes and a whole prompt's rows give the resident's logits in every
+ *                arm (each late unit as it lands, two waves, --ab arrive's arm B on the calling thread);
+ *                the first two counted arrived > 0, the third 0; misses, evictions and bytes equal in all
  *
  * Seen red: tools/mutate_stream.sh; progress: tools/mutate_bar.sh.
  */
@@ -1113,6 +1119,95 @@ static void test_progress(const char *argv0) {
     TR_CHECK_EQ_INT(checked, 2);
 }
 
+/* ---- arrival: a layer's misses read by the store's I/O thread while its present experts compute ---- */
+
+/* 6 layers of 8 experts, 4 used: 48 units, the I/O thread from 2 x 8 + 4 = 20 slots (tr_experts_prefetch_start) */
+enum { AR_LAYERS = 6, AR_USED = 4, AR_ARMS = 3 };
+static const char *const AR_ARM_NAME[AR_ARMS] = {"arrival", "two waves", "on the calling thread"};
+static int64_t g_ar_arrived, g_ar_waves2, g_ar_same_bytes;
+
+static void test_arrival_one(const char *argv0, tr_type type, int64_t embd, int64_t ff, const char *file) {
+    const synth_params P = {AR_LAYERS, embd, N_HEAD, N_HEAD_KV, ff, N_EXPERT, AR_USED, VOCAB, CTX, type};
+    char path[512];
+    TR_CHECK(synth_write(&P, argv0, file, path, sizeof path) == 0);
+    int32_t tokens[N_PROMPT];
+    for (int i = 0; i < N_PROMPT; i++) tokens[i] = prompt_token(i);
+
+    float ref[N_PROMPT][VOCAB];
+    uint64_t slot_bytes = 0;
+    tr_model *m = load_budget(path, NULL, HUGE_BUDGET);
+    tr_session *s = create_session(m, 0);
+    if (s != NULL) {
+        for (int i = 0; i < N_PROMPT; i++) {
+            TR_CHECK(tr_session_eval(s, tokens + i, 1) == 0); /* one-token passes, resident: the reference */
+            memcpy(ref[i], tr_session_logits(s), sizeof ref[i]);
+        }
+        tr_experts_stats st;
+        TR_CHECK(tr_model_expert_stats(m, &st) == 0);
+        slot_bytes = st.slot_bytes;
+        tr_session_free(s);
+    }
+    tr_model_free(m);
+    if (slot_bytes == 0) return;
+
+    /* each budget, each arm on a fresh model: the decode's logits and a whole prompt's rows the reference's, and
+     * the store's reads the same in every arm (the arrival order moves no byte) */
+    static const int64_t slots_list[] = {2 * N_EXPERT + AR_USED, 2 * N_EXPERT + AR_USED + 6};
+    tr_pool *pool = tr_pool_create(4);
+    for (size_t b = 0; b < sizeof slots_list / sizeof slots_list[0]; b++) {
+        tr_experts_stats arm_st[AR_ARMS];
+        memset(arm_st, 0, sizeof arm_st);
+        for (int arm = 0; arm < AR_ARMS; arm++) {
+            m = load_budget(path, pool, (uint64_t)slots_list[b] * slot_bytes);
+            s = create_session(m, 0);
+            if (s == NULL) {
+                tr_model_free(m);
+                continue;
+            }
+            int sw_arrive = tr_session_ab_switch(s, "arrive"), sw_waves = tr_session_ab_switch(s, "waves");
+            TR_CHECK(sw_arrive > 0 && sw_waves > 0);
+            tr_session_ab_set(s, sw_arrive, arm == 2);
+            tr_session_ab_set(s, sw_waves, arm == 1);
+            int same = 1;
+            for (int i = 0; i < N_PROMPT; i++) {
+                TR_CHECK(tr_session_eval(s, tokens + i, 1) == 0);
+                same &= memcmp(tr_session_logits(s), ref[i], sizeof ref[i]) == 0;
+            }
+            TR_CHECK(tr_session_rewind(s, 0) == 0);
+            TR_CHECK(tr_session_eval_rows(s, tokens, N_PROMPT, N_PROMPT) == 0); /* several rows a group */
+            for (int i = 0; i < N_PROMPT; i++)
+                same &= memcmp(tr_session_logits_back(s, N_PROMPT - 1 - i), ref[i], sizeof ref[i]) == 0;
+            if (!same)
+                fprintf(stderr, "  arrival: %s, %lld slots: logits differ\n", AR_ARM_NAME[arm], (long long)slots_list[b]);
+            TR_CHECK(same);
+            TR_CHECK(tr_model_expert_stats(m, &arm_st[arm]) == 0);
+            TR_CHECK_EQ_INT(arm_st[arm].n_slots, slots_list[b]);
+            if (arm < 2) TR_CHECK(arm_st[arm].arrived > 0); /* the branch ran: misses read under the compute */
+            else TR_CHECK_EQ_INT(arm_st[arm].arrived, 0);
+            if (same && arm == 0 && arm_st[arm].arrived > 0) g_ar_arrived++;
+            if (same && arm == 1 && arm_st[arm].arrived > 0) g_ar_waves2++;
+            tr_session_free(s);
+            tr_model_free(m);
+        }
+        for (int arm = 1; arm < AR_ARMS; arm++) {
+            TR_CHECK_EQ_INT(arm_st[arm].misses, arm_st[0].misses);
+            TR_CHECK_EQ_INT(arm_st[arm].evictions, arm_st[0].evictions);
+            TR_CHECK_EQ_INT(arm_st[arm].bytes_read, arm_st[0].bytes_read);
+        }
+        if (arm_st[0].misses > 0 && arm_st[0].bytes_read == arm_st[2].bytes_read) g_ar_same_bytes++;
+    }
+    tr_pool_destroy(pool);
+    remove(path);
+}
+
+static void test_arrival(const char *argv0) {
+    test_arrival_one(argv0, TR_TYPE_Q4_K, 256, 512, "stream_arrival_q4k.gguf"); /* Q4_K's integer roads */
+    test_arrival_one(argv0, TR_TYPE_F32, 64, 128, "stream_arrival_f32.gguf");  /* the roads that read floats */
+    TR_CHECK(g_ar_arrived > 0);
+    TR_CHECK(g_ar_waves2 > 0);
+    TR_CHECK(g_ar_same_bytes > 0);
+}
+
 int main(int argc, char **argv) {
     const char *argv0 = argc > 0 ? argv[0] : "";
     test_content(argv0);
@@ -1125,5 +1220,6 @@ int main(int argc, char **argv) {
     test_direct(argv0);
     test_mem_available(argv0);
     test_progress(argv0);
+    test_arrival(argv0);
     TR_TEST_EXIT();
 }

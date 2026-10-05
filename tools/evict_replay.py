@@ -322,8 +322,8 @@ def replay(calls, slots, policy, n_expert, seed=0, n_layers=16, heats=None):
     return hits, misses, prompt_misses
 
 
-def replay_time(tr, slots, heats, k, src="in", comp=40.0, attn=0.25, mbs=500.0, chunk=512 << 10, arrive=False,
-                head=0.0):
+def replay_time(tr, slots, heats, k, src="in", comp=40.0, attn=0.25, mbs=500.0, chunk=512 << 10, arrive=0,
+                head=0.0, wave=0.0):
     """(decode misses, read-ahead units named, decode bytes, decode ms): heat's store, one disk queue, and the next
     call's units read ahead (MEASUREMENTS §The routes as time). A layer is attn x comp / n_layers of compute, its
     router, its units (the misses and a read ahead's rest first on the disk, in call order), the rest of its
@@ -331,10 +331,12 @@ def replay_time(tr, slots, heats, k, src="in", comp=40.0, attn=0.25, mbs=500.0, 
     queued, each taking a slot (heat's victim); "out": the same after the layer (pred_out); "oracle": the next
     call's true units. The queue reads while the disk is free, `chunk` bytes at a time (0: a unit whole), a demand
     waiting for the chunk in flight; at the next router a queued unit it names is finished as a demand, one it does
-    not name dropped (its slot freed if not read whole). k = 0: the serial model, comp + misses at mbs. arrive: the
+    not name dropped (its slot freed if not read whole). k = 0: the serial model, comp + misses at mbs. arrive 1: the
     rest of a layer's compute split evenly among its units, each computed as soon as its bytes are in (the resident
-    ones first, a miss read under them); else after the last. head: the share of comp after the last layer (the
-    output head, nothing to hide under it)."""
+    ones first, a miss read under them); 2: two waves, the units in at the router, then every late one once the last
+    is in; 3: 2 from three late units a layer, else 0 (ds4's split); 0: every unit after the last. wave: the ms
+    each wave of late units adds (the engine's extra pool regions). head: the share of comp after the last layer
+    (the output head, nothing to hide under it)."""
     calls = calls_of(tr)
     nl, ne, np_ = tr["n_layers"], tr["n_expert"], tr["n_prompt"]
     pred = tr["pred_out" if src == "out" else "pred_in"]
@@ -421,10 +423,15 @@ def replay_time(tr, slots, heats, k, src="in", comp=40.0, attn=0.25, mbs=500.0, 
             continue
         if t > max(st["disk"], st["T"]):
             st["disk"] = t
-        if arrive:
+        late = [r for r in arr if r > st["T"]]
+        if arrive == 3 and len(late) < 3:  # ds4's split: worth it from 3 misses a layer (ds4_metal.m:13095)
+            done = max(arr) + f
+        elif arrive >= 2 and late:      # two waves: the resident units, then every late one after the last
+            done = max(st["T"] + (len(arr) - len(late)) * f / len(units), max(late)) + len(late) * f / len(units) + wave
+        elif arrive:
             done = st["T"]
             for r in sorted(arr):
-                done = max(done, r) + f / len(units)
+                done = max(done, r) + f / len(units) + (wave if r > st["T"] else 0.0)
         else:
             done = max(arr) + f
         nxt = [] if k == 0 or L == nl - 1 else (
@@ -467,8 +474,9 @@ def main(argv):
     if "--prefetch" in opts:
         attn = float(opts.get("--attn-frac", "0.25"))
         chunks = [int(c) << 10 for c in opts.get("--chunk-kib", "512").split(",")]
-        arrives = [bool(int(x)) for x in opts.get("--arrive", "0").split(",")]
+        arrives = [int(x) for x in opts.get("--arrive", "0").split(",")]
         head = float(opts.get("--head-frac", "0.05"))
+        wave = float(opts.get("--wave-ms", "0"))
         print(f"the next call read ahead (replay_time): {attn:g} of a layer's compute before its router, "
               f"{head:g} of a token's "
               f"after the last layer; gain against "
@@ -482,9 +490,9 @@ def main(argv):
                 (a, src, k, ch) for a in arrives for src in opts.get("--src", "in,out,oracle").split(",")
                 for k in (ks[:1] if src == "oracle" else ks) for ch in chunks]
             for arrive, src, k, ch in runs:
-                m, u, rd, ms = replay_time(tr, S, heats["heat"], k, src, comp, attn, disk, ch, arrive, head)
+                m, u, rd, ms = replay_time(tr, S, heats["heat"], k, src, comp, attn, disk, ch, arrive, head, wave)
                 base = base or ms
-                print(f"{S:>6} {src + '+a' * arrive:>8} {k:>3} {ch >> 10:>6} {m / n_dec:>9.2f} {u / n_dec:>10.2f} "
+                print(f"{S:>6} {src + (f'+a{arrive}' if arrive else ''):>8} {k:>3} {ch >> 10:>6} {m / n_dec:>9.2f} {u / n_dec:>10.2f} "
                       f"{rd / n_dec / 2**20:>8.1f} {ms / n_dec:>7.2f} {1000 * n_dec / ms:>7.2f} {base / ms:>6.3f}")
         return 0
     print(f"{'slots':>6} {'policy':>7} {'hits/tok':>9} {'miss/tok':>9} {'MiB/tok':>8} {'prompt MiB':>11} {'tok/s':>7}")
@@ -612,6 +620,24 @@ def run_check():
         got = replay_time(tr, 4, [[1], [1, 1]], 0, "in", 4.0, 0.25, 0.25, 250, arrive)
         check(got[:3] == (1, 0, 1000) and abs(got[3] - want) <= 1e-9,
               f"replay_time arrive {arrive}: {got} want (1, 0, 1000, {want})")
+    # the waves: the decode asks 0 and 2 (misses, in at 5 and 9) and 1 (resident, in at 1), 1 ms a unit after the
+    # attention's 1. Per arrival: 1 -> 2, 0 5 -> 6, 2 9 -> 10, a wave's 0.5 after each late one 10.5; two waves:
+    # 1 -> 2, then both at 9 -> 11, 11.5; ds4's (two late, under 3): serial, 9 + 3 = 12; serial 12
+    tr = {"n_layers": 1, "n_expert": 4, "n_prompt": 1, "n_tokens": 2, "expert_bytes": 1000,
+          "chosen": [[[1]], [[0, 1, 2]]], "pred_in": None, "pred_out": None}
+    for arrive, wave, want in [(1, 0.0, 10.0), (1, 0.5, 10.5), (2, 0.0, 11.0), (2, 0.5, 11.5), (3, 0.0, 12.0),
+                               (0, 0.5, 12.0)]:
+        got = replay_time(tr, 4, [[1], [1, 1, 1]], 0, "in", 4.0, 0.25, 0.25, 250, arrive, 0.0, wave)
+        check(got[:3] == (2, 0, 2000) and abs(got[3] - want) <= 1e-9,
+              f"replay_time arrive {arrive} wave {wave}: {got} want (2, 0, 2000, {want})")
+    # ds4's split from three late units: 0, 2, 3 missing (in at 5, 9, 13), 1 resident; 0.75 ms a unit: 1 -> 1.75,
+    # then the three at 13 -> 15.25; serial 13 + 3 = 16
+    tr = {"n_layers": 1, "n_expert": 4, "n_prompt": 1, "n_tokens": 2, "expert_bytes": 1000,
+          "chosen": [[[1]], [[0, 1, 2, 3]]], "pred_in": None, "pred_out": None}
+    for arrive, want in [(3, 15.25), (0, 16.0)]:
+        got = replay_time(tr, 4, [[1], [1, 1, 1, 1]], 0, "in", 4.0, 0.25, 0.25, 250, arrive)
+        check(got[:3] == (3, 0, 3000) and abs(got[3] - want) <= 1e-9,
+              f"replay_time ds4 split {arrive}: {got} want (3, 0, 3000, {want})")
     # heat_add: c as is up to 64 tokens, else c x 64 / n rounded half up, at least 1
     for c, n, want in [(5, 64, 5), (3, 128, 2), (10, 321, 2), (1, 321, 1), (1, 1, 1)]:
         check(heat_add(c, n) == want, f"heat_add({c}, {n}) = {heat_add(c, n)} want {want}")
