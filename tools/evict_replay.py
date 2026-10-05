@@ -323,7 +323,7 @@ def replay(calls, slots, policy, n_expert, seed=0, n_layers=16, heats=None):
 
 
 def replay_time(tr, slots, heats, k, src="in", comp=40.0, attn=0.25, mbs=500.0, chunk=512 << 10, arrive=0,
-                head=0.0, wave=0.0):
+                head=0.0, wave=0.0, k2=0, counts=None, gate=None):
     """(decode misses, read-ahead units named, decode bytes, decode ms): heat's store, one disk queue, and the next
     call's units read ahead (MEASUREMENTS §The routes as time). A layer is attn x comp / n_layers of compute, its
     router, its units (the misses and a read ahead's rest first on the disk, in call order), the rest of its
@@ -336,7 +336,15 @@ def replay_time(tr, slots, heats, k, src="in", comp=40.0, attn=0.25, mbs=500.0, 
     ones first, a miss read under them); 2: two waves, the units in at the router, then every late one once the last
     is in; 3: 2 from three late units a layer, else 0 (ds4's split); 0: every unit after the last. wave: the ms
     each wave of late units adds (the engine's extra pool regions). head: the share of comp after the last layer
-    (the output head, nothing to hide under it)."""
+    (the output head, nothing to hide under it). Two layers ahead (MEASUREMENTS §The router's read ahead): src
+    "in2", L+2's top k2 on L's FFN input (pred_out of a TR_ROUTE_PRED=two trace) queued behind L+1's top k; "oracle2",
+    the true L+1 and L+2 calls. A router drops only its own layer's queued units it does not name; the queue's other
+    layers stay, behind its demand reads. counts (a dict): the decode's units read ahead (issued), and those a router
+    dropped half read (stopped) or unread (dropped), as the engine's store counts them. gate (ms): no guess at a router whose disk is still busy more than
+    that with what is already asked (the layer's misses, earlier guesses)."""
+    cnt = counts if counts is not None else {}
+    for key in ("issued", "stopped", "dropped"):
+        cnt[key] = 0
     calls = calls_of(tr)
     nl, ne, np_ = tr["n_layers"], tr["n_expert"], tr["n_prompt"]
     pred = tr["pred_out" if src == "out" else "pred_in"]
@@ -379,6 +387,7 @@ def replay_time(tr, slots, heats, k, src="in", comp=40.0, attn=0.25, mbs=500.0, 
                 last[u] = i
                 queue.append([u, ub])
                 st["issued"].add(u)
+                cnt["issued"] += 1
         st["q_t"] = st["T"]
 
     for i, (tok, units) in enumerate(calls):
@@ -395,11 +404,13 @@ def replay_time(tr, slots, heats, k, src="in", comp=40.0, attn=0.25, mbs=500.0, 
             progress(st["T"])
         left = {u: n for u, n in queue if u in named}
         for u, n in queue:
-            if u not in named and n > 0:
+            if u // ne == L and u not in named and n > 0:
                 present.discard(u)
-        queue.clear()
+                if tok >= 0:
+                    cnt["stopped" if n < ub else "dropped"] += 1
+        queue[:] = [q for q in queue if q[0] // ne != L]
         used += len(named & st["issued"])
-        st["issued"] = set()
+        st["issued"] = {u for u in st["issued"] if u // ne != L}
         t = max(st["disk"], st["T"])
         arr = []                      # when each unit's bytes are in
         for j, u in enumerate(units):
@@ -435,8 +446,14 @@ def replay_time(tr, slots, heats, k, src="in", comp=40.0, attn=0.25, mbs=500.0, 
         else:
             done = max(arr) + f
         nxt = [] if k == 0 or L == nl - 1 else (
-            [(L + 1) * ne + e for e in tr["chosen"][tok][L + 1]] if src == "oracle" else
+            [(L + 1) * ne + e for e in tr["chosen"][tok][L + 1]] if src in ("oracle", "oracle2") else
             [(L + 1) * ne + e for e in pred[tok][L][:k] if e != 0xFFFF])
+        if L + 2 < nl and src == "oracle2":
+            nxt += [(L + 2) * ne + e for e in tr["chosen"][tok][L + 2]]
+        elif L + 2 < nl and src == "in2":
+            nxt += [(L + 2) * ne + e for e in tr["pred_out"][tok][L][:k2] if e != 0xFFFF]
+        if gate is not None and max(st["disk"], st["T"]) - st["T"] > gate:
+            nxt = []                  # the disk busy past the gate: a guess would start too late to matter
         if src != "out":
             issue(nxt, i, named)
         st["T"] = done + (comp * head if L == nl - 1 else 0.0)
@@ -482,18 +499,26 @@ def main(argv):
               f"after the last layer; gain against "
               f"serial (k 0); oracle: the next call's true units")
         print(f"{'slots':>6} {'src':>8} {'k':>3} {'chunk':>6} {'miss/tok':>9} {'ahead/tok':>10} {'MiB/tok':>8} "
-              f"{'ms/tok':>7} {'tok/s':>7} {'gain':>6}")
+              f"{'ms/tok':>7} {'tok/s':>7} {'gain':>6} {'issued':>7} {'stopped':>8} {'dropped':>8}")
         for S in slots_list:
             base = None
             ks = [int(x) for x in opts["--prefetch"].split(",")]
-            runs = [(a, "serial", 0, chunks[0]) for a in arrives] + [
-                (a, src, k, ch) for a in arrives for src in opts.get("--src", "in,out,oracle").split(",")
-                for k in (ks[:1] if src == "oracle" else ks) for ch in chunks]
-            for arrive, src, k, ch in runs:
-                m, u, rd, ms = replay_time(tr, S, heats["heat"], k, src, comp, attn, disk, ch, arrive, head, wave)
+            k2s = [int(x) for x in opts.get("--k2", "0").split(",")]
+            gates = [None if g == "none" else float(g) for g in opts.get("--gate-ms", "none").split(",")]
+            runs = [(a, "serial", 0, chunks[0], 0, None) for a in arrives] + [
+                (a, src, k, ch, k2, g) for a in arrives for src in opts.get("--src", "in,out,oracle").split(",")
+                for k in (ks[:1] if src.startswith("oracle") else ks) for ch in chunks
+                for k2 in (k2s if src == "in2" else [0]) for g in gates]
+            for arrive, src, k, ch, k2, g in runs:
+                cnt = {}
+                m, u, rd, ms = replay_time(tr, S, heats["heat"], k, src, comp, attn, disk, ch, arrive, head, wave, k2,
+                                           cnt, g)
                 base = base or ms
-                print(f"{S:>6} {src + (f'+a{arrive}' if arrive else ''):>8} {k:>3} {ch >> 10:>6} {m / n_dec:>9.2f} {u / n_dec:>10.2f} "
-                      f"{rd / n_dec / 2**20:>8.1f} {ms / n_dec:>7.2f} {1000 * n_dec / ms:>7.2f} {base / ms:>6.3f}")
+                name = src + (f"{k2}" if src == "in2" else "") + (f"+a{arrive}" if arrive else "") + (
+                    f"<{g:g}" if g is not None else "")
+                print(f"{S:>6} {name:>8} {k:>3} {ch >> 10:>6} {m / n_dec:>9.2f} {u / n_dec:>10.2f} "
+                      f"{rd / n_dec / 2**20:>8.1f} {ms / n_dec:>7.2f} {1000 * n_dec / ms:>7.2f} {base / ms:>6.3f} "
+                      f"{cnt['issued'] / n_dec:>7.2f} {cnt['stopped'] / n_dec:>8.2f} {cnt['dropped'] / n_dec:>8.2f}")
         return 0
     print(f"{'slots':>6} {'policy':>7} {'hits/tok':>9} {'miss/tok':>9} {'MiB/tok':>8} {'prompt MiB':>11} {'tok/s':>7}")
     for S in slots_list:

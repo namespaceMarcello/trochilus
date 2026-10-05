@@ -1145,6 +1145,10 @@
         {
           "v": "the same binary run in each of its three ways, whole processes: computing each late expert as it lands is the best way on both models (Q4_K 1.079x, Q8_0 1.025x against the old way, two waves 1.073x and 1.015x); the threads handing work to each other cost 0.16% of a run",
           "d": "2026-10-05"
+        },
+        {
+          "v": "the router's read ahead (10-05): at a layer's router the next layer's router guesses its experts, 27 MiB of them read in pieces, a guess the next layer does not ask stopped mid-read, one it asks read whole from then on: the 8 GB machine's generation 1.031x (Q4_K), 1.000-1.005x (Q8_0), the same tokens; colibri's predictor replayed: its norm the same, its average 4.3 points worse; two layers ahead predicted at 74% and no gain",
+          "d": "2026-10-05"
         }
       ],
       "questions": [
@@ -1157,6 +1161,21 @@
           "n": 91,
           "state": "closed",
           "text": "why the arrival order's arm slowed in one process: the handoffs measured cheap (11-13 us a take, 0.16% of a run) and whole processes of one binary agree with the races; the in-process A/B's alternation was its own (LESSONS #318)"
+        },
+        {
+          "n": 92,
+          "state": "closed",
+          "text": "the router's read ahead on top of the arrival order: built and raced (10-05): 1.031x (Q4_K) and 1.000-1.005x (Q8_0) on the 8 GB machine; whole-unit reads lose, pieces stopped when not named gain, a guess named is read a part a request (MEASUREMENTS §The router's read ahead)"
+        },
+        {
+          "n": 93,
+          "state": "open",
+          "text": "the read ahead raced against the old binary (Smart App Control held 12147b2 all of 10-05) and on the average machine's Q8_0 (a 2 GB/s disk)"
+        },
+        {
+          "n": 94,
+          "state": "open",
+          "text": "a draft from the bytes the machine already holds (Marcello, 10-05: one piece for the whole structure, a gain on every machine): several exact tokens a pass, the draft restricted to the experts already in RAM (disk-bound machines, and from R2 on every ordinary one) or already streamed by the pass (RAM-bound); phase 1 measures and models it (build/prompt-draft.md)"
         }
       ],
       "files": [
@@ -1171,7 +1190,9 @@
         "src/memory/experts.c (tr_experts_set_slots)",
         "src/models/olmoe.c (kv_room, kv_hold)",
         "src/base/platform.c (tr_pages_*)",
-        "src/memory/experts.c (tr_experts_acquire_async, the arrival order)"
+        "src/memory/experts.c (tr_experts_acquire_async, the arrival order)",
+        "src/memory/experts.c (tr_experts_prefetch_ids, the router's read ahead)",
+        "src/models/olmoe.c (olmoe_router_ahead)"
       ],
       "commands": [
         "sh tools/machines.sh <binary> 8 q4k q8",
@@ -1180,7 +1201,8 @@
         "sh tools/machines.sh table build/machines",
         "MACHINES_ARGS=\"-c 4096\" MACHINES_COUNTS=1 MACHINES_LIST=\"weak weakold\" MACHINES_BIN_weakold=<before> sh tools/machines.sh <binary> 1 q4k q8",
         "tools/.venv/Scripts/python.exe tools/evict_replay.py <trace> --slots 615 --compute-ms 34.8 --prefetch 4,8,12 --arrive 0,1",
-        "tools/.venv/Scripts/python.exe tools/evict_replay.py <trace> --slots 615 --compute-ms 34.8 --prefetch 8 --src in --arrive 0,1,2,3 --wave-ms 0.05"
+        "tools/.venv/Scripts/python.exe tools/evict_replay.py <trace> --slots 615 --compute-ms 34.8 --prefetch 8 --src in --arrive 0,1,2,3 --wave-ms 0.05",
+        "tools/.venv/Scripts/python.exe tools/evict_replay.py <trace> --slots 615 --compute-ms 34.8 --prefetch 8 --src in,in2,oracle2 --k2 1,2,3 --chunk-kib 512 --arrive 1 --gate-ms none,2"
       ],
       "depends": [
         "m1-plan",

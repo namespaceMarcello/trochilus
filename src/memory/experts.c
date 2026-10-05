@@ -26,6 +26,10 @@ typedef struct {
     int64_t layer, id;
     int64_t cap; /* the most units one run of it carries (tr_experts_prefetch_n), 0: run_take's */
     int demand;  /* 1: a call's own unit (tr_experts_acquire_async), counted arrived; 0: read ahead */
+    uint64_t chunk; /* > 0: read alone in requests of at most this many bytes (tr_experts_prefetch_ids) */
+    int stop;       /* tr_experts_prefetch_cancel dropped it in flight: the I/O thread stops at its next request */
+    int named;      /* a call named it (tr_experts_acquire_async): no more a guess, the rest read a part a request */
+    int stopped;    /* published with done: it stopped before its last request */
     tr_experts_read_fn read;
     tr_experts_readv_fn readv;
     void *read_ctx;
@@ -84,6 +88,8 @@ struct tr_experts {
     int32_t *queue;          /* [n_slots] ring of slots for the I/O thread, under mon */
     int64_t q_head, q_len;   /* under mon */
     int io_stop;             /* under mon: the I/O thread ends once the queue is empty */
+    int io_busy;             /* under mon: the I/O thread holds a job or has one queued (not asleep) */
+    int32_t io_slot;         /* under mon: the slot it reads alone (no run), -1: none; still set once done */
     unsigned char *pending;  /* [n_slots]: reserved and not taken in yet -- calling thread only */
     int64_t n_pending;       /* calling thread only */
     int prefetch_failed;     /* calling thread only: a read ahead failed since the last wait */
@@ -245,6 +251,40 @@ static int read_parts(const tr_experts *x, tr_experts_read_fn read, void *ctx, i
     return 0;
 }
 
+/* read_parts for slot s's job read ahead in pieces (job->chunk bytes at most a request, rounded up to read_align),
+ * the stop asked by tr_experts_prefetch_cancel looked at before each request: 1 stopped there, 0 read whole, -1
+ * failed. Once a call names it (job->named) it is no more a guess: the rest of each part in one request, as
+ * read_parts reads it (a request's fixed cost paid once, not a piece at a time). The same bytes land where
+ * read_parts puts them. */
+static int read_parts_chunked(const tr_experts *x, int32_t s, const experts_job *job, unsigned char *base,
+                              uint64_t shift[TR_EXPERT_PARTS], uint64_t *bytes, double *sec, uint64_t *requests) {
+    uint64_t align = x->read_align;
+    uint64_t chunk = (job->chunk + align - 1) / align * align;
+    for (int p = 0; p < TR_EXPERT_PARTS; p++) {
+        size_t idx = (size_t)job->layer * TR_EXPERT_PARTS + (size_t)p;
+        uint64_t file_off = x->part_offset[idx] + (uint64_t)x->part_bytes[idx] * (uint64_t)job->id;
+        uint64_t lo = file_off / align * align;
+        uint64_t hi = (file_off + (uint64_t)x->part_bytes[idx] + align - 1) / align * align;
+        for (uint64_t off = lo; off < hi;) {
+            tr_monitor_lock(x->mon);
+            int stop = x->jobs[s].stop, named = x->jobs[s].named;
+            tr_monitor_unlock(x->mon);
+            if (stop) return 1;
+            size_t n = (size_t)(named || hi - off < chunk ? hi - off : chunk);
+            double t0 = tr_time_sec();
+            int rc = job->read(job->read_ctx, base + x->part_slot_offset[idx] + (off - lo), n, off);
+            if (rc == 0) disk_emulate(x, t0, n);
+            *sec += tr_time_sec() - t0;
+            (*requests)++;
+            if (rc != 0) return -1;
+            *bytes += n;
+            off += n;
+        }
+        shift[p] = file_off - lo;
+    }
+    return 0;
+}
+
 /* The units (layer, id0 .. id0 + k - 1) into slots[0..k), one request a part through readv, the
  * three in flight together (two give this disk +7.6% over one at 68 MiB: docs/MEASUREMENTS.md §The
  * disk at its limit): each unit's aligned range [lo, hi) as read_parts reads it, laid end to end.
@@ -321,6 +361,7 @@ static void io_main(void *arg) {
         int waited = 0;
         while (x->q_len == 0 && !x->io_stop) {
             waited = 1;
+            x->io_busy = 0;
             tr_monitor_wait(x->mon);
         }
         if (x->q_len == 0) break;
@@ -332,7 +373,8 @@ static void io_main(void *arg) {
         int64_t left = 1;
         while (left <= x->q_len && left < x->n_expert && (job.cap == 0 || left < job.cap)) {
             const experts_job *nx = &x->jobs[x->queue[(x->q_head + left - 1) % x->n_alloc]];
-            if (nx->layer != job.layer || nx->id != job.id + left || nx->readv != job.readv || job.readv == NULL)
+            if (nx->layer != job.layer || nx->id != job.id + left || nx->readv != job.readv || job.readv == NULL ||
+                nx->chunk > 0)
                 break;
             left++;
         }
@@ -345,13 +387,21 @@ static void io_main(void *arg) {
             x->q_head = (x->q_head + 1) % x->n_alloc;
             x->q_len--;
         }
+        x->io_busy = 1;
+        x->io_slot = k == 1 ? s : -1;
         tr_monitor_broadcast(x->mon); /* taken: tr_experts_prefetch_n waits for its first */
         tr_monitor_unlock(x->mon);
         if (!waited && prev_done > 0) atomic_fetch_add(&x->io_gap_ns, (uint64_t)((tr_time_sec() - prev_done) * 1e9));
 
         job.bytes = job.requests = 0;
         job.sec = 0.0;
-        if (k > 1) {
+        job.stopped = 0;
+        if (k == 1 && job.chunk > 0) {
+            unsigned char *base = x->slab + (uint64_t)s * x->stats.slot_bytes;
+            int rc = read_parts_chunked(x, s, &job, base, job.shift, &job.bytes, &job.sec, &job.requests);
+            job.rc = rc < 0 ? -1 : 0;
+            job.stopped = rc == 1;
+        } else if (k > 1) {
             job.rc = read_run(x, 1, job.readv, job.read_ctx, job.layer, job.id, k, slots, x->run_shift[1],
                               &job.bytes, &job.sec, &job.requests);
         } else {
@@ -687,6 +737,11 @@ static int prefetch_take(tr_experts *x, int32_t s) {
     x->stats.bytes_read += job.bytes;
     x->stats.requests += job.requests;
     x->stats.read_sec += job.sec;
+    if (x->slots[s].unit == -1) { /* dropped in flight (tr_experts_prefetch_cancel): its unit already absent */
+        lru_unlink(x, s);
+        lru_push_back(x, s);
+        return 0;
+    }
     if (job.rc != 0) {
         x->slot_of[x->slots[s].unit] = -1;
         x->slots[s].unit = -1;
@@ -705,8 +760,9 @@ static int prefetch_take(tr_experts *x, int32_t s) {
 
 /* Slot v reserved for (layer, id) and queued for the I/O thread, under x->mon: its unit evicted, the new one
  * present to the index, hot in the LRU, in flight until taken in. cap: the job's (tr_experts_prefetch_n);
- * demand: the job's. */
-static void reserve_slot(tr_experts *x, int32_t v, int64_t layer, int64_t id, int64_t cap, int demand) {
+ * demand, chunk: the job's. */
+static void reserve_slot(tr_experts *x, int32_t v, int64_t layer, int64_t id, int64_t cap, int demand,
+                         uint64_t chunk) {
     experts_slot *sl = &x->slots[v];
     if (sl->unit != -1) {
         x->slot_of[sl->unit] = -1;
@@ -726,6 +782,7 @@ static void reserve_slot(tr_experts *x, int32_t v, int64_t layer, int64_t id, in
     job->id = id;
     job->cap = cap;
     job->demand = demand;
+    job->chunk = chunk;
     job->read = x->read;
     job->readv = x->readv;
     job->read_ctx = x->read_ctx;
@@ -754,6 +811,8 @@ int tr_experts_prefetch_start(tr_experts *x) {
     x->pending = (unsigned char *)calloc(n, 1);
     x->q_head = x->q_len = 0;
     x->io_stop = 0;
+    x->io_busy = 0;
+    x->io_slot = -1;
     x->n_pending = 0;
     x->prefetch_failed = 0;
     if (x->mon == NULL || x->jobs == NULL || x->queue == NULL || x->pending == NULL ||
@@ -792,7 +851,7 @@ int64_t tr_experts_prefetch_n(tr_experts *x, int64_t layer, int64_t keep, uint64
         if (x->slot_of[unit] != -1) continue;
         int32_t v = coldest_victim(x, layer, keep);
         if (v == -1) break;
-        reserve_slot(x, v, layer, id, cap, 0);
+        reserve_slot(x, v, layer, id, cap, 0, 0);
         queued++;
     }
     queue_wake(x, queued);
@@ -800,10 +859,44 @@ int64_t tr_experts_prefetch_n(tr_experts *x, int64_t layer, int64_t keep, uint64
     return queued;
 }
 
+int64_t tr_experts_prefetch_ids(tr_experts *x, int64_t layer, const int64_t *ids, int64_t n, int64_t keep,
+                                uint64_t chunk_bytes) {
+    if (x->io == NULL || layer < 0 || layer >= x->n_layers) return 0;
+    uint64_t chunk = chunk_bytes > 0 ? chunk_bytes : UINT64_MAX / 2; /* a part a request: one piece each */
+    int64_t queued = 0;
+    tr_monitor_lock(x->mon);
+    const int busy = x->io_busy; /* a busy I/O thread reaches these after what it holds: waiting would wait for that */
+    for (int64_t i = 0; i < n; i++) {
+        if (ids[i] < 0 || ids[i] >= x->n_expert || x->slot_of[layer * x->n_expert + ids[i]] != -1) continue;
+        int32_t v = coldest_victim(x, layer, keep);
+        if (v == -1) break;
+        reserve_slot(x, v, layer, ids[i], 1, 0, chunk);
+        queued++;
+    }
+    if (busy) tr_monitor_broadcast(x->mon);
+    else queue_wake(x, queued);
+    tr_monitor_unlock(x->mon);
+    return queued;
+}
+
 int64_t tr_experts_prefetch_cancel(tr_experts *x, int64_t layer, const int64_t *ids, int64_t n) {
     if (x->io == NULL) return 0;
-    int64_t dropped = 0, kept = 0;
+    int64_t dropped = 0, kept = 0, stopped = 0;
     tr_monitor_lock(x->mon);
+    /* the unit the I/O thread reads alone, in pieces, of this layer and not named: it stops at its next request,
+     * absent from now; the slot stays in flight (no victim) until prefetch_take lets it go */
+    int32_t f = x->io_slot;
+    if (f != -1 && x->pending[f] && !x->jobs[f].done && x->jobs[f].chunk > 0 && x->jobs[f].layer == layer &&
+        x->slots[f].unit != -1) {
+        int asked = 0;
+        for (int64_t k = 0; k < n && !asked; k++) asked = ids[k] == x->jobs[f].id;
+        if (!asked) {
+            x->jobs[f].stop = 1;
+            x->slot_of[x->slots[f].unit] = -1;
+            x->slots[f].unit = -1;
+            stopped++;
+        }
+    }
     /* the queue compacted in place: what stays keeps its order (a kept entry moves only back) */
     for (int64_t i = 0; i < x->q_len; i++) {
         int32_t s = x->queue[(x->q_head + i) % x->n_alloc];
@@ -827,7 +920,8 @@ int64_t tr_experts_prefetch_cancel(tr_experts *x, int64_t layer, const int64_t *
     x->q_len = kept;
     tr_monitor_unlock(x->mon);
     x->stats.cancelled += (uint64_t)dropped;
-    return dropped;
+    x->stats.stopped += (uint64_t)stopped;
+    return dropped + stopped;
 }
 
 int tr_experts_prefetch_wait(tr_experts *x) {
@@ -1008,12 +1102,22 @@ static int64_t acquire_body(tr_experts *x, int64_t layer, const int64_t *ids, co
     }
 
     /* first pass: touch every unit already present, in the order given; one still in flight is
-     * waited for and taken in first, and one whose read ahead failed fails the call like a read */
+     * waited for and taken in first, and one whose read ahead failed fails the call like a read.
+     * Async: one tr_experts_prefetch_ids still reads is left late (taken as it lands) */
+    int64_t late = 0;
     for (int64_t i = 0; i < n; i++) {
         int64_t unit = layer * x->n_expert + ids[i];
         int32_t slot = x->slot_of[unit];
         if (slot != -1) {
-            if (x->pending != NULL && x->pending[slot] && prefetch_take(x, slot) != 0) return -1;
+            int leave = 0;
+            if (x->pending != NULL && x->pending[slot]) {
+                tr_monitor_lock(x->mon);
+                x->jobs[slot].named = 1; /* no more a guess: the rest of it a part a request */
+                leave = async && x->jobs[slot].chunk > 0 && !x->jobs[slot].done;
+                tr_monitor_unlock(x->mon);
+                late += leave;
+            }
+            if (!leave && x->pending != NULL && x->pending[slot] && prefetch_take(x, slot) != 0) return -1;
             lru_unlink(x, slot);
             lru_push_front(x, slot);
             x->stats.hits++;
@@ -1028,19 +1132,22 @@ static int64_t acquire_body(tr_experts *x, int64_t layer, const int64_t *ids, co
     if (async && x->io != NULL) {
         int64_t queued = 0;
         tr_monitor_lock(x->mon);
+        const int busy = x->io_busy; /* its late reads ahead first: waiting for the first new one would wait for them */
         for (int64_t i = 0; i < n; i++) {
             int64_t unit = layer * x->n_expert + ids[i];
             if (x->slot_of[unit] != -1) continue;
             int32_t v = coldest_victim(x, -1, -1);
             if (v == -1) break; /* every slot in flight: tr_experts_prefetch_start's margin forbids it */
-            reserve_slot(x, v, layer, ids[i], 0, 1);
+            reserve_slot(x, v, layer, ids[i], 0, 1, 0);
             queued++;
         }
-        queue_wake(x, queued);
+        if (busy) tr_monitor_broadcast(x->mon);
+        else queue_wake(x, queued);
         tr_monitor_unlock(x->mon);
         for (int64_t i = 0; i < n; i++)
             if (x->slot_of[layer * x->n_expert + ids[i]] == -1) return -1;
-        return queued;
+        x->stats.ahead_late += (uint64_t)late;
+        return queued + late;
     }
     for (int64_t i = 0; i < n;) {
         int64_t id = ids[i];

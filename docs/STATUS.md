@@ -345,9 +345,11 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
   (#309-#313, replayed): the window, not the prediction, is the limit. **10-05, the arrival order** (MEASUREMENTS
   §The arrival order built; #314-#317): a layer's misses read by the I/O thread while its present experts compute,
   the late ones in waves as they land, the same bytes and bits: the weak decode **Q4_K 14.98 -> 16.08, Q8_0 2.33 ->
-  2.40 tok/s** (three races); one binary in whole processes 1.079 / 1.025 against sync, the handoffs 0.16% (#318, q. 91).
-  **Next** (R1 phase 3, the 8 GB machine): the router's read ahead on top of the arrival order (model
-  1.129 Q4_K, 1.043 Q8_0); then a miss as one request, the prompt's last 2-3%, this PC
+  2.40 tok/s**; its handoffs 0.16% of a run (#318, q. 91).
+  **10-05, the router's read ahead** (MEASUREMENTS, same name; #323-#332): the next layer's guess (27 MiB),
+  read in pieces, stopped if not named: the weak decode **Q4_K 1.031, Q8_0 1.000-1.005**. Owed: the
+  old binary's race (#332), the average machine's Q8_0.
+  **Next**: question 94 (build/prompt-draft.md); a miss as one request, this PC
   at half budget; then the integrated GPU (r1-igpu:
   Vulkan; q. 87-88); then R1's first prompt's cost, generation's fixed cost, the review, the server; the races
   with llama.cpp, colibri and ds4 together at R1's close. The decode's
@@ -360,14 +362,14 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
 Mutants open: `threads.c`'s 22 (speed, not bits), `platform.c`'s Windows half (#268). Steps of 17–20/09: DONE.
 
 **M1** (`docs/ARCHITECTURE.md` §Execution «Experts (M1)»): slots allocated at load, ds4's eviction; demand reads
-on the calling thread, a prompt's next layer read ahead by one I/O thread, nothing ahead in decode; one path (full
+on the I/O thread under the compute, a prompt's next layer read ahead, a decode's router guesses the next; one path (full
 budget = the engine before M1); a read error fails the evaluation, not the process. The volume encrypted
 (BitLocker, question 41) and untouched: the target PCs' factory state.
 - **Batches 1–3, done** (2026-09-20, in DONE): the store, `--expert-budget`, direct reads; 23 red mutations.
 - **Measured 2026-09-20/21** (MEASUREMENTS §M1 measured, §Prefill reads model once per pass):
   **M1 works, the cost is the prompt**: decode 35.5 / 29.6 / 24.3 / 20.6 tok/s at 100 / 75 / 50 /
   25% (64 tokens), 0.90× and 0.87× of resident at 1000 tokens; direct reads give 2.42× the system
-  cache's prefill (the guard was right). Decided: no prefetch in decode (0.03–0.14 units a token
+  cache's prefill (the guard was right). Decided then: no prefetch in decode (0.03–0.14 units a token
   far from the prompt); the budget is not the lever (4% between 25 and 75%). Question 46 half
   closed: the fixed cost at generation start is the store settling (~0.35 s at 50%), absent when
   resident. Layer-major prefill (question 47): 2048 tokens read 6,273 MiB instead of 22,880, 12.41 s

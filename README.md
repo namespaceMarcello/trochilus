@@ -88,7 +88,11 @@ machine a chat keeps 278 Q8_0 experts in RAM instead of 131 and reads 193.7 MiB 
 3, stopped steady). A layer whose experts are not all in RAM now computes the ones that are while its disk reads
 the others, each late one as its bytes land, the same bytes and the same bits: on the 8 GB machine generation goes
 from 14.98 to 16.08 tok/s (Q4_K) and from 2.33 to 2.40 (Q8_0), the same tokens (2026-10-05, median of 3, stopped
-steady). ds4 splits a layer this way on its GPU from three misses; colibri and llama.cpp wait for each.
+steady). ds4 splits a layer this way on its GPU from three misses; colibri and llama.cpp wait for each. Meanwhile
+the next layer's router guesses which experts that layer will ask, and the disk reads them in short pieces, a
+guess dropped mid-read as soon as the layer asks for others and read whole once it is asked: 15.92 -> 16.26 tok/s
+(Q4_K) and 2.40 -> 2.41 (Q8_0), the same tokens (2026-10-05, median of 3, stopped steady). colibri's own guess,
+off by default, reads whole experts, which on such a disk loses more than it gains; ds4 and llama.cpp guess nothing.
 
 ## How it keeps up, bit for bit
 

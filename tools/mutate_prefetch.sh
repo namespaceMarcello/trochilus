@@ -62,7 +62,7 @@ run "a reserved unit is readable before it is taken in" gcc "test_experts" $B \
   "    if (x->pending != NULL && x->pending[slot]) return NULL; /* in flight: its bytes are not ours yet */
 " ""
 run "acquire does not wait for a unit in flight" gcc "test_experts test_prefetch" $B \
-  "            if (x->pending != NULL && x->pending[slot] && prefetch_take(x, slot) != 0) return -1;
+  "            if (!leave && x->pending != NULL && x->pending[slot] && prefetch_take(x, slot) != 0) return -1;
 " ""
 run "a failed read ahead asked for is not an error" gcc "test_experts" $B \
   "x->pending[slot] && prefetch_take(x, slot) != 0) return -1;" "x->pending[slot]) prefetch_take(x, slot);"
@@ -71,9 +71,17 @@ run "the wait takes nothing in" gcc "test_experts test_prefetch" $B \
 
 # victims
 run "the kept layer may be evicted" gcc "test_experts test_prefetch" $B \
-  "int32_t v = coldest_victim(x, layer, keep);" "int32_t v = coldest_victim(x, layer, -1);"
+  "int32_t v = coldest_victim(x, layer, keep);
+        if (v == -1) break;
+        reserve_slot(x, v, layer, id, cap" "int32_t v = coldest_victim(x, layer, -1);
+        if (v == -1) break;
+        reserve_slot(x, v, layer, id, cap"
 run "a resident unit of the target layer may be evicted" gcc "test_experts" $B \
-  "int32_t v = coldest_victim(x, layer, keep);" "int32_t v = coldest_victim(x, -1, keep);"
+  "int32_t v = coldest_victim(x, layer, keep);
+        if (v == -1) break;
+        reserve_slot(x, v, layer, id, cap" "int32_t v = coldest_victim(x, -1, keep);
+        if (v == -1) break;
+        reserve_slot(x, v, layer, id, cap"
 run "a slot in flight may be a victim (the LRU)" asan "test_experts test_prefetch" $B \
   "        if (x->pending != NULL && x->pending[s]) continue;
         int32_t u = x->slots[s].unit;
@@ -155,6 +163,49 @@ run "the read ahead returns before its first run is taken" gcc "test_experts tes
   "    while (x->q_len >= queued) tr_monitor_wait(x->mon);" ""
 run "the short requests ignored" gcc "test_prefetch" $B \
   " && (job.cap == 0 || left < job.cap)) {" ") {"
+# the router's guess (tr_experts_prefetch_ids, test_experts ahead; docs/MEASUREMENTS.md §The router's read ahead)
+run "ahead: a guess read whole, not in pieces" gcc "test_experts" $B \
+  "        if (k == 1 && job.chunk > 0) {" "        if (0) {"
+run "ahead: the stop never looked at" gcc "test_experts" $B "            if (stop) return 1;" "            (void)stop;"
+run "ahead: a cancel does not stop the guess in flight" gcc "test_experts" $B \
+  "            x->jobs[f].stop = 1;" ""
+run "ahead: a cancel stops a guess it names" gcc "test_experts" $B \
+  "        if (!asked) {
+            x->jobs[f].stop = 1;" "        if (1) {
+            x->jobs[f].stop = 1;"
+run "ahead: a guess stopped in flight taken as read" asan "test_experts" $B \
+  "    if (x->slots[s].unit == -1) { /* dropped in flight (tr_experts_prefetch_cancel): its unit already absent */
+        lru_unlink(x, s);
+        lru_push_back(x, s);
+        return 0;
+    }" ""
+run "ahead: a named guess in flight waited for" gcc "test_experts" $B \
+  "                leave = async && x->jobs[slot].chunk > 0 && !x->jobs[slot].done;" "                leave = 0;"
+run "ahead: a call waits behind the guess queued" gcc "test_experts" $B \
+  "        if (busy) tr_monitor_broadcast(x->mon);
+        else queue_wake(x, queued);" "        queue_wake(x, queued);"
+run "ahead: the guess queued in reverse" gcc "test_experts" $B \
+  "    for (int64_t i = 0; i < n; i++) {
+        if (ids[i] < 0 || ids[i] >= x->n_expert" "    for (int64_t i = n - 1; i >= 0; i--) {
+        if (ids[i] < 0 || ids[i] >= x->n_expert"
+run "ahead: a guess may evict the kept layer" gcc "test_experts" $B \
+  "int32_t v = coldest_victim(x, layer, keep);
+        if (v == -1) break;
+        reserve_slot(x, v, layer, ids[i]" "int32_t v = coldest_victim(x, layer, -1);
+        if (v == -1) break;
+        reserve_slot(x, v, layer, ids[i]"
+run "ahead: a guess may evict its own layer" gcc "test_experts" $B \
+  "int32_t v = coldest_victim(x, layer, keep);
+        if (v == -1) break;
+        reserve_slot(x, v, layer, ids[i]" "int32_t v = coldest_victim(x, -1, keep);
+        if (v == -1) break;
+        reserve_slot(x, v, layer, ids[i]"
+run "ahead: a named guess read on in pieces" gcc "test_experts" $B \
+  "                x->jobs[slot].named = 1;" ""
+run "ahead: a guess queued before the I/O thread" asan "test_experts" $B \
+  "    if (x->io == NULL || layer < 0 || layer >= x->n_layers) return 0;
+    uint64_t chunk = chunk_bytes" "    if (layer < 0 || layer >= x->n_layers) return 0;
+    uint64_t chunk = chunk_bytes"
 run "TR_PREFETCH=0 ignored" gcc "test_prefetch" $O \
   "(want_prefetch == NULL || strcmp(want_prefetch, \"0\") != 0)" "(want_prefetch == NULL || 1)"
 # the prompt's routings told the store's eviction (olmoe_refresh_experts, test_prefetch's heat)

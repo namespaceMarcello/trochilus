@@ -42,6 +42,8 @@
  *   lru        layer-major and one pass under TR_EXPERT_EVICT=lru at the exact margin: the reference
  *              (ds4's eviction is the default; the LRU's victims are another walk)
  *
+ * The router's read ahead (short passes: the decode, the 2-token blocks) is off here (TR_AHEAD_K=0): its own
+ * branches are test_stream's ahead and test_experts' ahead.
  * TSan: run it under build/linux-tsan (the I/O thread and the calling thread share the store).
  * Seen red: the mutations listed in the report of the change that wrote it (docs/STATUS.md). */
 #if defined(__linux__) && !defined(_POSIX_C_SOURCE)
@@ -337,6 +339,7 @@ static void test_unused(const char *argv0, tr_pool *pool) {
 
 int main(int argc, char **argv) {
     t_test_thread = 1;
+    set_env("TR_AHEAD_K", "0"); /* a prompt's read ahead only: the router's, in short passes, is test_stream's ahead */
     char path[512];
     TR_CHECK(synth_write(&P, argc > 0 ? argv[0] : "./test_prefetch", "prefetch.gguf", path, sizeof path) == 0);
 
@@ -500,6 +503,7 @@ int main(int argc, char **argv) {
     tr_pool_destroy(pool8);
     tr_pool_destroy(pool3);
     set_env("TR_PREFETCH", NULL);
+    set_env("TR_AHEAD_K", NULL);
     remove(path);
 
     TR_CHECK(n.same_on > 0);

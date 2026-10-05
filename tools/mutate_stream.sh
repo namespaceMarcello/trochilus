@@ -134,8 +134,8 @@ run "arrival: a row left in its id order's place" $O \
   "        s->place[j] = offs[grp_of[e]] + s->place[j] - s->offsets[e];" \
   "        (void)grp_of;"
 run "arrival: the late groups first" $O \
-  "            if (s->offsets[e + 1] > s->offsets[e] && (layer->gate_exps[e].data == NULL) == late) {" \
-  "            if (s->offsets[e + 1] > s->offsets[e] && (layer->gate_exps[e].data == NULL) != late) {"
+  "            if (s->offsets[e + 1] > s->offsets[e] && (layer->gate_exps[e].data == NULL) == late && grp_of[e] == -1) {" \
+  "            if (s->offsets[e + 1] > s->offsets[e] && (layer->gate_exps[e].data == NULL) != late && grp_of[e] == -1) {"
 run "arrival: a wave's offsets from the layer's start" $O \
   "        for (int64_t i = 0; i <= k; i++) wo[i] = offs[g + i] - offs[g];" \
   "        for (int64_t i = 0; i <= k; i++) wo[i] = offs[g + i];"
@@ -151,5 +151,19 @@ run "arrival: a late unit's weights not refreshed in its group" $O \
 run "arrival: a wave's floats from the first rows" $O \
   "        tr_matmul_grouped_s(pool, w, offsets, n_groups, s->xg + row0 * n_embd, h1, &s->pm);" \
   "        tr_matmul_grouped_s(pool, w, offsets, n_groups, s->xg, h1, &s->pm);"
+# the router's read ahead (test_stream ahead): the next layer's guess at this layer's router
+run "ahead: never guesses" $O \
+  "    if (s->ahead_k == 0 || s->ab_no_ahead || !s->prefetch_pass" \
+  "    if (1 || s->ahead_k == 0 || s->ab_no_ahead || !s->prefetch_pass"
+run "ahead: --ab ahead does not turn it off" $O \
+  "    if (sw == OLMOE_AB_AHEAD) s->ab_no_ahead = arm;" "    if (sw == OLMOE_AB_AHEAD) s->ab_no_ahead = 0;"
+run "ahead: a guess never dropped at the next router" $O \
+  "        s->cancel_layer = nx;" "        (void)nx;"
+run "ahead: the groups' marks left from the last layer" $O \
+  "    for (int64_t e = 0; e < n_expert; e++) grp_of[e] = -1;" ""
+run "ahead: k by bytes guesses nothing" $O \
+  "        if (k < 1) k = 1;
+    }" "        k = 0;
+    }"
 }
 main "$@"; exit

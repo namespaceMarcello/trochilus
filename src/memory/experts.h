@@ -133,6 +133,10 @@ typedef struct {
                                            * spent waiting for units still in flight */
     uint64_t cancelled;                   /* units queued ahead and dropped before a byte of them was
                                            * read (tr_experts_prefetch_cancel): never counted as read */
+    uint64_t stopped;                     /* units read ahead in pieces (tr_experts_prefetch_ids) dropped
+                                           * while in flight: their bytes so far in bytes_read, not in misses */
+    uint64_t ahead_late;                  /* units read ahead in pieces still in flight when a call named
+                                           * them (tr_experts_acquire_async): left late, taken as they land */
     double touch_sec;                     /* time of tr_experts_touch, the slots' pages faulted */
     double disk_bytes_per_sec;            /* cfg.disk_bytes_per_sec: > 0 while a slower disk is emulated */
     int evict;                            /* cfg.evict: the policy a miss evicts by */
@@ -203,7 +207,9 @@ int tr_experts_acquire_counts(tr_experts *x, int64_t layer, const int64_t *ids, 
 /* tr_experts_acquire_counts with the missing units read by the I/O thread while the caller computes the present
  * ones (docs/MEASUREMENTS.md §The arrival order built): the same hotness, the same victims, the same runs and
  * bytes, the reads queued in the order given under one wake, and the call returns once the I/O thread has taken
- * the first. Returns the units queued (0: every one present), -1 as tr_experts_acquire_counts. Until
+ * the first. A unit tr_experts_prefetch_ids read ahead and still in flight is late too, not waited for (its read
+ * ahead of the new ones in the queue). Returns the late units (0: every one present), -1 as
+ * tr_experts_acquire_counts. Until
  * tr_experts_acquire_take takes a queued unit in, tr_experts_part gives NULL for it and it counts as present (no
  * victim, no second read). Reading ahead not started (tr_experts_prefetch_start): tr_experts_acquire_counts,
  * 0 on success. Allocates nothing. */
@@ -248,10 +254,23 @@ int64_t tr_experts_prefetch(tr_experts *x, int64_t layer, int64_t keep);
  * the I/O thread has taken the first unit queued (one wake): the read starts before the caller
  * computes on, whatever else holds the cores. */
 int64_t tr_experts_prefetch_n(tr_experts *x, int64_t layer, int64_t keep, uint64_t run_bytes);
+/* The units ids[0..n) of `layer` (a router's guess at its next call, best first) not in RAM reserved and queued
+ * in the order given, behind whatever the I/O thread already holds, each read alone in requests of at most
+ * chunk_bytes (rounded up to read_align; 0: a part a request), so tr_experts_prefetch_cancel can stop a unit
+ * the call does not name between two of them (docs/MEASUREMENTS.md §The router's read ahead). Victims as
+ * tr_experts_prefetch's (never a unit of `layer` nor of `keep`); it stops at the first unit no victim is left
+ * for. An idle I/O thread is woken and its first unit taken before the return; a busy one is only told. A unit
+ * of these still in flight when a tr_experts_acquire_async call names it is left late (that call's count), not
+ * waited for; once any call names it, it is no more a guess and the rest of it is read a part a request. Returns
+ * the units queued; 0 when reading ahead is not started. Allocates nothing. */
+int64_t tr_experts_prefetch_ids(tr_experts *x, int64_t layer, const int64_t *ids, int64_t n, int64_t keep,
+                                uint64_t chunk_bytes);
 /* Drops every unit of `layer` still queued ahead (no byte of it read yet) that ids[0..n) does not
  * name: its slot free at the cold end, its unit absent, never counted as read. A unit already in
- * flight is left to land. For the layer's only call (a pass's), before it, so it never waits
- * behind a read nobody asked for. Returns the units dropped; 0 when reading ahead is not started.
+ * flight is left to land, unless tr_experts_prefetch_ids queued it: then it stops at its next
+ * request and is absent at once, its slot taken back once the I/O thread lets it go (stats.stopped).
+ * For the layer's only call (a pass's), before it, so it never waits behind a read nobody asked
+ * for. Returns the units dropped (stopped ones too); 0 when reading ahead is not started.
  * Allocates nothing. */
 int64_t tr_experts_prefetch_cancel(tr_experts *x, int64_t layer, const int64_t *ids, int64_t n);
 /* Waits until nothing is in flight and takes every unit in. 0, or -1 if a read ahead failed

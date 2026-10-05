@@ -204,6 +204,18 @@ typedef struct {
     int ahead_issued; /* the pass running read ahead at least once: it waits for it before returning */
     uint64_t ahead_run_bytes; /* a pass's read ahead, the most a request asks a part: OLMOE_AHEAD_RUN_BYTES,
                                * or TR_AHEAD_RUN_KIB (measurements, and tests on tiny models) */
+    /* The router's read ahead (olmoe_router_ahead): ahead_k a token, TR_AHEAD_K (0: off; -1, unset: by
+     * OLMOE_AHEAD_BYTES), in requests of ahead_chunk, OLMOE_AHEAD_CHUNK_BYTES or TR_AHEAD_CHUNK_KIB; ab_no_ahead:
+     * --ab ahead's arm B.
+     * ahead_layer: the layer ahead_ids[0..n_ahead) guesses, best first (-1: none), its late units taken first */
+    int64_t ahead_k;
+    uint64_t ahead_chunk;
+    int ab_no_ahead;
+    int ahead_dry;          /* research, TR_AHEAD_DRY=1: the guess made, nothing queued (its own cost) */
+    int64_t ahead_layer, n_ahead;
+    int64_t *ahead_ids;     /* [(OLMOE_AHEAD_TOKENS + 1) n_expert]: the guess, then each token's top ahead_k */
+    unsigned char *ahead_seen; /* [n_expert] */
+    float *ahead_scores;    /* [OLMOE_AHEAD_TOKENS][n_expert]: the next layer's router on this layer's FFN input */
 } olmoe_session;
 
 /* Reading ahead during a layer-major prompt (olmoe_refresh_experts): the next layer's missing
@@ -222,6 +234,17 @@ typedef struct {
  * names its own: 8 MiB reads at 3.05 GB/s on this PC's disk against 3.25 at 68 MiB
  * (docs/MEASUREMENTS.md §The disk at its limit), 17 ms at 500 MB/s. */
 #define OLMOE_AHEAD_RUN_BYTES ((uint64_t)8 << 20)
+
+/* The router's read ahead (olmoe_router_ahead, docs/MEASUREMENTS.md §The router's read ahead): in a pass of at
+ * most OLMOE_AHEAD_TOKENS tokens (colibri's PILOT reads ahead in passes of at most 8 too) naming at most half the
+ * experts, layer L+1's router on layer L's FFN input names its top k a token, k as many units as fit
+ * OLMOE_AHEAD_BYTES (a wrong guess costs its bytes on the one disk: the races' best k is 8 for Q4_K's 3.4 MiB
+ * units and 4 for Q8_0's 6.4 MiB, the same 27 MiB), read in requests of OLMOE_AHEAD_CHUNK_BYTES so a unit layer
+ * L+1 does not name stops between two (whole units lose 4.2% on Q4_K where 512 KiB gains it, a part a request
+ * keeps 1%) */
+#define OLMOE_AHEAD_TOKENS 8
+#define OLMOE_AHEAD_BYTES ((uint64_t)27 << 20)
+#define OLMOE_AHEAD_CHUNK_BYTES ((uint64_t)512 << 10)
 
 /* ---- loading helpers ---------------------------------------------------- */
 
@@ -943,6 +966,9 @@ static void olmoe_session_free(void *session) {
     tr_free_aligned(s->acquire_ids);
     tr_free_aligned(s->wave);
     tr_free_aligned(s->wave_w);
+    tr_free_aligned(s->ahead_ids);
+    tr_free_aligned(s->ahead_seen);
+    tr_free_aligned(s->ahead_scores);
     tr_free_aligned(s->taken);
     tr_free_aligned(s->xg);
     tr_free_aligned(s->xq_tok);
@@ -1084,6 +1110,14 @@ static void *olmoe_session_create(void *model, int64_t n_ctx, int64_t n_batch, c
     const char *arrive = getenv("TR_ARRIVE");
     s->ab_sync = arrive != NULL && strcmp(arrive, "0") == 0;
     s->ab_waves2 = arrive != NULL && strcmp(arrive, "2") == 0;
+    /* research: the router's read ahead, raced process against process (tools/ab_env.sh) */
+    const char *ahead_k = getenv("TR_AHEAD_K"), *ahead_chunk = getenv("TR_AHEAD_CHUNK_KIB");
+    s->ahead_k = ahead_k != NULL ? atoi(ahead_k) : -1; /* -1: by OLMOE_AHEAD_BYTES */
+    s->ahead_chunk = OLMOE_AHEAD_CHUNK_BYTES;
+    if (ahead_chunk != NULL) s->ahead_chunk = strtoull(ahead_chunk, NULL, 10) << 10; /* 0: a part a request */
+    const char *ahead_dry = getenv("TR_AHEAD_DRY");
+    s->ahead_dry = ahead_dry != NULL && strcmp(ahead_dry, "1") == 0;
+    s->ahead_layer = -1;
 
     int kv_rc = tr_kv_init(&s->kv, m->n_layers, m->n_head_kv, m->head_dim, actual_ctx);
     s->rope_cos = (float *)tr_alloc_aligned((size_t)rope_elems * sizeof(float), 64);
@@ -1105,6 +1139,9 @@ static void *olmoe_session_create(void *model, int64_t n_ctx, int64_t n_batch, c
     s->acquire_ids = (int64_t *)tr_alloc_aligned((size_t)(2 * m->n_expert) * sizeof(int64_t), 64);
     s->wave = (int64_t *)tr_alloc_aligned((size_t)(4 * m->n_expert + 2) * sizeof(int64_t), 64);
     s->wave_w = (tr_mat *)tr_alloc_aligned((size_t)(3 * m->n_expert) * sizeof(tr_mat), 64);
+    s->ahead_ids = (int64_t *)tr_alloc_aligned((size_t)((OLMOE_AHEAD_TOKENS + 1) * m->n_expert) * sizeof(int64_t), 64);
+    s->ahead_seen = (unsigned char *)tr_alloc_aligned((size_t)m->n_expert, 64);
+    s->ahead_scores = alloc_f32(OLMOE_AHEAD_TOKENS * m->n_expert);
     s->taken = (unsigned char *)tr_alloc_aligned((size_t)(n_workers * m->n_expert), 64);
     s->xg = alloc_f32(B * U * m->n_embd);
     s->xq_tok = (unsigned char *)tr_alloc_aligned((size_t)xq_tok_bytes, 64);
@@ -1124,7 +1161,7 @@ static void *olmoe_session_create(void *model, int64_t n_ctx, int64_t n_batch, c
         s->normed == NULL || s->attn_out == NULL || s->ffn_out == NULL || s->q == NULL || s->attn_concat == NULL ||
         s->k == NULL || s->v == NULL || s->router == NULL || s->sel_id == NULL || s->sel_w == NULL ||
         s->place == NULL || s->offsets == NULL || s->acquire_ids == NULL || s->wave == NULL || s->wave_w == NULL ||
-        s->taken == NULL || s->xg == NULL ||
+        s->ahead_ids == NULL || s->ahead_seen == NULL || s->ahead_scores == NULL || s->taken == NULL || s->xg == NULL ||
         s->xq_tok == NULL || s->xmap == NULL || s->h1 == NULL || s->h2 == NULL || s->h3 == NULL || s->logits == NULL ||
         s->scores == NULL ||
         (store_partial && s->x_all == NULL)) {
@@ -1443,6 +1480,11 @@ static int olmoe_refresh_experts(olmoe_model *m, olmoe_session *s, int64_t L, in
  * data refreshed in the layer and in s->wave_w. The groups taken (>= 1), or -1 on a failed read. */
 static int64_t olmoe_take_late(olmoe_model *m, olmoe_session *s, int64_t L, int64_t g0, int64_t n);
 
+/* Defined below, after the hot zone: the router's read ahead at layer L of a short pass (OLMOE_AHEAD_TOKENS): layer
+ * L+1's router on L's FFN input (s->normed) names its top s->ahead_k a token, queued behind L's late units, dropped
+ * at L+1 if not named (s->cancel_layer). Allocates nothing. */
+static void olmoe_router_ahead(olmoe_model *m, olmoe_session *s, int64_t L, int64_t n_tok);
+
 /* Defined below, after the hot zone: the KV's pages of positions [0, end) taken from the store's room before a
  * pass faults them (the store gives slots back, tr_experts_set_slots); nothing when they are held already. */
 static void kv_hold(olmoe_model *m, olmoe_session *s, int64_t end);
@@ -1488,12 +1530,23 @@ static void arrival_layout(olmoe_model *m, olmoe_session *s, int64_t L, int64_t 
     int64_t *grp_of = s->wave, *grp_id = grp_of + n_expert, *offs = grp_id + n_expert;
     tr_mat *w = s->wave_w;
     int64_t g = 0;
-    for (int late = 0; late < 2; late++)
-        for (int64_t e = 0; e < n_expert; e++)
-            if (s->offsets[e + 1] > s->offsets[e] && (layer->gate_exps[e].data == NULL) == late) {
+    for (int64_t e = 0; e < n_expert; e++) grp_of[e] = -1;
+    /* the late ones the router's read ahead named first, in its order: their reads were queued before the misses' */
+    const int64_t n_ahead = s->ahead_layer == L ? s->n_ahead : 0;
+    for (int late = 0; late < 2; late++) {
+        for (int64_t i = 0; i < n_ahead * late; i++) {
+            const int64_t e = s->ahead_ids[i];
+            if (s->offsets[e + 1] > s->offsets[e] && layer->gate_exps[e].data == NULL) {
                 grp_of[e] = g;
                 grp_id[g++] = e;
             }
+        }
+        for (int64_t e = 0; e < n_expert; e++)
+            if (s->offsets[e + 1] > s->offsets[e] && (layer->gate_exps[e].data == NULL) == late && grp_of[e] == -1) {
+                grp_of[e] = g;
+                grp_id[g++] = e;
+            }
+    }
     s->n_groups = g;
     offs[0] = 0;
     for (int64_t i = 0; i < g; i++) {
@@ -1748,6 +1801,7 @@ static int forward_layer(olmoe_model *m, olmoe_session *s, int64_t L, const int3
         n_groups = s->n_groups;
         n_now = n_groups - s->n_late;
     }
+    olmoe_router_ahead(m, s, L, n_tok); /* behind this layer's late units, read while its experts compute */
     hint_next(m, s, w, offs, n_now, &s->pm); /* its pointers refreshed; after the prep */
 
     /* experts in stages, each one job over every (token, slot) row grouped by expert. Gate and up on Q4_K's
@@ -1844,6 +1898,7 @@ static int forward_pass(olmoe_model *m, olmoe_session *s, const int32_t *tokens,
     kv_touch_pass(m, s, pos0 + n_tok);
     forward_embed(m, s, tokens, n_tok, s->x);
     s->ahead_issued = 0;
+    s->ahead_layer = -1;
     for (int64_t L = 0; L < m->n_layers; L++) {
         s->prefetch_layer = L + 1 < m->n_layers ? L + 1 : -1;
         s->prefetch_pass = 1;
@@ -2069,6 +2124,53 @@ static void olmoe_read_ahead(olmoe_model *m, olmoe_session *s, int64_t L) {
     s->prefetch_layer = -1;
 }
 
+static void olmoe_router_ahead(olmoe_model *m, olmoe_session *s, int64_t L, int64_t n_tok) {
+    const int64_t n_expert = m->n_expert, nx = L + 1;
+    s->ahead_layer = -1;
+    if (s->ahead_k == 0 || s->ab_no_ahead || !s->prefetch_pass || nx >= m->n_layers || n_tok > OLMOE_AHEAD_TOKENS ||
+        2 * s->n_ids > n_expert || !tr_experts_prefetching(m->experts))
+        return;
+    const unsigned char *off = m->expert_off != NULL ? m->expert_off + nx * n_expert : NULL;
+    int64_t k = s->ahead_k;
+    if (k < 0) { /* as many of the next layer's units as OLMOE_AHEAD_BYTES holds, at least one */
+        const olmoe_layer *nl = &m->layers[nx];
+        const uint64_t ub = mat_bytes(&nl->gate_exps[0]) + mat_bytes(&nl->up_exps[0]) + mat_bytes(&nl->down_exps[0]);
+        k = ub > 0 ? (int64_t)((OLMOE_AHEAD_BYTES + ub / 2) / ub) : 1;
+        if (k < 1) k = 1;
+    }
+    int64_t on = n_expert;
+    if (k > n_expert) k = n_expert;
+    if (off != NULL)
+        for (int64_t e = 0; e < n_expert; e++) on -= off[e] != 0;
+    if (k > on) k = on;
+    if (k <= 0) return;
+    int64_t *list = s->ahead_ids, *tops = s->ahead_ids + n_expert;
+    uint64_t t0 = tr_prof_begin(&s->prof); /* the guess is a router's work: the router's zone */
+    tr_matmul(m->pool, &m->layers[nx].gate_inp, s->normed, n_tok, s->ahead_scores);
+    for (int64_t t = 0; t < n_tok; t++) /* route_token's order on the raw scores: the softmax keeps it */
+        top_experts(s->ahead_scores + t * n_expert, n_expert, off, s->taken, k, tops + t * k, NULL);
+    /* every token's best before any token's second: the union best first */
+    int64_t n = 0;
+    memset(s->ahead_seen, 0, (size_t)n_expert);
+    for (int64_t r = 0; r < k; r++)
+        for (int64_t t = 0; t < n_tok; t++) {
+            const int64_t e = tops[t * k + r];
+            if (!s->ahead_seen[e]) {
+                s->ahead_seen[e] = 1;
+                list[n++] = e;
+            }
+        }
+    s->ahead_layer = nx;
+    s->n_ahead = n;
+    tr_prof_end(&s->prof, TR_PROF_ROUTER, t0);
+    tr_prof_count(&s->prof, TR_PROF_ROUTER, mat_bytes(&m->layers[nx].gate_inp), 0);
+    if (s->ahead_dry) return; /* research: the guess's own cost, nothing read */
+    if (tr_experts_prefetch_ids(m->experts, nx, list, n, L, s->ahead_chunk) > 0) {
+        s->cancel_layer = nx;
+        s->ahead_issued = 1;
+    }
+}
+
 static int olmoe_prefetch_drain(olmoe_model *m, olmoe_session *s) {
     if (!tr_experts_prefetching(m->experts)) return 0;
     tr_experts_stats before, after;
@@ -2130,6 +2232,14 @@ struct olmoe_route_trace {
     float *router;                         /* [B][n_expert] scratch: a prediction's raw scores */
     float *normed;                         /* [B][n_embd] scratch: next layer's ffn_norm over this layer's x */
     unsigned char *taken;                  /* [n_expert] scratch for top_experts, one row (serial) */
+    /* research, TR_ROUTE_PRED (colibri's PILOT, ref/colibri/c/olmoe.c:1110-1150): pred_in as colibri predicts.
+     * 1 "next": this layer's FFN input under the next layer's own ffn_norm; 2 "ema": that, and the scores a
+     * moving average a layer, 0.3 of the last token's (colibri's SMOOTH default); 3 "two": pred_in as 0, pred_out
+     * the layer after next's router on this layer's own FFN input (two layers ahead); 0: the next layer's router
+     * on this layer's own FFN input */
+    int pred_mode;
+    float *ema;                            /* [n_layers][n_expert]: pred_mode 2's average a layer */
+    unsigned char *ema_set;                /* [n_layers]: the average begun */
 };
 
 static void olmoe_route_trace_free(olmoe_route_trace *tr) {
@@ -2142,6 +2252,8 @@ static void olmoe_route_trace_free(olmoe_route_trace *tr) {
     tr_free_aligned(tr->router);
     tr_free_aligned(tr->normed);
     tr_free_aligned(tr->taken);
+    tr_free_aligned(tr->ema);
+    tr_free_aligned(tr->ema_set);
     free(tr);
 }
 
@@ -2181,10 +2293,16 @@ static int olmoe_route_trace_begin(void *session, int64_t max_tokens) {
     tr->router = alloc_f32(B * n_expert);
     tr->normed = alloc_f32(B * m->n_embd);
     tr->taken = (unsigned char *)tr_alloc_aligned((size_t)n_expert, 64);
+    const char *pred = getenv("TR_ROUTE_PRED");
+    tr->pred_mode = pred == NULL ? 0 : strcmp(pred, "next") == 0 ? 1 : strcmp(pred, "ema") == 0 ? 2
+                                     : strcmp(pred, "two") == 0 ? 3 : 0;
+    tr->ema = alloc_f32(n_layers * n_expert);
+    tr->ema_set = (unsigned char *)tr_alloc_aligned((size_t)n_layers, 64);
+    if (tr->ema_set != NULL) memset(tr->ema_set, 0, (size_t)n_layers);
 
     if ((max_tokens > 0 && (tr->chosen == NULL || tr->pred_in == NULL || tr->pred_out == NULL ||
                             tr->tokens == NULL || tr->margins == NULL)) ||
-        tr->router == NULL || tr->normed == NULL || tr->taken == NULL) {
+        tr->router == NULL || tr->normed == NULL || tr->taken == NULL || tr->ema == NULL || tr->ema_set == NULL) {
         olmoe_route_trace_free(tr);
         return -1;
     }
@@ -2257,10 +2375,27 @@ static void route_trace_record(olmoe_session *s, int64_t L, const int32_t *token
         int64_t ids[TR_ROUTE_TRACE_PRED];
 
         /* pred_in: the next layer's router applied to this layer's own FFN input -- known
-         * before this layer's experts run. */
-        tr_matmul(m->pool, &next->gate_inp, s->normed, rec, tr->router);
+         * before this layer's experts run. pred_mode (research): that input under the next layer's
+         * ffn_norm (normed x w_{L+1} / w_L: the same input, its other scale), then the moving average. */
+        const float *in = s->normed;
+        if (tr->pred_mode == 1 || tr->pred_mode == 2) {
+            const float *wl = m->layers[L].ffn_norm, *wn = next->ffn_norm;
+            for (int64_t i = 0; i < rec; i++)
+                for (int64_t j = 0; j < n_embd; j++)
+                    tr->normed[i * n_embd + j] = wl[j] != 0.0f ? s->normed[i * n_embd + j] * wn[j] / wl[j] : 0.0f;
+            in = tr->normed;
+        }
+        tr_matmul(m->pool, &next->gate_inp, in, rec, tr->router);
         for (int64_t i = 0; i < rec; i++) {
             float *scores = tr->router + i * n_expert;
+            if (tr->pred_mode == 2) {
+                float *ema = tr->ema + (L + 1) * n_expert;
+                for (int64_t e = 0; e < n_expert; e++) {
+                    if (tr->ema_set[L + 1]) scores[e] = 0.7f * scores[e] + 0.3f * ema[e];
+                    ema[e] = scores[e];
+                }
+                tr->ema_set[L + 1] = 1;
+            }
             tr_softmax(scores, n_expert);
             top_experts(scores, n_expert, NULL, tr->taken, n_pred, ids, NULL);
             uint16_t *out = tr->pred_in + (base + i) * n_layers * n_pred + L * n_pred;
@@ -2268,15 +2403,25 @@ static void route_trace_record(olmoe_session *s, int64_t L, const int32_t *token
         }
 
         /* pred_out: the next layer's own ffn_norm and router applied to this layer's own
-         * output -- known only after this layer's experts ran and added their residual. */
-        memcpy(tr->normed, x, (size_t)rec * n_embd * sizeof(float));
-        for (int64_t i = 0; i < rec; i++) tr_rmsnorm(tr->normed + i * n_embd, next->ffn_norm, n_embd, m->rms_eps);
-        tr_matmul(m->pool, &next->gate_inp, tr->normed, rec, tr->router);
+         * output -- known only after this layer's experts ran and added their residual.
+         * pred_mode 3 (research, "two"): the layer after next's router on this layer's own FFN input
+         * instead, known where pred_in is (0xFFFF on the last two layers) */
+        if (tr->pred_mode == 3) {
+            if (L + 2 < n_layers) tr_matmul(m->pool, &m->layers[L + 2].gate_inp, s->normed, rec, tr->router);
+        } else {
+            memcpy(tr->normed, x, (size_t)rec * n_embd * sizeof(float));
+            for (int64_t i = 0; i < rec; i++) tr_rmsnorm(tr->normed + i * n_embd, next->ffn_norm, n_embd, m->rms_eps);
+            tr_matmul(m->pool, &next->gate_inp, tr->normed, rec, tr->router);
+        }
         for (int64_t i = 0; i < rec; i++) {
             float *scores = tr->router + i * n_expert;
+            uint16_t *out = tr->pred_out + (base + i) * n_layers * n_pred + L * n_pred;
+            if (tr->pred_mode == 3 && L + 2 >= n_layers) {
+                for (int64_t k = 0; k < n_pred; k++) out[k] = 0xFFFF;
+                continue;
+            }
             tr_softmax(scores, n_expert);
             top_experts(scores, n_expert, NULL, tr->taken, n_pred, ids, NULL);
-            uint16_t *out = tr->pred_out + (base + i) * n_layers * n_pred + L * n_pred;
             for (int64_t k = 0; k < n_pred; k++) out[k] = (uint16_t)ids[k];
         }
     } else if (rec > 0) {
@@ -2293,7 +2438,8 @@ static void route_trace_record(olmoe_session *s, int64_t L, const int32_t *token
 /* the in-process A/B's switches (tr_session_ab_switch), arm 1 the road before: prep, the prep once a row (every
  * matmul preparing its own rows, the experts' rows gathered, the swiglu apart); act, only the swiglu and the down's
  * prep in one call; idle, no hints to the idle workers; fuse, q, k, v and gate, up one call each */
-enum { OLMOE_AB_PREP = 1, OLMOE_AB_ACT = 2, OLMOE_AB_IDLE = 3, OLMOE_AB_FUSE = 4, OLMOE_AB_ARRIVE = 5, OLMOE_AB_WAVES = 6 };
+enum { OLMOE_AB_PREP = 1, OLMOE_AB_ACT = 2, OLMOE_AB_IDLE = 3, OLMOE_AB_FUSE = 4, OLMOE_AB_ARRIVE = 5, OLMOE_AB_WAVES = 6,
+       OLMOE_AB_AHEAD = 7 };
 
 static int olmoe_ab_switch(const char *name) {
     if (strcmp(name, "prep") == 0) return OLMOE_AB_PREP;
@@ -2302,6 +2448,7 @@ static int olmoe_ab_switch(const char *name) {
     if (strcmp(name, "fuse") == 0) return OLMOE_AB_FUSE;
     if (strcmp(name, "arrive") == 0) return OLMOE_AB_ARRIVE;
     if (strcmp(name, "waves") == 0) return OLMOE_AB_WAVES;
+    if (strcmp(name, "ahead") == 0) return OLMOE_AB_AHEAD;
     return -1;
 }
 
@@ -2313,6 +2460,7 @@ static void olmoe_ab_set(void *session, int sw, int arm) {
     if (sw == OLMOE_AB_FUSE) s->ab_no_fuse = arm;
     if (sw == OLMOE_AB_ARRIVE) s->ab_sync = arm;
     if (sw == OLMOE_AB_WAVES) s->ab_waves2 = arm;
+    if (sw == OLMOE_AB_AHEAD) s->ab_no_ahead = arm;
 }
 
 const tr_arch_vtable tr_olmoe_vtable = {

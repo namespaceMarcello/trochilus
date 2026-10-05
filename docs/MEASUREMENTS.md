@@ -209,6 +209,8 @@ decides | — | — |
 | 88 | **What the integrated GPU gives on a real machine** (Marcello, 2026-10-03): **until real PCs are available, every number of the integrated GPU is an estimate**, and is written as one (Iris Xe or Radeon 680M ~2-3.4 TFLOPS against ~0.4 of four AVX2 cores: a prompt 3-5x; the UHD of the cheapest machines ~0.2-0.4, about the CPU). This PC's Radeon 610M (2 compute units) checks the bits, not the speed | `tools/machines.sh` on a real 8 or 16 GB laptop with an integrated GPU: the prompt and the decode with and without it, the same tokens | the emulation gives fewer cores and less memory, never another GPU: the integrated machines' prompt limits stay unmeasured until then |
 | 89 | **A MoE larger than RAM: its experts at the disk's limit, the VRAM as their cache** (Marcello, 2026-10-04; rung R3, **not before R2 closes**): Qwen3.8-Flash-Next FP8, 185 GB, 48 layers x 512 experts of 4.9 MB, 10 a token a layer. On this 8 GB-GPU, 31 GB laptop colibri decodes it at 0.75-1.01 tok/s and is disk-bound: it reads the experts buffered at 0.6 GB/s, queue depth ~1.5, against 2.1-3.0 GB/s O_DIRECT on the same drive (LESSONS #297); its VRAM gives more as expert cache than as trunk compute (#296; §Qwen3.8-Flash-Next FP8 on colibri's Vulkan tier). How close to the drive's limit can our store read 4.9 MB experts, and how many misses a token does the VRAM save as a cache tier under the RAM's? | the drive's ceiling for 4.9 MB reads at depth 1-16 (`make bench-disk`); a routing trace of the real model replayed through RAM + VRAM slots (`tools/evict_replay.py`); then the engine on the real model, the same tokens, against colibri on this machine | colibri used 0.6 of the drive's 2-3 GB/s: on a disk-bound decode that is up to 3.5-5x before any compute (an estimate); the VRAM holds ~5% of the experts (1248 of 24576), the RAM ~9% |
 | 90 | **A decode layer's experts as their bytes arrive** (R1 phase 3, the 8 GB machine; 2026-10-04): today a layer's misses are read on the calling thread, then its experts computed. Computing the resident ones while an I/O thread reads the misses, then the late ones, hides a miss under its own layer (§The routes as time: the model 1.084 Q4_K, 1.038 Q8_0, the same bytes); the next layer's router reading ahead adds 4% on Q4_K at +11% bytes. Does the engine keep the model's word, and what do the extra pool regions cost? | the expert stages split (resident, then late) with the store's reads on an I/O thread, the same bits (`make check`); counted (`MACHINES_COUNTS=1`), then raced on the 8 GB machine (`sh tools/machines.sh <binary> 5 q4k q8`) | Q4_K 1.06-1.08, Q8_0 1.03-1.04 (the model less two or three region ends a layer with a miss) |
+| 92 | ~~**The router's read ahead on top of the arrival order**~~ **Answered 2026-10-05** (§The router's read ahead): the 8 GB machine's decode Q4_K **1.031**, Q8_0 1.000 (k 8) and 1.005 (k 4), the same bits; a guess read in pieces and stopped when the next router does not name it, read a part a request once it does, k the next layer's units in 27 MiB. Open beside it: the race against the old binary (#332), the average machine's Q8_0 | ab_env.sh, `TR_AHEAD_K=0` against the default | Q4_K +2.5..4.5%, in |
+| 94 | **A draft from the bytes the machine already holds** (Marcello, 2026-10-05: the one piece that would change the whole structure, a gain on every machine): the reads for one token are near their ceilings (Q8_0 at 97% of its disk on 8 GB, the RAM-bound machines at 98-99%), and from R2 on every ordinary machine's experts come from disk. A pass of k rows reads 2.33x one row's experts at k 4 (question 54) and yields up to k exact tokens; the draft restricted to the experts already in RAM (disk-bound) or already streamed by the pass (RAM-bound, question 79) costs nothing on the bottleneck, the verification exact. How many exact tokens a pass, on each machine? | phase 1 (build/prompt-draft.md): agreement of each draft (a `draft_probe` variant, chains of k tokens), then a bytes-and-time model per machine checked against the engine's counts; built only at >= 1.2x and never below 1.0 | disk-bound 1.3-1.6x, RAM-bound 1.0-1.2x (question 71's draft inside the bits was 0.81-1.09x of llama.cpp's bytes) |
 Reference machine: Ryzen 9 7940HX (Zen 4, 16 core / 32 thread, AVX-512 VNNI/BF16), 31 GB
 RAM (2×16 GB DDR5-5200), NVMe Micron 1 TB, GPU RTX 4070 Laptop 8 GB and Radeon 610M (not used
 until M3/M6), Windows 11, MinGW-w64 gcc 15.2 `-O2`. Laptop on power, other programs open
@@ -6139,3 +6141,72 @@ binary, `TR_ARRIVE` read at session start, `tools/ab_env.sh`, 5 rounds, code-edi
 - **So the in-process A/B's verdict on this switch is its own** (LESSONS #318): the arrival arm slows only when
   its passes alternate with the calling thread's; whole processes of one binary agree with the races. An
   in-process A/B is not used for a switch that changes which threads run.
+
+## The router's read ahead (question 92, 2026-10-05)
+
+R1 phase 3, the 8 GB machine, on top of the arrival order. **Built**: at layer L's router, once L's misses are
+queued, layer L+1's router on L's FFN input (`pred_in`) names its top k a token (`olmoe_router_ahead`, passes of
+at most 8 tokens naming at most half the experts); the absent ones are queued in that order behind L's late units
+(`tr_experts_prefetch_ids`), each read alone in pieces of 512 KiB. At L+1's router the queued guesses it does not
+name are dropped unread and the one in flight stops at its next piece, absent at once (`tr_experts_prefetch_cancel`,
+`stats.stopped`); a guess it names still in flight is a late unit of the arrival order (`stats.ahead_late`, taken
+first: its read was queued first), and **from then on is read a part a request** (`experts_job.named`). k is the
+next layer's units in 27 MiB (`OLMOE_AHEAD_BYTES`: 8 for Q4_K, 4 for Q8_0); `TR_AHEAD_K`, `TR_AHEAD_CHUNK_KIB`,
+`TR_AHEAD_DRY` (the guess made, nothing queued) and `--ab ahead` for measurements. The same bits (test_stream ahead:
+the resident's logits on, off and by default).
+
+**The references** (read 10-05, ORIGINS row 7): colibri's PILOT (off by default, `PILOT=1`) reads ahead in decode
+passes of at most 8 tokens: layer L+1's router on the state after L's attention under **L+1's own norm**
+("IMPROVEMENT B"), the scores **averaged with the last token's** (SMOOTH 0.3), the top k (`WIDE` 1, so
+`CONF_LIMIT` never cuts), queued to a worker that reads whole experts, the stale queue flushed every token
+(ref/colibri/c/olmoe.c:10-18, 976-989, 1110-1124); ds4 and llama.cpp read nothing ahead in decode.
+
+**Replayed first** (predictions in build/q92/predictions.txt; traces build/q92, code.txt 321 + 256 or + 64 tokens,
+recorded in Docker: byte for byte the native ones):
+
+| what was replayed (Q4_K 615 slots, arrival order, head 0.05) | result |
+|---|---|
+| top-8 recall of layer L+1's choice: ours / colibri's norm / colibri's default (norm + SMOOTH 0.3) | 81.8% / 81.8% / **77.5%** |
+| k 8 against the arrival order alone: whole units / pieces of 2304, 1152 (a part), 512, 256 KiB | **0.958** / 1.001, 1.031, **1.042**, 1.042 |
+| Q8_0 (290 slots) k 4-8: whole / a part / 512 KiB | 0.932-0.990 / 0.986-1.002 / 1.006 |
+| layer L+2 from L's FFN input: recall at top 4 / 8 / 12 / 16 | 46.5% / **74.4%** / 85.9% / 91.2% |
+| two layers ahead: the true calls / L+1 top 8 + L+2's top 1-12 | **1.140** (L+1 alone 1.087) / 1.040-1.047 |
+| no guess while the disk is busy past G ms (G 0-7) | Q4_K 1.034 -> 1.025-1.028, Q8_0 1.002 -> 1.004 (issued 28.9 -> 2.3 a token) |
+
+- **Pieces, not units**: a wrong unit read whole holds the one disk when the next layer's demand needs it (#324).
+- **One layer ahead, ours**: colibri's norm predicts as ours; its average loses 4.3 points (#323). Two layers
+  ahead are predicted at 74% and still do not pay: the disk is the scarce resource, and the doubled window's
+  wrong bytes cost what it gains (#325).
+- **The model and the engine agree on the same tokens** (code.txt + 64, MACHINES_COUNTS=1, build/q92/counts_*;
+  #329): a token's guesses stopped 2.94 (model) / 2.95 (engine), dropped unread 0.78 / 0.78, used 1.95 / 2.08,
+  the disk 15.4 -> 18.0 / 15.7 -> 18.8 MiB; Q8_0 189.6 -> 195.7 MiB. The model's gain there: 1.034 and 1.002.
+
+**The races** (one binary, `tools/ab_env.sh`, whole processes, the 8 GB machine emulated, code-edit.txt's 411
+tokens then 200 (Q4_K) or 80 (Q8_0), 5 rounds, medians, the load 1.2-2.9 processors; build/q92/env_*, dry_*,
+prom_*):
+
+| decode tok/s, against off | Q4_K | Q8_0 |
+|---|---|---|
+| read in pieces to the end, k 8 (the A/A 1.001 / 1.000) | 1.024 (13.33 / 13.02) | **0.991** (2.02 / 2.04) |
+| k 12 / a part a request | 1.006 / 1.018 | |
+| the guess alone (`TR_AHEAD_DRY=1`) | 1.002 | 1.000 |
+| **a named guess read a part a request**, k 8 | **1.031** (13.37 / 12.97) | 1.000 |
+| the same, k 4 / k 10 | | **1.005** (2.04 / 2.03) / k 10 on Q4_K 1.023 |
+
+The prompt the same in every arm (+-0.3%), every token the same. **machines.sh**, the default (k by bytes) against
+`weakna` (the same binary, `TR_AHEAD_K=0`), code.txt's 321 tokens then 64, median of 3, stopped steady
+(build/q92/race_m): the decode **Q4_K 15.92 -> 16.26 tok/s (1.021), Q8_0 2.40 -> 2.41 (1.004)**, the prompt the
+same, the disk a token 15.8 -> 18.8 and 189.6 -> 190.8 MiB, the same tokens in all 10 runs of each model.
+
+- **The guess is free; its pieces were not** (#330): the guess alone costs 0.08-0.14 ms a token (the router's
+  zone), nothing in the totals; reading on in pieces after the router named a guess tripled Q8_0's requests
+  (9 033 -> 28 200 a run) and the emulated disk's late wakes (13 -> 251 ms), its whole loss. Read a part a request
+  once named: 7 641 requests for the same bytes.
+- **The best k is a byte budget** (#331): 8 x 3.4 MiB (Q4_K) and 4 x 6.4 MiB (Q8_0), the same 27 MiB.
+- **Where the time goes** (Q4_K, ms a token, off -> k 8 promoted): disk waits 41.51 -> 38.68, the other zones 35.57 -> 35.96
+  (qkv_proj +0.14, gate_up +0.07, the guess +0.08): the I/O thread's extra reads beside the four cores.
+- The predictions (build/q92/predictions.txt): decode Q4_K +2.5..+4.5%, **in** (+3.1%); Q8_0 -1..+1.5%, in (0 and
+  +0.5%); the prompt +-1%, in; the disk a token Q4_K 17.0-18.5 MiB, **out** (18.8: the first 64 tokens' store, #329),
+  Q8_0 191-196, in (195.7); the demand misses -45..-60%, **out** (-36%: the same model on 64 tokens says -43%).
+- **Owed**: the race against the old binary (Smart App Control held 12147b2's builds all session, #332): the
+  resident machines unchanged, the code's layout; the average machine's Q8_0 (2 GB/s: the guess on a faster disk).

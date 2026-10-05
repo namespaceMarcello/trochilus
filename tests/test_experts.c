@@ -53,6 +53,12 @@
  *                through tr_experts_acquire_counts, some of more tokens than TR_EXPERTS_HOT_PROMPT),
  *                apart from the LRU's; a run's several victims in one call, every unit exact in a
  *                slot of its own; and (prompt) the unit a pass's tokens chose most kept into the decode
+ *   ahead        tr_experts_prefetch_ids (the router's guess): (queue) the absent ones queued in the order given,
+ *                read alone in pieces (the requests counted), exact once taken, a present one skipped, none
+ *                before the I/O thread starts; (order) a call naming the guess returns at once with it late,
+ *                taken in the guess's order; (promote) once named, the rest read a part a request; (stop) a
+ *                guess not named stopped mid-read, absent at once, its slot back, never a miss; (victims) never
+ *                the target layer nor the keep; (named) a cancel naming the unit in flight leaves it to land
  *   slots        tr_experts_set_slots: 14 -> 10 slots under HOT drops the four coolest and moves the four
  *                units above 10 below it, bytes exact; under the LRU the four least recent go and a moved
  *                unit keeps its recency (the next miss evicts the least recent left, not it); clamped to
@@ -2075,6 +2081,174 @@ static void test_arrival(uint64_t align) {
     }
 }
 
+/* ---- the router's read ahead (tr_experts_prefetch_ids): a guess queued in its order, read in pieces, a unit not
+ * named stopped mid-read, one named while in flight left late ---- */
+
+static int64_t g_ah_queue, g_ah_order, g_ah_stop, g_ah_named, g_ah_skip, g_ah_promote, g_ah_victims;
+
+/* the requests one unit's pieces of `chunk` bytes make (experts.c read_parts_chunked): each part's aligned range */
+static int64_t ahead_pieces(int64_t layer, int64_t id, uint64_t chunk, uint64_t align) {
+    uint64_t c = (chunk + align - 1) / align * align;
+    int64_t n = 0;
+    for (int p = 0; p < TR_EXPERT_PARTS; p++) {
+        uint64_t pb = PART_BYTES_TABLE[layer][p];
+        uint64_t off = part_offset_table[layer * TR_EXPERT_PARTS + p] + pb * (uint64_t)id;
+        uint64_t lo = off / align * align, hi = (off + pb + align - 1) / align * align;
+        n += (int64_t)((hi - lo + c - 1) / c);
+    }
+    return n;
+}
+
+static void test_ahead(uint64_t align) {
+    uint64_t slot_bytes = tr_experts_slot_bytes(&PART_BYTES_TABLE[0][0], N_LAYERS, align);
+    shared_file f;
+    shared_init(&f, align);
+    char err[256];
+    tr_experts_config cfg = mk_cfg((uint64_t)PREFETCH_SLOTS * slot_bytes, shared_read, &f, align);
+    tr_experts *x = tr_experts_create(&cfg, err, sizeof err);
+    TR_CHECK(x != NULL);
+    if (x == NULL) return;
+
+    /* skip: no I/O thread yet, nothing queued */
+    static const int64_t want[3] = {4, 1, 3};
+    TR_CHECK_EQ_INT(tr_experts_prefetch_ids(x, 1, want, 3, 0, 16), 0);
+    TR_CHECK(tr_experts_prefetch_start(x) == 0);
+    TR_CHECK(tr_experts_acquire(x, 0, ALL_EXPERTS, N_EXPERT) == 0);
+    static const int64_t one[1] = {1};
+    TR_CHECK(tr_experts_acquire(x, 1, one, 1) == 0);
+
+    /* queue: layer 1's {4, 1, 3} guessed, 1 present: 4 and 3 queued, each read alone in pieces of 16 bytes (one
+     * request a part on a direct store: a piece rounds up to its 4096), invisible until taken, then exact; counted
+     * prefetched and misses; layer 0 kept (the keep) */
+    {
+        tr_experts_stats a, b;
+        tr_experts_get_stats(x, &a);
+        TR_CHECK_EQ_INT(tr_experts_prefetch_ids(x, 1, want, 3, 0, 16), 2);
+        int ok = unit_absent(x, 1, 4) && unit_absent(x, 1, 3);
+        TR_CHECK(tr_experts_prefetch_wait(x) == 0);
+        tr_experts_get_stats(x, &b);
+        ok &= unit_ok(x, 1, 4, align) && unit_ok(x, 1, 3, align) && unit_ok(x, 1, 1, align) && layer_ok(x, 0, align);
+        TR_CHECK(ok);
+        int64_t pieces = ahead_pieces(1, 4, 16, align) + ahead_pieces(1, 3, 16, align);
+        TR_CHECK_EQ_INT((int64_t)(b.requests - a.requests), pieces);
+        TR_CHECK_EQ_INT((int64_t)(b.prefetched - a.prefetched), 2);
+        TR_CHECK_EQ_INT((int64_t)(b.misses - a.misses), 2);
+        if (ok && b.requests - a.requests == (uint64_t)pieces && (align > 1 || pieces > 6)) g_ah_queue++;
+        if (ok && align == 1) g_ah_skip++;
+    }
+
+    /* order and late: layer 2's {5, 2} guessed at 0.02 s a piece; a call naming {2, 5, 0} returns at once with three
+     * late (two read ahead, 0 queued behind them), not waiting for any; taken in the guess's order, 5 lands first
+     * (the take of {5, 2} waited for one stops there), then 2 and 0; each exact */
+    {
+        static const int64_t guess[2] = {5, 2}, call[3] = {0, 2, 5}, take[3] = {5, 2, 0};
+        f.delay = 0.02;
+        tr_experts_stats a, b;
+        tr_experts_get_stats(x, &a);
+        TR_CHECK_EQ_INT(tr_experts_prefetch_ids(x, 2, guess, 2, 1, 16), 2);
+        double t0 = tr_time_sec();
+        int64_t late = tr_experts_acquire_async(x, 2, call, NULL, 1, 3);
+        double dt = tr_time_sec() - t0;
+        TR_CHECK_EQ_INT(late, 3);
+        TR_CHECK(dt < 0.5 * 0.02 * (double)ahead_pieces(2, 5, 16, align)); /* not one unit's read waited for */
+        int64_t first = tr_experts_acquire_take(x, 2, take, 3, 1);
+        TR_CHECK_EQ_INT(first, 1);
+        int ok = first == 1 && unit_ok(x, 2, 5, align) && unit_absent(x, 2, 2);
+        TR_CHECK_EQ_INT(tr_experts_acquire_take(x, 2, take + 1, 2, 2), 2);
+        f.delay = 0.0;
+        ok &= unit_ok(x, 2, 5, align) && unit_ok(x, 2, 2, align) && unit_ok(x, 2, 0, align);
+        TR_CHECK(ok);
+        tr_experts_get_stats(x, &b);
+        TR_CHECK_EQ_INT((int64_t)(b.ahead_late - a.ahead_late), 2);
+        TR_CHECK_EQ_INT((int64_t)(b.prefetched - a.prefetched), 2);
+        TR_CHECK_EQ_INT((int64_t)(b.arrived - a.arrived), 1);
+        /* (named) once the call names them they are no more guesses: the rest a part a request. On a buffered store
+         * 0 and 2 take three requests each, 5 its pieces read before the call (none to two) and three more; read
+         * on in pieces they would be 3 + 14 + 14 */
+        int64_t reqs = (int64_t)(b.requests - a.requests);
+        if (align == 1) TR_CHECK(reqs >= 9 && reqs <= 11);
+        if (ok && late == 3 && b.ahead_late - a.ahead_late == 2) g_ah_order++;
+        if (ok && align == 1 && reqs <= 11) g_ah_promote++;
+    }
+
+    /* stop: layer 1's 0 guessed at 0.02 s a piece, its first piece under way: a cancel naming only 5 drops it, the
+     * unit absent at once; the I/O thread stops at its next piece (at most two of its pieces read), the slot back
+     * with the wait, nothing counted a miss; read on demand after, exact */
+    {
+        static const int64_t g0[1] = {0}, named[1] = {5};
+        f.delay = 0.02;
+        tr_experts_stats a, b;
+        tr_experts_get_stats(x, &a);
+        long long calls0 = atomic_load(&f.calls);
+        int64_t q = tr_experts_prefetch_ids(x, 1, g0, 1, 2, 16);
+        TR_CHECK_EQ_INT(q, 1);
+        while (q == 1 && atomic_load(&f.calls) == calls0) {
+        }
+        TR_CHECK_EQ_INT(tr_experts_prefetch_cancel(x, 1, named, 1), 1);
+        int ok = unit_absent(x, 1, 0);
+        TR_CHECK(tr_experts_prefetch_wait(x) == 0);
+        long long reads = atomic_load(&f.calls) - calls0;
+        f.delay = 0.0;
+        tr_experts_get_stats(x, &b);
+        TR_CHECK(reads >= 1 && reads <= 2 && reads < ahead_pieces(1, 0, 16, align));
+        TR_CHECK_EQ_INT((int64_t)(b.stopped - a.stopped), 1);
+        TR_CHECK_EQ_INT((int64_t)(b.misses - a.misses), 0);
+        TR_CHECK_EQ_INT((int64_t)(b.requests - a.requests), reads);
+        ok &= unit_absent(x, 1, 0);
+        TR_CHECK(tr_experts_acquire(x, 1, g0, 1) == 0);
+        ok &= unit_ok(x, 1, 0, align);
+        TR_CHECK(ok);
+        if (ok && b.stopped - a.stopped == 1 && reads < ahead_pieces(1, 0, 16, align)) g_ah_stop++;
+    }
+
+    /* victims, on a store of its own filled to the last slot under the LRU: layer 1 the coldest, then layer 2's 0
+     * and 1, then layer 0; a guess of layer 2 kept off layer 1 (the keep) and off layer 2's own: its victim is
+     * layer 0's coldest, every unit of layers 1 and 2 still exact */
+    {
+        tr_experts *v = tr_experts_create(&cfg, err, sizeof err);
+        TR_CHECK(v != NULL && tr_experts_prefetch_start(v) == 0);
+        if (v != NULL) {
+            static const int64_t two[2] = {0, 1}, g3[1] = {3};
+            TR_CHECK(tr_experts_acquire(v, 1, ALL_EXPERTS, N_EXPERT) == 0);
+            TR_CHECK(tr_experts_acquire(v, 2, two, 2) == 0);
+            TR_CHECK(tr_experts_acquire(v, 0, ALL_EXPERTS, N_EXPERT) == 0);
+            TR_CHECK_EQ_INT(tr_experts_prefetch_ids(v, 2, g3, 1, 1, 16), 1);
+            TR_CHECK(tr_experts_prefetch_wait(v) == 0);
+            int ok = layer_ok(v, 1, align) && unit_ok(v, 2, 0, align) && unit_ok(v, 2, 1, align) &&
+                     unit_ok(v, 2, 3, align);
+            int64_t gone = 0;
+            for (int64_t e = 0; e < N_EXPERT; e++) gone += unit_absent(v, 0, e);
+            ok &= gone == 1;
+            TR_CHECK(ok);
+            if (ok) g_ah_victims++;
+            tr_experts_free(v);
+        }
+    }
+
+    /* named: layer 2's 1 (never read) guessed at 0.02 s a piece: a cancel naming it leaves it to land whole */
+    {
+        static const int64_t ga[1] = {1};
+        tr_experts_stats a, b;
+        int ok = unit_absent(x, 2, 1);
+        f.delay = 0.02;
+        tr_experts_get_stats(x, &a);
+        long long calls0 = atomic_load(&f.calls);
+        int64_t q = tr_experts_prefetch_ids(x, 2, ga, 1, 1, 16);
+        TR_CHECK_EQ_INT(q, 1);
+        while (q == 1 && atomic_load(&f.calls) == calls0) {
+        }
+        TR_CHECK_EQ_INT(tr_experts_prefetch_cancel(x, 2, ga, 1), 0);
+        TR_CHECK(tr_experts_prefetch_wait(x) == 0);
+        f.delay = 0.0;
+        tr_experts_get_stats(x, &b);
+        ok &= q == 1 && unit_ok(x, 2, 1, align) && b.stopped == a.stopped;
+        TR_CHECK(ok);
+        TR_CHECK_EQ_INT((int64_t)(b.requests - a.requests), ahead_pieces(2, 1, 16, align));
+        if (ok) g_ah_named++;
+    }
+    tr_experts_free(x);
+}
+
 int main(void) {
     t_test_thread = 1;
     build_part_offsets();
@@ -2098,6 +2272,7 @@ int main(void) {
         test_hot(align);
         test_slots(align);
         test_arrival(align);
+        test_ahead(align);
     }
     test_align_reuse();
     TR_CHECK(g_ar_twin > 0);
@@ -2107,6 +2282,13 @@ int main(void) {
     TR_CHECK(g_ar_order > 0);
     TR_CHECK(g_ar_fail > 0);
     TR_CHECK(g_ar_sync > 0);
+    TR_CHECK(g_ah_queue >= 2);
+    TR_CHECK(g_ah_order >= 2);
+    TR_CHECK(g_ah_stop >= 2);
+    TR_CHECK(g_ah_named >= 2);
+    TR_CHECK(g_ah_skip > 0);
+    TR_CHECK(g_ah_promote > 0);
+    TR_CHECK(g_ah_victims >= 2);
     TR_CHECK(g_sl_hot > 0);
     TR_CHECK(g_sl_lru > 0);
     TR_CHECK(g_sl_clamp > 0);

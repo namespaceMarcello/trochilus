@@ -173,10 +173,11 @@ remain.
   pin from use at any capacity, and below one token's units an LRU over the layers' cycle hits
   nothing where ds4's hotness hits 47 of 128 (§The 8 GB machine's store, 2026-10-03); disk gives the same bandwidth to one and eight readers, so
   no I/O thread until there is something to overlap: a prompt's next layer (it asks nearly every
-  expert; what it does not ask is dropped while still queued); in decode, without prediction, nothing to
-  overlap, and prediction (the router of the next layer, 92–95%) on a 1.5 GB/s disk costs
-  more than it pays. I/O threads and preloading come together, as option that the plan
-  switches on for fast disks (question 43). Minimum budget: units of one whole layer plus
+  expert; what it does not ask is dropped while still queued); in decode, a layer's misses read while
+  its present experts compute (the arrival order), and the next layer's router guessing its units: 27 MiB
+  of them queued behind the misses, read in 512 KiB pieces so a guess the next router does not name stops,
+  a part a request once it does (§The arrival order built, §The router's read ahead: the 8 GB machine's
+  Q4_K 1.031). Minimum budget: units of one whole layer plus
   those of one token, or the engine refuses. A read error makes evaluation return -1 and
   leaves the session as it was, never closes the process.
 - **Auto plan (M1)**: at load we measure available RAM and subtract the reserve

@@ -1786,3 +1786,21 @@ runnable copy before they take the marker (LESSONS #322). On the 8 GB machine, o
 How to try it: `make check`; `MSYS_NO_PATHCONV=1 docker run --rm -e ONLY=handoff -v "$(pwd -W):/src" -w /src
 trochilus-dev:local sh tools/mutate_experts.sh`: every line RED; the race: docs/COMMANDS.md's ab_env.sh line
 with the arrival order's modes.
+
+### 2026-10-05 — The router's read ahead (question 92)
+
+What it is: at a decode layer's router, once its misses are queued, the next layer's router on this layer's FFN
+input names its top k (the next layer's units in 27 MiB: 8 for Q4_K, 4 for Q8_0); the absent ones are queued to
+the store's I/O thread behind the misses (`tr_experts_prefetch_ids`), each read in 512 KiB pieces; the next
+router drops the queued guesses it does not name and stops the one in flight at its next piece
+(`tr_experts_prefetch_cancel`); a guess it names still in flight is a late unit of the arrival order, taken
+first, and the rest of it is read a part a request. The store counts `stopped` and `ahead_late` (the
+`experts:` line). Research switches: `TR_AHEAD_K` (0 off), `TR_AHEAD_CHUNK_KIB`, `TR_AHEAD_DRY=1`, `--ab ahead`;
+the trace's `TR_ROUTE_PRED=next|ema|two` (colibri's predictor variants, two layers ahead); evict_replay's
+`--src in2 --k2`, `oracle2`, `--gate-ms` and its issued, stopped and dropped columns. On the 8 GB machine,
+one binary in whole processes: the decode Q4_K 1.031, Q8_0 1.000 (k 8) and 1.005 (k 4), the same tokens.
+
+How to try it: `make check`; `MSYS_NO_PATHCONV=1 docker run --rm -e ONLY=ahead --security-opt seccomp=unconfined
+-v "$(pwd -W):/src" -w /src trochilus-dev:local sh tools/mutate_prefetch.sh` and `... sh tools/mutate_stream.sh`:
+every ahead line RED; the race: `TR_CPU_MAX=avx2 TR_MEM_TOTAL_MIB=8192 TR_MEM_AVAILABLE_MIB=4608
+TR_EXPERT_DISK_MBPS=500 AB_ENV_THREADS=4 sh tools/ab_env.sh build/trochilus.exe 5 "off=TR_AHEAD_K=0" "on=TR_AHEAD_K=-1"`.

@@ -38,14 +38,17 @@ run() {
 }
 M=src/models/olmoe.c
 run "no mutation" $M \
-  "tr_matmul(m->pool, &next->gate_inp, s->normed, rec, tr->router);" \
-  "tr_matmul(m->pool, &next->gate_inp, s->normed, rec, tr->router);"
+  "tr_matmul(m->pool, &next->gate_inp, in, rec, tr->router);" \
+  "tr_matmul(m->pool, &next->gate_inp, in, rec, tr->router);"
 run "pred uses layer L's own gate_inp, not layer L+1's" $M \
-  "tr_matmul(m->pool, &next->gate_inp, s->normed, rec, tr->router);" \
-  "tr_matmul(m->pool, &m->layers[L].gate_inp, s->normed, rec, tr->router);"
+  "tr_matmul(m->pool, &next->gate_inp, in, rec, tr->router);" \
+  "tr_matmul(m->pool, &m->layers[L].gate_inp, in, rec, tr->router);"
 run "pred_in taken from x instead of normed" $M \
-  "tr_matmul(m->pool, &next->gate_inp, s->normed, rec, tr->router);" \
-  "tr_matmul(m->pool, &next->gate_inp, s->x, rec, tr->router);"
+  "        const float *in = s->normed;" \
+  "        const float *in = s->x;"
+run "pred_in under the next layer's norm by default (TR_ROUTE_PRED unset)" $M \
+  "        if (tr->pred_mode == 1 || tr->pred_mode == 2) {" \
+  "        if (tr->pred_mode != 3) {"
 run "pred_out uses layer L's own ffn_norm, not layer L+1's" $M \
   "for (int64_t i = 0; i < rec; i++) tr_rmsnorm(tr->normed + i * n_embd, next->ffn_norm, n_embd, m->rms_eps);" \
   "for (int64_t i = 0; i < rec; i++) tr_rmsnorm(tr->normed + i * n_embd, m->layers[L].ffn_norm, n_embd, m->rms_eps);"

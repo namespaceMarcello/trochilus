@@ -409,6 +409,10 @@ static void print_experts(const tr_model *model) {
                     st.io_gap_sec * 1e3, st.disk_late_sec * 1e3);
         /* queued ahead and dropped unread: the next layer's call did not name them (a pass's read ahead) */
         if (st.cancelled > 0) fprintf(stderr, ", %llu dropped unread", (unsigned long long)st.cancelled);
+        /* the router's read ahead: units stopped mid-read (not named), and units named while still read (late) */
+        if (st.stopped > 0 || st.ahead_late > 0)
+            fprintf(stderr, ", %llu stopped mid-read, %llu named in flight", (unsigned long long)st.stopped,
+                    (unsigned long long)st.ahead_late);
         /* slots whose pages went to the KV as the positions advanced (olmoe.c kv_hold), of the ones made */
         if (st.slots_given > 0)
             fprintf(stderr, ", %llu of %lld slots given to the KV (%llu units moved)",

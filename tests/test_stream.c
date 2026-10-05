@@ -62,6 +62,10 @@
  *                pool of 4: one-token passes and a whole prompt's rows give the resident's logits in every
  *                arm (each late unit as it lands, two waves, --ab arrive's arm B on the calling thread);
  *                the first two counted arrived > 0, the third 0; misses, evictions and bytes equal in all
+ *                (the router's read ahead off: it moves bytes)
+ *   ahead        the router's read ahead (olmoe_router_ahead): 3 a token, off and by bytes, the disk at
+ *                40 MB/s: the resident's logits in every arm, units read ahead only when on, guesses dropped
+ *                and guesses named while still read (late) both seen
  *
  * Seen red: tools/mutate_stream.sh; progress: tools/mutate_bar.sh.
  */
@@ -1165,9 +1169,11 @@ static void test_arrival_one(const char *argv0, tr_type type, int64_t embd, int6
                 continue;
             }
             int sw_arrive = tr_session_ab_switch(s, "arrive"), sw_waves = tr_session_ab_switch(s, "waves");
-            TR_CHECK(sw_arrive > 0 && sw_waves > 0);
+            int sw_ahead = tr_session_ab_switch(s, "ahead");
+            TR_CHECK(sw_arrive > 0 && sw_waves > 0 && sw_ahead > 0);
             tr_session_ab_set(s, sw_arrive, arm == 2);
             tr_session_ab_set(s, sw_waves, arm == 1);
+            tr_session_ab_set(s, sw_ahead, 1); /* the arrival order alone: the router's read ahead moves bytes */
             int same = 1;
             for (int i = 0; i < N_PROMPT; i++) {
                 TR_CHECK(tr_session_eval(s, tokens + i, 1) == 0);
@@ -1208,6 +1214,93 @@ static void test_arrival(const char *argv0) {
     TR_CHECK(g_ar_same_bytes > 0);
 }
 
+/* ahead: the router's read ahead (olmoe_router_ahead) on the arrival model, 3 guessed a token (TR_AHEAD_K), and
+ * the default (k by OLMOE_AHEAD_BYTES: every expert of these tiny units), in pieces of 16 KiB, the disk emulated
+ * at 40 MB/s so a guess is still read when the next layer names its own: one-token passes and a whole prompt's
+ * rows give the resident's logits on, off (--ab ahead) and by default; on, the one-token passes read units ahead
+ * (prefetched > 0), off none */
+static int64_t g_ah_on, g_ah_off, g_ah_bytes, g_ah_dropped, g_ah_late;
+
+static void test_ahead_one(const char *argv0, tr_type type, int64_t embd, int64_t ff, const char *file) {
+    const synth_params P = {AR_LAYERS, embd, N_HEAD, N_HEAD_KV, ff, N_EXPERT, AR_USED, VOCAB, CTX, type};
+    char path[512];
+    TR_CHECK(synth_write(&P, argv0, file, path, sizeof path) == 0);
+    int32_t tokens[N_PROMPT];
+    for (int i = 0; i < N_PROMPT; i++) tokens[i] = prompt_token(i);
+
+    float ref[N_PROMPT][VOCAB];
+    uint64_t slot_bytes = 0;
+    tr_model *m = load_budget(path, NULL, HUGE_BUDGET);
+    tr_session *s = create_session(m, 0);
+    if (s != NULL) {
+        for (int i = 0; i < N_PROMPT; i++) {
+            TR_CHECK(tr_session_eval(s, tokens + i, 1) == 0);
+            memcpy(ref[i], tr_session_logits(s), sizeof ref[i]);
+        }
+        tr_experts_stats st;
+        TR_CHECK(tr_model_expert_stats(m, &st) == 0);
+        slot_bytes = st.slot_bytes;
+        tr_session_free(s);
+    }
+    tr_model_free(m);
+    if (slot_bytes == 0) return;
+
+    set_env("TR_AHEAD_CHUNK_KIB", "16");
+    set_env("TR_EXPERT_DISK_MBPS", "40");
+    tr_pool *pool = tr_pool_create(4);
+    for (int arm = 0; arm < 3; arm++) { /* 3 a token; off (--ab ahead); the default, k by OLMOE_AHEAD_BYTES */
+        set_env("TR_AHEAD_K", arm == 2 ? NULL : "3");
+        m = load_budget(path, pool, (uint64_t)(2 * N_EXPERT + AR_USED + 2) * slot_bytes);
+        s = create_session(m, 0);
+        if (s == NULL) {
+            tr_model_free(m);
+            continue;
+        }
+        int sw = tr_session_ab_switch(s, "ahead");
+        TR_CHECK(sw > 0);
+        tr_session_ab_set(s, sw, arm == 1);
+        int same = 1;
+        for (int i = 0; i < N_PROMPT; i++) {
+            TR_CHECK(tr_session_eval(s, tokens + i, 1) == 0);
+            same &= memcmp(tr_session_logits(s), ref[i], sizeof ref[i]) == 0;
+        }
+        tr_experts_stats st;
+        TR_CHECK(tr_model_expert_stats(m, &st) == 0);
+        TR_CHECK(tr_session_rewind(s, 0) == 0);
+        TR_CHECK(tr_session_eval_rows(s, tokens, N_PROMPT, N_PROMPT) == 0);
+        for (int i = 0; i < N_PROMPT; i++)
+            same &= memcmp(tr_session_logits_back(s, N_PROMPT - 1 - i), ref[i], sizeof ref[i]) == 0;
+        if (!same) fprintf(stderr, "  ahead: arm %d: logits differ\n", arm);
+        TR_CHECK(same);
+        if (arm != 1) TR_CHECK(st.prefetched > 0); /* the branch ran: one-token passes read ahead */
+        else TR_CHECK_EQ_INT(st.prefetched, 0);
+        if (same && arm == 0 && st.prefetched > 0) g_ah_on++;
+        if (same && arm == 1 && st.prefetched == 0) g_ah_off++;
+        if (same && arm == 2 && st.prefetched > 0) g_ah_bytes++;
+        if (arm == 0) {
+            g_ah_dropped += (int64_t)(st.stopped + st.cancelled);
+            g_ah_late += (int64_t)st.ahead_late;
+        }
+        tr_session_free(s);
+        tr_model_free(m);
+    }
+    tr_pool_destroy(pool);
+    set_env("TR_AHEAD_K", NULL);
+    set_env("TR_AHEAD_CHUNK_KIB", NULL);
+    set_env("TR_EXPERT_DISK_MBPS", NULL);
+    remove(path);
+}
+
+static void test_ahead(const char *argv0) {
+    test_ahead_one(argv0, TR_TYPE_Q4_K, 256, 512, "stream_ahead_q4k.gguf");
+    test_ahead_one(argv0, TR_TYPE_F32, 64, 128, "stream_ahead_f32.gguf");
+    TR_CHECK(g_ah_on > 0);
+    TR_CHECK(g_ah_off > 0);
+    TR_CHECK(g_ah_bytes > 0);
+    TR_CHECK(g_ah_dropped > 0); /* a guess not named dropped (queued or mid-read) */
+    TR_CHECK(g_ah_late > 0);    /* a guess named while still read: left late */
+}
+
 int main(int argc, char **argv) {
     const char *argv0 = argc > 0 ? argv[0] : "";
     test_content(argv0);
@@ -1221,5 +1314,6 @@ int main(int argc, char **argv) {
     test_mem_available(argv0);
     test_progress(argv0);
     test_arrival(argv0);
+    test_ahead(argv0);
     TR_TEST_EXIT();
 }
