@@ -131,15 +131,264 @@ def dense(kind, rows):
     return np.repeat(dsc, 32, axis=1) * q.reshape(q.shape[0], -1) - np.repeat(dm, 32, axis=1)
 
 
+TOL = 2e-3  # the study's float32 products: a bound this far below its row's value would be a bug
+
+
+class Head:
+    """The head for the study (question 73, build/q73): float32 planes, the bounds' variants on chunks of positions.
+    Q8_0: scale d per block of 32, codes -128..127 (8 bits). Q4_K: d*sc per subblock of 32, codes 0..15 (4 bits),
+    the dmin*m term exact from the block sums of h."""
+
+    def __init__(self, kind, rows):
+        self.kind = kind
+        if kind == "q8_0":
+            d, q = rows
+            self.scale, self.q, self.dm, self.qmax, self.top = d.astype(np.float32), q.astype(np.int8), None, 128.0, 8
+        else:
+            dsc, dm, q = rows
+            self.scale, self.q, self.dm, self.qmax, self.top = (dsc.astype(np.float32), q.astype(np.uint8),
+                                                                dm.astype(np.float32), 15.0, 4)
+        self.V, self.nb = self.scale.shape
+        self.n_embd = self.nb * 32
+        self.spos = np.maximum(self.scale, 0)
+        self.sneg = np.minimum(self.scale, 0)
+        self.sabs = np.abs(self.scale)
+        self.planes = {0: self.plane_matrix(0)}
+        self.svd = None
+
+    def plane_matrix(self, s):
+        q = self.q.astype(np.int16)
+        if s:
+            q = (q >> s) << s  # floor, the arithmetic shift
+        return np.repeat(self.scale, 32, axis=1) * q.reshape(self.V, -1).astype(np.float32)
+
+    def blk(self, H):
+        return H.reshape(self.nb, 32, -1).sum(axis=1)
+
+    def mins(self, H):
+        return 0.0 if self.dm is None else self.dm @ self.blk(H)
+
+    def exact(self, H):
+        return self.planes[0] @ H - self.mins(H)
+
+    def upper(self, b, H, Hu=None, E=None):
+        """Every row's bound from its scales and top b bits; Hu: h as the bound pass sees it (a quantized copy),
+        E: its error's block sums of |h - Hu| (the codes at their largest against it)."""
+        s = self.top - b
+        if s not in self.planes:
+            self.planes[s] = self.plane_matrix(s)
+        Hu = H if Hu is None else Hu
+        u = self.planes[s] @ Hu - self.mins(H)
+        if s:
+            u += ((1 << s) - 1) * (self.spos @ self.blk(np.maximum(Hu, 0)) + self.sneg @ self.blk(np.minimum(Hu, 0)))
+        if E is not None:
+            u += self.qmax * (self.sabs @ E)
+        return u
+
+    def quant(self, H, bits):
+        """h rounded per block of 32 to signed integers of `bits` bits (scale max|h| / (2^(bits-1) - 1))."""
+        G = H.reshape(self.nb, 32, -1)
+        delta = np.abs(G).max(axis=1, keepdims=True) / ((1 << (bits - 1)) - 1)
+        delta[delta == 0] = 1.0
+        Hq = (np.rint(G / delta) * delta).reshape(H.shape)
+        return Hq.astype(np.float32), self.blk(np.abs(H - Hq)).astype(np.float32)
+
+    def svd_prepare(self, ks):
+        """FEXIPRO's bound (Li et al. 2017): the rows in the head's singular basis, the first k coordinates kept (as
+        f16, their rounding counted), the rest bounded by Cauchy-Schwarz."""
+        W = self.planes[0] if self.dm is None else self.planes[0] - np.repeat(self.dm, 32, axis=1)
+        G = np.zeros((self.n_embd, self.n_embd))
+        for r in range(0, self.V, 8192):
+            c = W[r:r + 8192].astype(np.float64)
+            G += c.T @ c
+        _, vec = np.linalg.eigh(G)
+        Vb = vec[:, ::-1].astype(np.float32)
+        A = W @ Vb
+        self.svd = {"V": Vb}
+        for k in ks:
+            Ah = A[:, :k].astype(np.float16).astype(np.float32)
+            err = np.sqrt(((A[:, :k] - Ah) ** 2).sum(axis=1))
+            rest = np.sqrt((A[:, k:] ** 2).sum(axis=1))
+            self.svd[k] = (Ah, err * 1.0001 + 1e-6, rest * 1.0001 + 1e-6)
+
+    def upper_svd(self, k, H):
+        Z = self.svd["V"].T @ H
+        Ah, err, rest = self.svd[k]
+        zk = np.sqrt((Z[:k] ** 2).sum(axis=0))
+        zr = np.sqrt((Z[k:] ** 2).sum(axis=0))
+        return Ah @ Z[:k] + err[:, None] * zk[None, :] + rest[:, None] * zr[None, :]
+
+
+def study_counts(U, ex, best, prev):
+    """The rows the exact pass computes, a position a column, for four thresholds: the best exact score (the
+    least), the exact score of the best bound's row, the best of the four best bounds' rows, the previous
+    position's argmax row (the best bound's where there is none)."""
+    p = np.arange(U.shape[1])
+    n_min = (U >= best[None, :] - EPS).sum(axis=0)
+    t1 = ex[U.argmax(axis=0), p]
+    n_maxb = (U >= t1[None, :] - EPS).sum(axis=0)
+    top4 = np.argpartition(-U, 4, axis=0)[:4]
+    t4 = ex[top4, p[None, :]].max(axis=0)
+    n_top4 = (U >= t4[None, :] - EPS).sum(axis=0)
+    tp = np.where(prev >= 0, ex[np.maximum(prev, 0), p], t1)
+    n_prev = (U >= tp[None, :] - EPS).sum(axis=0)
+    return np.stack([n_min, n_maxb, n_top4, n_prev])
+
+
+def study_variants(kind):
+    if kind == "q8_0":
+        return ["b3", "b4", "b5", "b6", "b4i8", "b4i16", "b5i8", "svd16", "svd64", "svd256", "svd64+b4"]
+    return ["b2", "b3", "b3i8", "b3i16", "svd16", "svd64", "svd256", "svd64+b3"]
+
+
+def study_bytes(kind, var, n, V, n_other=None):
+    """The head's bytes a token reads, against the whole, for a variant whose exact pass computes n rows (means).
+    svdK+bB: the f16 coordinates of every row, then the plane for the svd's survivors (n_other), then the rest of
+    the rows both bounds keep (n)."""
+    blk, row = (34.0, 2176.0) if kind == "q8_0" else (144.0, 1152.0)
+
+    def plane(b):
+        return (2 + 4 * b) / 34.0 if kind == "q8_0" else (16 + 32 * b) / 144.0
+
+    if var.startswith("svd"):
+        k = int(var[3:].split("+")[0])
+        svd = (2 * k + 8) / row
+        if "+" not in var:
+            return svd + n / V
+        b = int(var.split("+b")[1])
+        return svd + n_other / V * plane(b) + n / V * (1 - plane(b))
+    b = int(var[1])
+    return plane(b) + n / V * (1 - plane(b))
+
+
+def study(model, paths, out_dir, chunk):
+    """Question 73, phase 1 (build/q73): every variant's rows left at every position of each logits file, saved as
+    <out_dir>/<file>.npz (counts: variants x 4 thresholds x positions; the prompt's length when <file>.np says it),
+    a line a variant printed."""
+    import os
+    kind, rows, n_rows, n_cols = load_head(model)
+    hd = Head(kind, rows)
+    del rows
+    W = hd.planes[0] if hd.dm is None else hd.planes[0] - np.repeat(hd.dm, 32, axis=1)
+    Gm = np.zeros((n_cols, n_cols))
+    for r in range(0, n_rows, 8192):
+        c = W[r:r + 8192].astype(np.float64)
+        Gm += c.T @ c
+    Gc = np.linalg.cholesky(Gm)
+    variants = study_variants(kind)
+    hd.svd_prepare([16, 64, 256])
+    os.makedirs(out_dir, exist_ok=True)
+    for path in paths:
+        L = np.memmap(path, dtype=np.float32, mode="r").reshape(-1, n_rows)
+        P = L.shape[0]
+        npf = path[:-4] + ".np"
+        n_prompt = int(open(npf).read().split()[0]) if os.path.exists(npf) else P
+        genf = path[:-4] + ".gen"  # generate's "tokens: a,b,..." line: the prompt and the generation fill the file
+        if os.path.exists(genf):
+            gen = [ln for ln in open(genf).read().splitlines() if ln.startswith("tokens:")]
+            n_gen = len(gen[0].split(":", 1)[1].split(",")) if gen else 0
+            if n_prompt + n_gen != P:
+                sys.exit(f"{path}: {P} positions, but {n_prompt} prompt tokens ({npf}) and {n_gen} generated ({genf})")
+        counts = np.zeros((len(variants), 4, P), np.int32)
+        worst = np.inf
+        prev_last = -1
+        for c0 in range(0, P, chunk):
+            Lc = np.asarray(L[c0:c0 + chunk], dtype=np.float64)
+            p = Lc.shape[0]
+            rhs = np.zeros((n_cols, p))
+            for r in range(0, n_rows, 8192):
+                rhs += W[r:r + 8192].astype(np.float64).T @ Lc[:, r:r + 8192].T
+            H = np.linalg.solve(Gc.T, np.linalg.solve(Gc, rhs)).astype(np.float32)
+            ex = hd.exact(H)
+            best = Lc.max(axis=1).astype(np.float32)
+            am = Lc.argmax(axis=1)
+            prev = np.concatenate([[prev_last], am[:-1]])
+            prev_last = am[-1]
+            ups = {}
+            for i, var in enumerate(variants):
+                if var.startswith("svd") and "+" in var:
+                    k, b = var[3:].split("+b")
+                    U = np.minimum(ups["svd" + k], ups["b" + b])
+                elif var.startswith("svd"):
+                    U = hd.upper_svd(int(var[3:]), H)
+                elif "i" in var:
+                    b, bits = var[1:].split("i")
+                    Hq, E = hd.quant(H, int(bits))
+                    U = hd.upper(int(b), H, Hq, E)
+                else:
+                    U = hd.upper(int(var[1:]), H)
+                ups[var] = U
+                worst = min(worst, float((U - ex).min()))
+                counts[i, :, c0:c0 + p] = study_counts(U, ex, best, prev)
+            del ups
+        if worst < -TOL:
+            sys.exit(f"{path}: a bound below its own row's value ({worst:.3g})")
+        stem = os.path.basename(path)[:-4]
+        np.savez(os.path.join(out_dir, stem + ".npz"), counts=counts, variants=np.array(variants), n_prompt=n_prompt,
+                 kind=kind)
+        print(f"{path}: {kind}, {P} positions ({n_prompt} the prompt's), the bounds' worst margin {worst:.2e}")
+        study_print(kind, variants, counts, n_rows)
+    return 0
+
+
+def study_print(kind, variants, counts, V, label=""):
+    for i, var in enumerate(variants):
+        n = counts[i]
+        other = None
+        if "+" in var:
+            other = counts[variants.index(var.split("+")[0]), 0].mean()
+        print(f"  {label}{var:9s} rows left mean {n[0].mean():8.1f} ({n[0].mean() / V:.4f}), median "
+              f"{np.median(n[0]):.0f}, p99 {np.percentile(n[0], 99):.0f}, max {n[0].max()}; computed: best bound's "
+              f"{n[1].mean():.1f}, top 4's {n[2].mean():.1f}, previous argmax's {n[3].mean():.1f}; the head's bytes "
+              f"{study_bytes(kind, var, n[0].mean(), V, other):.4f} (top 4's "
+              f"{study_bytes(kind, var, n[2].mean(), V, counts[variants.index(var.split('+')[0]), 2].mean() if other is not None else None):.4f})")
+
+
+def study_report(npzs, V=50304):
+    """The study's files pooled by kind and category: the prompts' positions, the greedy ones (the engine's own
+    tokens, from the prompt's last position on), the chats' greedy ones, the long contexts' by position."""
+    pools = {}
+    for f in npzs:
+        z = np.load(f)
+        kind, variants, counts, n_prompt = str(z["kind"]), [str(v) for v in z["variants"]], z["counts"], int(z["n_prompt"])
+        name = f.replace("\\", "/").split("/")[-1]
+        P = counts.shape[2]
+        cats = []
+        pos = np.arange(P)
+        if "long" in name:
+            for lo, hi in ((0, 1024), (1024, 2048), (2048, 3072), (3072, 3800), (3800, P + 1)):
+                cats.append((f"long {lo}-{hi - 1 if hi <= P else 'end'}", (pos >= lo) & (pos < hi)))
+        elif "chat" in name:
+            cats.append(("chat greedy", pos >= n_prompt - 1))
+        else:
+            cats.append(("prompt", pos < n_prompt - 1))
+            cats.append(("greedy", pos >= n_prompt - 1))
+        for c, m in cats:
+            key = (kind, c)
+            pools.setdefault(key, (variants, []))[1].append(counts[:, :, m])
+    for (kind, c), (variants, parts) in sorted(pools.items()):
+        counts = np.concatenate(parts, axis=2)
+        print(f"{kind} {c}: {counts.shape[2]} positions")
+        study_print(kind, variants, counts, V)
+    return 0
+
+
 def main(argv):
     ap = argparse.ArgumentParser()
     ap.add_argument("model", nargs="?")
     ap.add_argument("logits", nargs="*")
     ap.add_argument("--bits", default=None)
     ap.add_argument("--check", action="store_true")
+    ap.add_argument("--study", default=None, help="question 73's variants: the folder of the counts (.npz)")
+    ap.add_argument("--chunk", type=int, default=128)
+    ap.add_argument("--report", action="store_true", help="the study's .npz files (given as the arguments) pooled")
     a = ap.parse_args(argv)
     if a.check:
         return run_check()
+    if a.report:
+        return study_report(([a.model] if a.model else []) + a.logits)
+    if a.study:
+        return study(a.model, a.logits, a.study, a.chunk)
     kind, rows, n_rows, n_cols = load_head(a.model)
     W = dense(kind, rows)  # rows x n_embd, float64
     G = np.linalg.cholesky(W.T @ W)
@@ -206,6 +455,39 @@ def run_check():
     check(dsc_[0, 0] == 5 and dm_[0, 0] == 7 and dsc_[0, 4] == 3 + (3 << 4) and dm_[0, 4] == 2 + (1 << 4),
           f"Q4_K scales unpacked: {dsc_[0, [0, 4]]}, {dm_[0, [0, 4]]}")
     check(q_[0, 0, 0] == 1 and q_[0, 1, 0] == 2, f"Q4_K codes unpacked: {q_[0, 0, 0]}, {q_[0, 1, 0]}")
+    # the study's Head: the hand-made rows again, then random heads (negative scales too) against every variant
+    hd = Head("q8_0", (np.ones((1, 1)), np.full((1, 1, 32), 23, np.int32)))
+    h = np.array([1.0] * 16 + [-1.0] * 16, np.float32)[:, None]
+    check(abs(hd.upper(4, h)[0, 0] - 240) < 1e-4 and abs(hd.exact(h)[0, 0]) < 1e-4, "Head q8_0: bound 240, exact 0")
+    hd = Head("q4_k", (np.full((1, 1), 2.0), np.ones((1, 1)), np.full((1, 1, 32), 9, np.int32)))
+    h = np.ones((32, 1), np.float32)
+    check(abs(hd.upper(2, h)[0, 0] - 672) < 1e-4 and abs(hd.exact(h)[0, 0] - 544) < 1e-4, "Head q4_k: 672, 544")
+    rng = np.random.default_rng(73)
+    for kind in ("q8_0", "q4_k"):
+        V, nb = 300, 4
+        if kind == "q8_0":
+            rows = (rng.normal(0, 0.01, (V, nb)), rng.integers(-128, 128, (V, nb, 32)))
+        else:
+            rows = (rng.normal(0, 0.01, (V, nb)), rng.uniform(0, 0.01, (V, nb)), rng.integers(0, 16, (V, nb, 32)))
+        hd = Head(kind, rows)
+        hd.svd_prepare([16])
+        H = rng.normal(0, 1, (nb * 32, 5)).astype(np.float32)
+        ex = hd.exact(H)
+        worst, no_e = np.inf, np.inf
+        for b in ((3, 4, 5) if kind == "q8_0" else (2, 3)):
+            worst = min(worst, (hd.upper(b, H) - ex).min())
+            Hq, E = hd.quant(H, 8)
+            worst = min(worst, (hd.upper(b, H, Hq, E) - ex).min())
+        Hq, E = hd.quant(H, 8)
+        no_e = (hd.upper(hd.top, H, Hq, None) - ex).min()  # every bit kept: only the error term covers h's rounding
+        worst = min(worst, (hd.upper(hd.top, H, Hq, E) - ex).min())
+        worst = min(worst, (hd.upper_svd(16, H) - ex).min())
+        check(worst > -1e-4, f"{kind}: every variant's bound above its row ({worst:.3g})")
+        check(no_e < -1e-4, f"{kind}: without its error term the int8 bound fails somewhere ({no_e:.3g}): the term is seen")
+        n = study_counts(hd.upper(4 if kind == "q8_0" else 3, H), ex, ex.max(axis=0), np.full(5, -1))
+        check(n.min() >= 1 and (n[0] <= n[1]).all(), f"{kind}: the argmax's row survives, the least threshold the least")
+    check(abs(study_bytes("q8_0", "b4", 0, 1) - 18 / 34) < 1e-12 and abs(study_bytes("q8_0", "svd64", 0, 1) - 136 / 2176)
+          < 1e-12 and abs(study_bytes("q4_k", "svd64+b3", 1, 1, 1) - (136 / 1152 + 1)) < 1e-12, "study_bytes")
     print("head_bound --check:", "ok" if bad == 0 else f"{bad} failed")
     return 1 if bad else 0
 

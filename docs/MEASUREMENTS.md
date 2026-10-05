@@ -191,7 +191,7 @@ decides | — | — |
 | 70 | The softmax's exponential in a vector (question 58's AVX-512 kernel, 0.73 ns against `tr_expf`'s 3.52, 0 of 2^32 differ): with the tiles it is half of a prompt's (query, position) pair (4.45 of 9.2 ns on a core). Predicted: the prompt's attention 1.5-1.8x more, the prefill at 4000 +5-8%. **Built 2026-09-26** (§The softmax's exp in a vector): the table's `expf_f32`, AVX-512 and AVX2 without FMA, 0 of 2^32 differ from `tr_expf` in each tier; the prompt's attention 12.6 -> 8.9 ns a pair on a core (1.42x, loaded machine, indicative); in the engine on a free machine (8 pairs, background 2.3-2.4): the attention zone 1.34-1.37x, **the prefill 1.05x at 2048 and at 4000** | — | — |
 | 71 | A draft inside the exact bits (Q8_0 high nibble, KV high 16 bits) verified k tokens a pass: can it pass llama.cpp's bytes a token? (Marcello, 2026-09-26) **Measured** (§The engine read as entangled pairs): 97-100% where the exact model is sure, 82-98% overall; **0.81-1.04x llama.cpp's bytes on the real text** (model), 0.97-1.09x on the greedy continuation: this form closed on the CPU. **The two levers measured 2026-09-26** (§The draft's two levers): the second choice as a leaf +0.07-0.10x on prose and Italian; a KV of constant bytes (the previous token's top positions and their successors) keeps the sure positions at 512 and on code, not on prose at 2048-4000; **1.15-1.46x llama.cpp only on code** (repetitive), 0.89-1.04x on prose and Italian (model, upper bounds). Open: the skipped part of the softmax handed over by the exact pass; the selection's staleness | `make draft-probe`, `tools/draft_probe_report.py` | a pass's own drafts are 56% of its bytes; passes end where the draft doubts |
 | 72 | ~~Gate and up interleaved at load, one call with the activation~~ **Closed 2026-09-26 as no** (§The engine read as entangled pairs): on the free machine 1.006-1.023x of three calls from RAM (predicted 1.03-1.08x): with the experts balanced three calls already read at 97-98% of a plain read | — | — |
-| 73 | The head's argmax from its high plane: bounds from the high nibbles, exact dots only for the rows that can still win; greedy needs the argmax, `logits` keeps every row. **Rows left measured 2026-10-05** (§A draft from the bytes the machine holds, `tools/head_bound.py`): Q8_0's high nibble leaves 0.2-3.8% of the rows, the head read at 0.53-0.55, a RAM-bound Q8_0 token 1.039x by bytes; Q4_K's top 3 of 4 bits 0.2-3.7%, the head at 0.78, 1.017x. Open: built (the head repacked in planes at load, greedy and verify passes only) and raced on avg and pc | the rows left after the bounds, on the real text | <= 49 MiB a token (4%) |
+| 73 | The head's argmax from its high plane: bounds from the high nibbles, exact dots only for the rows that can still win; greedy needs the argmax, `logits` keeps every row. **Rows left measured 2026-10-05** (§A draft from the bytes the machine holds, `tools/head_bound.py`): Q8_0's high nibble leaves 0.2-3.8% of the rows, the head read at 0.53-0.55, a RAM-bound Q8_0 token 1.039x by bytes; Q4_K's top 3 of 4 bits 0.2-3.7%, the head at 0.78, 1.017x. **Phase 1 done 2026-10-05** (§The head's argmax by a bound): the head reads at the RAM on avg and pc (1.92-2.03 ms Q8_0, 1.02-1.06 Q4_K, 7.2-7.9% of a token); greedy positions leave 0.28-0.36% of the rows, long contexts 1.6-2.5%; the whole argmax by the bound measured in a bench (16 threads: Q8_0 2102 -> 1162-1278 us, Q4_K 1141 -> 928-1048); by the model a token pc and avg Q8_0 1.034-1.037x, weak Q4_K 1.018x, pc Q4_K 1.010x, avg Q4_K level, weak Q8_0 1.002x. Decided: build (phase 2), greedy first; then raced on avg and pc | the rows left after the bounds, on the real text | <= 49 MiB a token (4%) |
 | 74 | The draft on the GPU: the Q8_0 high-nibble planes and the draft's KV in VRAM, the CPU verifying from RAM, overlapped (the idea bounce of 2026-09-26, `build/entangled/bounce.md`): ~2.2x overlapped, ~1.7x serial in time (model). For Marcello: does the GPU count in the race (the GPU attention did) | a ~50-line CUDA probe timing one batch-1 draft step (plane 635 MiB + KV halves 256): pass <= 6 ms a draft token, fail > 15 ms | the draft's 891 MiB a draft token off the RAM bus |
 | 75 | ~~A draft KV in int4 (or int8) written once per position, and a draft head of the top ~16k rows~~ **Measured 2026-09-26** (§The draft's KV in 8 and 4 bits): the 8-bit copy changes no draft token and lifts every cell 0.02-0.14x; out of sample prose 0.93-1.09x, Italian 0.95-1.12x, code 1.14-1.26x; the 16k head covers 85-93% of the exact tokens: out. Prose does not pass 1.1x: the draft's weight plane is what is left | — | — |
 | 76 | Why does a 4-bit draft KV agree with the exact model more often than a 16-bit one (18 flips won, 3 lost, mostly where the exact margin is under 1 nat)? A guess: noise on the old keys inflates their softmax weight (Jensen) against the last 64 kept at 16 bits | kv4 with no positions kept at 16 bits; Gaussian noise on the 16-bit draft's old keys | a draft that is cheaper and closer at once |
@@ -6328,3 +6328,93 @@ head drafts with 128 experts of its own (3 a token, a fifth of a main token) and
 DraftExpert 1.45x with trained resident draft experts at 84-87% acceptance, AcceptMoE, cache-conditional routing,
 the last two not exact): the GPU's verify cheap, the bus the limit; none counts the store's own reuse of consecutive
 tokens.
+
+## The head's argmax by a bound (question 73, 2026-10-05)
+
+**Asked** (build/prompt-head.md, phase 1: studied to the bottom and measured, nothing in the engine): at every greedy
+token the engine scores the 50304 rows of the output head and keeps the argmax. A row's score is a sum over blocks of
+scale x codes . h; read each code's top bits only and take the low bits at their worst against h: every row gets a
+provable upper bound, and only the rows whose bound reaches the best exact score can win. Predictions first
+(build/q73/predictions.txt, their outcomes beside them); everything in build/q73.
+
+**The references** (ORIGINS row 15, read 10-05): all four compute every row. colibri one `matmul_qt` over the
+vocabulary (h int8 once, `matmul_q_idot`), a serial argmax (`c/sample.h` 20-24); ds4 `matvec_q8_0` over every row
+(h Q8_0), a serial 8x-unrolled argmax; its one pruned head is the Qwen4 MTP draft's (an id prefix or a ranked subset,
+`DS4_QWEN4_MTP_DRAFT_VOCAB`: not exact, its verify rows keep the whole head); llama.cpp and ik_llama.cpp the full
+`output` matmul after `ggml_get_rows` of the outputs (h Q8_0 / Q8_K), the head repacked like any weight (`repack.cpp`,
+`-rtr`), a serial greedy scan. **None prunes rows for an exact argmax.** The literature (known, not re-read): exact
+maximum inner product search with bounds, LEMP (Teflioudi et al. 2015) and FEXIPRO (Li et al. 2017: an SVD rotation,
+Cauchy-Schwarz on the tail, integer-scaled bounds); the threshold algorithm (Fagin et al. 2001); top-k from bit slices,
+most significant first (bit-sliced index arithmetic, Rinfret, O'Neil and O'Neil 2001): the closest to ours. Not exact,
+not rivals: SVD-softmax (Shim et al. 2017), learning to screen (L2S, Chen et al. 2019).
+
+**The share, measured** (two profiled decode runs an arm, `MACHINES_COUNTS=1`, build/q73/prof1-2): the head reads at
+this PC's RAM ceiling on avg and pc; on weak its Q4_K is the cores' (the exact integers on AVX2), its Q8_0 a token the
+disk's.
+
+| machine | Q8_0 lm_head (GB/s), share of a token | Q4_K lm_head (GB/s), share |
+|---|---|---|
+| weak (4, AVX2) | 2.27-2.31 ms (47-48), 0.5-0.6% of 415 ms | 2.56-2.59 ms (22-23), 4.2% of 61 ms |
+| avg (8) | 1.92-2.03 ms (54-57), 7.8% | 1.02-1.06 ms (55-57), 7.2% |
+| pc (16) | 1.92-1.95 ms (56-57), 7.8-7.9% | 1.02-1.03 ms (56-57), 7.4-7.5% |
+
+**The rows left, on more data** (`tools/head_bound.py --study`, then `--report`: 13 texts a model in the container,
+build/q73/data.sh: the three prompts, 6 new-code files, 2 chats, each with the engine's own 256 greedy tokens after
+it, and 2 long contexts of 3800 tokens + 256 (code from this repo, English prose); 13,950 positions a model, h solved
+from the engine's logits, every bound checked against its own row). h as the bound pass sees it: two int8 digits a
+block of 32 (a 16-bit code; one int8 digit leaves 2.0-2.1x the rows on Q8_0, 3.1-3.3x on Q4_K, its rounding error
+counted at the codes' largest), the mean with the threshold the best exact score of the four best bounds' rows (1.02-1.1x
+the least possible, whose median, p99 and max the table gives; the best bound's row alone 1.2-2.7x; the previous token's row 38000-50000 rows: never):
+
+| positions | Q8_0, top 4 of 8 bits: mean (median, p99, max) | Q4_K, top 3 of 4 bits |
+|---|---|---|
+| greedy (the engine's own tokens) | 0.28% (4, 3281, 6497) | 0.36% (4, 3554, 21106) |
+| chat, greedy | 0.85% (27, 6492, 15043) | 0.69% (16, 5120, 7197) |
+| the prompts' positions | 1.7% (48, 9574, 19874) | 1.6% (49, 8626, 22527) |
+| long context, positions 0-3800 | 1.6-2.5% (p99 6900-9900) | 1.6-2.3% (p99 6300-8900) |
+| long context, greedy at 3800+ | 1.3% (34, 6824, 12830) | 0.9% (21, 4609, 6549) |
+
+The head's bytes: Q8_0 top 4 bits 0.531-0.541 (5 bits 0.647: 5-27 rows left; 3 bits 0.58-0.86), Q4_K top 3 bits
+0.779-0.783 (2 bits 0.94-0.99). A cascade (Q8_0's 4 bits for every row, the 5th for the rows left, then exact) saves
+0.001-0.008 of the head: closed by its share. FEXIPRO's bound (the head's SVD, 16 / 64 / 256 coordinates kept as f16,
+Cauchy-Schwarz on the rest) leaves 99.4% of the rows: h's energy is not in the head's top directions. Closed.
+
+**The time, piece by piece** (`tests/bench_head_bound.c`, `sh tools/bench_native.sh bench_head_bound`: a head of the
+real shape, random codes, two rows aligned with h, one a copy of the other, for the check; the bounds against the
+engine's own value of every row, the kernels against the bound's formula in double, the whole argmax against the
+engine's (the lowest row on a tie); every timed run reads its own of 4 copies of the heads, #344; medians of 21 in a
+quiet window, 1.3-1.4 logical processors busy). The plane kernels: Q8_0's high nibbles (1152 B a row), Q4_K's top 3
+bits as a two-bit and a one-bit plane (896 B a row), against h's two digits by `maddubs` (AVX2) or `vpdpbusd`
+(AVX-512 VNNI); the margin of the float sums (2^-16 of the terms' magnitudes, above both the engine's rounding and the
+bound's) folded into each block's prepared terms at no cost. In cache, one core: AVX2 Q8_0 52 ns a row (22 GB/s of
+plane), Q4_K 89 (10 GB/s; 164 before #341); AVX-512 50.5 and 72 ns. The whole argmax (the bounds and each worker's
+largest; the best bound's row exactly, four in the engine, a few us more; one more region collecting the rows whose
+bound reaches that score and computing them from the two planes; the rows left forced by the threshold):
+
+| threads (tier) | Q8_0: today's head | the argmax by the bound, rows left 100 / 1000 / 3000 / 12000 | Q4_K: today's | by the bound |
+|---|---|---|---|---|
+| 4 (AVX2, weak) | 1993 us | 1224 / 1345 / 1499 / 2517 | 2963 | 1615 / 1680 / 1962 / 2766 (AVX2) |
+| 8 (avg) | 2014 | 1072 / 1212 / 1317 / 1877 (AVX2 kernel) | 1085 | 1015 / 1070 / 1139 / 1445 (AVX-512) |
+| 16 (pc) | 2102 | 1162 / 1182 / 1278 / 1620 (AVX2 kernel) | 1141 | 928 / 1007 / 1048 / 1299 (AVX-512) |
+
+A region woken from sleep costs 40-110 us, a hot one 1-5 us; the 50304 bounds scanned by one thread 19-29 us (the
+pass scans them in its second region). The Q4_K plane kernel stays below the RAM's speed at 8 threads with AVX2
+(37-42 GB/s): AVX-512's bits to bytes (`vpmovm2b`) bring it to 48-50.
+
+**The model per machine** (build/q73/model.py: the bench's argmax at every position's rows left, averaged, scaled to
+the engine by today's head; a verify pass of k rows reads the planes once and computes k bounds a row; model.txt):
+
+| a token, greedy | weak | avg | pc |
+|---|---|---|---|
+| Q8_0 | head 2.29 -> 1.40-1.52 ms: **1.002x** (the disk's token) | 1.98 -> 1.09-1.16: **1.034-1.036x** | 1.94 -> 1.06-1.10: **1.035-1.037x** |
+| Q4_K | 2.57 -> 1.43-1.49: **1.018-1.019x** | 1.04 -> 1.02-1.03: **1.0005-1.0012x** | 1.03 -> 0.88-0.89: **1.010-1.011x** |
+
+Verify passes: Q8_0 k 2 1.022-1.026x, k 4 1.009-1.017x; Q4_K on pc 1.003-1.008x, on avg at k 4 0.975x with k bounds
+computed apart (a k-row kernel decoding the plane once would not lose: not measured). On the real machines' RAM (the
+model's bytes): avg at 34.6 GB/s reads today's Q8_0 head in 3.2 ms and its planes in 1.7, Q4_K 1.7 and 1.3; the 8 GB
+machine at 14.3 GB/s 7.6 and 4.0 ms, 4.0 and 3.2: every one gains.
+
+**Decided: build (phase 2)** for greedy tokens, Q8_0 and Q4_K: four machines-and-formats gain 1-3.7%, avg's Q4_K is
+level, none loses; the verify passes only with a k-row bound kernel (or off where the model loses). The head repacked
+at load into its two planes (the same bytes: no RAM), the exact rows and `logits` from the planes, bit for bit. Model,
+not measured: the race in whole processes decides.

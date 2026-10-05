@@ -65,3 +65,4 @@ State on 2026-10-02: one piece raced (the exp), level; every other is the debt. 
 | 12 | Activations prepared once a row | q, k, v from one prep; gate, up 16 preps to 1 a token | not raced (int8 once a layer) | not raced (q8_K once a token) | race first: a likely offer |
 | 13 | The KV's pages at their first write | touched over the pool: kv_write 80 -> 50 us a token | not raced (faults inside the writes) | not raced (calloc, faults inside the writes) | race first: a likely offer |
 | 14 | The router's matrix | kept bf16 where every value fits: 1.40-1.48x, the same bits | not raced (F32) | not raced (F32) | race first: a likely offer |
+| 15 | The output head of a greedy token | every row today; the argmax by a bound measured (question 73 phase 1, a bench: 16 threads Q8_0 2102 -> 1162-1278 us), not built | not raced (every row, h int8) | not raced (every row, h Q8_0) | build (phase 2), then race: an exact argmax neither has, a likely offer |

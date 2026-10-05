@@ -463,7 +463,7 @@
         {
           "n": 73,
           "state": "open",
-          "text": "the most likely token from the output head's high half, exact only on the rows that can still win. Measured (10-05): the high half of each weight already rules out 96-99.8% of the 50304 rows; the head read at 0.53 of its bytes, a token 1.039x on the machines limited by their RAM (Q8_0), 1.017x (Q4_K). To build and race"
+          "text": "the most likely token from the output head's high half, exact only on the rows that can still win. Phase 1 done (10-05): on the engine's own greedy tokens only 0.3% of the 50304 rows can still win; the head 1.94 -> about 1.08 ms in a bench (Q8_0, 16 threads); by the model a token 1.035x on the average machine and this PC (Q8_0), 1.018x on the 8 GB machine (Q4_K), none loses. Decided: build it (phase 2), then race"
         }
       ],
       "files": [

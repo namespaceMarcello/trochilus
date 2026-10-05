@@ -341,22 +341,20 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
   its slots as it is written; a chat's decode on weak **Q8_0 1.22 -> 2.29, Q4_K 4.55 -> 14.77 tok/s**.
   **10-04, offered to colibri** (UPSTREAM row 7; #293-#294): `kv_room_fit` (fork branch `perf/olmoe-kv-room`), on
   colibri's engine a request **1.19x**, the logits byte-identical: **colibri #1873**, waiting for its review.
-  **10-04, the eviction told the future** (#304-#307): closed, heat stays; **the routes as time** (#309-#313):
-  the window, not the prediction, is the limit. **10-05, the arrival order** (#314-#318): a layer's misses read
-  while its present experts compute: the weak decode **Q4_K 14.98 -> 16.08, Q8_0 2.33 -> 2.40 tok/s**.
-  **10-05, the router's read ahead** (#323-#332): the next layer's guess (27 MiB), read in pieces, stopped if not
-  named: the weak decode **Q4_K 1.031, Q8_0 1.000-1.005**. Owed: the old binary's race (#332), avg's Q8_0.
-  **10-05, question 94** (#335-#338): a draft from the store's experts agrees 0.89-0.98 on code, 0.50-0.88 on
-  prose, loses on every machine (0.74-0.98x, model): the store already gives the union's saving; not built.
-  **Next**: question 95 (free drafts on weak Q4_K: its row price); a miss as one request, this PC
-  at half budget; then the integrated GPU (r1-igpu:
-  Vulkan; q. 87-88); then R1's first prompt's cost, generation's fixed cost, the review, the server; the races
-  with llama.cpp, colibri and ds4 together at R1's close. The decode's
-  speed backlog (R1 phase 3 where the weak machines need it): question 85's serial steps as messages; the pool's
+  **10-04**: the eviction told the future closed (#304-#307); the routes as time: the window is the limit (#309-#313).
+  **10-05, the arrival order** (#314-#318): the weak decode **Q4_K 14.98 -> 16.08, Q8_0 2.33 -> 2.40 tok/s**.
+  **10-05, the router's read ahead** (#323-#332): the weak decode **Q4_K 1.031, Q8_0 1.000-1.005**. Owed: the old
+  binary's race (#332), avg's Q8_0. **10-05, question 94** (#335-#338): a draft from the store's experts loses on
+  every machine (0.74-0.98x, model): not built. **10-05, question 73 phase 1** (#341-#345; MEASUREMENTS §The head's
+  argmax by a bound): greedy positions leave 0.3% of the head's rows; the head 1.94 -> ~1.08 ms (bench, Q8_0, 16
+  threads); by the model a token **1.035x on avg and pc (Q8_0), 1.018x on weak (Q4_K)**, none loses: phase 2 builds it.
+  **Next**: question 73 phase 2 (build/prompt-head.md); question 95 (free drafts on weak Q4_K); a miss as one
+  request, this PC at half budget; the integrated GPU (r1-igpu: Vulkan; q. 87-88); R1's first prompt's cost,
+  generation's fixed cost, the review, the server; the races with llama.cpp, colibri and ds4 at R1's close. The
+  decode's backlog (R1 phase 3 where the weak machines need it): question 85's serial steps as messages; the pool's
   messages; the prep's bit arithmetic; the dense at 3 rows, AVX2's own xt, #229, questions 79-80, the gate in C,
-  `--spec` by default; the GPU A/B at a free machine; W16's deletion series; AVX2 tile's tails (f64 16%, broadcasts
-  15%); `dot_row2` dead code;
-  the race of whole binaries (#243-#244); questions 68, 74, 76; **for Marcello, 59 and 60**.
+  `--spec` by default; the GPU A/B; W16's deletion series; AVX2 tile's tails; `dot_row2` dead code; the race of
+  whole binaries (#243-#244); questions 68, 74, 76; **for Marcello, 59 and 60**.
 
 Mutants open: `threads.c`'s 22 (speed, not bits), `platform.c`'s Windows half (#268). Steps of 17–20/09: DONE.
 

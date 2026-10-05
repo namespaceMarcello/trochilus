@@ -1824,3 +1824,19 @@ How to try it: `tools/.venv/Scripts/python.exe tools/spec_replay.py --check`; th
 probe's runs: `build/q94/phase1.sh` and `build/q94/phase2.sh` in the container (`MSYS_NO_PATHCONV=1 docker run --rm
 -v "$(pwd -W):/src" -v trochilus-models:/src/models -w /src trochilus-dev:local sh build/q94/phase1.sh`), then
 `spec_replay.py <trace> --slots 290 --chain build/q94/probe_<text>_Q8_0_s290.tsv --halve tokens`.
+
+### 2026-10-05 — The head's argmax by a bound, phase 1 (question 73)
+Measured, nothing in the engine. `tools/head_bound.py --study` (and `--report`) counts every variant of the bound at
+every position of the engine's logits: the bits kept, h as int8 or as two int8 digits (its rounding counted), four
+first thresholds, FEXIPRO's SVD bound, a cascade; its `--check` covers the new pieces (the int8 error term seen red
+without it). `tests/bench_head_bound.c` (a research bench, `make` builds it with the others): today's head call against
+the bound's plane pass (Q8_0's high nibbles, Q4_K's top 3 bits as two planes; AVX2 and AVX-512 VNNI kernels) and the
+whole argmax by the bound, from RAM through 4 rotating copies of the heads; every bound checked against the engine's
+value of its row, the argmax against the engine's (a tie included). Result: greedy positions leave 0.28-0.36% of the
+rows; the head 1.94 -> ~1.08 ms on Q8_0 (16 threads); by the model a token on avg and pc 1.034-1.037x (Q8_0), on the
+8 GB machine 1.018x (Q4_K); decided: build (MEASUREMENTS §The head's argmax by a bound; LESSONS #341-#345).
+
+How to try it: `sh tools/bench_native.sh bench_head_bound --runs 21 --threads 4,8,16 [--avx512]`; the counts:
+`build/q73/data.sh` in the container, then `tools/.venv/Scripts/python.exe tools/head_bound.py <model.gguf>
+build/q73/data/*_Q8_0.f32 --study build/q73/rows` and `--report build/q73/rows/*.npz`; the model:
+`tools/.venv/Scripts/python.exe build/q73/model.py`.
