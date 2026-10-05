@@ -1887,4 +1887,4 @@ The margin now grows with the longest rounding path, (D + 16) 2^-24, never below
 
 How to try it: `docker build -t trochilus-proof:local -f tools/docker/Dockerfile.proof tools`, then `make proof`. It
 prints one line a harness, about 15 minutes, logs in build/proof. `sh tools/mutate_head.sh` in that image turns every
-harness red under its own mutation.
+harness red under its own mutation. Commit: `27ed028` (not pushed).

@@ -391,8 +391,6 @@ budget = the engine before M1); a read error fails the evaluation, not the proce
   4. **file reordering for co-activation** (mbolt, MIT): ≤ 1.15× on this disk with these
      experts, costs our format. Later.
 - **Then**: questions 42 (layer 0), 43 (from which disk up prefetch pays), 46 (fixed cost of decode).
-  Three matrices in one read: **no**, three separate GGUF tensors (docs/ORIGINS.md
-  §The expert store).
 
 **Order decided by Marcello 2026-09-19 evening**: (a) **M1**, experts from disk, starting from
 measurements 13–16 and with GGUF and pool folders from component comparison inside (point 5);
@@ -430,11 +428,12 @@ forces width** (`--decode-threads`), never `auto`: no conclusion rests on unvali
    Every inexact mode is decided with equal tokens and KL in front (`tools/compare_llamacpp.py`).
 4. Prefill on long prompts: **exact part and scalar `tr_expf` done** (decisions 2026-09-19 above:
    clean machine 306–315 tok/s at 512, 303–308 at 2048, 276 at 4000). Remain:
-   - `tr_expf` in SIMD: **no** (question 39, closed 2026-09-19: 1.01–1.04× estimated, at noise
-     threshold, for ~200 delicate rows; scalar took almost all);
-   - attention groups with **GQA** and beyond 4096 tokens (question 38), when Qwen3-Coder arrives:
-     8 query heads per key head can fit same group;
-   - KV at 16 bits **not** needed for prefill anymore (keys and values read once per group):
+   - attention groups with **GQA** and beyond 4096 tokens (question 38), for Qwen3-Coder:
+     8 query heads a key head in one group;
+   - the head by a bound for Qwen3-Coder: kernel and proof fit (n 2048), its model code must wire it as
+     olmoe.c does; only a Q8_0 or Q4_K head takes it (a Q4_K_M GGUF's head is often Q6_K: full scan,
+     exact, no gain; Q6_K planes would be a new piece and proof); 151 936 rows, 3× OLMoE's;
+   - KV at 16 bits **not** needed for prefill (keys and values read once a group):
      remains decode lever (point 6).
 5. Component-by-component comparison (decision above), then fixes from it. **Marcello's yes
    2026-09-19, on three sources**: colibri, ds4, llama.cpp. Review of what is already built
