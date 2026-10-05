@@ -87,6 +87,11 @@ while [ "$R" -le "$ROUNDS" ]; do
                                print l, "read_s", r, $(i + 1)
           if ($i == "in" && $(i - 1) == "touched") print l, "touch_s", r, $(i + 1)
           if ($i == "requests") print l, "requests", r, $(i - 1)
+          # the handoffs between the threads (LESSONS #318), when the I/O thread worked
+          if ($i == "takes" && $(i + 1) == "woken") { print l, "takes", r, $(i - 1); print l, "wake_ms", r, $(i + 2) }
+          if ($i == "thread" && $(i + 1) == "woken") print l, "iowake_ms", r, $(i + 2)
+          if ($i == "reads" && $(i - 1) == "its") print l, "gap_ms", r, $(i + 1)
+          if ($i == "late" && $(i - 1) == "disk") print l, "late_ms", r, $(i + 1)
       } }')
     [ -z "$EXPERTS" ] || LINES="$LINES
 $EXPERTS"

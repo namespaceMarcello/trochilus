@@ -36,6 +36,8 @@ fi
 TR_GPU=0
 export TR_GPU
 . tools/measure_guard.lib
+# a binary Smart App Control holds: a copy a byte longer, found before the marker is taken (LESSONS #322)
+B=$(measure_runnable "$B") || { echo "ab_inproc: $B is held by Smart App Control, its longer copies too"; exit 1; }
 trap measure_end EXIT
 trap 'exit 130' INT TERM
 measure_begin ab_inproc

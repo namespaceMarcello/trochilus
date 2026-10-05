@@ -1141,6 +1141,10 @@
         {
           "v": "built: a layer's missing experts read by a second thread while the experts already in RAM compute, the late ones computed as they land; the same bytes from disk, the same bits: on the 8 GB machine generation 14.98 -> 16.08 tok/s (Q4_K, 1.073x) and 2.33 -> 2.40 (Q8_0, 1.030x) in three races, the prompt unchanged; ds4 does it on its GPU from three misses only, which replayed here keeps almost nothing (1.004x)",
           "d": "2026-10-05"
+        },
+        {
+          "v": "the same binary run in each of its three ways, whole processes: computing each late expert as it lands is the best way on both models (Q4_K 1.079x, Q8_0 1.025x against the old way, two waves 1.073x and 1.015x); the threads handing work to each other cost 0.16% of a run",
+          "d": "2026-10-05"
         }
       ],
       "questions": [
@@ -1151,8 +1155,8 @@
         },
         {
           "n": 91,
-          "state": "open",
-          "text": "why, in one process, the arrival order's arm slows every compute zone (qkv_proj +8% Q4_K, +22% Q8_0) and two waves beat one a unit on Q8_0 (LESSONS #318-#319): each handoff's latency measured, then a wait that spins before it blocks"
+          "state": "closed",
+          "text": "why the arrival order's arm slowed in one process: the handoffs measured cheap (11-13 us a take, 0.16% of a run) and whole processes of one binary agree with the races; the in-process A/B's alternation was its own (LESSONS #318)"
         }
       ],
       "files": [

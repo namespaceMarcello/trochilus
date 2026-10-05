@@ -122,6 +122,13 @@ typedef struct {
                                            * counted in misses and bytes_read too once taken in */
     uint64_t arrived;                     /* units a call's I/O thread read while it computed the present
                                            * ones (tr_experts_acquire_async), in misses and bytes_read too */
+    /* the handoffs between the calling thread and the I/O thread (LESSONS #318), in seconds: */
+    uint64_t take_waits;                  /* takes of a unit still in flight: the calling thread blocked */
+    double take_wake_sec;                 /* their wakes: from the I/O thread's publish to the take's return */
+    double queue_wake_sec;                /* a call's wait for the I/O thread to take its first job */
+    double io_gap_sec;                    /* the I/O thread between a job's publish and its next read, the queue
+                                           * not empty (its own time between two requests) */
+    double disk_late_sec;                 /* the emulated disk's sleeps woken past their end, both threads */
     double prefetch_wait_sec;             /* time tr_experts_acquire and tr_experts_prefetch_wait
                                            * spent waiting for units still in flight */
     uint64_t cancelled;                   /* units queued ahead and dropped before a byte of them was

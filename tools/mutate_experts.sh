@@ -244,6 +244,19 @@ run "arrival: a failed call's unit reported again by the wait" $E \
 run "arrival: the misses read in the call" $E \
   "    if (async && x->io != NULL) {" \
   "    if (0) {"
+# the handoffs' counters (test_experts arrival's order, disk): LESSONS #318
+run "handoff: a blocked take not counted" $E \
+  "        x->stats.take_waits++;" \
+  "        (void)0;"
+run "handoff: the I/O thread's gap never counted" $E \
+  "        if (!waited && prev_done > 0) atomic_fetch_add" \
+  "        if (0) atomic_fetch_add"
+run "handoff: the emulated disk's lateness never counted" $E \
+  "    if (late > 0) atomic_fetch_add" \
+  "    if (0) atomic_fetch_add"
+run "handoff: a take's wake from the wait's start" $E \
+  "        x->stats.take_wake_sec += t1 - x->jobs[s].done_at;" \
+  "        x->stats.take_wake_sec += t1 - t0;"
 run "pages: release keeps the pages (test_base)" src/base/platform.c \
   "    return madvise((void *)lo, hi - lo, MADV_DONTNEED) == 0 ? 0 : -1;" \
   "    return 0;" test_base

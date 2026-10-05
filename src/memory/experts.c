@@ -32,6 +32,7 @@ typedef struct {
     int done, rc;
     uint64_t bytes, requests; /* a run's whole count on its first job, 0 on the others */
     double sec;
+    double done_at; /* tr_time_sec when the I/O thread published it done */
     uint64_t shift[TR_EXPERT_PARTS];
 } experts_job;
 
@@ -91,6 +92,8 @@ struct tr_experts {
      * the time the disk is free again, in ns of tr_time_sec, is shared by both threads */
     _Atomic uint64_t *disk_free_ns;
     double disk_bps;
+    /* the handoffs' clocks written by either thread (tr_experts_stats io_gap_sec, disk_late_sec), in ns */
+    _Atomic uint64_t io_gap_ns, disk_late_ns;
 
     /* cfg.evict == TR_EXPERTS_EVICT_HOT: every unit's hotness, +1 a call that names it, every one
      * halved each hot_period successful calls (hot_calls counts them); NULL under the LRU */
@@ -211,6 +214,8 @@ static void disk_emulate(const tr_experts *x, double t0, uint64_t bytes) {
         end = (free_ns > t0_ns ? free_ns : t0_ns) + cost;
     } while (!atomic_compare_exchange_weak(x->disk_free_ns, &free_ns, end));
     tr_wait_until((double)end / 1e9);
+    double late = tr_time_sec() - (double)end / 1e9;
+    if (late > 0) atomic_fetch_add((_Atomic uint64_t *)&x->disk_late_ns, (uint64_t)(late * 1e9));
 }
 
 /* (layer, id)'s parts into the slot area at base, one read each, through read/ctx: 0, or -1 at
@@ -310,9 +315,14 @@ static int64_t run_take(const tr_experts *x, int64_t layer, int64_t left) {
  * when told to and the queue is empty. */
 static void io_main(void *arg) {
     tr_experts *x = (tr_experts *)arg;
+    double prev_done = 0.0; /* the last publish, for the gap to the next read */
     tr_monitor_lock(x->mon);
     for (;;) {
-        while (x->q_len == 0 && !x->io_stop) tr_monitor_wait(x->mon);
+        int waited = 0;
+        while (x->q_len == 0 && !x->io_stop) {
+            waited = 1;
+            tr_monitor_wait(x->mon);
+        }
         if (x->q_len == 0) break;
         int32_t s = x->queue[x->q_head];
         x->q_head = (x->q_head + 1) % x->n_alloc;
@@ -337,6 +347,7 @@ static void io_main(void *arg) {
         }
         tr_monitor_broadcast(x->mon); /* taken: tr_experts_prefetch_n waits for its first */
         tr_monitor_unlock(x->mon);
+        if (!waited && prev_done > 0) atomic_fetch_add(&x->io_gap_ns, (uint64_t)((tr_time_sec() - prev_done) * 1e9));
 
         job.bytes = job.requests = 0;
         job.sec = 0.0;
@@ -350,6 +361,8 @@ static void io_main(void *arg) {
         }
 
         tr_monitor_lock(x->mon);
+        prev_done = tr_time_sec();
+        job.done_at = prev_done;
         for (int64_t e = 0; e < k; e++) {
             experts_job *j = &x->jobs[slots[e]];
             if (e == 0) {
@@ -358,6 +371,7 @@ static void io_main(void *arg) {
                 j->bytes = j->requests = 0;
                 j->sec = 0.0;
                 j->rc = job.rc;
+                j->done_at = job.done_at;
             }
             if (k > 1) memcpy(j->shift, x->run_shift[1][e], sizeof j->shift);
             j->done = 1;
@@ -482,6 +496,8 @@ tr_experts *tr_experts_create(const tr_experts_config *cfg, char *err, size_t er
     x->slots = (experts_slot *)malloc(sizeof(experts_slot) * (size_t)n_slots);
     x->slot_part_shift = (uint64_t *)calloc((size_t)n_slots * TR_EXPERT_PARTS, sizeof(uint64_t));
     x->seen_call = (uint64_t *)calloc((size_t)n_units, sizeof(uint64_t));
+    atomic_init(&x->io_gap_ns, 0);
+    atomic_init(&x->disk_late_ns, 0);
     if (x->part_bytes == NULL || x->part_slot_offset == NULL || x->part_offset == NULL || x->slab == NULL ||
         x->slot_of == NULL || x->slots == NULL || x->slot_part_shift == NULL || x->seen_call == NULL) {
         if (err != NULL) snprintf(err, err_len, "out of memory");
@@ -658,7 +674,10 @@ static int prefetch_take(tr_experts *x, int32_t s) {
     if (!x->jobs[s].done) {
         double t0 = tr_time_sec();
         while (!x->jobs[s].done) tr_monitor_wait(x->mon);
-        x->stats.prefetch_wait_sec += tr_time_sec() - t0;
+        double t1 = tr_time_sec();
+        x->stats.prefetch_wait_sec += t1 - t0;
+        x->stats.take_waits++;
+        x->stats.take_wake_sec += t1 - x->jobs[s].done_at;
     }
     experts_job job = x->jobs[s];
     tr_monitor_unlock(x->mon);
@@ -719,8 +738,10 @@ static void reserve_slot(tr_experts *x, int32_t v, int64_t layer, int64_t id, in
  * pool busy on every core: LESSONS #286). The queue is in order: fewer than `queued` left, the first is out. */
 static void queue_wake(tr_experts *x, int64_t queued) {
     if (queued <= 0) return;
+    double t0 = tr_time_sec();
     tr_monitor_broadcast(x->mon);
     while (x->q_len >= queued) tr_monitor_wait(x->mon);
+    x->stats.queue_wake_sec += tr_time_sec() - t0;
 }
 
 int tr_experts_prefetch_start(tr_experts *x) {
@@ -1081,6 +1102,8 @@ const void *tr_experts_part(const tr_experts *x, int64_t layer, int64_t expert, 
 
 void tr_experts_get_stats(const tr_experts *x, tr_experts_stats *out) {
     *out = x->stats;
+    out->io_gap_sec = (double)atomic_load((_Atomic uint64_t *)&x->io_gap_ns) / 1e9;
+    out->disk_late_sec = (double)atomic_load((_Atomic uint64_t *)&x->disk_late_ns) / 1e9;
 }
 
 void tr_experts_get_reader(const tr_experts *x, tr_experts_read_fn *read, tr_experts_readv_fn *readv, void **ctx) {

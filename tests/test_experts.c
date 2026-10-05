@@ -1851,7 +1851,10 @@ static void test_disk_emulated(uint64_t align) {
             TR_CHECK(wall >= want * 0.999);
             TR_CHECK(st.read_sec >= want * 0.999);
             TR_CHECK(wall < 2 * want + 0.05);
-            if (layer_ok(x, 1, align) && wall >= want * 0.999 && wall < 2 * want + 0.05) g_disk_rate++;
+            /* each emulated wait woke at or past its end: the lateness counted, under the read's own time */
+            TR_CHECK(st.disk_late_sec > 0 && st.disk_late_sec < want);
+            if (layer_ok(x, 1, align) && wall >= want * 0.999 && wall < 2 * want + 0.05 && st.disk_late_sec > 0)
+                g_disk_rate++;
             tr_experts_free(x);
         }
     }
@@ -2020,7 +2023,14 @@ static void test_arrival(uint64_t align) {
             TR_CHECK_EQ_INT(st.arrived, 3);
             TR_CHECK_EQ_INT(st.prefetched, 0);
             TR_CHECK_EQ_INT(st.misses, N_EXPERT + 3);
-            if (ok && st.arrived == 3) g_ar_order++;
+            /* the handoffs counted (LESSONS #318): two takes blocked (the first unit, then the last two), each woken
+             * after its publish and well within a read; the call waited for the I/O thread's first job; the I/O
+             * thread went from one queued unit to the next without sleeping */
+            TR_CHECK(st.take_waits >= 2);
+            TR_CHECK(st.take_wake_sec > 0 && st.take_wake_sec < 0.1);
+            TR_CHECK(st.queue_wake_sec > 0);
+            TR_CHECK(st.io_gap_sec > 0 && st.io_gap_sec < 0.1);
+            if (ok && st.arrived == 3 && st.take_waits >= 2 && st.io_gap_sec > 0) g_ar_order++;
             tr_experts_free(x);
         }
     }

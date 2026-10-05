@@ -345,10 +345,9 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
   (#309-#313, replayed): the window, not the prediction, is the limit. **10-05, the arrival order** (MEASUREMENTS
   §The arrival order built; #314-#317): a layer's misses read by the I/O thread while its present experts compute,
   the late ones in waves as they land, the same bytes and bits: the weak decode **Q4_K 14.98 -> 16.08, Q8_0 2.33 ->
-  2.40 tok/s** (three races); in one process Q4_K 1.110, Q8_0 0.977 (#318); ds4's split replays 1.004.
-  **Next** (R1 phase 3, the 8 GB machine): the handoffs one at a time (#318-#319: each take's wake, the I/O
-  thread's gap, waves a token), a wait that spins before it blocks, the waves by the numbers; the router's read ahead
-  on top (model 1.129) after; then a miss as one request, the prompt's last 2-3%, this PC
+  2.40 tok/s** (three races); one binary in whole processes 1.079 / 1.025 against sync, the handoffs 0.16% (#318, q. 91).
+  **Next** (R1 phase 3, the 8 GB machine): the router's read ahead on top of the arrival order (model
+  1.129 Q4_K, 1.043 Q8_0); then a miss as one request, the prompt's last 2-3%, this PC
   at half budget; then the integrated GPU (r1-igpu:
   Vulkan; q. 87-88); then R1's first prompt's cost, generation's fixed cost, the review, the server; the races
   with llama.cpp, colibri and ds4 together at R1's close. The decode's

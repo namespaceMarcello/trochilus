@@ -193,6 +193,11 @@ int app_expert_stats(const tr_model *model, tr_experts_stats *out) {
         out->read_sec -= g_serve.base.read_sec;
         out->prefetched -= g_serve.base.prefetched;
         out->arrived -= g_serve.base.arrived;
+        out->take_waits -= g_serve.base.take_waits;
+        out->take_wake_sec -= g_serve.base.take_wake_sec;
+        out->queue_wake_sec -= g_serve.base.queue_wake_sec;
+        out->io_gap_sec -= g_serve.base.io_gap_sec;
+        out->disk_late_sec -= g_serve.base.disk_late_sec;
         out->prefetch_wait_sec -= g_serve.base.prefetch_wait_sec;
         out->cancelled -= g_serve.base.cancelled;
     }

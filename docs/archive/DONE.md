@@ -1772,3 +1772,17 @@ src/models/olmoe.c `arrival_layout`, `expert_stages`, `olmoe_take_late`). On the
 How to try it: `make check`; `MSYS_NO_PATHCONV=1 docker run --rm -e ONLY=arrival -v "$(pwd -W):/src" -w /src
 trochilus-dev:local sh tools/mutate_experts.sh` (and `mutate_stream.sh`): every line RED; the race:
 `MACHINES_LIST="weak weakold" MACHINES_BIN_weakold=<before> sh tools/machines.sh <binary> 5 q4k q8`.
+
+### 2026-10-05 — The arrival order's handoffs measured (question 91)
+
+What it is: the expert store counts its handoffs between the calling thread and the I/O thread (blocked takes
+and their wake, the I/O thread's wake and its gap between reads, the emulated disk's lateness: tr_experts_stats,
+printed on the `experts:` line, parsed by tools/ab_modes.sh into takes, wake_ms, iowake_ms, gap_ms, late_ms);
+`TR_ARRIVE` (0 sync, 2 two waves, else each late unit as it lands) sets the arrival order for a whole session,
+raced process against process with tools/ab_env.sh (now with AB_ENV_N); ab_env.sh and ab_inproc.sh find a
+runnable copy before they take the marker (LESSONS #322). On the 8 GB machine, one binary: each as it lands
+1.079 (Q4_K) and 1.025 (Q8_0) against sync, two waves 1.073 and 1.015; the handoffs 0.16% of a run.
+
+How to try it: `make check`; `MSYS_NO_PATHCONV=1 docker run --rm -e ONLY=handoff -v "$(pwd -W):/src" -w /src
+trochilus-dev:local sh tools/mutate_experts.sh`: every line RED; the race: docs/COMMANDS.md's ab_env.sh line
+with the arrival order's modes.

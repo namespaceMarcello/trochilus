@@ -1078,6 +1078,12 @@ static void *olmoe_session_create(void *model, int64_t n_ctx, int64_t n_batch, c
     s->kv_touch = touch == NULL || strcmp(touch, "0") != 0;
     const char *hint_kb = getenv("TR_HINT_KB"); /* research: the idle workers' bytes a hint, in KiB */
     s->hint_bytes = hint_kb != NULL && atoi(hint_kb) > 0 ? (size_t)atoi(hint_kb) << 10 : OLMOE_HINT_BYTES;
+    /* research: the arrival order's mode for the whole session, raced process against process (tools/ab_env.sh,
+     * LESSONS #318): 0 a layer's misses on the calling thread (--ab arrive's arm B), 2 two waves (--ab waves's arm
+     * B), anything else each late unit as it lands (the default) */
+    const char *arrive = getenv("TR_ARRIVE");
+    s->ab_sync = arrive != NULL && strcmp(arrive, "0") == 0;
+    s->ab_waves2 = arrive != NULL && strcmp(arrive, "2") == 0;
 
     int kv_rc = tr_kv_init(&s->kv, m->n_layers, m->n_head_kv, m->head_dim, actual_ctx);
     s->rope_cos = (float *)tr_alloc_aligned((size_t)rope_elems * sizeof(float), 64);

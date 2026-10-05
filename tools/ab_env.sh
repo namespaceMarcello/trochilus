@@ -5,12 +5,13 @@
 # lines and medians), each run's zones kept (--profile-json), then tools/ab_env.py: per mode the prompt's and the
 # decode's time and every zone, and each round's ratio to the first mode. Give a mode twice for the A/A. Native,
 # still machine (tools/measure_guard.lib), the attention on the CPU (TR_GPU=0), every pass on the given threads,
-# code-edit.txt (411 tokens), 200 tokens.
+# code-edit.txt (411 tokens), 200 tokens (AB_ENV_N).
 #
 #   sh tools/ab_env.sh <binary> <rounds> "label=VAR=value" "label=VAR=value" [...]
 #   e.g. sh tools/ab_env.sh build/q83/kt.exe 12 "on=TR_KV_TOUCH=1" "off=TR_KV_TOUCH=0" "on2=TR_KV_TOUCH=1"
 #   AB_ENV_OUT (default build/ab_env) takes the runs; a folder that already holds some is refused.
-#   AB_ENV_MODEL (Q4_K), AB_ENV_THREADS (8).
+#   AB_ENV_MODEL (Q4_K), AB_ENV_THREADS (8), AB_ENV_N (200: the tokens a run generates; fewer keep a slow
+#   machine's run within 60 s, the 8 GB machine's Q8_0: 80).
 set -e
 # The body is one function, called on the last line: the shell parses all of it before it runs
 # any, so editing this file while it runs cannot change a run under way (docs/LESSONS.md #69).
@@ -31,6 +32,8 @@ if [ -n "$(find "$OUT" -name '*.json' 2> /dev/null | head -1)" ]; then
   exit 1
 fi
 . tools/measure_guard.lib
+# a binary Smart App Control holds: a copy a byte longer, found before the marker is taken (LESSONS #322)
+B=$(measure_runnable "$B") || { echo "ab_env: $B is held by Smart App Control, its longer copies too"; exit 1; }
 trap measure_end EXIT
 trap 'exit 130' INT TERM
 measure_begin ab_env
@@ -45,7 +48,7 @@ MODES=""
 for MODE in "$@"; do
   LABEL=${MODE%%=*}
   VARS=${MODE#*=}
-  MODES="$MODES \"$LABEL=TR_GPU=0 $VARS $B generate -m $MF --tokens $IDS -n 200 -t $T --decode-threads $T --profile-json $OUT/$LABEL-\\\$(date +%s%N).json\""
+  MODES="$MODES \"$LABEL=TR_GPU=0 $VARS $B generate -m $MF --tokens $IDS -n ${AB_ENV_N:-200} -t $T --decode-threads $T --profile-json $OUT/$LABEL-\\\$(date +%s%N).json\""
 done
 echo "$B, $M, $T threads, modes:$MODES" | cut -c1-400 > "$OUT/what.txt"
 eval "cleanup_run sh tools/ab_modes.sh $R $MODES" > "$OUT/ab_modes.txt"

@@ -6118,3 +6118,24 @@ ab_*; predictions in build/q90/predictions.txt, every one of race3's in):
   against aa, the same binary) spread 7-70% (another window's test gates beside it, #321): inconclusive.
 - Next, one handoff at a time (#318): each take's wake from its read's end, the I/O thread's gap between
   requests, waves a token; then a wait that spins before it blocks, and the waves by the numbers.
+
+**The handoffs measured, whole processes** (question 91, 10-05 05:36-06:12, the load ~2.5 processors; one
+binary, `TR_ARRIVE` read at session start, `tools/ab_env.sh`, 5 rounds, code-edit.txt's 411 tokens then 200
+(Q4_K) or 80 (Q8_0); build/q91/env_*; predictions in build/q90/predictions.txt, every one in):
+
+| mode | Q4_K decode tok/s | against sync | Q8_0 | against sync |
+|---|---|---|---|---|
+| sync (`TR_ARRIVE=0`, the calling thread) | 12.08 | 1 | 1.99 | 1 |
+| two waves (`TR_ARRIVE=2`) | 12.96 | 1.073 | 2.02 | 1.015 |
+| **each late unit as it lands** (the default) | **13.04** | **1.079** | **2.04** | **1.025** |
+| the same again (A/A) | 13.03 | 1.079 | 2.04 | 1.025 |
+
+- Spreads 0.0-1.2%; the prompt the same in every mode; the misses the same to the unit (Q4_K) and within 4 of
+  3770 (Q8_0). Each unit as it lands is the best mode on both models: the default stays.
+- **The handoffs a run** (the store's new counters, ab_modes.txt): Q4_K 1444 blocked takes woken in 16 ms in
+  all (11 us a take), the I/O thread woken 18 ms, between its reads 1.3 ms; Q8_0 2933 takes, 38 ms (13 us),
+  19 ms, 7 ms; the emulated disk's sleeps woke 31-60 ms late a run in every mode, sync's too. Together 0.16%
+  of a Q4_K run: the arrival order's machinery is cheap.
+- **So the in-process A/B's verdict on this switch is its own** (LESSONS #318): the arrival arm slows only when
+  its passes alternate with the calling thread's; whole processes of one binary agree with the races. An
+  in-process A/B is not used for a switch that changes which threads run.

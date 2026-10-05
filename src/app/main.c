@@ -400,6 +400,13 @@ static void print_experts(const tr_model *model) {
         /* a layer's misses read by the I/O thread while its present experts computed (the arrival order) */
         if (st.arrived > 0) fprintf(stderr, ", %llu read under the compute", (unsigned long long)st.arrived);
         if (st.prefetched > 0 || st.arrived > 0) fprintf(stderr, ", %.2f s waited", st.prefetch_wait_sec);
+        /* the handoffs between the threads (LESSONS #318): only when the I/O thread worked */
+        if (st.prefetched > 0 || st.arrived > 0)
+            fprintf(stderr,
+                    " (handoffs: %llu takes woken %.1f ms in all, the I/O thread woken %.1f ms, between its reads "
+                    "%.1f ms, the emulated disk late %.1f ms)",
+                    (unsigned long long)st.take_waits, st.take_wake_sec * 1e3, st.queue_wake_sec * 1e3,
+                    st.io_gap_sec * 1e3, st.disk_late_sec * 1e3);
         /* queued ahead and dropped unread: the next layer's call did not name them (a pass's read ahead) */
         if (st.cancelled > 0) fprintf(stderr, ", %llu dropped unread", (unsigned long long)st.cancelled);
         /* slots whose pages went to the KV as the positions advanced (olmoe.c kv_hold), of the ones made */

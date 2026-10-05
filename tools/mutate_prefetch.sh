@@ -91,7 +91,7 @@ run "read ahead not counted as prefetched" gcc "test_experts test_prefetch test_
 " ""
 run "read ahead not counted as a miss" gcc "test_experts test_prefetch" $B "    x->stats.misses++;
     if (job.demand) x->stats.arrived++;" "    if (job.demand) x->stats.arrived++;"
-run "the wait time is not measured" gcc "test_experts" $B "        x->stats.prefetch_wait_sec += tr_time_sec() - t0;
+run "the wait time is not measured" gcc "test_experts" $B "        x->stats.prefetch_wait_sec += t1 - t0;
 " ""
 run "a failed read ahead is not reported" gcc "test_experts test_prefetch" $B "        if (!job.demand) x->prefetch_failed = 1; /* a call's own unit fails that call (tr_experts_acquire_take) */
 " ""
@@ -114,7 +114,7 @@ run "the I/O thread reads the next expert" gcc "test_experts test_prefetch" $B \
   "job.rc = read_parts(x, job.read, job.read_ctx, job.layer, (job.id + 1) % x->n_expert, base"
 run "the I/O thread never says done" gcc "test_experts" $B "            j->done = 1;" "            j->done = 0;"
 run "the I/O thread publishes without the lock" tsan "test_experts test_prefetch" $B "        tr_monitor_lock(x->mon);
-        for (int64_t e = 0; e < k; e++) {" "        for (int64_t e = 0; e < k; e++) {"
+        prev_done = tr_time_sec();" "        prev_done = tr_time_sec();"
 run "freed without joining the I/O thread" asan "test_experts" $B "        tr_thread_join(x->io);
 " ""
 
