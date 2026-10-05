@@ -97,13 +97,15 @@ size_t tr_q4x_bytes(int64_t n);
  *   Q4_K, a super-block: hi = [16 B: d, dmin and the twelve scale bytes][64 B: q_k >> 2 at byte 32 (k / 128) + k % 32,
  *     shift 2 ((k % 128) / 32)][32 B: bit 1 of q_k at byte k / 8, bit k % 8], lo = [32 B: bit 0, the same way].
  * A token h is prepared once (tr_hb_prep_build): per block of 32, delta = max|h| / 32639 and h ~ delta (256 X + Xl),
- * two int8 digits, with the block's terms, where the float sums' margin (2^-16 of the terms' magnitudes), h's own
+ * two int8 digits, with the block's terms, where the float sums' margin ((D + 16) 2^-24 of the terms' magnitudes, D the
+ * most roundings on a term's path, never below 2^-16), h's own
  * rounding (sum |h - delta (256 X + Xl)| at the codes' largest) and the engine's Q4_K rounding of h (2^-30 of a
  * super-block's max|h| an element) are folded in. A row's bound from its high plane
  *   Q8_0: U = sum_b d_b (a_b I_b + be_b) + |d_b| g_b,                      I_b = sum_k u_k (256 X_k + Xl_k)
  *   Q4_K: U = sum_j d sc_j (a_j I_j + be_j) + |d| sc_j g_j - dmin m_j H_j + |dmin| m_j mu_j,   I_j over q >> 1
- * is at or above the engine's own value of the row (dot_row, q4x_dot2) for every h of finite |h| <= 2^64: only the
- * rows whose bound reaches the best exact score found can be the argmax. Every tier's float order: I_b as eight int32
+ * is at or above the engine's own value of the row (dot_row, q4x_dot2) for every h of finite |h| <= 2^64 whose every
+ * block of 32 is zero or reaches 2^-64 (others go to the full head), proved (docs/MEASUREMENTS.md §The head's bound
+ * proved, make proof): only the rows whose bound reaches the best exact score found can be the argmax. Every tier's float order: I_b as eight int32
  * lanes of four elements (exact), lane l of block b (Q4_K: sub-block) into chain b % 4 as acc + (float)P * coef, coef
  * = d a (Q4_K: (d sc) a), the side terms of block b into lane b % 8 in the order written above, then lane l = ((c0 +
  * c2) + (c1 + c3)) + side and the eight lanes ((l0 + l4) + (l2 + l6)) + ((l1 + l5) + (l3 + l7)). */

@@ -1872,4 +1872,19 @@ the head by a bound is: the next token without scoring the whole vocabulary.
 
 How to try it: `RACE_OUT=build/race_llama_1005 sh tools/race_llama.sh 5` (Q8_0, about 17 minutes) and
 `RACE_MODEL=models/OLMoE-1B-7B-0125-Instruct-Q4_K.gguf RACE_PROMPTS=512 RACE_THREADS=4 RACE_OUT=build/race_q4k_llama_1005b
-sh tools/race_llama.sh 5`, on a quiet machine.
+sh tools/race_llama.sh 5`, on a quiet machine. Commit: `90966a0` (pushed 2026-10-05).
+
+### 2026-10-05 — The head by a bound proved
+The head's argmax by a bound (question 73) is now proved, not only tested: for every row and every token the bound is at
+or above the engine's own score, float roundings included, so the token is the full scan's. The proof is in three
+lemmas (docs/MEASUREMENTS.md §The head's bound proved). The integer and bit layer, the prep's float facts, the margin
+for every n and the argmax are checked by CBMC on the real `head_bound.c` (`tests/proof/`, 12 harnesses), and the
+per-element inequalities over all 17.8 M cases (`proof_enum.c`). The float rounding is a written bound on the standard
+model, reviewed adversarially. The proof found two inputs where the token could change, both fixed in the same bits for
+every head up to 3776 columns (today's models). A block of h below 2^-64 now goes to the full head (#349, a red test).
+The margin now grows with the longest rounding path, (D + 16) 2^-24, never below 2^-16 (#350). The lint fails while
+`head_bound.c` or a harness differs from the last proof.
+
+How to try it: `docker build -t trochilus-proof:local -f tools/docker/Dockerfile.proof tools`, then `make proof`. It
+prints one line a harness, about 15 minutes, logs in build/proof. `sh tools/mutate_head.sh` in that image turns every
+harness red under its own mutation.

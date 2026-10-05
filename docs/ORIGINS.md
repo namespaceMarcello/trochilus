@@ -184,6 +184,20 @@ debt, and the next piece is the first row with one. Measured = a number in MEASU
 | 14 | The router's matrix | F32: "norms, router, bias stay f32 (small and sensitive)" (read 09-27, colibri.c 13, 393) | F32 on the CPU (`tensor_expect_layout(l->ffn_gate_inp, DS4_TENSOR_F32, ...)`, ds4.c 5605); an F16 router kernel on its GPU for its own format (`ds4_gpu_matmul_f16_router_rows_exact_tensor`) (read 09-27) | llama.cpp: `ffn_gate_inp` F32 in the GGUF, ggml's F32 dot (read 09-27) | OLMoE's routers are bf16 values stored F32 (every low half zero); narrowed at load where exact, widened by a shift: the router zone 179-186 -> 120-130 us a token, the same bits (MEASUREMENTS §The routers as bf16) | **built 2026-09-27** |
 | 15 | The output head of a greedy token (every vocabulary row, then the argmax) | one `matmul_qt` over the vocabulary, h int8 once (`matmul_q_idot`, colibri.c 1168-1240), the head kept at higher precision (2362-2367); a serial argmax (`c/sample.h` 20-24); its MTP draft scores the full vocabulary too (read 10-05) | `matvec_q8_0` over every row, h Q8_0 once (ds4.c 9722-9744, 16178-16189); a serial 8x-unrolled argmax (44039); one pruned head, the Qwen4 MTP draft's (an id prefix or a ranked subset, 58197-58207: not exact, its verify rows keep the whole head) (read 10-05) | llama.cpp: the full `output` matmul after `ggml_get_rows` of the outputs (src/models/llama.cpp 174-240), h Q8_0 / Q8_K, the head repacked like any weight (ggml-cpu/repack.cpp 4778-4785), a serial greedy scan (llama-sampler.cpp 1053-1059); ik: the same, `-rtr` repacks the head (iqk_quantize.cpp 8603-8699), the head split across devices by vocabulary slices (read 10-05). **None prunes rows for an exact argmax** | ours today reads the head at the RAM's speed (1.92-2.03 ms Q8_0, 56 GB/s). The argmax by a bound (question 73, ours: each row's scales and top bits against h's two int8 digits, exact only the rows that can still win) in a bench: 16 threads Q8_0 2102 -> 1162-1278 us, Q4_K 1141 -> 928-1048 (MEASUREMENTS §The head's argmax by a bound) | **read and measured 2026-10-05**; built and raced 2026-10-05 (phase 2): ~10 rows computed a greedy token, the head Q8_0 2.01-2.08 -> 1.08-1.13 ms, Q4_K 1.07-1.12 -> 0.84-0.89 (weak 2.60 -> 1.35); the decode Q8_0 1.041-1.046x, Q4_K 1.009-1.022x, the same tokens |
 
+## Tools (outside the core)
+
+Programs the project runs but never links: they stay in a container image, never in `src/`.
+
+| Tool | Version | Licence | Used for | Where |
+|---|---|---|---|---|
+| CBMC (Kroening, Clarke et al.; Oxford, ETH Zurich, CMU) | 5.95.1, Ubuntu 24.04's `cbmc` package | BSD-4-Clause | the bounded model checker of the head's bound proof: the real `head_bound.c` compiled with nondeterministic inputs (2026-10-05) | `tools/docker/Dockerfile.proof`, `tools/proof.sh`, `tests/proof/` |
+| MiniSat (Eén, Sörensson) | 2.2.1, Ubuntu's `minisat`, CBMC's dependency | MIT | CBMC's SAT solver | the same image |
+
+The proof's written part leans on the standard model of float rounding and its error bound for sums along a fixed
+tree (N. J. Higham, *Accuracy and Stability of Numerical Algorithms*, 2nd ed., SIAM 2002, §2.2 and §4.2): cited, no
+code. The question that started it, a proof that covers the code and not a model of it, came from antirez's post on
+RedLock proved in TLA+ by an AI, whose stated boundary was exactly that (brought by Marcello, 2026-10-05).
+
 ## Sources not yet studied (2026-09-24)
 
 Proposed by Marcello to improve and evolve Trochilus; my first read of each, from what they declare

@@ -3,9 +3,10 @@
 # each mutation is applied to a copy of the tree, the copy is built and the checks that should notice are run:
 # test_head_bound (the planes, every tier against the scalar bound, every bound against the engine's row, the argmax
 # against the scan, the logits from the planes) and test_head_model (the engine: greedy tokens, lazy logits, verify
-# passes, one head call a greedy pass). Linux container, from the repo root:
+# passes, one head call a greedy pass); the proof's rows (prove) run tools/proof.sh's harnesses that should go red
+# (docs/MEASUREMENTS.md §The head's bound proved). Linux container with cbmc, from the repo root:
 #
-#   MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src trochilus-dev:local sh tools/mutate_head.sh
+#   MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src" -w /src trochilus-proof:local sh tools/mutate_head.sh
 #
 # One line per mutation: which checks went red. "no mutation" must be all green, every other line must have at least
 # one RED. ONLY=<text>: only the mutations whose name holds it (docker run -e ONLY=...). About 20 minutes.
@@ -42,9 +43,39 @@ run() {
   echo "$1:$RES"
   cd /src
 }
+# the same for the proof (tools/proof.sh): $5 the harnesses that should go red (proof.sh's ONLY); no cbmc, n/a
+prove() {
+  case "$1" in *"${ONLY:-}"*) ;; *) return 0 ;; esac
+  command -v cbmc > /dev/null || { echo "$1: proof=n/a (no cbmc: the trochilus-proof image)"; return 0; }
+  rm -rf /tmp/mut && mkdir -p /tmp/mut/tools && cp -r Makefile src tests /tmp/mut/ &&
+    find tools -maxdepth 1 -mindepth 1 ! -name .venv ! -name __pycache__ -exec cp -r {} /tmp/mut/tools/ ';'
+  cd /tmp/mut
+  $PYBIN /tmp/mut.py "$2" "$3" "$4"
+  if ONLY="$5" OUT=/tmp/mut/proof sh tools/proof.sh > /tmp/mut/proof.out 2>&1; then RES=" proof $5=green"
+  elif grep -q FAILED /tmp/mut/proof.out; then RES=" proof $5=RED"
+  else RES=" proof $5: NOT RUN (fix the row): $(tail -1 /tmp/mut/proof.out)"; fi
+  echo "$1:$RES"
+  cd /src
+}
 H=src/kernels/head_bound.c
 run "no mutation" $H "#define HB_LIM 32639" "#define HB_LIM 32639"
-run "prep: no float margin" $H "#define HB_MARGIN 1.52587890625e-05" "#define HB_MARGIN 0.0"
+prove "no mutation (proof)" $H "#define HB_LIM 32639" "#define HB_LIM 32639" proof_
+prove "proof: the margin halved" $H "? d : HB_MARGIN) * 0x1p-24;" "? d : HB_MARGIN) * 0x1p-25;" /margin/
+prove "proof: the engine's path one rounding short" $H "n / 64 + 5 : n / 16 + 4;" "n / 64 + 5 : n / 16 + 3;" /margin/
+prove "proof: hb_up not rounding up" $H "return (double)f >= v ? f : nextafterf(f, INFINITY);" "return f;" /up/
+prove "proof: Q8_0's second half's u dropped" $H "((c0 >> 4) | ((c1 >> 4) << 4))" "((c0 >> 4))" planes_q8_0
+prove "proof: Q4_K's bit-1 plane dropped" $H "ph[80 + k / 8] |= (unsigned char)(((q >> 1) & 1) << (k % 8));" \
+  "(void)0;" planes_q4_k
+prove "proof: a Q8_0 lane's u against the next element's low digit" $H "hb_u_q8_0(nib, i) * (256 * X[i] + Xl[i])" \
+  "hb_u_q8_0(nib, i) * (256 * X[i] + Xl[i ^ 1])" bound_q8_0
+prove "proof: a Q4_K lane's digits swapped" $H "hb_hv_q4_k(ph, k) * (256 * X[k] + Xl[k])" \
+  "hb_hv_q4_k(ph, k) * (256 * Xl[k] + X[k])" bound_q4_k
+prove "proof: the high digit one off" $H "(q + 32896) / 256 - 128" "(q + 32896) / 256 - 127" /digits/
+prove "proof: the threshold strict" $H "if (U[r] >= th) ids" "if (U[r] > th) ids" argmax_q8_0/
+prove "proof: the workers' tie to the higher row" $H "(wk->best == best && wk->best_i < bi)" \
+  "(wk->best == best && wk->best_i > bi)" argmax_q8_0_pool
+run "prep: no float margin" $H "return (double)(d > HB_MARGIN ? d : HB_MARGIN) * 0x1p-24;" "return 0.0;"
+run "prep: a block of h below 2^-64 kept (#349)" $H "if (!zero && m < HB_HMIN) return -1;" "(void)0;"
 run "prep: Q4_K's rounding of h left out of g" $H "+ 480.0 * err_el" "+ 0.0 * err_el"
 run "prep: Q4_K's rounding of h left out of mu" $H "+ 32.0 * err_el" "+ 0.0 * err_el"
 run "prep: the high digit one off" $H "(q + 32896) / 256 - 128" "(q + 32896) / 256 - 127"

@@ -6505,3 +6505,240 @@ predicted); the prompts at the edge of their range (1.37 against 1.33 +- 0.03 at
 341 -> 350 there); the Q4_K right (52.9 and 218). llama.cpp's Q4_K prompt 220.6 -> 204.7 today (its own A/A 205.8 /
 203.5), so the Q4_K prompt's 1.07 is theirs moving more than ours. What is left to llama.cpp: the decode at 2048 with
 16 threads (0.94, the KV's bytes, §The attention against llama.cpp's).
+
+## The head's bound proved (2026-10-05)
+
+The head by a bound (question 73, on by default since `78a82d6`) was *tested* to give the full scan's token (13 821
+positions of two models; random, adversarial and tight heads; 20 mutations red). Its exactness rests on one claim:
+every row's bound U(r) is at or above the engine's own score s(r), with every float rounding of both counted. A test
+shows that claim on the inputs it tries. Here it is proved for every input, on the C code itself. The attempt found two
+places where the code did not hold it (#349, #350), both now fixed, and an adversarial review of the written part (a
+pensatore-opus agent) found one false display in it (#353), now corrected.
+
+### The theorem
+
+**Hypotheses.**
+- A Q8_0 or Q4_K head of n columns, n a multiple of 256 and at most TR_HB_COLS_MAX = 16384.
+- Any codes, every scale finite (Q8_0's d; Q4_K's d and dmin; sc and m are 6-bit integers).
+- A token h that `tr_hb_prep_build` accepts: every |h_k| at most 2^64 (no NaN, no infinity), and every block of 32
+  either all zero or of max|h| at least 2^-64. Anything else goes to the full head, which is the scan itself.
+- The default floating-point environment, which the engine never changes: IEEE-754 binary32 and binary64, round to
+  nearest even, no excess precision, gradual underflow (no flush to zero), and a correct `nextafterf`.
+- For T2, a call from outside a pool body, as the engine makes it (the greedy pass's token). From inside a body the
+  pool hands the caller's worker id on, past the scratch's slots (LESSONS #63's open rule).
+
+s(r) is the engine's score as the scalar definitions compute it: Q8_0 `k_dot_row_q8_0` (sixteen lanes,
+`tr_lane_combine`), Q4_K `k_q4x_dot2` (`q4x_prep`'s fixed point, exact integers, then doubles and one float rounding).
+U(r) is `hb_bounds_q8_0` / `hb_bounds_q4_k`.
+
+**T1.** For every row r: U(r) >= s(r).
+
+**T2.** `tr_hb_argmax` returns the scan's row, `tr_argmax_f32` over the rows' s (the first of the largest).
+
+**Not by proof.**
+- Every SIMD tier of `hb_bounds`, `dot_row` and `q4x_dot2` gives the scalar definition's bits by test
+  (tests/test_head_bound.c branch tiers; the kernels' tests), not by proof.
+- The engine's own head (`tr_matmul_s`) gives the same bits by test.
+- A row with a scale that is not finite has U = +infinity or NaN, by reading: |d| g is +infinity on a nonzero block; 0
+  times infinity (a zero block, sc or m 0) is NaN; Q4_K's mu term adds +infinity. Its s is +-infinity or NaN, so lemma
+  C's premise still holds; the test is branch full.
+- CBMC's model of C and of IEEE-754 is trusted, and so is the standard model of rounding (lemma B).
+
+### The proof: three lemmas, and who checks each
+
+| Piece | Claim | Checked by |
+|---|---|---|
+| A1 | the planes rebuild every row byte for byte; the bound reads each code's top part: Q8_0 q = 16 (u - 8) + lo, lo in [0, 15]; Q4_K q = 2 hv + bit | CBMC, every byte of two blocks and of a super-block: `planes_q8_0`, `planes_q4_k`; more blocks by reading (one loop, one offset a block) |
+| A2 | each lane's int32 P = sum u (256 X + Xl) over its own four elements and their own digits; every P below 2^21, so (float)P exact | CBMC, every code, any element, lane by lane: `bound_q8_0`, `bound_q4_k`; P's range enumerated; `hb_bounds_*` around the lanes (block offsets, chains, side lanes, fold) by reading |
+| A3 | the digits: q = 256 X + Xl, both int8, for every q in [-32639, 32639] | CBMC: `digits` |
+| A4 | per element: abs(q Q - (16 u - 120.5) Q) <= 7.5 abs(Q) (Q8_0), abs(q Q - (2 hv + 1/2) Q) <= abs(Q) / 2 (Q4_K) | every case enumerated: `proof_enum`, 17 755 888 cases |
+| A5 | the block's terms taken exactly sit above its exact contribution by the margin | written below, from A1-A4 |
+| B1 | `hb_up(v)` is the least float at or above v | CBMC, every double: `up`; `nextafterf`'s model against its definition: `next_float` |
+| B2 | the margin covers the most roundings on any term's path, for every n: hb_margin(n) >= (D + 16) 2^-24 | CBMC, every n: `margin`; that its path counts are the code's, by reading (the table in lemma B) |
+| B3 | each float sum within about (D + 1) 2^-24 of its terms' magnitudes of its exact value, underflow included | written below (the standard model) |
+| C | the argmax: the scan's row, from any threshold that is some row's exact score | written below for every n; CBMC on the real `tr_hb_argmax`, any scores and bounds: one worker on 6 rows and any prefix, two on 5, a worker's two ranges in reverse order: `argmax_*`; `tr_argmax_f32`'s rule by reading and by test |
+
+`sh tools/proof.sh` (`make proof`, image trochilus-proof) runs them all. **The run of 2026-10-06, 00:02-00:21** (CBMC
+5.95.1 with MiniSat 2.2.1 in the Docker VM, 15 GB, this PC; the lemmas two at a time, the argmax one at a time): every
+harness proved, **1120 s in all**.
+
+| Harness | Seconds | Harness | Seconds |
+|---|---|---|---|
+| planes_q8_0 | 1 | margin | 1 |
+| planes_q4_k | 3 | next_float | 1 |
+| bound_q8_0 | 9 | argmax_q8_0 (every float, 6 rows) | 200 |
+| bound_q4_k | 23 | argmax_q8_0_pool | 316 |
+| digits | 1 | argmax_q8_0_steal | 334 |
+| up | 2 | argmax_q4_k_pool | 243 |
+
+`proof_enum`: 17 755 888 cases, every one holds, under a second. **Seen red** (`tools/mutate_head.sh` in the same
+image, 10-06 00:45-01:08): each of 10 mutations turns its harness red (the margin halved, the engine's path one
+rounding short, hb_up not rounding up, a plane's bit dropped in each type, a lane's digits misread in each type, the
+high digit one off, the threshold strict, the workers' tie to the higher row), the unmutated proof green; the 21 test
+mutations red as before, the new one (a block of h below 2^-64 kept) included. At 19 minutes `make proof` stays out of
+`make check`; `tools/lint.py` fails the gate while `head_bound.c` or a harness differs from the hashes of the last proof
+(tests/proof/proved.sha256, written by `proof.sh` only when every harness passed).
+
+### Lemma A: the bound's terms, taken exactly, sit above the row by the margin
+
+Notation for one block of 32 (Q8_0's block, Q4_K's sub-block):
+- h_k its elements; delta > 0 the prep's step; Q_k its integer code, |Q_k| <= 32639. The argument never uses how they
+  were found: any delta and any Q work.
+- eps_k = h_k - delta Q_k, and E >= sum |eps_k|: the prep's e, each |h - delta Q| in double (delta Q exact there, 24 +
+  16 bits; one rounding), 32 additions, then x (1 + 1e-12), far above the 2^-47 of its roundings.
+- ha = sum |h_k|; I = sum u_k Q_k (Q4_K: hv_k); sx = sum Q_k; sax = sum |Q_k|.
+- M the margin (`hb_margin`), u = 2^-24.
+
+**Q8_0**, a block of scale d. By A1, q_k = 16 u_k - 120.5 + (lo_k - 7.5). By A4, on both sides (d of either sign), and
+|q| <= 128:
+
+    c = d sum q_k h_k = d delta sum q_k Q_k + d sum q_k eps_k
+      <= d (16 delta) I + d (-120.5 delta sx) + |d| (7.5 delta sax + 128 E)
+
+The prep's floats:
+- a = 16 delta exactly.
+- be = fl(-120.5 delta sx): delta sx is exact in double (24 + 20 bits), and so is its product with 120.5; one rounding
+  to float, so |d (-120.5 delta sx) - d be| <= u 120.5 |d delta sx|.
+- g = hb_up(G) >= G (B1). G is the double computed for 7.5 delta sax + 128 E + M (mag + 120.5 |delta sx|), with mag =
+  240 delta sax + 120.5 |delta sx| + g_0 + 128 ha and g_0 = 7.5 delta sax + 128 E. Its roundings are a few, and ha's
+  31 enter multiplied by M, so G >= its exact value (1 - 2^-47).
+
+Hence, with T = d a I + d be + |d| g the block's terms taken exactly:
+
+    c <= T - |d| (M - u - 2^-47) mag.
+
+**Q4_K**, sub-block j of super-block s. d, dmin, sc_j and m_j come from `tr_q4_k_sc_m` on the same 16 bytes the engine
+reads (A1: the planes keep them).
+
+The engine sees h through its fixed point: h~_k = X~_k 2^-sh, X~_k the nearest integer to h_k 2^sh, sh =
+`tr_q4x_shift`(ms), ms the super-block's max|h|. That function's sh is m 2^(31 - e) in [2^30, 2^31), lowered once if
+above TR_Q4X_XMAX, so ms 2^sh >= XMAX / 2 = 2^29.958. So |h~_k - h_k| <= 2^-sh-1 <= err_el / 1.9427, with err_el = ms
+2^-30, and |h~_k| <= |h_k| + err_el / 1.9427.
+
+The row's exact value is sum_j (d sc_j sum q_k h~_k - dmin m_j sum h~_k): `q4x_block`'s T and M are exact integers, and
+the base-64591 digits recombine exactly. By A1, A4 and |q| <= 15:
+
+    d sc sum q h~ <= d sc (2 delta I + 0.5 delta sx) + |d| sc (0.5 delta sax + 15 E + 248 err_el)
+    -dmin m sum h~ <= -dmin m H + |dmin| m (|hs - H| + |hs - sum h| + 16.5 err_el)
+
+hs is the prep's double sum of the h_k, |hs - sum h| <= 2^-48 ha, and H = fl(hs). The prep:
+- a = 2 delta exactly; be = fl(0.5 delta sx), off by at most u 0.5 |delta sx|.
+- g = hb_up(...) >= (0.5 delta sax + 15 E + 480 err_el + M mag)(1 - 2^-47), with mag = 14 delta sax + 0.5 |delta sx|
+  + g_0 + 15 ha.
+- mu = hb_up(4 M ha + |hs - H| + 32 err_el) (|hs - H| exact in double).
+
+So with T_j = d sc a I + d sc be + |d| sc g - dmin m H + |dmin| m mu:
+
+    c_j <= T_j - |d| sc ((M - u - 2^-47) mag + 232 err_el) - |dmin| m ((4 M - 2^-47) ha + 15.5 err_el).
+
+### Lemma B: the float sums stay inside the margin
+
+The standard model (IEEE-754, round to nearest; Higham, *Accuracy and Stability of Numerical Algorithms*, 2nd ed., §2.2,
+§4.2):
+- fl(x op y) = (x op y)(1 + theta), |theta| <= u, without underflow.
+- An addition is exact when its result is subnormal.
+- A product that underflows errs by at most 2^-150.
+
+A sum evaluated along a fixed tree, term i met by D_i roundings on its way (its own products included), differs from
+the exact sum by at most sum gamma(D_i) |t_i|, with gamma(D) = D u / (1 - D u), plus the underflows. The paths, counted
+on the code (`margin` restates each and checks M against them for every n):
+
+| | path of a term | roundings |
+|---|---|---|
+| Q8_0 engine | w = d q exact (11 by 8 bits, \|w\| >= 2^-24); w x; n / 16 terms a lane, the first added to 0 exactly; the lanes' tree of depth 4 | n / 16 + 4 |
+| Q8_0 bound, chains | coef = d a; P coef; nb / 4 terms a chain; (c0 + c2), + (c1 + c3), + side, the eight lanes' tree of depth 3 | n / 128 + 7 |
+| Q8_0 bound, side | d be or \|d\| g; nb / 4 terms a lane; + into its lane, the tree | n / 128 + 4 |
+| Q4_K engine | integers exact; d T, dmin M, their difference, x 2^-sh (exact), n / 256 additions, all in double; one float rounding | 1, plus (n / 256 + 3) 2^-53 |
+| Q4_K bound, chains | d sc (exact: 11 by 6 bits, counted anyway), coef, P coef; 2 ns terms a chain; the fold | n / 128 + 8 |
+| Q4_K bound, side | (d sc) be, (\|d\| sc) g, (dmin m) H, (\|dmin\| m) mu, two roundings each; 4 ns terms a lane; the fold | n / 64 + 5 |
+
+D, a type's longest path:
+- Q8_0: n / 16 + 4 (1028 at n = 16384, 132 at 2048).
+- Q4_K: the larger of n / 64 + 5 and n / 128 + 8 (the chains win at n = 256).
+- M >= (D + 16) u (B2), and M <= 2^-13 for every n the head takes.
+
+The terms' magnitudes:
+- The engine's: |w x| sums to at most sum |d| 128 ha. Q4_K: |d| sc 15 sum |h~| and |dmin| m sum |h~|, with sum |h~| <=
+  ha + 16.5 err_el.
+- The bound's: |d| (240 delta sax + 120.5 |delta sx| (1 + u) + g), with g <= (g_0 + 2 M mag)(1 + 2u) (hb_up can land
+  two units of rounding above). Q4_K's min terms: |dmin| m (|H| + mu), with mu up to 4 M ha + 33 err_el.
+- Each mag holds both. Q8_0: mag >= 128 ha plus the bound's part. Q4_K: mag >= 14 (ha - E) + 15 E + 15 ha >= 29 ha, and
+  the engine's coefficient is u, not gamma(D).
+- gamma(D)(1 + 2M + 3u) <= (D + 1) u for D <= 1028.
+
+So, with R = sum T the bound's terms taken exactly and S the row's exact value:
+
+    |U - R| + |s - S| <= (D + 1) u sum |d| mag  +  (D + 1) u |dmin| m (2 ha + 50 err_el)  +  underflows
+
+(Q4_K: |d| sc in place of |d|, and the err_el parts of the d terms inside the 232 err_el of lemma A).
+
+**Underflows.**
+- Q8_0: a block with d = 0 or h = 0 has every product exactly 0 (and g = hb_up(0) = 0). Otherwise |d| >= 2^-24 (f16's
+  least) and max|h| >= 2^-64 (the prep sends a block between 0 and 2^-64 to the full head: #349). So mag >= 128 2^-64,
+  and the margin's spare 13 u |d| mag >= 2^-104, while the block's at most 44 products (32 engine, 12 bound) err by at
+  most 44 2^-150 together.
+- Q4_K: the products that can underflow are the engine's final (float)y, once a row, and the bound's, (dmin m) H among
+  them (H can be subnormal: hs of a few terms that cancel). A sub-block of zeros in a nonzero super-block still has g
+  and mu above zero, from err_el >= 2^-94. The spare that pays: the d term's 13 u |d| sc mag when d sc is not 0, else
+  the min term's (4 M - 2 (D + 1) u) |dmin| m ha or 15 err_el |dmin| m, each at least 2^-118 against a few 2^-150.
+
+**No overflow**: |h| <= 2^64, |d| <= 65504 and n <= 2^14 keep every partial sum below 2^110.
+
+With lemma A:
+
+    U >= R - |U - R| >= S + sum |d| (M - u - 2^-47) mag - |U - R| >= S + |s - S| >= s
+
+since M - (D + 2) u - 2^-47 >= 13 u covers the underflows. The min terms work the same way: 4 M against 2 (D + 1) u,
+and 15.5 err_el against (D + 1) u 50 err_el. **T1 holds.**
+
+### Lemma C: the argmax
+
+Let r* be the scan's row: the first r with s(r) = max s.
+- The threshold th is the largest exact score among the rows of the TR_HB_TOP largest bounds (or -infinity if none).
+  It is some row's score, so th <= s(r*).
+- Every row with U(r) >= th is computed exactly, with the same function as the scan (`hb_exact2`: `dot_row` or
+  `q4x_dot2` on the rebuilt row, A1).
+- A row left out has s(r) <= U(r) < th <= s(r*) (T1): it is below the maximum, so it can be neither r* nor a tie of it.
+- r*, and every row tying it, has U >= s = s(r*) >= th, so each is computed.
+- Each worker keeps its best (the lowest row on a tie) over every range it is given, in any order. The workers merge
+  with the same rule, so the result is the first of the largest: r*.
+- A NaN bound or score sends the token to the full head, the scan.
+
+Nothing here depends on which rows the top list held: any threshold that is some row's exact score works. **T2 holds.**
+
+CBMC checks it on the real code, past TR_HB_TOP = 4: any prefix, any finite scores, and any bounds at or above them or
+NaN. One worker on six rows and any prefix (Q8_0); two workers on five rows, each region cut at any row, a side each
+(Q8_0, and Q4_K's road, two rows a call); and worker 0 taking both sides, the later first (a worker's several ranges in
+any order, as the balanced pool's stolen blocks). The one-worker harness takes every float; the two-worker ones take
+scores and bounds as the integers 0 to 10 (or a NaN bound). That is enough because the code never computes with a
+score or a bound, it only compares them (>, >=, ==, x != x; against -infinity and 0 only behind an index guard), so its
+result depends on their order alone, and eleven values realize every order of ten floats, -0 == +0 as one value.
+Bigger models of the pool (six rows, three chunks, every chunk to either worker in either order, every float) ran
+the Docker VM's 15 GB out of memory or past 30 minutes (#351). `tr_argmax_f32`'s own rule (kernels.c, each chunk's lanes
+keep the first of their largest, merged by the lowest row) is by reading, and tests/test_head_bound.c compares the two
+on every head it builds.
+
+### What the proof found
+
+1. **A subnormal h dropped the scan's row** (#349).
+   - The case: h's block 0 at -2^-149, the rest 0. One row has d = 0.5 - 2^-11 and every code -128; four rows have
+     d = 0.5 with one code -126.
+   - The engine gives the first row 2048 2^-149 (each of its 32 products, 63.94, rounds up to 64) and the others 2047.
+   - The first row's bound is one product, 2046.5, rounded to even: 2046. That is below 2047, so the threshold
+     excluded it: the bound path returned row 0, the scan row 4, on every tier (tests/test_head_bound.c tiny_case:
+     red before the fix, green after).
+   - The cause: the old prep folded a block below 2^-64 into h's rounding (X = 0), where the margin is relative to
+     magnitudes that underflow.
+   - Fixed: such a block, if not zero, goes to the full head (`HB_HMIN`). No real hidden state has one.
+2. **The margin fixed at 2^-16 covered paths of at most 240 roundings** (#350).
+   - Q8_0's engine has n / 16 + 4, so the proof closed only up to n = 3776, while the head accepts 16384 (D = 1028: a
+     margin 4.1x short). Q4_K's side lanes were covered up to n = 14848 (at 16384, D = 261).
+   - Not shown to fail on a row: the worst case wants one large lane and a thousand terms, each rounding the same way.
+     The proof did not reach these sizes.
+   - Fixed: `hb_margin` grows with n, as (D + 16) 2^-24, never below 2^-16. Every head up to 3776 columns, OLMoE's 2048
+     among them, keeps the same bits.
+3. **The written proof's own error** (#353).
+   - The first draft's lemma B left the err_el inside mu out of the Q4_K min terms' magnitudes. The review built a row
+     on the real code where that display fails: n = 256, d = 0, dmin = 65504, h_0 = 2^64, h_32 = 1.5 2^-64.
+   - T1 held there through a spare the text did not state (err_el is at least 1.94 times the engine's rounding of h).
+     The text now states it, and with it the floating-point environment and the worker hypothesis.

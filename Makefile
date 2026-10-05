@@ -67,7 +67,7 @@ DISK_BIN := $(BUILD)/tests/bench_disk$(EXE)
 # premise benches of 2026-09-24 (docs/MEASUREMENTS.md): built by the gate so they do not rot, run by hand
 RESEARCH_BIN := $(foreach b,bench_gpu_attn bench_gpu_q8 bench_attn_bw bench_kvpack bench_expf32 bench_peak bench_q4k_genome bench_q4x bench_q4x_genome bench_disk_misses bench_head_bound,$(BUILD)/tests/$(b)$(EXE))
 
-.PHONY: all attn-probe test check-gcc check-clang check-asan check-tsan check-tiny check-real check-cut oracle tier-check oracle-tokenizer chat-check oracle-real spec-check bench bench-mem bench-attn bench-expf bench-disk lint profile check check-linux clean-machine clean platform-guard quick
+.PHONY: all attn-probe test proof check-gcc check-clang check-asan check-tsan check-tiny check-real check-cut oracle tier-check oracle-tokenizer chat-check oracle-real spec-check bench bench-mem bench-attn bench-expf bench-disk lint profile check check-linux clean-machine clean platform-guard quick
 all: $(BUILD)/trochilus$(EXE)
 
 # Objects of two platforms must never share a BUILD directory: a build in the container with
@@ -234,6 +234,16 @@ oracle: $(BUILD)/trochilus$(EXE) $(FIX)/model-f32.gguf $(FIX)/model-f16.gguf $(F
 	$(PY) tools/oracle.py $(FIX) $(FIX)/model-q8_0.gguf --binary $(BUILD)/trochilus$(EXE) --expect report
 	$(PY) tools/check_gguf.py $(FIXO)/model-f32.gguf --compare-hf $(FIXO)
 	$(PY) tools/oracle.py $(FIXO) $(FIXO)/model-f32.gguf --binary $(BUILD)/trochilus$(EXE) --expect exact
+
+# The head's bound proved (docs/MEASUREMENTS.md §The head's bound proved): CBMC on the real head_bound.c and every
+# case of the per-element inequalities (tools/proof.sh). It needs cbmc, which lives in the image trochilus-proof
+# (tools/docker/Dockerfile.proof) and never in the core: on Windows it runs there, on Linux where cbmc is installed.
+proof:
+ifeq ($(OS),Windows_NT)
+	MSYS_NO_PATHCONV=1 docker run --rm -v "$(CURDIR):/src" -w /src trochilus-proof:local sh tools/proof.sh
+else
+	sh tools/proof.sh
+endif
 
 # Every kernel tier end to end, not only the best one this CPU has (tools/tier_check.sh): the model
 # tests under TR_CPU_MAX=scalar and avx2, and the logits of the tiny fixtures identical, byte for

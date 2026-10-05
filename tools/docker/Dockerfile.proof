@@ -1,0 +1,7 @@
+# trochilus-proof: trochilus-dev plus CBMC, the bounded model checker that runs tests/proof/ (make proof; docs/COMMANDS.md).
+# The checker stays in this image only, never in the core (CLAUDE.md §Invariants). CBMC 5.95.1 and MiniSat from Ubuntu
+# 24.04's archive (licences in docs/ORIGINS.md §Tools).
+#   docker build -t trochilus-proof:local -f tools/docker/Dockerfile.proof tools
+FROM trochilus-dev:local
+RUN apt-get update && apt-get install -y --no-install-recommends cbmc \
+    && rm -rf /var/lib/apt/lists/*

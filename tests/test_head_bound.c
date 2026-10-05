@@ -17,6 +17,8 @@
  *   top        three large decoys above the aligned row's bound: the threshold from TR_HB_TOP rows reaches the aligned
  *              row's score and a quarter of the rows at most is computed (the best bound's row alone: every row);
  *   full       h with a NaN or an infinity, a row with a NaN or an infinite scale: every row computed, the scan's rule;
+ *   tiny h     the proof's first counterexample (tiny_case, LESSONS #349): a block of h at 2^-149, where one rounded
+ *              product of the bound fell 2 units below the engine's 32: the full head, the scan's row;
  *   logits     tr_hb_logits for 1 to 5 input rows against tr_matmul_s, bit for bit. */
 #include <math.h>
 #include <stdint.h>
@@ -32,7 +34,7 @@
 
 enum { R = 300, NMAX = 2048, TMAX = 5, ALIGNED = 250, COPY = 77 };
 
-static long n_planes, n_tiers, n_bound, n_tight, n_pruned, n_tie, n_full, n_logits, n_argmax, n_zero_th, n_top;
+static long n_planes, n_tiers, n_bound, n_tight, n_pruned, n_tie, n_full, n_logits, n_argmax, n_zero_th, n_top, n_tiny;
 static double tight_gap = 1.0; /* the least (bound - value) / sum|w h| over the tight rows */
 
 static uint32_t rnd(uint32_t *s) {
@@ -66,8 +68,9 @@ static void make_h(float *x, int64_t n, int mode, uint32_t *s) {
         /* a block 2^-30 below its super-block's others, still on its own grid: Q4_K's engine rounds it (2^-26) */
         if (mode == 2 && b % 8 == 5)
             for (int k = 0; k < 32; k++) xb[k] = ldexpf(xb[k], -30);
+        /* blocks 2^-60 below the others, just above HB_HMIN (a block not zero below it goes to the full head) */
         if (mode == 3 && b % 5 == 1)
-            for (int k = 0; k < 32; k++) xb[k] = ldexpf(xb[k], -80);
+            for (int k = 0; k < 32; k++) xb[k] = ldexpf(xb[k], -60);
         if (mode == 3 && b == 2) xb[7] = 0x1p60f;
     }
 }
@@ -217,6 +220,44 @@ static int same_bits(const float *a, const float *b, int64_t n) {
 static const tr_kernels *g_tiers[3];
 static int g_n_tiers;
 
+/* LESSONS #349, the proof's first counterexample: h's block 0 all -2^-149, the rest 0; row 4 d = 0.5 - 2^-11 and every
+ * code -128, rows 0-3 d = 0.5, 31 codes -128 and one -126. In units of 2^-149 the engine gives row 4 2048 (each
+ * product 63.9375 rounds up to 64) and rows 0-3 2047; row 4's bound, one product 2046.5, rounds to 2046: below 2047,
+ * so the bound path dropped the scan's row. A block of h not zero below 2^-64 now goes to the full head. */
+static void tiny_case(void) {
+    enum { N = 256, NR = 5 };
+    static float h[N], y[NR], y2[NR];
+    static unsigned char orig[NR * (N / 32) * 34], hi[NR * (N / 32) * 18], lo[NR * (N / 32) * 16];
+    for (int i = 0; i < 32; i++) h[i] = -0x1p-149f;
+    for (int r = 0; r < NR; r++) {
+        unsigned char *blk = orig + (size_t)r * (N / 32) * 34;
+        const uint16_t d = r == 4 ? 0x37FE : 0x3800;
+        memcpy(blk, &d, 2);
+        for (int i = 0; i < 32; i++) blk[2 + i] = (unsigned char)(int8_t)(r < 4 && i == 31 ? -126 : -128);
+        tr_hb_planes(TR_TYPE_Q8_0, orig + (size_t)r * (N / 32) * 34, N, hi + (size_t)r * (N / 32) * 18,
+                     lo + (size_t)r * (N / 32) * 16);
+    }
+    const tr_mat m = {TR_TYPE_Q8_0, NR, N, orig};
+    tr_pm_scratch pm;
+    TR_CHECK(tr_pm_scratch_init(&pm, 1, 1, 1, N, N) == 0);
+    tr_matmul_s(NULL, &m, h, 1, y, &pm);
+    TR_CHECK(y[4] == 2048 * 0x1p-149f && y[0] == 2047 * 0x1p-149f); /* the engine's values, as worked out above */
+    const tr_hb_head w = {TR_TYPE_Q8_0, NR, N, hi, lo};
+    for (int ti = 0; ti < g_n_tiers; ti++) {
+        tr_kernels_set_active(g_tiers[ti]);
+        tr_hb_scratch hs;
+        TR_CHECK(tr_hb_scratch_init(&hs, &w, 1, 1) == 0);
+        tr_hb_result res;
+        const int32_t got = tr_hb_argmax(NULL, &w, h, NR, &hs, y2, &res);
+        if (got != 4) fprintf(stderr, "  tiny h: tier %s gave row %d, the scan 4\n", g_tiers[ti]->tier, (int)got);
+        TR_CHECK(got == 4 && res.full);
+        n_tiny++;
+        tr_hb_scratch_free(&hs);
+        tr_kernels_set_active(NULL);
+    }
+    tr_pm_scratch_free(&pm);
+}
+
 static void run_case(tr_type t, int64_t n, int head_mode, int h_mode, tr_pool *const *pools, uint32_t *s) {
     const size_t rb = tr_row_bytes(t, n), hb = tr_hb_hi_bytes(t, n), lb = tr_hb_lo_bytes(t, n);
     static unsigned char orig[R * (NMAX / 32) * 34], hi[R * (NMAX / 32) * 18], lo[R * (NMAX / 32) * 16];
@@ -346,12 +387,14 @@ int main(void) {
         for (int ni = 0; ni < 2; ni++)
             for (int hm = 0; hm < 6; hm++)
                 for (int xm = 0; xm < 5; xm++) run_case(types[ti], ns[ni], hm, xm, pools, &seed);
+    tiny_case();
     printf("test_head_bound: tiers %d; planes %ld, tiers %ld, bounds %ld (tight %ld, least gap %.3g of sum|w h|), "
-           "argmax %ld (pruned %ld, tie %ld, full %ld, threshold reached exactly %ld, past the decoys %ld), logits %ld\n",
+           "argmax %ld (pruned %ld, tie %ld, full %ld, threshold reached exactly %ld, past the decoys %ld, tiny h %ld), "
+           "logits %ld\n",
            g_n_tiers, n_planes, n_tiers, n_bound, n_tight, tight_gap, n_argmax, n_pruned, n_tie, n_full, n_zero_th, n_top,
-           n_logits);
+           n_tiny, n_logits);
     TR_CHECK(n_planes > 0 && n_bound > 0 && n_tight > 0 && n_pruned > 0 && n_tie > 0 && n_full > 0 && n_logits > 0);
-    TR_CHECK(n_zero_th > 0 && n_top > 0);
+    TR_CHECK(n_zero_th > 0 && n_top > 0 && n_tiny > 0);
     TR_CHECK(g_n_tiers < 2 || n_tiers > 0);
     TR_CHECK(tight_gap < 0x1p-8); /* the tight rows are tight: the margin is what keeps them above */
     tr_pool_destroy(pools[1]);

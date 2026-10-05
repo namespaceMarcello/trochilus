@@ -318,7 +318,7 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
   The KV's pages touched before a pass's layers: the decode +0.17% (#250). Environment switches raced process
   against process (`tools/ab_env.sh`). The routers as bf16: ~0.4% a token, the same bits. The parallel argmax fixed (#252: +0.74%; the lint refuses `malloc(sizeof *x)`).
   Question 84 answered (a region's end ~0.8% of a dense call; #254-#256). The idle workers (piece 3, B): level in the
-  engine, off by default (`TR_POOL_HINT=2`; #255, question 85). **10-02, pretouch**: out (#259).
+  engine, off by default (`TR_POOL_HINT=2`; #255, question 85).
   **10-02, piece 4**: q, k, v and gate, up one call each, the weights' items one flat range
   (`tr_matmul_q4x_prepared_n`): the decode **1.0054 +- 0.0007**, the same bits (MEASUREMENTS §Piece 4, #260-#261).
 - **next: the ladder** (ARCHITECTURE §The roadmap, status.json R1-R4): **R1, OLMoE to the end**. **10-03, the three
@@ -348,8 +348,10 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
   every machine (0.74-0.98x, model): not built. **10-05, question 73, the head by a bound** (#341-#346;
   MEASUREMENTS §The head's argmax by a bound, phase 2): a greedy token computes ~10 of 50304 head rows, the same
   token; the decode **Q8_0 1.046x pc, 1.041x avg; Q4_K 1.022x pc, 1.009x avg, 1.015x weak**: on by default.
-  **README raced**: Q8_0 decode **1.07x** at 512, 1.01x at 2048 (#347).
-  **Next**: verify passes' k-row bound;
+  **README raced**: Q8_0 decode **1.07x** at 512, 1.01x at 2048 (#347). **Proved** (MEASUREMENTS §The head's bound
+  proved, `make proof`, #349-#353): CBMC on the real code, a written float bound, reviewed; it found two inputs
+  that could change the token (a subnormal h; a margin fixed while the paths grow with n), both fixed, same bits today.
+  **Next**: the head by a bound offered to ds4, then colibri (build/prompt-next.md); verify passes' k-row bound;
   question 95 (drafts on weak Q4_K); a miss as one
   request, this PC at half budget; the integrated GPU (r1-igpu: Vulkan; q. 87-88); R1's first prompt's cost,
   generation's fixed cost, the review, the server; the races with llama.cpp, colibri and ds4 at R1's close. The
@@ -366,13 +368,10 @@ budget = the engine before M1); a read error fails the evaluation, not the proce
 (BitLocker, question 41) and untouched: the target PCs' factory state.
 - **Batches 1–3, done** (2026-09-20, in DONE): the store, `--expert-budget`, direct reads; 23 red mutations.
 - **Measured 2026-09-20/21** (MEASUREMENTS §M1 measured, §Prefill reads model once per pass):
-  **M1 works, the cost is the prompt**: decode 35.5 / 29.6 / 24.3 / 20.6 tok/s at 100 / 75 / 50 /
-  25% (64 tokens), 0.90× and 0.87× of resident at 1000 tokens; direct reads give 2.42× the system
-  cache's prefill (the guard was right). Decided then: no prefetch in decode (0.03–0.14 units a token
-  far from the prompt); the budget is not the lever (4% between 25 and 75%). Question 46 half
-  closed: the fixed cost at generation start is the store settling (~0.35 s at 50%), absent when
-  resident. Layer-major prefill (question 47): 2048 tokens read 6,273 MiB instead of 22,880, 12.41 s
-  instead of 23.51 (**1.89×**), `tests/test_stream.c` §`once_per_prompt` (LESSONS #99).
+  **M1 works, the cost is the prompt**: decode 35.5 / 20.6 tok/s at 100 / 25% (64 tokens); direct
+  reads 2.42× the system cache's prefill; the budget is not the lever (4% between 25 and 75%); question
+  46's fixed cost is the store settling (~0.35 s at 50%). Layer-major prefill (question 47): 2048
+  tokens 12.41 s instead of 23.51 (**1.89×**, LESSONS #99).
 - **M1 work order, decided 2026-09-21** (from numbers, not plan):
   1. ~~layer-major order in prefill~~ **done** (line above, 1.89×);
   2. **first prompt cost** (questions 45, 48, 49; 4.7 s at 2048, the whole gap to the resident

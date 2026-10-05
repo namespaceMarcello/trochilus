@@ -137,7 +137,9 @@ llama.cpp and ik_llama.cpp compute all 50 304 rows of the output head and keep t
 one token at a time, Trochilus reads only the top bits of each row's weights (four of Q8_0's eight, three of Q4_K's four), takes from
 them a bound no row can exceed, and computes in full only the rows whose bound reaches the best exact
 score: on the engine's own tokens, 0.3% of the rows on average and a handful in most. The token is the
-full scan's, the lowest row on a tie, at each of the 13 821 positions of 13 texts, on both models; on this
+full scan's, the lowest row on a tie: proved for every row and every input on the C code itself (a model
+checker, CBMC, runs the real code for the integer layer and the argmax; a written bound covers the float
+rounding: `make proof`), and seen at each of the 13 821 positions of 13 texts, on both models. On this
 laptop the Q8_0 head takes 1.2 ms instead of 2.0, and `logits` still computes every row.
 
 **Nothing to configure.** At startup the engine measures the cores, the instructions, the free RAM
@@ -216,7 +218,8 @@ Trochilus is written from scratch, on what four other engines taught. They are p
 | [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) — MIT | its K-quant CPU kernels, read before we wrote ours |
 
 **`transformers`** and Hugging Face **`tokenizers`** define what a correct result is here, and the
-first model is **OLMoE-1B-7B**, from AI2. Only two files carry code from elsewhere — the GGUF type
+first model is **OLMoE-1B-7B**, from AI2. **CBMC** (BSD-4-Clause), run from its own container and never
+linked, checks the head by a bound's proof. Only two files carry code from elsewhere — the GGUF type
 table in `src/format/gguf.c` and `tools/make_tiny_olmoe.py` — and each names its origin in its header.
 
 ## License

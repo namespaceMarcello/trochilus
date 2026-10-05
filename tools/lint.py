@@ -725,8 +725,8 @@ def stale_mutations(script, read_source, is_file, implicit=None):
     names = dict(re.findall(r"^([A-Z][A-Z0-9_]*)=([^\s$`'\"]+)$", script, re.M))
     resolve = lambda w: re.sub(r"\$\{?([A-Z][A-Z0-9_]*)\}?", lambda m: names.get(m.group(1), m.group(0)), w)
     stale = []
-    for m in re.finditer(r'^run "', script, re.M):
-        words = shell_words(script, m.start() + 4)
+    for m in re.finditer(r'^(?:run|prove) "', script, re.M):  # prove: a mutation the proof must see (mutate_head.sh)
+        words = shell_words(script, m.end() - 1)
         name, path, text = words[0], implicit, None
         if implicit is not None:
             text = words[1] if len(words) > 1 else None
@@ -744,6 +744,35 @@ def stale_mutations(script, read_source, is_file, implicit=None):
         elif once and read_source(path).count(text) > 1:
             stale.append(f"{name} (found {read_source(path).count(text)} times)")
     return stale
+
+
+PROVED = ROOT / "tests" / "proof" / "proved.sha256"
+
+
+def proof_files():
+    """What the head's bound proof reads: the code proved and every harness (tools/proof.sh writes their hashes)."""
+    files = [ROOT / "src" / "kernels" / "head_bound.c"]
+    files += sorted(p for p in (ROOT / "tests" / "proof").glob("*") if p.suffix in (".c", ".h"))
+    return [p.relative_to(ROOT).as_posix() for p in files]
+
+
+def check_proof_current():
+    """#350: the head's bound is proved on head_bound.c's bytes (docs/MEASUREMENTS.md §The head's bound proved), and
+    `make proof` takes minutes, so it is not in the gate: a change to the code or to a harness since the last proof
+    fails here until `make proof` runs again and records the new hashes."""
+    import hashlib
+    if not PROVED.is_file():
+        fail(350, "tests/proof/proved.sha256 is missing: run make proof (docs/COMMANDS.md)")
+        return
+    recorded = {}
+    for line in PROVED.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            digest, path = line.split(None, 1)
+            recorded[path.strip().lstrip("*")] = digest
+    for rel in proof_files():
+        digest = hashlib.sha256((ROOT / rel).read_bytes()).hexdigest()
+        if recorded.get(rel) != digest:
+            fail(350, f"{rel} changed since the head's bound was last proved: run make proof (docs/COMMANDS.md)")
 
 
 def check_mutations_apply():
@@ -775,7 +804,8 @@ def main():
                   check_type_table, check_tests_no_tmpfile, check_hot_zones, check_global_state,
                   check_makefile_recipes_ascii, check_shell_scripts_whole, check_scripts_clean_up, check_orphans_lists,
                   check_no_failure_into_tee, check_struct_calloc, check_expf_table, check_readme_numbers,
-                  check_english, check_status_json, check_one_rung, check_upstream_verdicts, check_mutations_apply):
+                  check_english, check_status_json, check_one_rung, check_upstream_verdicts, check_mutations_apply,
+                  check_proof_current):
         check()
     for f in failures:
         print(f)

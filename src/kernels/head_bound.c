@@ -11,9 +11,10 @@
 #include "kernels_internal.h"
 #include "../base/platform.h"
 
-#define HB_LIM 32639                /* 127 * 257: h's 16-bit code, its high digit within int8 */
-#define HB_MARGIN 1.52587890625e-05 /* 2^-16: every float sum's rounding here and in the engine is below it */
-#define HB_HMAX 0x1p64f             /* a larger |h| leaves the bound to the full head: no float of a row overflows */
+#define HB_LIM 32639    /* 127 * 257: h's 16-bit code, its high digit within int8 */
+#define HB_MARGIN 256   /* the float sums' margin, in units of 2^-24, at least (hb_margin) */
+#define HB_HMAX 0x1p64f /* a larger |h| leaves the bound to the full head: no float of a row overflows */
+#define HB_HMIN 0x1p-64f /* a block of h below it and not zero too: no product of a row underflows unnoticed */
 #define HB_WORKER_BYTES 64
 
 /* ---- sizes ---------------------------------------------------------------------------------------------------- */
@@ -60,9 +61,29 @@ static float hb_up(double v) { /* the float at or above v */
     return (double)f >= v ? f : nextafterf(f, INFINITY);
 }
 
+/* The float sums' margin relative to the terms' magnitudes (docs/MEASUREMENTS.md §The head's bound proved): the most
+ * roundings a term meets on its way to a row's value, in the engine's sum or in the bound's, plus 16 for the rest, in
+ * units of 2^-24, and never below HB_MARGIN. Q8_0: the engine's sixteen lanes, n / 16 + 4 (the bound's chains n / 128
+ * + 7); Q4_K: the bound's side lanes, n / 64 + 5 (its chains n / 128 + 8; the engine rounds once). */
+static double hb_margin(int q4, int64_t n) {
+    int64_t d = q4 ? n / 64 + 5 : n / 16 + 4;
+    const int64_t chains = q4 ? n / 128 + 8 : n / 128 + 7;
+    if (chains > d) d = chains;
+    d += 16;
+    return (double)(d > HB_MARGIN ? d : HB_MARGIN) * 0x1p-24;
+}
+
+/* q = 256 X + Xl, both int8 for |q| <= HB_LIM: X = floor((q + 128) / 256), the dividend kept positive */
+static inline void hb_digits(long q, int8_t *X, int8_t *Xl) {
+    const long qh = (q + 32896) / 256 - 128;
+    *X = (int8_t)qh;
+    *Xl = (int8_t)(q - 256 * qh);
+}
+
 int tr_hb_prep_build(tr_type type, const float *h, int64_t n, const tr_hb_prep *p) {
     if (!tr_hb_supports(type, n)) return -1;
     const int q4 = type == TR_TYPE_Q4_K;
+    const double margin = hb_margin(q4, n);
     double err_el = 0.0; /* Q4_K: the engine's rounding of h, 2^-30 of its super-block's max|h| an element */
     for (int64_t b = 0; b < n / 32; b++) {
         const float *x = h + 32 * b;
@@ -81,19 +102,19 @@ int tr_hb_prep_build(tr_type type, const float *h, int64_t n, const tr_hb_prep *
             if (!(a <= HB_HMAX)) return -1;
             if (a > m) m = a;
         }
-        /* a block below 2^-64 keeps X = 0: all of it counted as h's rounding */
-        const int tiny = m < 0x1p-64f;
-        const float delta = tiny ? 1.0f : m / (float)HB_LIM;
+        /* a block of zeros keeps X = 0 and adds nothing; one not zero below HB_HMIN goes to the full head: its products
+         * may underflow, by up to 2^-150 each, where no margin of its own magnitude is left to cover them (LESSONS #349) */
+        const int zero = m == 0.0f;
+        if (!zero && m < HB_HMIN) return -1;
+        const float delta = zero ? 1.0f : m / (float)HB_LIM;
         int64_t sx = 0, sax = 0;
         double e = 0.0, ha = 0.0, hs = 0.0;
         for (int k = 0; k < 32; k++) {
             /* the nearest integer, ties to even: adding and taking away 1.5 2^52 (|x / delta| <= 32640, as q4x_prep) */
-            long q = tiny ? 0 : (long)(((double)(x[k] / delta) + 6755399441055744.0) - 6755399441055744.0);
+            long q = zero ? 0 : (long)(((double)(x[k] / delta) + 6755399441055744.0) - 6755399441055744.0);
             if (q > HB_LIM) q = HB_LIM;
             if (q < -HB_LIM) q = -HB_LIM;
-            const long qh = (q + 32896) / 256 - 128; /* floor((q + 128) / 256), the dividend positive */
-            p->X[32 * b + k] = (int8_t)qh;
-            p->Xl[32 * b + k] = (int8_t)(q - 256 * qh);
+            hb_digits(q, &p->X[32 * b + k], &p->Xl[32 * b + k]);
             sx += q;
             sax += q < 0 ? -q : q;
             e += fabs((double)x[k] - (double)delta * (double)q);
@@ -108,7 +129,7 @@ int tr_hb_prep_build(tr_type type, const float *h, int64_t n, const tr_hb_prep *
             const double mag = 240.0 * dsax + 120.5 * fabs(dsx) + g + 128.0 * ha;
             p->a[b] = 16.0f * delta;
             p->be[b] = (float)(-120.5 * dsx);
-            p->g[b] = hb_up(g + HB_MARGIN * (mag + 120.5 * fabs(dsx)));
+            p->g[b] = hb_up(g + margin * (mag + 120.5 * fabs(dsx)));
             p->H[b] = 0.0f;
             p->mu[b] = 0.0f;
         } else {
@@ -118,9 +139,9 @@ int tr_hb_prep_build(tr_type type, const float *h, int64_t n, const tr_hb_prep *
             const double mag = 14.0 * dsax + 0.5 * fabs(dsx) + g + 15.0 * ha;
             p->a[b] = 2.0f * delta;
             p->be[b] = (float)(0.5 * dsx);
-            p->g[b] = hb_up(g + HB_MARGIN * mag);
+            p->g[b] = hb_up(g + margin * mag);
             p->H[b] = (float)hs;
-            p->mu[b] = hb_up(HB_MARGIN * 4.0 * ha + fabs(hs - (double)(float)hs) + 32.0 * err_el);
+            p->mu[b] = hb_up(margin * 4.0 * ha + fabs(hs - (double)(float)hs) + 32.0 * err_el);
         }
     }
     return 0;
@@ -193,6 +214,31 @@ static void hb_rebuild_q4_k(const unsigned char *hi, const unsigned char *lo, in
  * A block's I as eight int32 lanes of four elements (exact: |P| < 2^21), lane l of block b into chain b % 4, the
  * side terms of block b into lane b % 8, then the fixed fold below. */
 
+/* Q8_0: element i's u = (q >> 4) + 8 from its block's 16 bytes of the high plane */
+static inline int hb_u_q8_0(const unsigned char *nib, int i) {
+    const int v = nib[i & 15];
+    return i < 16 ? (v & 15) : (v >> 4);
+}
+
+/* Q4_K: element k's q >> 1 from its super-block's 112 bytes of the high plane */
+static inline int hb_hv_q4_k(const unsigned char *ph, int k) {
+    return (((ph[16 + 32 * (k / 128) + k % 32] >> (2 * ((k % 128) / 32))) & 3) << 1) | ((ph[80 + k / 8] >> (k % 8)) & 1);
+}
+
+/* Q8_0: lane l's P = sum over its four elements of u (256 X + Xl), exact (|P| < 2^21); nib, X and Xl at the block */
+static inline int32_t hb_lane_q8_0(const unsigned char *nib, const int8_t *X, const int8_t *Xl, int l) {
+    int32_t P = 0;
+    for (int i = 4 * l; i < 4 * l + 4; i++) P += hb_u_q8_0(nib, i) * (256 * X[i] + Xl[i]);
+    return P;
+}
+
+/* Q4_K: sub-block j's lane l, the same over q >> 1; ph, X and Xl at the super-block */
+static inline int32_t hb_lane_q4_k(const unsigned char *ph, const int8_t *X, const int8_t *Xl, int j, int l) {
+    int32_t P = 0;
+    for (int k = 32 * j + 4 * l; k < 32 * j + 4 * l + 4; k++) P += hb_hv_q4_k(ph, k) * (256 * X[k] + Xl[k]);
+    return P;
+}
+
 static float hb_fold(float acc[4][8], const float side[8]) {
     float v[8];
     for (int l = 0; l < 8; l++) v[l] = ((acc[0][l] + acc[2][l]) + (acc[1][l] + acc[3][l])) + side[l];
@@ -210,11 +256,7 @@ static void hb_bounds_q8_0(const unsigned char *hi, int64_t rows, const tr_hb_pr
             memcpy(&dh, h + 2 * b, 2);
             const float d = tr_half_to_float(dh), ad = fabsf(d), coef = d * p->a[b];
             for (int l = 0; l < 8; l++) {
-                int32_t P = 0;
-                for (int i = 4 * l; i < 4 * l + 4; i++) {
-                    const int v = nib[16 * b + (i & 15)], u = i < 16 ? (v & 15) : (v >> 4);
-                    P += u * (256 * p->X[32 * b + i] + p->Xl[32 * b + i]);
-                }
+                const int32_t P = hb_lane_q8_0(nib + 16 * b, p->X + 32 * b, p->Xl + 32 * b, l);
                 acc[b & 3][l] = acc[b & 3][l] + (float)P * coef;
             }
             side[b & 7] = side[b & 7] + d * p->be[b];
@@ -242,13 +284,7 @@ static void hb_bounds_q4_k(const unsigned char *hi, int64_t rows, const tr_hb_pr
                 const int64_t sb = 8 * s + j;
                 const float fsc = (float)sc[j], fm = (float)m[j], dsc = d * fsc, coef = dsc * p->a[sb];
                 for (int l = 0; l < 8; l++) {
-                    int32_t P = 0;
-                    for (int i = 4 * l; i < 4 * l + 4; i++) {
-                        const int k = 32 * j + i;
-                        const int hv = (((ph[16 + 32 * (k / 128) + i] >> (2 * (j % 4))) & 3) << 1) |
-                                       ((ph[80 + k / 8] >> (k % 8)) & 1);
-                        P += hv * (256 * p->X[256 * s + k] + p->Xl[256 * s + k]);
-                    }
+                    const int32_t P = hb_lane_q4_k(ph, p->X + 256 * s, p->Xl + 256 * s, j, l);
                     acc[j & 3][l] = acc[j & 3][l] + (float)P * coef;
                 }
                 side[j] = side[j] + dsc * p->be[sb];
