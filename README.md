@@ -39,17 +39,17 @@ an NVIDIA GPU when one is there — without a CUDA toolkit. And it gives the **s
 ## Results
 
 OLMoE-1B-7B, the same GGUF for both engines, both in the same Linux container on one laptop (Ryzen 9
-7940HX, 16 cores, 31 GB), a free machine, the night of 2026-09-26 to 27. Tokens per second, the median
-of 10 runs: two series of 5 for each engine, alternated with the other's.
+7940HX, 16 cores, 31 GB), 2026-10-05. Tokens per second, the median of each engine's runs in series of 5
+alternated with the other's: 10 runs for Q4_K, 30 for Q8_0 (three races).
 
 | | llama.cpp | Trochilus | Trochilus / llama.cpp |
 |---|---|---|---|
-| Q4_K, prompt of 512 tokens, 4 threads | 220.6 | 220.0 | 1.00× |
-| Q4_K, generation after that prompt, 4 threads | 50.9 | 52.4 | 1.03× |
-| Q8_0, prompt of 512 tokens, 16 threads | 370.7 | 492.9 | **1.33×** |
-| Q8_0, prompt of 2048 tokens, 16 threads | 341.3 | 485.2 | **1.42×** |
-| Q8_0, generation at 512 tokens of context, 8 threads | 33.1 | 33.1 | 1.00× |
-| Q8_0, generation at 2048 tokens of context, 8 threads | 27.2 | 26.3 | 0.96× |
+| Q4_K, prompt of 512 tokens, 4 threads | 204.7 | 218.2 | 1.07× |
+| Q4_K, generation after that prompt, 4 threads | 50.6 | 52.9 | 1.04× |
+| Q8_0, prompt of 512 tokens, 16 threads | 374.9 | 515.3 | **1.37×** |
+| Q8_0, prompt of 2048 tokens, 16 threads | 349.8 | 483.9 | **1.38×** |
+| Q8_0, generation at 512 tokens of context, 8 threads | 33.3 | 35.7 | **1.07×** |
+| Q8_0, generation at 2048 tokens of context, 8 threads | 27.6 | 27.7 | 1.01× |
 
 The difference is in what is computed: llama.cpp rounds the activations to 8 bits before each matrix
 product and keeps its attention cache in 16 bits; Trochilus computes what `transformers` computes, the
@@ -131,6 +131,14 @@ them otherwise; ggml's 3.36%, by up to 2 units in the last place.)
 on the real model; tiny models built for the purpose are compared with `transformers` in every gate,
 and so is the real model cut to two layers. Speculative decoding cannot change the answer: every
 verified row is bit for bit the computation of a single-token pass.
+
+**The next token without scoring the whole vocabulary.** To pick the next token, colibri, ds4,
+llama.cpp and ik_llama.cpp compute all 50 304 rows of the output head and keep the largest. Generating
+one token at a time, Trochilus reads only the top bits of each row's weights (four of Q8_0's eight, three of Q4_K's four), takes from
+them a bound no row can exceed, and computes in full only the rows whose bound reaches the best exact
+score: on the engine's own tokens, 0.3% of the rows on average and a handful in most. The token is the
+full scan's, the lowest row on a tie, at each of the 13 821 positions of 13 texts, on both models; on this
+laptop the Q8_0 head takes 1.2 ms instead of 2.0, and `logits` still computes every row.
 
 **Nothing to configure.** At startup the engine measures the cores, the instructions, the free RAM
 and the disk, and places the work itself; while it runs it times how many threads each kind of pass

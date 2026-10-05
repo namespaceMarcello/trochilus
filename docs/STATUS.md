@@ -346,9 +346,10 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
   **10-05, the router's read ahead** (#323-#332): the weak decode **Q4_K 1.031, Q8_0 1.000-1.005**. Owed: the old
   binary's race (#332), avg's Q8_0. **10-05, question 94** (#335-#338): a draft from the store's experts loses on
   every machine (0.74-0.98x, model): not built. **10-05, question 73, the head by a bound** (#341-#346;
-  MEASUREMENTS §The head's argmax by a bound, phase 2): a greedy token computes ~10 of the head's 50304 rows, the same
+  MEASUREMENTS §The head's argmax by a bound, phase 2): a greedy token computes ~10 of 50304 head rows, the same
   token; the decode **Q8_0 1.046x pc, 1.041x avg; Q4_K 1.022x pc, 1.009x avg, 1.015x weak**: on by default.
-  **Next**: the README's llama.cpp table raced again (Q8_0's decode moved); the verify passes' k-row bound;
+  **README raced**: Q8_0 decode **1.07x** at 512, 1.01x at 2048 (#347).
+  **Next**: verify passes' k-row bound;
   question 95 (drafts on weak Q4_K); a miss as one
   request, this PC at half budget; the integrated GPU (r1-igpu: Vulkan; q. 87-88); R1's first prompt's cost,
   generation's fixed cost, the review, the server; the races with llama.cpp, colibri and ds4 at R1's close. The

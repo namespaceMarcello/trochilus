@@ -565,6 +565,10 @@
         {
           "v": "races for the README on a free machine (container, same GGUF): Q4_K at 4 threads prompt 0.97x llama.cpp, generation 1.03x; Q8_0 at 16 threads prompt 1.33x at 512 and 1.42x at 2048, generation even at 512, theirs 1.04x at 2048",
           "d": "2026-09-26"
+        },
+        {
+          "v": "raced again after the head by a bound (the median of three Q8_0 races, each marked NOT FREE only by its own Memory Compression, LESSONS #347): Q8_0 generation at 8 threads 1.07x llama.cpp at 512 and 1.01x at 2048, the prompt 1.37x and 1.38x at 16 threads; Q4_K at 4 threads generation 1.04x, prompt 1.07x",
+          "d": "2026-10-05"
         }
       ],
       "questions": [],

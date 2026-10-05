@@ -6474,3 +6474,34 @@ Defender scanning: 1.010 +- 0.010, structure only) and was raced again (above). 
 the disk's (the head 2.24 -> 1.31 ms of a 415 ms token, 0.2%). **Decided: on by default on every machine**
 (`TR_HEAD_BOUND=0` the switch back). Open: the verify passes (k rows) still compute every row, from the planes; a
 k-row bound kernel next (phase 1's model: avg's Q4_K loses at k 4 with k separate bounds).
+
+## The race for the README after the head by a bound (2026-10-05)
+
+`78a82d6` (question 73 phase 2: the head's argmax by a bound, on by default) moves the README's Q8_0 decode, so the
+README's table was raced again on HEAD `4b947bc` (build/linux-gcc, the same sources): `RACE_OUT=build/race_llama_1005
+sh tools/race_llama.sh 5` and the Q4_K line (`RACE_MODEL=<Q4_K> RACE_PROMPTS=512 RACE_THREADS=4`), the same llama.cpp
+build. Predictions first (build/race_llama_1005/predictions.txt, the outcome beside them).
+
+**Every Q8_0 race ended NOT FREE at its after-declaration only** (three races: build/race_llama_1005, 1005b, 1005c):
+before the first series 2.40 / 1.24 / 2.08 logical processors busy, after the last 2.85 / 3.29 / 2.97, each time with
+Windows' Memory Compression at 0.52-0.59 and Defender at 0.21-0.34; the guard found the machine still before all 24
+series. The race's own aftermath: the container lets go of the Q8_0's 7 GB and Windows compresses (0.49 after the
+09-26 race too; the Q4_K races 0.20-0.30). The three agree within 1-3% a cell, so the table is the median of their
+30 runs an engine (LESSONS #347). The first Q4_K race was NOT FREE before its first series (Defender 0.30) and its
+llama.cpp prompt moved 207 / 180 between its series: raced again, free (2.39 before, 1.63 after): build/race_q4k_llama_1005b.
+
+| tok/s, median of 30 (Q4_K: 10) | llama.cpp | Trochilus | ratio | the three races' ratios | 09-26/27 |
+|---|---|---|---|---|---|
+| Q4_K, prompt 512, 4 threads | 204.7 (205.8 / 203.5) | 218.2 (210.0 / 224.4) | 1.07 | | 1.00 |
+| Q4_K, generation after it, 4 threads | 50.6 (50.7 / 50.6) | 52.9 (51.6 / 53.4) | 1.04 | | 1.03 |
+| Q8_0, prompt 512, 16 / 8 threads | 374.9 / 235.4 | 515.3 / 338.6 | **1.37 / 1.44** | 1.41 1.38 1.36 / 1.49 1.42 1.42 | 1.33 / 1.40 |
+| Q8_0, prompt 2048, 16 / 8 threads | 349.8 / 216.3 | 483.9 / 319.9 | **1.38 / 1.48** | 1.40 1.37 1.37 / 1.47 1.44 1.48 | 1.42 / 1.45 |
+| Q8_0, generation at 512, 16 / 8 threads | 33.8 / 33.3 | 35.1 / 35.7 | 1.04 / **1.07** | 1.04 1.02 1.06 / 1.08 1.07 1.07 | 0.97 / 1.00 |
+| Q8_0, generation at 2048, 16 / 8 threads | 29.2 / 27.6 | 27.3 / 27.7 | 0.94 / 1.01 | 0.94 0.95 0.95 / 1.00 1.00 1.03 | 0.95 / 0.96 |
+
+Outcome against the predictions: the Q8_0 decode at 8 threads faster than predicted (512: 35.7 against 34.0-34.6,
++8% on 09-27's 33.1: the head's 0.9 ms and what came since; 2048: 27.7 against 26.9-27.4, level with llama.cpp as
+predicted); the prompts at the edge of their range (1.37 against 1.33 +- 0.03 at 512, 1.38 against 1.42 at 2048: llama.cpp
+341 -> 350 there); the Q4_K right (52.9 and 218). llama.cpp's Q4_K prompt 220.6 -> 204.7 today (its own A/A 205.8 /
+203.5), so the Q4_K prompt's 1.07 is theirs moving more than ours. What is left to llama.cpp: the decode at 2048 with
+16 threads (0.94, the KV's bytes, §The attention against llama.cpp's).

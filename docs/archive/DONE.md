@@ -1860,3 +1860,16 @@ the 8 GB machine; on by default (MEASUREMENTS §The head's argmax by a bound, ph
 
 How to try it: `build/trochilus generate -m <Q8_0 or Q4_K.gguf> -p 64 -n 100 --profile` (the lm_head line's rows/call),
 `TR_HEAD_BOUND=0` for today's road; `build/trochilus logits -m <f.gguf> --tokens <ids> --out x -b 1 --check-argmax`.
+Commits: `78a82d6` (the engine, the tests, the documents) and `4b947bc` (UPSTREAM row 15, offered to ds4 too).
+
+### 2026-10-05 — The README's table raced again after the head by a bound
+The README's results against llama.cpp raced on today's engine (`4b947bc`): the Q8_0 decode at 8 threads 1.07x at 512
+tokens of context (35.7 against 33.3 tok/s; level on 09-27) and 1.01x at 2048, the prompt 1.37-1.38x at 16 threads,
+Q4_K at 4 threads 1.04x in generation and 1.07x on the prompt. Three Q8_0 races, each marked NOT FREE only by its
+after-declaration (the race's own Memory Compression, LESSONS #347), agreeing within 1-3%: the table is the median of
+their 30 runs an engine (MEASUREMENTS §The race for the README after the head by a bound). The README also says what
+the head by a bound is: the next token without scoring the whole vocabulary.
+
+How to try it: `RACE_OUT=build/race_llama_1005 sh tools/race_llama.sh 5` (Q8_0, about 17 minutes) and
+`RACE_MODEL=models/OLMoE-1B-7B-0125-Instruct-Q4_K.gguf RACE_PROMPTS=512 RACE_THREADS=4 RACE_OUT=build/race_q4k_llama_1005b
+sh tools/race_llama.sh 5`, on a quiet machine.
