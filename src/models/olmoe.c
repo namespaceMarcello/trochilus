@@ -31,11 +31,12 @@ void tr_attn_probe_out(int64_t layer, int64_t head, const float *out, int64_t n_
 #endif
 
 #ifdef TR_DRAFT_PROBE
-/* A diagnostic build only (make draft-probe, tools/draft_probe.c): a draft's routing (the top k of
- * the used experts, rescaled) and a decode token's attention over a subset of positions (a window,
+/* A diagnostic build only (make draft-probe, tools/draft_probe.c; make resident-probe,
+ * tools/resident_probe.c): a draft's routing (the top k of the used experts, rescaled; or the absent
+ * ones skipped) and a decode token's attention over a subset of positions (a window,
  * or those the exact session's previous token attended to most). The probe returns 1 when it
  * computed the head itself. The engine is never built with it. */
-void tr_draft_probe_route(float *sel_w, int64_t n_used);
+void tr_draft_probe_route(const int64_t *sel_id, float *sel_w, int64_t n_used);
 int tr_draft_probe_attention(int64_t layer, int64_t head, const float *q, const float *keys, const float *values,
                              int64_t n_pos, int64_t head_dim, float scale, float *scores, int64_t score_stride,
                              float *out);
@@ -1411,7 +1412,7 @@ static void route_token(const olmoe_model *m, float *router, const unsigned char
         for (int64_t i = 0; i < n_used; i++) sel_w[i] /= sum;
     }
 #ifdef TR_DRAFT_PROBE
-    tr_draft_probe_route(sel_w, n_used); /* sel_w is still in decreasing order here */
+    tr_draft_probe_route(sel_id, sel_w, n_used); /* still in decreasing order of weight here */
 #endif
     for (int64_t i = 1; i < n_used; i++) {
         int64_t id = sel_id[i];

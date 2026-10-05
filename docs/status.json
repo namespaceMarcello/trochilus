@@ -463,7 +463,7 @@
         {
           "n": 73,
           "state": "open",
-          "text": "the most likely token from the output head's high half, exact only on the rows that can still win (up to 4% of the bytes)"
+          "text": "the most likely token from the output head's high half, exact only on the rows that can still win. Measured (10-05): the high half of each weight already rules out 96-99.8% of the 50304 rows; the head read at 0.53 of its bytes, a token 1.039x on the machines limited by their RAM (Q8_0), 1.017x (Q4_K). To build and race"
         }
       ],
       "files": [
@@ -1046,7 +1046,7 @@
         {
           "n": 79,
           "state": "open",
-          "text": "a row that costs no bytes: the model restricted to the experts already in flight, as a draft or a filter"
+          "text": "a row that costs no bytes: the model restricted to the experts already in flight, as a draft or a filter. As a draft, answered by question 94's model (10-05): it reads the dense part of a token again for each token it drafts, 0.74-0.86x; as a filter, open"
         },
         {
           "n": 80,
@@ -1149,6 +1149,10 @@
         {
           "v": "the router's read ahead (10-05): at a layer's router the next layer's router guesses its experts, 27 MiB of them read in pieces, a guess the next layer does not ask stopped mid-read, one it asks read whole from then on: the 8 GB machine's generation 1.031x (Q4_K), 1.000-1.005x (Q8_0), the same tokens; colibri's predictor replayed: its norm the same, its average 4.3 points worse; two layers ahead predicted at 74% and no gain",
           "d": "2026-10-05"
+        },
+        {
+          "v": "question 94, measured and modelled, not built: a draft that uses only the experts already in RAM guesses the next 8 tokens well on code (89-98% for the first) and badly on prose (50-88%); but checking its guesses costs more disk than it saves, because the expert store already reuses what neighbouring tokens share: every machine would lose (0.74-0.98x by the model). What survives: a draft that costs nothing, on the 8 GB machine's Q4_K (question 95)",
+          "d": "2026-10-05"
         }
       ],
       "questions": [
@@ -1174,8 +1178,13 @@
         },
         {
           "n": 94,
+          "state": "closed",
+          "text": "a draft from the bytes the machine already holds (Marcello, 10-05): phase 1 done, not built. The draft from the store's experts agrees 0.89-0.98 on code, 0.50-0.88 on prose (measured, chains of 8 from the exact state); every machine loses by the model on those chains (0.74-0.98x): the store already gives the saving a pass's shared experts promised, and a pass's rejected rows are read from disk twice (MEASUREMENTS §A draft from the bytes the machine holds)"
+        },
+        {
+          "n": 95,
           "state": "open",
-          "text": "a draft from the bytes the machine already holds (Marcello, 10-05: one piece for the whole structure, a gain on every machine): several exact tokens a pass, the draft restricted to the experts already in RAM (disk-bound machines, and from R2 on every ordinary one) or already streamed by the pass (RAM-bound); phase 1 measures and models it (build/prompt-draft.md)"
+          "text": "the drafts that cost nothing (the lookup, the gate) on the 8 GB machine's Q4_K, where a token is half disk, half compute and a verify row may cost a fraction of a token: the model gives 1.02-1.40x with the resident draft's chains; first that machine's row price"
         }
       ],
       "files": [
@@ -1192,7 +1201,9 @@
         "src/base/platform.c (tr_pages_*)",
         "src/memory/experts.c (tr_experts_acquire_async, the arrival order)",
         "src/memory/experts.c (tr_experts_prefetch_ids, the router's read ahead)",
-        "src/models/olmoe.c (olmoe_router_ahead)"
+        "src/models/olmoe.c (olmoe_router_ahead)",
+        "tools/spec_replay.py (verify passes on the store)",
+        "tools/resident_probe.c (make resident-probe)"
       ],
       "commands": [
         "sh tools/machines.sh <binary> 8 q4k q8",

@@ -1804,3 +1804,23 @@ How to try it: `make check`; `MSYS_NO_PATHCONV=1 docker run --rm -e ONLY=ahead -
 -v "$(pwd -W):/src" -w /src trochilus-dev:local sh tools/mutate_prefetch.sh` and `... sh tools/mutate_stream.sh`:
 every ahead line RED; the race: `TR_CPU_MAX=avx2 TR_MEM_TOTAL_MIB=8192 TR_MEM_AVAILABLE_MIB=4608
 TR_EXPERT_DISK_MBPS=500 AB_ENV_THREADS=4 sh tools/ab_env.sh build/trochilus.exe 5 "off=TR_AHEAD_K=0" "on=TR_AHEAD_K=-1"`.
+
+### 2026-10-05 — A draft from the bytes the machine holds: measured, modelled, not built (question 94)
+Two diagnostic tools, nothing in the engine. `tools/spec_replay.py` replays the expert store (`heat`) under verify
+passes: rows all kept (a perfect draft's bound), drafts agreeing at random, or a probe's measured chains; the disk
+and RAM units a token against one row; `--halve` and `--heat` set the store's policy under passes; `--dump-resident`
+writes the store's set before each row, `--routes` checks a probe's routing against the trace; its `--check` runs in
+`make lint`. `tools/resident_probe.c` (`make resident-probe`; the router's probe hook now passes the chosen ids, under
+`-DTR_DRAFT_PROBE` only) runs, at every greedy row, a draft that reads only the store's experts (`sub`, `skip`,
+`norm`) as a chain from the exact state, against the exact chain. Result: the draft agrees 0.89-0.98 on code and
+0.50-0.88 on prose, and loses on every machine by the model on those chains (0.74-0.98x): the store already gives
+the union's saving, and a chain's rejected rows are read again (MEASUREMENTS §A draft from the bytes the machine
+holds; LESSONS #335-#340). `tools/head_bound.py` (its `--check` in `make lint`) measures question 73: the head's
+argmax from each row's scales and top bits, exact only the rows that can still win: Q8_0's high nibble leaves
+0.2-3.8% of the rows, the head read at 0.53 (a RAM-bound token 1.039x by bytes), Q4_K's top 3 bits 0.78 (1.017x).
+
+How to try it: `tools/.venv/Scripts/python.exe tools/spec_replay.py --check`; the bound:
+`tools/.venv/Scripts/python.exe tools/spec_replay.py build/q92/l_Q8_0_own.trace --slots 290 --rows 2,4,8`; the
+probe's runs: `build/q94/phase1.sh` and `build/q94/phase2.sh` in the container (`MSYS_NO_PATHCONV=1 docker run --rm
+-v "$(pwd -W):/src" -v trochilus-models:/src/models -w /src trochilus-dev:local sh build/q94/phase1.sh`), then
+`spec_replay.py <trace> --slots 290 --chain build/q94/probe_<text>_Q8_0_s290.tsv --halve tokens`.

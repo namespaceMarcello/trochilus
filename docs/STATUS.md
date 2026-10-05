@@ -341,15 +341,14 @@ Replace, do not append. Cap 40 KB. History is in `archive/DONE.md`.
   its slots as it is written; a chat's decode on weak **Q8_0 1.22 -> 2.29, Q4_K 4.55 -> 14.77 tok/s**.
   **10-04, offered to colibri** (UPSTREAM row 7; #293-#294): `kv_room_fit` (fork branch `perf/olmoe-kv-room`), on
   colibri's engine a request **1.19x**, the logits byte-identical: **colibri #1873**, waiting for its review.
-  **10-04, the eviction told the future** (#304-#307): closed, heat stays. **10-04 night, the routes as time**
-  (#309-#313, replayed): the window, not the prediction, is the limit. **10-05, the arrival order** (MEASUREMENTS
-  §The arrival order built; #314-#317): a layer's misses read by the I/O thread while its present experts compute,
-  the late ones in waves as they land, the same bytes and bits: the weak decode **Q4_K 14.98 -> 16.08, Q8_0 2.33 ->
-  2.40 tok/s**; its handoffs 0.16% of a run (#318, q. 91).
-  **10-05, the router's read ahead** (MEASUREMENTS, same name; #323-#332): the next layer's guess (27 MiB),
-  read in pieces, stopped if not named: the weak decode **Q4_K 1.031, Q8_0 1.000-1.005**. Owed: the
-  old binary's race (#332), the average machine's Q8_0.
-  **Next**: question 94 (build/prompt-draft.md); a miss as one request, this PC
+  **10-04, the eviction told the future** (#304-#307): closed, heat stays; **the routes as time** (#309-#313):
+  the window, not the prediction, is the limit. **10-05, the arrival order** (#314-#318): a layer's misses read
+  while its present experts compute: the weak decode **Q4_K 14.98 -> 16.08, Q8_0 2.33 -> 2.40 tok/s**.
+  **10-05, the router's read ahead** (#323-#332): the next layer's guess (27 MiB), read in pieces, stopped if not
+  named: the weak decode **Q4_K 1.031, Q8_0 1.000-1.005**. Owed: the old binary's race (#332), avg's Q8_0.
+  **10-05, question 94** (#335-#338): a draft from the store's experts agrees 0.89-0.98 on code, 0.50-0.88 on
+  prose, loses on every machine (0.74-0.98x, model): the store already gives the union's saving; not built.
+  **Next**: question 95 (free drafts on weak Q4_K: its row price); a miss as one request, this PC
   at half budget; then the integrated GPU (r1-igpu:
   Vulkan; q. 87-88); then R1's first prompt's cost, generation's fixed cost, the review, the server; the races
   with llama.cpp, colibri and ds4 together at R1's close. The decode's

@@ -35,7 +35,7 @@
 
 void *tr_draft_probe_session(tr_session *s);
 tr_kv *tr_draft_probe_kv(void *session);
-void tr_draft_probe_route(float *sel_w, int64_t n_used);
+void tr_draft_probe_route(const int64_t *sel_id, float *sel_w, int64_t n_used);
 int tr_draft_probe_attention(int64_t layer, int64_t head, const float *q, const float *keys, const float *values,
                              int64_t n_pos, int64_t head_dim, float scale, float *scores, int64_t score_stride,
                              float *out);
@@ -132,7 +132,8 @@ static void record_selection(int64_t layer, int64_t head, const float *q, const 
     g_n_selected[slot][layer][head] = m;
 }
 
-void tr_draft_probe_route(float *sel_w, int64_t n_used) {
+void tr_draft_probe_route(const int64_t *sel_id, float *sel_w, int64_t n_used) {
+    (void)sel_id;
     if (g_topk <= 0 || g_topk >= n_used) return;
     float all = 0.0f, kept = 0.0f;
     for (int64_t i = 0; i < n_used; i++) all += sel_w[i];

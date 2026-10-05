@@ -185,6 +185,15 @@ draft-probe:
 $(BUILD)/draft_probe$(EXE): tools/draft_probe.c $(CORE_OBJ)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDLIBS)
 
+# A diagnostic program: how far a draft that reads only the experts the store holds agrees with the
+# exact greedy chain (tools/resident_probe.c, the resident sets from tools/spec_replay.py; docs/MEASUREMENTS.md
+# §A draft from the bytes the machine holds).
+resident-probe:
+	$(MAKE) BUILD=$(BUILD)/residentprobe EXTRA_CFLAGS=-DTR_DRAFT_PROBE $(BUILD)/residentprobe/resident_probe$(EXE)
+
+$(BUILD)/resident_probe$(EXE): tools/resident_probe.c $(CORE_OBJ)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDLIBS)
+
 # Scenarios with the engine profiler (bench/scenarios.json), compared with the
 # previous run on this machine. See docs/ARCHITECTURE.md §Profiling.
 # SCENARIOS=bench/scenarios-olmoe-1b-7b.json for the real model (skipped if not downloaded)
@@ -196,6 +205,8 @@ lint:
 	$(PY) tools/lint.py
 	$(PY) tools/route_trace_report.py --check
 	$(PY) tools/evict_replay.py --check
+	$(PY) tools/spec_replay.py --check
+	$(PY) tools/head_bound.py --check
 	$(PY) tools/check_measurements.py
 
 # Tiny OLMoE: transformers reference -> GGUF -> engine, greedy tokens must match exactly.
@@ -319,6 +330,7 @@ check: clean-machine lint
 	$(CC) $(filter-out -MMD -MP,$(CFLAGS)) -Werror -DTR_ATTN_PROBE -fsyntax-only src/models/olmoe.c tools/attn_probe.c
 	@# and the draft probe's (make draft-probe) and the traced pool's (TR_POOL_TRACE, the token's timeline)
 	$(CC) $(filter-out -MMD -MP,$(CFLAGS)) -Werror -DTR_DRAFT_PROBE -fsyntax-only src/models/olmoe.c src/models/model.c tools/draft_probe.c
+	$(CC) $(filter-out -MMD -MP,$(CFLAGS)) -Werror -DTR_DRAFT_PROBE -fsyntax-only tools/resident_probe.c
 	$(CC) $(filter-out -MMD -MP,$(CFLAGS)) -Werror -DTR_POOL_TRACE -fsyntax-only src/base/threads.c src/kernels/kernels.c src/models/olmoe.c
 	@# the models volume, when it exists, replaces models/ read over the Windows bind mount:
 	@# the real-model checks load the same file from ext4 instead of 9p (docs/LESSONS.md #41).

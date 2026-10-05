@@ -191,12 +191,12 @@ decides | — | — |
 | 70 | The softmax's exponential in a vector (question 58's AVX-512 kernel, 0.73 ns against `tr_expf`'s 3.52, 0 of 2^32 differ): with the tiles it is half of a prompt's (query, position) pair (4.45 of 9.2 ns on a core). Predicted: the prompt's attention 1.5-1.8x more, the prefill at 4000 +5-8%. **Built 2026-09-26** (§The softmax's exp in a vector): the table's `expf_f32`, AVX-512 and AVX2 without FMA, 0 of 2^32 differ from `tr_expf` in each tier; the prompt's attention 12.6 -> 8.9 ns a pair on a core (1.42x, loaded machine, indicative); in the engine on a free machine (8 pairs, background 2.3-2.4): the attention zone 1.34-1.37x, **the prefill 1.05x at 2048 and at 4000** | — | — |
 | 71 | A draft inside the exact bits (Q8_0 high nibble, KV high 16 bits) verified k tokens a pass: can it pass llama.cpp's bytes a token? (Marcello, 2026-09-26) **Measured** (§The engine read as entangled pairs): 97-100% where the exact model is sure, 82-98% overall; **0.81-1.04x llama.cpp's bytes on the real text** (model), 0.97-1.09x on the greedy continuation: this form closed on the CPU. **The two levers measured 2026-09-26** (§The draft's two levers): the second choice as a leaf +0.07-0.10x on prose and Italian; a KV of constant bytes (the previous token's top positions and their successors) keeps the sure positions at 512 and on code, not on prose at 2048-4000; **1.15-1.46x llama.cpp only on code** (repetitive), 0.89-1.04x on prose and Italian (model, upper bounds). Open: the skipped part of the softmax handed over by the exact pass; the selection's staleness | `make draft-probe`, `tools/draft_probe_report.py` | a pass's own drafts are 56% of its bytes; passes end where the draft doubts |
 | 72 | ~~Gate and up interleaved at load, one call with the activation~~ **Closed 2026-09-26 as no** (§The engine read as entangled pairs): on the free machine 1.006-1.023x of three calls from RAM (predicted 1.03-1.08x): with the experts balanced three calls already read at 97-98% of a plain read | — | — |
-| 73 | The head's argmax from its high plane: bounds from the high nibbles, exact dots only for the rows that can still win; greedy needs the argmax, `logits` keeps every row | the rows left after the bounds, on the real text | <= 49 MiB a token (4%) |
+| 73 | The head's argmax from its high plane: bounds from the high nibbles, exact dots only for the rows that can still win; greedy needs the argmax, `logits` keeps every row. **Rows left measured 2026-10-05** (§A draft from the bytes the machine holds, `tools/head_bound.py`): Q8_0's high nibble leaves 0.2-3.8% of the rows, the head read at 0.53-0.55, a RAM-bound Q8_0 token 1.039x by bytes; Q4_K's top 3 of 4 bits 0.2-3.7%, the head at 0.78, 1.017x. Open: built (the head repacked in planes at load, greedy and verify passes only) and raced on avg and pc | the rows left after the bounds, on the real text | <= 49 MiB a token (4%) |
 | 74 | The draft on the GPU: the Q8_0 high-nibble planes and the draft's KV in VRAM, the CPU verifying from RAM, overlapped (the idea bounce of 2026-09-26, `build/entangled/bounce.md`): ~2.2x overlapped, ~1.7x serial in time (model). For Marcello: does the GPU count in the race (the GPU attention did) | a ~50-line CUDA probe timing one batch-1 draft step (plane 635 MiB + KV halves 256): pass <= 6 ms a draft token, fail > 15 ms | the draft's 891 MiB a draft token off the RAM bus |
 | 75 | ~~A draft KV in int4 (or int8) written once per position, and a draft head of the top ~16k rows~~ **Measured 2026-09-26** (§The draft's KV in 8 and 4 bits): the 8-bit copy changes no draft token and lifts every cell 0.02-0.14x; out of sample prose 0.93-1.09x, Italian 0.95-1.12x, code 1.14-1.26x; the 16k head covers 85-93% of the exact tokens: out. Prose does not pass 1.1x: the draft's weight plane is what is left | — | — |
 | 76 | Why does a 4-bit draft KV agree with the exact model more often than a 16-bit one (18 flips won, 3 lost, mostly where the exact margin is under 1 nat)? A guess: noise on the old keys inflates their softmax weight (Jensen) against the last 64 kept at 16 bits | kv4 with no positions kept at 16 bits; Gaussian noise on the 16-bit draft's old keys | a draft that is cheaper and closer at once |
 | 78 | The verify pass of 2-4 rows at its bytes (§The post-it taken apart): while no group reaches 4 rows the grouped matmul cut by weight rows and balanced (every input row of a group against a weight row while it is in cache), a kernel decoding a weight row once for 2-3 tokens. **Q8_0 done 2026-09-27** (§The short verify pass at its bytes: 3 rows at its bytes, a row 0.31 of a pass; 2 rows 0.43). **Q4_K 2026-09-27** (§The Q4_K short passes: the W16 panel's rows brought ahead, a 2-row group by `q4x_dot2` pairs: 3 rows 28.0 -> 26.5 ms, 2 rows 22.9 -> 22.2 at 8 threads); then **road (c)** (§A Q4_K weight row decoded once for 2-3 tokens: `q4x_dot_xt`, two weight rows decoded once for a group's 2-3 rows: 2 rows 0.94-0.98, 3 rows 0.96-0.985 in three sessions, the prompt unchanged, the decode +0.8-1.7% spread over every zone: open, the code's layout?); left: the rest's +0.30-0.42 ms a row and the dense at 3 rows, +0.39-0.45 (xt(3) reads at 0.88 of the bytes at 8 threads) | `sh tools/row_price.sh` before and after (2, 3, 5, 9 rows), also with a 2048 and 4000-position prefix (the context is modelled today); then `tools/draft_gate_sim.py` | new code's drafts are short: a row costs 0.50-0.72 of a pass today, 0.31-0.36 at its bytes; every draft source gains |
-| 79 | A row that costs no bytes: the model restricted to the experts the pass already reads (the union of its exact rows'), as a draft, or as a filter of the gate's draft before its exact rows (two-stage verification) | a `draft_probe` variant: agreement with the exact argmax by margin, restricted to the union of 1 and of 2 exact rows | the model's knowledge of names at ~0.03-0.05 of a pass a row, where the table knows 22% of them |
+| 79 | A row that costs no bytes. **As a draft, answered by question 94 (2026-10-05, model, not measured; §A draft from the bytes the machine holds)**: it re-reads the dense 37-40% of a token's bytes for each drafted token, 0.74-0.86x with the measured chains; as a filter of the gate's draft, open. Asked: the model restricted to the experts the pass already reads (the union of its exact rows'), as a draft, or as a filter of the gate's draft before its exact rows (two-stage verification) | a `draft_probe` variant: agreement with the exact argmax by margin, restricted to the union of 1 and of 2 exact rows | the model's knowledge of names at ~0.03-0.05 of a pass a row, where the table knows 22% of them |
 | 80 | Drop a draft row mid-pass when the main row's intermediate state says its draft is wrong (logit lens on the draft's and the gate's candidates' rows of the head, a few KB) | per layer, the draft's logit-lens rank among the candidates on the replay's positions | a wrong row then costs its new experts only up to the layer where it is dropped |
 | 81 | The drafts on code written with a real context: a function of a real file continued mid-file with the rest of the file and its neighbours in the prompt, and a table built from the user's own repository. **Answered 2026-09-27** (§Drafts with a real context): the engine's lookup 1.067x, the gate 1.146x at the measured prices (1.27-1.32x with the context modelled), the repo table adds nothing to the gate; left: the row's price measured at ~3000 positions | the 18-prompt pipeline (`tools/draft_table_gen.sh`, `tools/draft_gate_sim.py`) on prompts cut from this repo's `src/` and `tools/`, the table from the repo minus the file under test | the 18 prompts are file beginnings (~100-200 positions): real use has thousands, and the context sources are the best drafters measured |
 | 82 | The short passes' width when every pass drafts (LESSONS #228): the tuner probes one-row passes only, so a session with a draft on every pass runs its 2-4-row passes on the whole pool. **Answered 2026-09-27** (§The verify passes' own width): every size of verify pass measures its own width, the narrowest skipped; on a pool of 16 Q8_0 0.961-0.966 of the pool, Q4_K 0.982-1.005, 8 threads picked everywhere; left: the probes' cost on long sessions (a re-measure every doubling) | the passes of 1, 2 and 3 rows at 4, 8 and 16 threads forced (`--decode-threads`) on a pool of 16, alternated; then the tuner fed the short passes too | after question 78 the short passes are still 1.04-1.09x slower at 16 threads than at 8 |
@@ -210,7 +210,8 @@ decides | — | — |
 | 89 | **A MoE larger than RAM: its experts at the disk's limit, the VRAM as their cache** (Marcello, 2026-10-04; rung R3, **not before R2 closes**): Qwen3.8-Flash-Next FP8, 185 GB, 48 layers x 512 experts of 4.9 MB, 10 a token a layer. On this 8 GB-GPU, 31 GB laptop colibri decodes it at 0.75-1.01 tok/s and is disk-bound: it reads the experts buffered at 0.6 GB/s, queue depth ~1.5, against 2.1-3.0 GB/s O_DIRECT on the same drive (LESSONS #297); its VRAM gives more as expert cache than as trunk compute (#296; §Qwen3.8-Flash-Next FP8 on colibri's Vulkan tier). How close to the drive's limit can our store read 4.9 MB experts, and how many misses a token does the VRAM save as a cache tier under the RAM's? | the drive's ceiling for 4.9 MB reads at depth 1-16 (`make bench-disk`); a routing trace of the real model replayed through RAM + VRAM slots (`tools/evict_replay.py`); then the engine on the real model, the same tokens, against colibri on this machine | colibri used 0.6 of the drive's 2-3 GB/s: on a disk-bound decode that is up to 3.5-5x before any compute (an estimate); the VRAM holds ~5% of the experts (1248 of 24576), the RAM ~9% |
 | 90 | **A decode layer's experts as their bytes arrive** (R1 phase 3, the 8 GB machine; 2026-10-04): today a layer's misses are read on the calling thread, then its experts computed. Computing the resident ones while an I/O thread reads the misses, then the late ones, hides a miss under its own layer (§The routes as time: the model 1.084 Q4_K, 1.038 Q8_0, the same bytes); the next layer's router reading ahead adds 4% on Q4_K at +11% bytes. Does the engine keep the model's word, and what do the extra pool regions cost? | the expert stages split (resident, then late) with the store's reads on an I/O thread, the same bits (`make check`); counted (`MACHINES_COUNTS=1`), then raced on the 8 GB machine (`sh tools/machines.sh <binary> 5 q4k q8`) | Q4_K 1.06-1.08, Q8_0 1.03-1.04 (the model less two or three region ends a layer with a miss) |
 | 92 | ~~**The router's read ahead on top of the arrival order**~~ **Answered 2026-10-05** (§The router's read ahead): the 8 GB machine's decode Q4_K **1.031**, Q8_0 1.000 (k 8) and 1.005 (k 4), the same bits; a guess read in pieces and stopped when the next router does not name it, read a part a request once it does, k the next layer's units in 27 MiB. Open beside it: the race against the old binary (#332), the average machine's Q8_0 | ab_env.sh, `TR_AHEAD_K=0` against the default | Q4_K +2.5..4.5%, in |
-| 94 | **A draft from the bytes the machine already holds** (Marcello, 2026-10-05: the one piece that would change the whole structure, a gain on every machine): the reads for one token are near their ceilings (Q8_0 at 97% of its disk on 8 GB, the RAM-bound machines at 98-99%), and from R2 on every ordinary machine's experts come from disk. A pass of k rows reads 2.33x one row's experts at k 4 (question 54) and yields up to k exact tokens; the draft restricted to the experts already in RAM (disk-bound) or already streamed by the pass (RAM-bound, question 79) costs nothing on the bottleneck, the verification exact. How many exact tokens a pass, on each machine? | phase 1 (build/prompt-draft.md): agreement of each draft (a `draft_probe` variant, chains of k tokens), then a bytes-and-time model per machine checked against the engine's counts; built only at >= 1.2x and never below 1.0 | disk-bound 1.3-1.6x, RAM-bound 1.0-1.2x (question 71's draft inside the bits was 0.81-1.09x of llama.cpp's bytes) |
+| 94 | **A draft from the bytes the machine already holds**. **Phase 1 answered 2026-10-05: not built** (§A draft from the bytes the machine holds): below 1.0x on every machine (model, not measured: on the measured chains and the replayed store) (weak Q8_0 0.87-0.98, weak Q4_K 0.82-0.94, RAM-bound 0.74-0.86): the store already gives the union's saving, a chain's rejected rows are read again, the RAM-bound draft re-reads the dense bytes. Measured: the resident draft agrees 0.89-0.98 on code, 0.50-0.88 on prose. Open only for an engine's measurement, which the model does not ask for. Asked (Marcello, 2026-10-05: the one piece that would change the whole structure, a gain on every machine): the reads for one token are near their ceilings (Q8_0 at 97% of its disk on 8 GB, the RAM-bound machines at 98-99%), and from R2 on every ordinary machine's experts come from disk. A pass of k rows reads 2.33x one row's experts at k 4 (question 54) and yields up to k exact tokens; the draft restricted to the experts already in RAM (disk-bound) or already streamed by the pass (RAM-bound, question 79) costs nothing on the bottleneck, the verification exact. How many exact tokens a pass, on each machine? | phase 1 (build/prompt-draft.md): agreement of each draft (a `draft_probe` variant, chains of k tokens), then a bytes-and-time model per machine checked against the engine's counts; built only at >= 1.2x and never below 1.0 | disk-bound 1.3-1.6x, RAM-bound 1.0-1.2x (question 71's draft inside the bits was 0.81-1.09x of llama.cpp's bytes) |
+| 95 | **The free drafts on the 8 GB machine's Q4_K** (question 94's survivor, 2026-10-05): there a token is half disk waits, half the four AVX2 cores' compute, and a verify row may cost far less than a token (the prompt's tiles: weakr's prompt 7.9 ms a row against a 31.3 ms token). A draft that reads nothing (the engine's lookup, question 81's gate) pays only its agreement; with the resident draft's chains the model gives code 1.07-1.40x, prose 1.03-1.23x, by the row's price (0.8-0.3 of a token). What is the weak machine's row price, and what do the lookup and the gate give there? | `tools/row_price.sh` with the weak machine's environment (2, 3, 5, 9 rows), then `tools/draft_gate_sim.py` at those prices on question 81's prompts; then `spec_replay --chain` for the disk | R1 phase 3 on the weakest machine; `--spec` by default there if it pays |
 Reference machine: Ryzen 9 7940HX (Zen 4, 16 core / 32 thread, AVX-512 VNNI/BF16), 31 GB
 RAM (2×16 GB DDR5-5200), NVMe Micron 1 TB, GPU RTX 4070 Laptop 8 GB and Radeon 610M (not used
 until M3/M6), Windows 11, MinGW-w64 gcc 15.2 `-O2`. Laptop on power, other programs open
@@ -6210,3 +6211,120 @@ same, the disk a token 15.8 -> 18.8 and 189.6 -> 190.8 MiB, the same tokens in a
   Q8_0 191-196, in (195.7); the demand misses -45..-60%, **out** (-36%: the same model on 64 tokens says -43%).
 - **Owed**: the race against the old binary (Smart App Control held 12147b2's builds all session, #332): the
   resident machines unchanged, the code's layout; the average machine's Q8_0 (2 GB/s: the guess on a faster disk).
+
+## A draft from the bytes the machine holds (question 94, 2026-10-05)
+
+Phase 1 of build/prompt-draft.md, nothing built: a draft that reads only what the machine already holds (the
+experts in the store on a disk-bound machine, those a pass already streams on a RAM-bound one), verified by the
+exact model k rows a pass. Counts and models only (no stopwatch); data and predictions in build/q94.
+
+**The bound first** (`tools/spec_replay.py`: the store's `heat` replayed with the decode in passes of r rows, every
+row kept, a perfect draft; model, not measured): the disk units a token against the one-row decode, on five Q8_0 traces (the
+race's code prompt, English and Italian prose, C, Python):
+
+| slots (of 1024) | rows 2 | rows 4 | rows 8 |
+|---|---|---|---|
+| 128 | 0.88-0.90 | 0.76-0.78 | 0.61-0.64 |
+| 200 | 0.88-0.93 | 0.78-0.82 | 0.63-0.70 |
+| **290** (the 8 GB machine's Q8_0) | 0.90-0.97 | **0.80-0.88** | 0.67-0.76 |
+| 400 | 0.92-1.00 | 0.83-0.94 | 0.71-0.82 |
+| 610 (the 8 GB machine's Q4_K share) | 0.90-1.07 | 0.85-1.08 | 0.82-1.00 |
+| the RAM's units (question 54's union) | 0.77 | 0.57 | 0.40 |
+
+- **The store already holds what the union saves** (#335): from RAM a pass of 4 rows reads 0.57 of four tokens'
+  experts, from disk 0.80-0.88 of their misses at 290 slots, and no fewer at 610: consecutive tokens' shared
+  experts are hits already. A perfect draft's pass of 8 rows bounds the 8 GB machine's Q8_0 at 1.21-1.31x after the
+  draft's compute (build/q94/model.txt).
+
+**The agreement, measured** (`tools/resident_probe.c`, `make resident-probe`, container): the store's set before
+every row from `spec_replay --dump-resident` on the same run's route trace; at each of 256 greedy rows after the
+prompt, each draft's chain from the exact state for up to 8 tokens, then the row exactly. Checked: the probe's exact
+routing of every row equals the trace's (`spec_replay --routes`: 0 sets apart in all 9 runs, 48 against another
+model's trace), its exact token pass 1's. `sub`: the router's best 8 among the resident; `skip`: the exact routing,
+the absent experts' weights 0; `norm`: skip, the present weights scaled to the 8's sum.
+
+| model, slots | text | resident share of a row's routing | first token sub / skip / norm | mean chain of 8, skip / norm | norm where the exact margin < 1 / >= 1 nat |
+|---|---|---|---|---|---|
+| Q8_0, 290 | code | 0.747 | 0.887 / 0.898 / **0.906** | 5.86 / 6.12 | 0.58 / 0.94 |
+| Q8_0, 290 | English prose | 0.556 | 0.594 / 0.578 / 0.500 | 1.23 / 0.88 | 0.33 / 0.57 |
+| Q8_0, 290 | Italian | 0.663 | 0.699 / 0.691 / 0.621 | 1.86 / 1.43 | 0.36 / 0.73 |
+| Q8_0, 128 | code | 0.509 | - / 0.805 / 0.785 | 4.41 / 3.95 | 0.42 / 0.82 |
+| Q8_0, 128 | English prose | 0.314 | - / 0.297 / 0.160 | 0.39 / 0.20 | 0.12 / 0.18 |
+| Q8_0, 128 | Italian | 0.441 | - / 0.543 / 0.395 | 1.10 / 0.58 | 0.07 / 0.53 |
+| Q4_K, 610 | code | 0.953 | **0.984** / 0.984 / 0.980 | **7.29** / 7.24 | 0.86 / 0.99 |
+| Q4_K, 610 | English prose (129 rows) | 0.826 | 0.845 / 0.853 / 0.791 | 3.64 / 3.35 | 0.63 / 0.89 |
+| Q4_K, 610 | Italian | 0.903 | 0.867 / 0.879 / 0.844 | 3.78 / 3.31 | 0.62 / 0.94 |
+
+- **The text decides more than the slots** (#337): at the same 290 slots the store holds 75% of a code row's routing
+  and 56% of an English one's; code's chains run 6 of 8, prose's 1. `sub` is not run at 128 slots (a layer always
+  holds fewer than 8); rescaling the present weights (`norm`) helps code and hurts prose. Prediction: 70-85% at 290
+  slots, 92-97% at 610: code above, prose below.
+
+**The verify passes with these chains** (`spec_replay --chain`; the store halved every 16 kept tokens and heated by
+every row named, the best of four policies on code at k 7: 1.20 against 1.23-1.33): the disk a token at k 1 and k 7.
+
+| model, slots | code | English prose | Italian |
+|---|---|---|---|
+| Q8_0, 290 | 1.01-1.02 / 1.20-1.30 | 1.10-1.13 / 2.1-2.5 | 1.06-1.10 / 1.9-2.3 |
+| Q8_0, 128 | 1.02 / 1.48-1.50 | 1.30-1.47 / 3.3-3.8 | 1.08-1.24 / 2.3-3.0 |
+| Q4_K, 610 | 0.98 / 0.99 (7.3 tokens a pass) | 0.97-1.00 / 1.24-1.37 | 1.00-1.01 / 1.24-1.26 |
+
+- **A real chain's pass reads more than one row a token** (#336): a pass of r rows names union(r) x 128 units, 298
+  at 4 rows and 427 at 8 against 290 slots; the rows a pass rejects are read and evicted before the next pass reads
+  them again. The perfect draft's 0.80-0.88 becomes 1.01-2.5.
+
+**The model per machine** (build/q94/model_chains.txt; model, not measured, on the measured chains): the draft's compute is the
+dense share plus the resident share of the experts of weakr's token (23.6 ms Q8_0, 36 ms Q4_K) or of a 21 GB/s RAM's;
+the verify pass its disk units at 400 ms a Q8_0 token and 39 ms of a Q4_K token's waits, Q4_K's extra rows at 0.3-0.8
+of a token; on the RAM-bound machines the draft reads the dense bytes and its experts, the pass its union. The best
+k, always 1:
+
+| machine | code | English prose | Italian |
+|---|---|---|---|
+| weak Q8_0, 290 slots (emulated RAM / 21 GB/s) | 0.98 / 0.94 | 0.90 / 0.87 | 0.94 / 0.90 |
+| weak Q4_K, 610 slots (rows at 0.3 / 0.8 of a token) | 0.94 / 0.84 | 0.93 / 0.83 | 0.92 / 0.82 |
+| avg and pc, the union draft (Q8_0 / Q4_K) | 0.86 / 0.86 | 0.74 / 0.81 | 0.78 / 0.82 |
+| larger than RAM (128 slots, Q8_0's shape) | 0.98 | 0.77 | 0.92 |
+
+- **Closed: a draft from the bytes the machine holds loses on every machine** (the rule: build at >= 1.2x, never
+  below 1.0). Disk-bound: the store already gives the union's saving and a chain's rejected rows cost more than its
+  accepted ones save. RAM-bound: the draft re-reads the dense 37-40% of a token for each token it drafts (question 79
+  closed by the same model). Weak Q4_K: the draft costs a token's compute.
+- **What survives** (question 95): on weak Q4_K the cost is the draft's compute alone, and the resident chains on
+  code are long (7.3 of 8): a draft that reads nothing, with these chains, gives code 1.07-1.40x by the model, prose
+  1.03-1.23x, Italian 1.02-1.18x (rows at 0.8-0.3 of a token): the engine's lookup and question 81's gate cost
+  nothing but agree less, and this machine's row price is not measured.
+
+**The fast inverse square root's lens** (Marcello, 10-05: a number's bits hold a coarse copy of another quantity;
+guess cheaply, then correct, the correction proven): each candidate's share first, on weak Q4_K's profile
+(build/q92/env_q4k.log, 75 ms a token) and the GGUFs' bytes.
+- (b) **The output head by a bound** (`tools/head_bound.py`, question 73): 104.4 MiB of a Q8_0 token's 1284.6
+  (8.1%), 55.3 of a Q4_K one's 723.5 (7.6%; the head is Q4_K, predicted Q6_K at 11%); 2.65 ms of weak Q4_K's 75.
+  First closed here by its share (#340: the 1.2x bar was the draft's, not the lens's); then measured. Every row's
+  upper bound from its scales and its codes' top b bits (the low bits at their worst against h), exact only the rows
+  whose bound reaches the best exact logit; h solved from the engine's logits (residual <= 1e-5, every argmax kept),
+  every bound checked against its own row; the three prompts' every position (321, 583, 941):
+
+| head | top bits kept | rows left: mean (median, p99) code / English / Italian | the head's bytes read | a RAM-bound token, by bytes |
+|---|---|---|---|---|
+| Q8_0 | 3 of 8 | 26% / 67% / 79% | 0.56-0.88 | - |
+| Q8_0 | **4 of 8** | **0.2% (3, 2372) / 0.6% (69, 3111) / 3.8% (781, 12590)** | **0.53-0.55** | **1.039x** |
+| Q8_0 | 5 of 8 | 0.01% / 0.02% / 0.07% | 0.65 | 1.029x |
+| Q4_K | 2 of 4 | 85% / 99% / 99% | 0.93-1.0 | - |
+| Q4_K | **3 of 4** | **0.2% (3, 3253) / 0.6% (82, 2741) / 3.7% (764, 12882)** | **0.78** | **1.017x** |
+
+  The high nibble decides almost every row: a Q8_0 head read at 0.53, a RAM-bound Q8_0 token 1.039x (model, not
+  measured), Q4_K 1.017x; greedy and the verify passes only (sampling needs every logit). Under question 94's bar,
+  above the pieces built at 1.005-1.03: question 73 stays open for the build and the race on avg and pc.
+- (b) Attention positions by a bound: closed 2026-09-24 (§Skipping cached positions exactly: the oracle skips
+  0.2-0.37% of the bytes; QK-norm keeps OLMoE's attention flat). Not reopened.
+- (a) A draft by bit tricks: a draft's cost is its matmuls; the nonlinearities and the router are under 1% of a token
+  (expert_act 0.17 ms, router 0.11): nothing to take.
+- (c) RMSNorm's 1/sqrt from a seed and Newton: the norms 0.127 ms of 75 (0.17%). Closed by its share.
+
+**The references** (`docs/ORIGINS.md` row 8): none drafts with the main MoE's own resident experts. colibri's DSpark
+head drafts with 128 experts of its own (3 a token, a fifth of a main token) and verifies the drafts' union once
+(`v4_moe_batch_union`); ds4's DSpark and MTP heads are trained, not byte-identical. The literature (SS-MoE, S2-MoE,
+DraftExpert 1.45x with trained resident draft experts at 84-87% acceptance, AcceptMoE, cache-conditional routing,
+the last two not exact): the GPU's verify cheap, the bus the limit; none counts the store's own reuse of consecutive
+tokens.
