@@ -1887,4 +1887,14 @@ The margin now grows with the longest rounding path, (D + 16) 2^-24, never below
 
 How to try it: `docker build -t trochilus-proof:local -f tools/docker/Dockerfile.proof tools`, then `make proof`. It
 prints one line a harness, about 15 minutes, logs in build/proof. `sh tools/mutate_head.sh` in that image turns every
-harness red under its own mutation. Commit: `27ed028` (not pushed).
+harness red under its own mutation. Commit: `27ed028`, pushed 2026-10-06 with `431a0da` and `8e4c2da`.
+
+### 2026-10-06 — What `restrict` would give the scalar tier: zero on the roadmap's machines
+A measurement, no code. gcc -O2 leaves the scalar axpy unvectorized; `-fvect-cost-model=dynamic` vectorizes it
+without `restrict`'s promise (3.1x on the loop), and the 16-lane keys dot written as blocks of 16 vectorizes at plain
+-O2 (3.2x, bits identical). 0.7-35% of a token on CPUs without AVX2, from 1K to 32K of context; zero on every
+roadmap machine (all AVX2). Kept for the ARM rung: LESSONS #355, MEASUREMENTS §What `restrict` would give the scalar
+tier.
+
+How to try it: the two loops' benches are described in that section (trochilus-dev, one core pinned, SSE2 code).
+Commit: `8e4c2da`, pushed 2026-10-06.
