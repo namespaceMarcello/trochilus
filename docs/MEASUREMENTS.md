@@ -6742,3 +6742,35 @@ on every head it builds.
      on the real code where that display fails: n = 256, d = 0, dmin = 65504, h_0 = 2^64, h_32 = 1.5 2^-64.
    - T1 held there through a spare the text did not state (err_el is at least 1.94 times the engine's rounding of h).
      The text now states it, and with it the floating-point environment and the worker hypothesis.
+
+## What `restrict` would give the scalar tier (2026-10-06)
+
+Asked after the 0xfab.ch article «Fortran is not faster than C» (aliasing, `restrict`). LESSONS #355.
+- **Compile only** (gcc 15.2, the Makefile's `-O2 -ffp-contract=off`): `k_axpy_f32` (kernels.c:34) is not
+  vectorized; with `restrict` on `y` and `x` it is (16-byte vectors). `-fvect-cost-model=dynamic` on the same
+  file vectorizes it **without the promise** (gcc adds an overlap check a call), and with it `tr_rmsnorm`'s and
+  `tr_swiglu`'s in-place loops, where `restrict` would be false. `k_dot_f32`'s `lane[k % 16]` form is not
+  vectorized under either; the same lanes written as blocks of 16 (`for k += 16: for l < 16: lane[l] += ...`)
+  are, at plain -O2.
+- **Timed** (trochilus-dev, gcc 13.3, one core pinned, SSE2 code as on an x86 without AVX2, n = 128, 1000 rows
+  hot, 11 runs x 200 passes, median):
+
+| loop | as today | vectorized | ratio | bits |
+|---|---|---|---|---|
+| values `y += a x` | 0.206 ns/elem (0.204-0.206) | 0.067 (0.066-0.067) with `-fvect-cost-model=dynamic` | 3.1x | same `check` value |
+| keys dot, 16 lanes | 0.433 (0.428-0.447) | 0.134 (0.133-0.201) as blocks of 16 | 3.2x | 0 of 1000 rows differ |
+
+- **Against the whole token** (an estimate: Qwen3-Coder-30B-A3B decode on the scalar tier, compute only, one
+  core). Weights ~3.0 G at ~1.3 ns: Q4_K prepared `dot2` 1.15 ns a weight (bench_q4x, TR_CPU_MAX=scalar, in
+  the container), Q6_K 1.72 (bench_kernels); ~3.9 s a token. Attention a cache position: 48 layers x 32 heads
+  x 128 = 196,608 elements, 40.5 us of values and 85 us of keys.
+
+| context | values vectorized (`restrict` or the flag) | values + keys as blocks |
+|---|---|---|
+| 1,000 | 0.7% | 2.1% |
+| 4,000 | 2.5% | 7.8% |
+| 32,000 | 11% | 35% |
+
+- **Verdict**: zero on every roadmap machine (all AVX2: the scalar tier never runs). For ARM before a NEON
+  tier and x86 without AVX2: the flag beats `restrict` (same gain, no promise), and the keys loop as blocks is
+  worth twice as much as either. A disk-fed machine's share is smaller (the disk's time is outside the count).
